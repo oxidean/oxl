@@ -1,0 +1,641 @@
+package main
+
+// oxl — the toolchain driver, in .oxl (toolchain-in-oxl stage T2).
+// Ports the seed driver's build/run/test/list from oxl/src/main.rs:
+// argv dispatch, the pkg-args/file-list rule, compile orchestration
+// over bootstrap/check + bootstrap/codegen, scratch-dir emission, and
+// the cc invocation with its proven flag order. fmt/doc/get/mod/lsp
+// land in T3–T5 — they dispatch here as stubs so the command surface
+// is already shaped like the seed's.
+import "oxl/bootstrap/check"
+
+import "oxl/bootstrap/codegen"
+
+import "std/errors"
+
+import "std/os"
+
+import "std/os/exec"
+
+import "std/sort"
+
+import "std/strings"
+
+// raw fs/process primitives the os package doesn't shape the way
+// emit_and_cc needs them (errno detail for driver diagnostics, the
+// exclusive-mkdir collision check, the windows probe)
+extern fn rt_mkdir(path: str) -> int
+
+extern fn rt_errstr(code: int) -> str
+
+extern fn rt_is_windows() -> int
+
+extern fn rt_open_write(path: str) -> int
+
+extern fn rt_fd_write(fd: int, b: []byte) -> int
+
+extern fn rt_fd_close(fd: int) -> int
+
+// ---------- stderr ----------
+// the seed prints every driver diagnostic to stderr; stdout stays for
+// `list` output and the compiled program's own output
+fn eprint(s: str) {
+    f := os.stderr()
+    [_, e] = f.write(s as []byte)
+    if e != nil {
+        exit(1) // stderr itself is gone — nothing left to do
+    }
+}
+
+fn eprintln(s: str) {
+    eprint(s + "\n")
+}
+
+// check.oxl diags carry {kind,msg} with no position — the seed's
+// `file:line:col:` prefix is stripped by the parity corpus before
+// comparison (the tests/diag convention), so the bare form is what
+// both sides converge on
+fn report_diags(diags: []check.DBox) {
+    i := 0
+    for i < len(diags) {
+        d := diags[i]
+        eprintln("error [" + d.kind + "] " + d.msg)
+        i = i + 1
+    }
+}
+
+// ---------- pkg args (seed pkg_args/pkg_src) ----------
+// positional args naming sources: a leading directory, or consecutive
+// .oxl files (the file-list rule); argi is where program args begin
+struct PkgArgs { fs: []str, argi: int }
+
+struct PkgSrc { dir: str, files: []str }
+
+fn pkg_args(start: int) -> PkgArgs {
+    fs := mkslice(str, 0)
+    i := start
+    for i < argc() && argv(i) != "--" {
+        a := argv(i)
+        if len(fs) == 0 && os.isdir(a) {
+            fs = push(fs, a)
+            i = i + 1
+            break
+        }
+        if strings.endswith(a, ".oxl") == false {
+            break
+        }
+        fs = push(fs, a)
+        i = i + 1
+    }
+    return PkgArgs{fs: fs, argi: i}
+}
+
+// source args -> package source: one dir = dir package, files = the
+// file-list package, none = the cwd package
+fn pkg_src(fs: []str) -> PkgSrc {
+    if len(fs) == 1 && os.isdir(fs[0]) {
+        return PkgSrc{dir: fs[0], files: mkslice(str, 0)}
+    }
+    if len(fs) == 0 {
+        return PkgSrc{dir: ".", files: mkslice(str, 0)}
+    }
+    return PkgSrc{dir: "", files: fs}
+}
+
+// the dir the entry concept anchors at — the package dir, or the
+// first file's parent in file-list mode
+fn entry_dir(src: PkgSrc) -> str {
+    if len(src.files) > 0 {
+        return check.dir_of(src.files[0])
+    }
+    return src.dir
+}
+
+// ---------- compile (seed compile_mode) ----------
+struct CRes { c: str, ok: int }
+
+fn compile_mode(src: PkgSrc, testm: int) -> own CRes {
+    need_main := 1 - testm
+    if len(src.files) > 0 {
+        return compile_res(check.check_files(src.files, need_main), testm)
+    }
+    return compile_res(check.check_file(src.dir, need_main), testm)
+}
+
+// report the checked diags, then emit; ok=0 keeps the failure path
+// shaped like the seed's Result<String, ()>
+fn compile_res(r: own check.CkRes, testm: int) -> own CRes {
+    res := new(CRes)
+    res.c = ""
+    res.ok = 0
+    if len(r.ck.diags) > 0 {
+        report_diags(r.ck.diags)
+        return res
+    }
+    res.c = codegen.emit(r, testm)
+    res.ok = 1
+    return res
+}
+
+fn compile(src: PkgSrc) -> own CRes {
+    return compile_mode(src, 0)
+}
+
+// ---------- scratch dir (seed mk_scratch_dir) ----------
+// private scratch dir under temp_dir(): created exclusively (never a
+// pre-existing dir someone else owns), retried a few times on a name
+// collision before giving up. The seed names dirs with pid+nanos; the
+// runtime exposes no pid call, so now_ms + the attempt counter carry
+// the entropy — mkdir's exclusivity is what guarantees safety anyway.
+fn mk_scratch_dir(prefix: str) -> str {
+    tmp := os.temp_dir()
+    attempt := 0
+    for attempt < 16 {
+        dir := tmp + "/" + prefix + "-" + itoa(now_ms()) + "-" + itoa(attempt)
+        r := rt_mkdir(dir)
+        if r == 0 {
+            return dir
+        }
+        if os.exists(dir) {
+            attempt = attempt + 1
+            continue
+        }
+        eprintln("cannot create build dir " + dir + ": " + rt_errstr(-r))
+        return ""
+    }
+    eprintln("cannot create a fresh " + prefix + " dir under " + tmp)
+    return ""
+}
+
+// ---------- files ----------
+// write a whole text file; 0 or a positive errno for the diagnostic
+fn write_text(path: str, data: str) -> int {
+    fd := rt_open_write(path)
+    if fd < 0 {
+        return -fd
+    }
+    b := data as []byte
+    off := 0
+    for off < len(b) {
+        n := rt_fd_write(fd, b[off:])
+        if n <= 0 {
+            c := n
+            if c == 0 {
+                c = -5 // a zero write on nonempty input is EIO
+            }
+            rt_fd_close(fd)
+            return -c
+        }
+        off = off + n
+    }
+    r := rt_fd_close(fd)
+    if r < 0 {
+        return -r
+    }
+    return 0
+}
+
+// ---------- runtime files ----------
+// the emitted C needs rt.h/rt.c beside it — the seed embeds them in
+// the binary (codegen::runtime_files); the .oxl side locates the
+// source tree's runtime/ the same way resolve_imp locates std/:
+// ancestors of the executable first (a shipped or in-repo binary),
+// then ancestors of the compiled package (a self driver run from a
+// scratch dir still finds the SOURCE tree).
+fn runtime_at(base: str) -> str {
+    d := base
+    for len(d) > 0 {
+        if os.exists(d + "/runtime/rt.c") {
+            return d
+        }
+        if d == "." || d == "/" {
+            break
+        }
+        d = check.dir_of(d)
+    }
+    return ""
+}
+
+fn runtime_dir(entry: str) -> str {
+    d := runtime_at(check.canon_or(check.dir_of(argv(0))))
+    if len(d) == 0 {
+        d = runtime_at(check.canon_or(entry))
+    }
+    if len(d) == 0 {
+        // last resort: the invocation cwd — a seed-built driver run
+        // from inside a checkout (scratch exe, out-of-tree sources)
+        // still finds the checkout's runtime/
+        d = runtime_at(check.canon_or("."))
+    }
+    return d
+}
+
+// ---------- cc (seed pick_cc/exe_out_name/emit_and_cc) ----------
+// LANG_CC wins unconditionally; else the first compiler that spawns
+// and answers --version with success.
+fn pick_cc() -> str {
+    cc := os.getenv("LANG_CC")
+    if len(cc) > 0 {
+        return cc
+    }
+    cands := mkslice(str, 0)
+    cands = push(cands, "cc")
+    cands = push(cands, "gcc")
+    cands = push(cands, "clang")
+    ver := mkslice(str, 0)
+    ver = push(ver, "--version")
+    i := 0
+    for i < len(cands) {
+        probe := exec.cmd(cands[i], ver)
+        [o, e] = probe.output()
+        if e == nil && o.status == 0 {
+            return cands[i]
+        }
+        i = i + 1
+    }
+    return "cc" // let the spawn error name a binary that isn't there
+}
+
+// the extension of the final path segment, seed Path::extension
+// semantics: "" when the last dot is the segment's first byte
+// (a dotfile like `.exe` carries no extension and WOULD grow .exe)
+fn file_ext(name: str) -> str {
+    seg := name
+    i := len(name) - 1
+    for i >= 0 {
+        if byteat(name, i) == 47 {
+            seg = substr(name, i + 1, len(name))
+            break
+        }
+        i = i - 1
+    }
+    d := -1
+    i = 0
+    for i < len(seg) {
+        if byteat(seg, i) == 46 {
+            d = i
+        }
+        i = i + 1
+    }
+    if d <= 0 {
+        return ""
+    }
+    return substr(seg, d + 1, len(seg))
+}
+
+// cc names its product after -o; on Windows the runnable artifact
+// needs .exe spelled out. Append rather than replace — `-o app.debug`
+// means app.debug.exe, not app.exe; the compare is case-insensitive.
+fn exe_out_name(out: str) -> str {
+    if rt_is_windows() != 0 && strings.upper(file_ext(out)) != "EXE" {
+        return out + ".exe"
+    }
+    return out
+}
+
+// macOS vs the ELF/gc-sections spelling — the runtime only probes
+// Windows, so ask uname (POSIX-only path; rt_is_windows short-circuits
+// first for the flags that differ there)
+fn is_macos() -> int {
+    if rt_is_windows() != 0 {
+        return 0
+    }
+    ua := mkslice(str, 0)
+    ua = push(ua, "-s")
+    un := exec.cmd("uname", ua)
+    [o, e] = un.output()
+    if e != nil {
+        return 0
+    }
+    if strings.trim(o.stdout as str) == "Darwin" {
+        return 1
+    }
+    return 0
+}
+
+// `out` needs .exe handling done by the caller (exe_out_name).
+fn emit_and_cc(csrc: str, out: str, entry: str) -> int {
+    // intermediates go in a private scratch dir — never beside the
+    // user's -o where they could clobber existing out.c/rt.c/rt.h
+    dir := mk_scratch_dir("oxl-build")
+    if len(dir) == 0 {
+        return 0
+    }
+    od := check.dir_of(out)
+    me := os.mkdir_all(od)
+    if me != nil {
+        eprintln("cannot create output dir " + od + ": " + errors.msg(me))
+        return 0
+    }
+    cfile := dir + "/out.c"
+    we := write_text(cfile, csrc)
+    if we != 0 {
+        eprintln("cannot write " + cfile + ": " + rt_errstr(we))
+        return 0
+    }
+    rt := runtime_dir(entry)
+    if len(rt) == 0 {
+        eprintln("cannot locate runtime/rt.c — no runtime/ tree above " + check.dir_of(argv(0)) + " or " + entry)
+        return 0
+    }
+    we = write_text(dir + "/rt.h", readfile(rt + "/runtime/rt.h"))
+    if we != 0 {
+        eprintln("cannot write " + dir + "/rt.h: " + rt_errstr(we))
+        return 0
+    }
+    we = write_text(dir + "/rt.c", readfile(rt + "/runtime/rt.c"))
+    if we != 0 {
+        eprintln("cannot write " + dir + "/rt.c: " + rt_errstr(we))
+        return 0
+    }
+    cc := pick_cc()
+    // link (and compile) sqlite/net/math only when the emitted program
+    // uses them — mirrors emit_and_cc's emitted-text scans
+    needs_sqlite := strings.contains(csrc, "rt_sqlite_")
+    needs_net := 0
+    nets := mkslice(str, 0)
+    nets = push(nets, "rt_sock_")
+    nets = push(nets, "rt_bind_any")
+    nets = push(nets, "rt_set_reuseaddr")
+    nets = push(nets, "rt_set_rcvtimo")
+    nets = push(nets, "rt_set_sndtimo")
+    nets = push(nets, "rt_htons")
+    nets = push(nets, "rt_htonl")
+    i := 0
+    for i < len(nets) {
+        if strings.contains(csrc, nets[i]) {
+            needs_net = 1
+        }
+        i = i + 1
+    }
+    args := mkslice(str, 0)
+    args = push(args, "-O2")
+    if rt_is_windows() == 0 {
+        args = push(args, "-pthread")
+    }
+    // G2: every emitted fn gets its own section so the linker can GC
+    // unreferenced runtime machinery — --gc-sections, or -dead_strip
+    // under Mach-O (MSVC cl never reaches here: pick_cc only tries
+    // cc/gcc/clang driver spellings)
+    args = push(args, "-ffunction-sections")
+    args = push(args, "-fdata-sections")
+    if is_macos() == 1 {
+        args = push(args, "-Wl,-dead_strip")
+    } else {
+        args = push(args, "-Wl,--gc-sections")
+    }
+    args = push(args, "-o")
+    args = push(args, out)
+    args = push(args, cfile)
+    args = push(args, dir + "/rt.c")
+    // ws2_32 only when the program uses sockets — under OXL_NET gating
+    // rt.c's WinSock code isn't even compiled otherwise
+    if rt_is_windows() != 0 && needs_net == 1 {
+        args = push(args, "-lws2_32")
+    }
+    if needs_net == 1 {
+        args = push(args, "-DOXL_NET")
+    }
+    // -DOXL_MATH compiles the rt_m_* wrappers and -lm links them,
+    // together (sqlite pattern). Windows skips both.
+    if strings.contains(csrc, "rt_m_") {
+        args = push(args, "-DOXL_MATH")
+        if rt_is_windows() == 0 {
+            args = push(args, "-lm")
+        }
+    }
+    if needs_sqlite {
+        // -D before the link libs, -l after: --as-needed linkers drop
+        // libs seen before the undefined refs they resolve
+        args = push(args, "-DOXL_SQLITE")
+        // a stock Windows box has no sqlite dev package —
+        // LANG_SQLITE_SRC points at an amalgamation to compile instead
+        sq := os.getenv("LANG_SQLITE_SRC")
+        if len(sq) > 0 {
+            args = push(args, "-I" + check.dir_of(sq))
+            args = push(args, sq)
+        } else {
+            args = push(args, "-lsqlite3")
+        }
+    }
+    // extra link inputs (FFI shim objects, libs) — e.g. the gui
+    // pilot's LANG_LDFLAGS="gui_shim.o $(pkg-config --libs gtk4)"
+    ldf := os.getenv("LANG_LDFLAGS")
+    if len(ldf) > 0 {
+        toks := check.split_ws(ldf)
+        for toks != nil {
+            args = push(args, toks.v)
+            toks = toks.next
+        }
+    }
+    ccp := exec.cmd(cc, args)
+    [st, e] = ccp.run()
+    if e == nil && st == 0 {
+        os.remove_all(dir) // scratch dir — best effort
+        return 1
+    }
+    eprintln("cc failed (emitted C kept at " + cfile + ")")
+    return 0
+}
+
+// child exit -> the driver's own exit (seed `st.code().unwrap_or(1)`):
+// a signaled child reports 1 — ExitStatus::code() is None there — and
+// exec.run's 128+sig convention marks exactly those deaths (real
+// exits >128 exist but can't be told apart through exec, and a
+// crashing program is the common case a run/test driver sees)
+fn child_code(st: int, e: err) -> int {
+    if e != nil {
+        return 1
+    }
+    if st > 128 {
+        return 1
+    }
+    return st
+}
+
+// ---------- commands ----------
+fn out_arg() -> str {
+    i := 0
+    for i < argc() {
+        if argv(i) == "-o" {
+            if i + 1 < argc() {
+                return argv(i + 1)
+            }
+            break
+        }
+        i = i + 1
+    }
+    return "a.out"
+}
+
+fn cmd_build() {
+    pa := pkg_args(2)
+    src := pkg_src(pa.fs)
+    out := exe_out_name(out_arg())
+    res := compile(src)
+    if res.ok == 0 {
+        exit(1)
+    }
+    if emit_and_cc(res.c, out, entry_dir(src)) == 0 {
+        exit(1)
+    }
+}
+
+fn cmd_run() {
+    pa := pkg_args(2)
+    src := pkg_src(pa.fs)
+    res := compile(src)
+    if res.ok == 0 {
+        exit(1)
+    }
+    dir := mk_scratch_dir("oxl-run")
+    if len(dir) == 0 {
+        exit(1)
+    }
+    out := exe_out_name(dir + "/a.out")
+    if emit_and_cc(res.c, out, entry_dir(src)) == 0 {
+        exit(1)
+    }
+    // everything after the sources is the program's argv — with or
+    // without a `--` separator (seed cmd_run)
+    ai := pa.argi
+    if ai < argc() && argv(ai) == "--" {
+        ai = ai + 1
+    }
+    cargs := mkslice(str, 0)
+    for ai < argc() {
+        cargs = push(cargs, argv(ai))
+        ai = ai + 1
+    }
+    child := exec.cmd(out, cargs)
+    [st, e] = child.run()
+    os.remove_all(dir)
+    exit(child_code(st, e))
+}
+
+fn cmd_test() {
+    pa := pkg_args(2)
+    src := pkg_src(pa.fs)
+    res := compile_mode(src, 1)
+    if res.ok == 0 {
+        exit(1)
+    }
+    dir := mk_scratch_dir("oxl-test")
+    if len(dir) == 0 {
+        exit(1)
+    }
+    out := exe_out_name(dir + "/a.out")
+    if emit_and_cc(res.c, out, entry_dir(src)) == 0 {
+        exit(1)
+    }
+    child := exec.cmd(out, mkslice(str, 0))
+    [st, e] = child.run()
+    os.remove_all(dir)
+    exit(child_code(st, e))
+}
+
+// `oxl list -m all` — the resolved build list: main module then every
+// selected requirement at its winning version
+fn cmd_list() {
+    mflag := 0
+    all := 0
+    i := 0
+    for i < argc() {
+        a := argv(i)
+        if a == "-m" || strings.startswith(a, "-m=") {
+            mflag = 1
+        }
+        if a == "all" {
+            all = 1
+        }
+        i = i + 1
+    }
+    if mflag == 0 || all == 0 || argc() != 4 {
+        eprintln("usage: oxl list -m all")
+        exit(2)
+    }
+    cwd := os.fullpath(".")
+    ck := check.ck_new()
+    if check.mod_ctx_load(ck, cwd) == 0 {
+        report_diags(ck.diags)
+        exit(1)
+    }
+    if ck.mod_on == 0 {
+        eprintln("error [check] not a module — no oxl.mod found above " + cwd)
+        exit(1)
+    }
+    // the seed's build list is a BTreeMap — sorted by module path;
+    // mod_sel is the same set front-pushed, so re-sort
+    mps := mkslice(str, 0)
+    l := ck.mod_sel
+    for l != nil {
+        mps = push(mps, l.alias)
+        l = l.next
+    }
+    sort.sort(mps)
+    println(ck.mod_path)
+    i = 0
+    for i < len(mps) {
+        mp := mps[i]
+        mv := ""
+        l = ck.mod_sel
+        for l != nil {
+            if l.alias == mp {
+                mv = l.stem
+                break
+            }
+            l = l.next
+        }
+        // `=> dir` only when a replace actually matched this version:
+        // an exact (path, version) replace, else the unversioned one
+        rep := ""
+        l2 := ck.mod_reps
+        for l2 != nil {
+            if l2.alias == mp && l2.ver == mv {
+                rep = l2.stem
+                break
+            }
+            l2 = l2.next
+        }
+        if len(rep) == 0 {
+            l2 = ck.mod_reps
+            for l2 != nil {
+                if l2.alias == mp && len(l2.ver) == 0 {
+                    rep = l2.stem
+                    break
+                }
+                l2 = l2.next
+            }
+        }
+        line := mp + " " + mv
+        if len(rep) > 0 {
+            line = line + " => " + rep
+        }
+        println(line)
+        i = i + 1
+    }
+}
+
+fn main() {
+    if argc() < 2 {
+        eprintln("oxl — one toolchain binary\n\n  oxl build [<pkg dir>|<file.oxl>...] [-o out]\n  oxl run [<pkg dir>|<file.oxl>...]\n  oxl test [<pkg dir>|<file.oxl>...]\n  oxl fmt <file.oxl>...\n  oxl doc <file.oxl>\n  oxl get <path>@<query>\n  oxl mod <init|tidy|verify|list> ...\n  oxl list -m all\n  oxl lsp")
+        exit(2)
+    }
+    c := argv(1)
+    if c == "build" {
+        cmd_build()
+    } else if c == "run" {
+        cmd_run()
+    } else if c == "test" {
+        cmd_test()
+    } else if c == "list" {
+        cmd_list()
+    } else if c == "fmt" || c == "doc" || c == "get" || c == "mod" || c == "lsp" {
+        // T3/T4/T5 fill these — the dispatch is shaped for them
+        eprintln("oxl " + c + ": not yet implemented in cmd/oxl")
+        exit(2)
+    } else {
+        eprintln("unknown command `" + c + "`")
+        exit(2)
+    }
+}

@@ -913,6 +913,137 @@ want=$("$OXL" run bootstrap/cmd/check -- tests/diag/own_use_moved.oxl || true)
 "$OXL" run bootstrap/cmd/codegen -- examples/hello.oxl > "$cgen_dir/direct.c"
 cmp "$cgen_dir/chain.c" "$cgen_dir/direct.c" || { echo "FAIL bootstrap chain"; exit 1; }
 
+echo "== toolchain driver in .oxl (t2) =="
+# cmd/oxl is the product driver ported to .oxl — argv dispatch, the
+# pkg-args/file-list rule, compile orchestration over bootstrap/check +
+# bootstrap/codegen, and the cc invocation itself (emit_and_cc's flag
+# order, -DOXL_* feature scans, scratch dirs). The seed builds it once
+# under target/ — an in-repo path, so the binary's exe-walk finds std/
+# and runtime/ — then seed-vs-self outputs must match on the diag and
+# module corpora plus the run/test/list paths. Diagnostics follow the
+# c1 convention: the seed's `file:line:col:` prefix is stripped before
+# comparison since check.oxl diags carry {kind,msg} only.
+"$OXL" build cmd/oxl -o "target/oxl-self$EXE" || { echo "FAIL self driver build"; exit 1; }
+SELFOXL="$PWD/target/oxl-self$EXE"
+# command surface: bare usage, unknown command, and list's usage error
+# are byte-identical stderr + exit codes (2/2/2)
+for inv in "" "bogus" "list"; do
+    seed_out=$("$OXL" $inv 2>&1) && seed_rc=0 || seed_rc=$?
+    self_out=$("$SELFOXL" $inv 2>&1) && self_rc=0 || self_rc=$?
+    if [ "$seed_out" != "$self_out" ] || [ "$seed_rc" != "$self_rc" ]; then
+        echo "FAIL driver parity: \`oxl $inv\`"
+        echo "-- seed ($seed_rc) --"; printf '%s\n' "$seed_out"
+        echo "-- self ($self_rc) --"; printf '%s\n' "$self_out"
+        exit 1
+    fi
+done
+# the diag corpus through the whole driver pipeline (load + check +
+# emit + cc): every fixture must fail identically on both drivers —
+# same text, same exit code, and neither side may accept
+for f in tests/diag/*.oxl; do
+    seed_out=$("$OXL" build "$f" -o "$scratch/drvbin" 2>&1 | sed 's/^[^:]*:[0-9][0-9]*:[0-9][0-9]*: //') && seed_rc=0 || seed_rc=$?
+    self_out=$("$SELFOXL" build "$f" -o "$scratch/drvbin2" 2>&1) && self_rc=0 || self_rc=$?
+    if [ "$seed_rc" = 0 ] || [ "$self_rc" = 0 ]; then
+        echo "FAIL driver corpus $f: a driver accepted"; exit 1
+    fi
+    if [ "$seed_out" != "$self_out" ] || [ "$seed_rc" != "$self_rc" ]; then
+        echo "FAIL driver parity $f"
+        echo "-- seed --"; printf '%s\n' "$seed_out"
+        echo "-- self --"; printf '%s\n' "$self_out"
+        exit 1
+    fi
+done
+# module modes: the m2 fixture walk through the full driver — ok
+# fixtures must build on both sides, error fixtures must fail with
+# identical diagnostics (empty module cache keeps `missing module`
+# deterministic, same as m2)
+mkdir -p "$scratch/oxlmodcache-drv"
+export OXLMODCACHE="$scratch/oxlmodcache-drv"
+for f in tests/mod/*/; do
+    case "$f" in tests/mod/widget/|tests/mod/intmod/) continue ;; esac
+    seed_out=$("$OXL" build "$f" -o "$scratch/drvbin" 2>&1 | sed 's/^[^:]*:[0-9][0-9]*:[0-9][0-9]*: //') && seed_rc=0 || seed_rc=$?
+    self_out=$("$SELFOXL" build "$f" -o "$scratch/drvbin2" 2>&1) && self_rc=0 || self_rc=$?
+    if [ "$(cat "$f/expected")" = ok ]; then
+        if [ "$seed_rc" != 0 ] || [ "$self_rc" != 0 ]; then
+            echo "FAIL driver module $f: a driver rejected (seed=$seed_rc self=$self_rc)"
+            echo "-- seed --"; printf '%s\n' "$seed_out"
+            echo "-- self --"; printf '%s\n' "$self_out"
+            exit 1
+        fi
+    else
+        if [ "$seed_rc" = 0 ] || [ "$self_rc" = 0 ]; then
+            echo "FAIL driver module corpus $f: a driver accepted"; exit 1
+        fi
+        if [ "$seed_out" != "$self_out" ] || [ "$seed_rc" != "$self_rc" ]; then
+            echo "FAIL driver module parity $f"
+            echo "-- seed --"; printf '%s\n' "$seed_out"
+            echo "-- self --"; printf '%s\n' "$self_out"
+            exit 1
+        fi
+    fi
+done
+# `oxl list -m all` — the MVS build list with replace markers —
+# byte-identical stdout from the module root
+( cd tests/mod/mvs && "$OXL" list -m all ) > "$scratch/mlist.seed" 2>&1 || { echo "FAIL driver list seed rc"; cat "$scratch/mlist.seed"; exit 1; }
+( cd tests/mod/mvs && "$SELFOXL" list -m all ) > "$scratch/mlist.self" 2>&1 || { echo "FAIL driver list self rc"; cat "$scratch/mlist.self"; exit 1; }
+diff "$scratch/mlist.seed" "$scratch/mlist.self" >/dev/null || { echo "FAIL driver list parity"; cat "$scratch/mlist.seed" "$scratch/mlist.self"; exit 1; }
+# `not a module` is the driver's own diagnostic, emitted from a cwd
+# with no oxl.mod ancestor (scratch is outside the repo)
+( cd "$scratch" && "$OXL" list -m all ) > "$scratch/nmod.seed" 2>&1 && { echo "FAIL driver list seed accepted"; exit 1; } || true
+( cd "$scratch" && "$SELFOXL" list -m all ) > "$scratch/nmod.self" 2>&1 && { echo "FAIL driver list self accepted"; exit 1; } || true
+diff "$scratch/nmod.seed" "$scratch/nmod.self" >/dev/null || { echo "FAIL driver not-a-module parity"; cat "$scratch/nmod.seed" "$scratch/nmod.self"; exit 1; }
+unset OXLMODCACHE
+# file-list mode: a multi-file program runs identically, and the
+# one-directory rule reports identically
+mkdir -p "$scratch/flist" "$scratch/flother"
+printf 'package main\nfn helper() -> int { return 7 }\n' > "$scratch/flist/h.oxl"
+printf 'package main\nfn main() { println("flist=" + itoa(helper())) }\n' > "$scratch/flist/m.oxl"
+printf 'package main\nfn main() {}\n' > "$scratch/flother/o.oxl"
+seed_out=$("$OXL" run "$scratch/flist/m.oxl" "$scratch/flist/h.oxl" 2>&1) && seed_rc=0 || seed_rc=$?
+self_out=$("$SELFOXL" run "$scratch/flist/m.oxl" "$scratch/flist/h.oxl" 2>&1) && self_rc=0 || self_rc=$?
+if [ "$seed_out" != "$self_out" ] || [ "$seed_rc" != "$self_rc" ]; then
+    echo "FAIL driver file-list parity"
+    echo "-- seed ($seed_rc) --"; printf '%s\n' "$seed_out"
+    echo "-- self ($self_rc) --"; printf '%s\n' "$self_out"
+    exit 1
+fi
+seed_out=$("$OXL" build "$scratch/flist/m.oxl" "$scratch/flother/o.oxl" -o "$scratch/flbin" 2>&1 | sed 's/^[^:]*:[0-9][0-9]*:[0-9][0-9]*: //') && seed_rc=0 || seed_rc=$?
+self_out=$("$SELFOXL" build "$scratch/flist/m.oxl" "$scratch/flother/o.oxl" -o "$scratch/flbin2" 2>&1) && self_rc=0 || self_rc=$?
+if [ "$seed_out" != "$self_out" ] || [ "$seed_rc" != "$self_rc" ]; then
+    echo "FAIL driver one-directory parity"
+    echo "-- seed ($seed_rc) --"; printf '%s\n' "$seed_out"
+    echo "-- self ($self_rc) --"; printf '%s\n' "$self_out"
+    exit 1
+fi
+# run/test child-status passthrough: an exit code propagates
+# losslessly, and a trapping child reports 1 on both drivers (the
+# seed's status->code maps signal death to None -> 1)
+printf 'package main\nfn main() { exit(42) }\n' > "$scratch/e42.oxl"
+"$OXL" run "$scratch/e42.oxl" >/dev/null 2>&1 && seed_rc=0 || seed_rc=$?
+"$SELFOXL" run "$scratch/e42.oxl" >/dev/null 2>&1 && self_rc=0 || self_rc=$?
+[ "$seed_rc" = "$self_rc" ] || { echo "FAIL driver exit passthrough: $seed_rc vs $self_rc"; exit 1; }
+printf 'package main\nfn main() { assert(false) }\n' > "$scratch/trap.oxl"
+"$OXL" run "$scratch/trap.oxl" >/dev/null 2>&1 && seed_rc=0 || seed_rc=$?
+"$SELFOXL" run "$scratch/trap.oxl" >/dev/null 2>&1 && self_rc=0 || self_rc=$?
+[ "$seed_rc" = "$self_rc" ] || { echo "FAIL driver trap parity: $seed_rc vs $self_rc"; exit 1; }
+# the self driver covers the suite's core sections end to end —
+# build, run with args, test, and the sqlite/net feature gates
+out=$("$SELFOXL" run examples/hello.oxl)
+[ "$out" = "hello, world" ] || { echo "FAIL self driver hello: $out"; exit 1; }
+out=$("$SELFOXL" run examples/features.oxl)
+[ "$(tail -1 <<<"$out")" = "done" ] || { echo "FAIL self driver features"; exit 1; }
+out=$("$SELFOXL" run examples/cli/main.oxl -- Jesse)
+grep -q "hello, Jesse" <<<"$out" || { echo "FAIL self driver cli"; exit 1; }
+out=$("$SELFOXL" test examples/smoke_test.oxl)
+grep -q "test_chan ... ok" <<<"$out" || { echo "FAIL self driver test: $out"; exit 1; }
+out=$("$SELFOXL" test tests/stdlib_test.oxl)
+grep -q "test_loops ... ok" <<<"$out" || { echo "FAIL self driver stdlib: $out"; exit 1; }
+"$SELFOXL" build examples/http-crud-sqlite/main.oxl -o "$scratch/httpsrv-self$EXE" || { echo "FAIL self driver sqlite+net build"; exit 1; }
+# the interpreted path too — the seed runs cmd/oxl itself (its
+# std/runtime resolution then anchors at the compiled package's tree)
+out=$("$OXL" run cmd/oxl -- run examples/hello.oxl)
+[ "$out" = "hello, world" ] || { echo "FAIL oxl-run driver hello: $out"; exit 1; }
+
 echo "== a1 coroutine scale =="
 # spec bar: 10k spawned tasks parked on recv must cost heap frames,
 # not OS threads — assert on the per-task delta over this binary's

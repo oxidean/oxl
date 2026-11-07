@@ -6574,11 +6574,8 @@ fn load_file_root(ck: mut Ck, ld: mut Loader, path: str) -> str {
 // result of the whole check pipeline — codegen consumes it too
 struct CkRes { ck: own Ck, items: []It }
 
-// load + register + typecheck + susp analysis for `path`.
-// `path` may name a file (file-list mode) or a package directory.
-// `need_main` mirrors compile_mode: building requires `package main`
-// (test mode's generated driver exempts it).
-fn check_file(path: str, need_main: int) -> own CkRes {
+// fresh checker state — every check_* entry shares the init
+fn ck_new() -> own Ck {
     ck := new(Ck)
     ck.tyv = mkslice(T, 0)
     ck.fns = collections.map_new()
@@ -6621,25 +6618,13 @@ fn check_file(path: str, need_main: int) -> own CkRes {
     ck.mod_reps = nil
     ck.modcache = ""
     ck.entry_dir = ""
-    ld := new(Loader)
-    ld.items = mkslice(It, 0)
-    // module ctx from the entry — dir args directly, file args' parent
-    start := path
-    if rt_isdir(path) == 0 {
-        start = dir_of(path)
-    }
-    ck.entry_dir = start
-    if mod_ctx_load(ck, start) == 0 {
-        ck.load_fail = 1
-    }
-    root_pkg := ""
-    if ck.load_fail == 0 {
-        if rt_isdir(path) == 1 {
-            root_pkg = load_pkg(ck, ld, path, path, 0, 1)
-        } else {
-            root_pkg = load_file_root(ck, ld, path)
-        }
-    }
+    return ck
+}
+
+// shared post-load pipeline: register + typecheck + susp analysis +
+// the dead-import sweep; the CkRes wraps ck + the loaded items either
+// way (diags distinguish ok from failed)
+fn check_run_tail(ck: own Ck, ld: own Loader, root_pkg: str, need_main: int) -> own CkRes {
     if ck.load_fail == 1 {
         r := new(CkRes)
         r.ck = ck
@@ -6694,4 +6679,105 @@ fn check_file(path: str, need_main: int) -> own CkRes {
     r.ck = ck
     r.items = ld.items
     return r
+}
+
+// load + register + typecheck + susp analysis for `path`.
+// `path` may name a file (file-list mode) or a package directory.
+// `need_main` mirrors compile_mode: building requires `package main`
+// (test mode's generated driver exempts it).
+fn check_file(path: str, need_main: int) -> own CkRes {
+    ck := ck_new()
+    ld := new(Loader)
+    ld.items = mkslice(It, 0)
+    // module ctx from the entry — dir args directly, file args' parent
+    start := path
+    if rt_isdir(path) == 0 {
+        start = dir_of(path)
+    }
+    ck.entry_dir = start
+    if mod_ctx_load(ck, start) == 0 {
+        ck.load_fail = 1
+    }
+    root_pkg := ""
+    if ck.load_fail == 0 {
+        if rt_isdir(path) == 1 {
+            root_pkg = load_pkg(ck, ld, path, path, 0, 1)
+        } else {
+            root_pkg = load_file_root(ck, ld, path)
+        }
+    }
+    return check_run_tail(ck, ld, root_pkg, need_main)
+}
+
+// fs[0].parent() as the seed's Path::parent displays it — "" for bare
+// names, "." for "./x", "/" for "/x"; trailing slashes normalize away
+fn parent_disp(p: str) -> str {
+    for len(p) > 1 && strings.endswith(p, "/") {
+        p = substr(p, 0, len(p) - 1)
+    }
+    ls := last_slash(p)
+    if ls < 0 {
+        return ""
+    }
+    if ls == 0 {
+        return "/"
+    }
+    return substr(p, 0, ls)
+}
+
+// file-list root: the explicit `a.oxl b.oxl` command-line form — one
+// shared decl namespace, no dir-name clause check, and the seed's
+// file-list rule (all named files in one directory). Mirrors
+// load_pkg_inner's PkgSrc::Files path.
+fn check_files(paths: []str, need_main: int) -> own CkRes {
+    ck := ck_new()
+    ld := new(Loader)
+    ld.items = mkslice(It, 0)
+    // module ctx anchors at the first file's parent, like check_file
+    start := dir_of(paths[0])
+    ck.entry_dir = start
+    if mod_ctx_load(ck, start) == 0 {
+        ck.load_fail = 1
+    }
+    root_pkg := ""
+    if ck.load_fail == 0 {
+        // parse all files first — clause validation precedes items,
+        // and the first parse failure aborts the whole list
+        pfs := mkslice(PFile, 0)
+        i := 0
+        for i < len(paths) && ck.load_fail == 0 {
+            pfs = push(pfs, parse_pfile(ck, paths[i]))
+            i = i + 1
+        }
+        if ck.load_fail == 0 {
+            disp := parent_disp(paths[0])
+            clause0 := pfs[0].clause
+            i = 1
+            for i < len(pfs) {
+                if pfs[i].clause != clause0 {
+                    diag(ck, "check", "found packages `" + clause0 + "` (`" + base_name(paths[0]) + "`) and `" + pfs[i].clause + "` (`" + base_name(paths[i]) + "`) in `" + disp + "`")
+                    ck.load_fail = 1
+                    break
+                }
+                i = i + 1
+            }
+            i = 1
+            for i < len(paths) && ck.load_fail == 0 {
+                if parent_disp(paths[i]) != disp {
+                    diag(ck, "check", "named files must all be in one directory; have `" + disp + "` and `" + parent_disp(paths[i]) + "`")
+                    ck.load_fail = 1
+                }
+                i = i + 1
+            }
+            if ck.load_fail == 0 {
+                root_pkg = clause0
+                i = 0
+                for i < len(pfs) {
+                    pfile_items(ck, ld, pfs[i].path, pfs[i].ast, "")
+                    i = i + 1
+                }
+            }
+        }
+    }
+    return check_run_tail(ck, ld, root_pkg, need_main)
 }

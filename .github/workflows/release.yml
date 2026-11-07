@@ -107,7 +107,14 @@ jobs:
               -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
               commit -am "chore(release): bump docs manifest to $ver"
           git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/$GITHUB_REPOSITORY"
-          git push origin "HEAD:main"
+          # main can advance between checkout and this push — concurrency
+          # serializes runs, not merges. Rebase the bump commit and retry.
+          for i in 1 2 3; do
+            if git push origin "HEAD:main"; then break; fi
+            [ "$i" = 3 ] && { echo "::error::main advanced past this run — push failed after 3 tries; rerun the release"; exit 1; }
+            git fetch origin main
+            git rebase origin/main || { git rebase --abort; echo "::error::rebase onto advancing main failed"; exit 1; }
+          done
           emit "$(git rev-parse HEAD)"
 
   release:

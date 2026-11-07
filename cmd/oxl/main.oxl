@@ -609,7 +609,7 @@ fn cmd_list() {
         }
         line := mp + " " + mv
         if len(rep) > 0 {
-            line = line + " => " + rep
+            line = line + " => " + check.verbatim_path(rep)
         }
         println(line)
         i = i + 1

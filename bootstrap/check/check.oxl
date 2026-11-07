@@ -36,6 +36,8 @@ extern fn rt_fexists(path: str) -> int
 // the internal rule compare real ancestors, not lexical ones
 extern fn rt_fullpath(path: str) -> str
 
+extern fn rt_is_windows() -> int
+
 // ---------- interned types ----------
 fn k_unk() -> int {
     return 0
@@ -5389,6 +5391,35 @@ fn canon_or(p: str) -> str {
         return p
     }
     return c
+}
+
+// a canonical path rendered the way Rust's display spells
+// canonicalize() — verbatim \\?\ UNC form on Windows, unchanged
+// elsewhere. The canonical form resolves "." segments; ".." never
+// survives canonicalize so only "." needs dropping. mod list's
+// `=> dir` suffix is the only consumer.
+fn verbatim_path(p: str) -> str {
+    if rt_is_windows() == 0 || len(p) < 3 || byteat(p, 1) != 58 {
+        return p
+    }
+    out := "\\\\?\\" + substr(p, 0, 2)
+    i := 2
+    seg := ""
+    for i <= len(p) {
+        if i == len(p) || byteat(p, i) == 47 || byteat(p, i) == 92 {
+            if len(seg) > 0 && seg != "." {
+                out = out + "\\" + seg
+            }
+            seg = ""
+        } else {
+            seg = seg + substr(p, i, i + 1)
+        }
+        i = i + 1
+    }
+    if byteat(out, len(out) - 1) == 58 {
+        out = out + "\\"
+    }
+    return out
 }
 
 // nearest ancestor dir holding oxl.mod — "" when none (module-off)

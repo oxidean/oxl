@@ -1137,7 +1137,7 @@ fn mod_list(cwd: str) {
         exit(1)
     }
     if ck.mod_on == 0 {
-        eprintln("error [check] not a module — no oxl.mod found above " + cwd)
+        eprintln("error [check] not a module — no oxl.mod found above " + check.native_path(cwd))
         exit(1)
     }
     print_build_list(ck)

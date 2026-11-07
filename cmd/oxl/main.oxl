@@ -561,7 +561,7 @@ fn cmd_list() {
         exit(1)
     }
     if ck.mod_on == 0 {
-        eprintln("error [check] not a module — no oxl.mod found above " + cwd)
+        eprintln("error [check] not a module — no oxl.mod found above " + check.native_path(cwd))
         exit(1)
     }
     // the seed's build list is a BTreeMap — sorted by module path;

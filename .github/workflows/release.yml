@@ -19,7 +19,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.v.outputs.tag }}
-      sha: ${{ steps.v.outputs.sha }}
+      sha: ${{ steps.sha.outputs.sha }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -58,13 +58,54 @@ jobs:
             range="$EVENT_BEFORE..$SHA"
           fi
           # recovery: a tag already on this sha (e.g. publish failed after
-          # tagging) is reused instead of burning another version
+          # tagging) is reused instead of burning another version. The
+          # docs-manifest sync below tags a bump commit one above the
+          # merge, so a retry's tag also lives on a direct child of sha.
           tag=$(git tag --points-at "$SHA" | grep -xE 'v[0-9]+\.[0-9]+\.[0-9]+' | sort -V | tail -1 || true)
+          if [ -z "$tag" ]; then
+            for child in $(git rev-list --all --children | awk -v s="$SHA" '$1==s {$1=""; print}'); do
+              tag=$(git tag --points-at "$child" | grep -xE 'v[0-9]+\.[0-9]+\.[0-9]+' | sort -V | tail -1 || true)
+              [ -n "$tag" ] && { SHA=$child; break; }
+            done
+          fi
           if [ -z "$tag" ]; then
             tag=$(scripts/release-version.sh next "$range")
           fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
+      # The docs bundle packs from the tagged tree and the packer gates the
+      # manifest version against the tag, so an auto-release must tag a
+      # commit whose docs/site/manifest.yaml already declares it. Bump the
+      # manifest in a release commit pushed to main first, then the release
+      # job tags the bump commit. A tag already on this sha (a retry after a
+      # failed publish) has a fixed tree — reuse it instead.
+      - id: sha
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          TAG: ${{ steps.v.outputs.tag }}
+          SHA: ${{ steps.v.outputs.sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          emit() { echo "sha=$1" >> "$GITHUB_OUTPUT"; }
+          if [ "$REF_TYPE" = "tag" ] || [ -z "$TAG" ]; then emit "$SHA"; exit 0; fi
+          if git tag --points-at "$SHA" | grep -qx "$TAG"; then emit "$SHA"; exit 0; fi
+          manifest=docs/site/manifest.yaml
+          if [ ! -f "$manifest" ]; then
+            echo "no docs/site manifest — release proceeds without a bundle"
+            emit "$SHA"; exit 0
+          fi
+          ver="${TAG#v}"
+          current="$(sed -nE 's/^version: "?(.*)"?$/\1/p' "$manifest" | head -1)"
+          if [ "$current" = "$ver" ]; then emit "$SHA"; exit 0; fi
+          sed -i -E "s/^version: .*/version: \"$ver\"/" "$manifest"
+          git -c user.name="github-actions[bot]" \
+              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              commit -am "chore(release): bump docs manifest to $ver"
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/$GITHUB_REPOSITORY"
+          git push origin "HEAD:main"
+          emit "$(git rev-parse HEAD)"
 
   release:
     needs: version
@@ -147,8 +188,30 @@ jobs:
   # workflows, and running after the release job guarantees the Release the
   # bundle attaches to already exists — for both API-created and manually
   # pushed tags.
-  docs:
+  docs-check:
     needs: [version, release]
+    runs-on: ubuntu-latest
+    outputs:
+      has_docs: ${{ steps.check.outputs.has_docs }}
+    steps:
+      # Tags that predate docs/site cannot carry a bundle — the pack would
+      # fail the manifest gate — so they skip the docs job instead of
+      # failing an otherwise-green re-release.
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          if gh api "repos/$GITHUB_REPOSITORY/contents/docs/site/manifest.yaml?ref=$TAG" >/dev/null 2>&1; then
+            echo "has_docs=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_docs=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::$TAG predates docs/site — skipping docs pack"
+          fi
+
+  docs:
+    needs: [version, release, docs-check]
+    if: needs.docs-check.outputs.has_docs == 'true'
     permissions:
       contents: write
     uses: oxidean/docs-manifest/.github/workflows/release.yml@v0.1.4

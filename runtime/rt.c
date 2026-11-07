@@ -20,10 +20,10 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <spawn.h>
-#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #endif
+#include <sys/stat.h>
 
 #define ARENA_CAP (1 << 20)
 
@@ -3208,6 +3208,20 @@ int64_t rt_rename(OxlStr old_p, OxlStr new_p) {
         ? 0 : RT_GLE();
 #else
     return rename(oc, nc) < 0 ? -(int64_t)errno : 0;
+#endif
+}
+
+/* chmod: POSIX mode bits; on Windows only the owner-write bit is
+ * honored (_chmod maps to the read-only file attribute) — mode with
+ * owner write clears read-only, without it sets read-only. */
+int64_t rt_chmod(OxlStr path, int64_t mode) {
+    if (path.n > 0 && memchr(path.p, 0, (size_t)path.n)) return -EINVAL;
+    const char *cp = rt_cstr(path);
+#ifdef _WIN32
+    return _chmod(cp, (mode & 0200) ? (_S_IREAD | _S_IWRITE) : _S_IREAD)
+        ? RT_GLE() : 0;
+#else
+    return chmod(cp, (mode_t)(mode & 0777)) < 0 ? -(int64_t)errno : 0;
 #endif
 }
 

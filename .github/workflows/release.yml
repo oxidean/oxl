@@ -97,9 +97,12 @@ jobs:
             emit "$SHA"; exit 0
           fi
           ver="${TAG#v}"
-          current="$(sed -nE 's/^version: "?(.*)"?$/\1/p' "$manifest" | head -1)"
+          current="$(sed -nE 's/^version:[[:space:]]*"?([^"[:space:]]*)"?[[:space:]]*$/\1/p' "$manifest" | head -1)"
           if [ "$current" = "$ver" ]; then emit "$SHA"; exit 0; fi
           sed -i -E "s/^version: .*/version: \"$ver\"/" "$manifest"
+          # A no-op rewrite (already-matching or unparsable line) must not
+          # hard-fail the release — the pack version gate is the real check.
+          if git diff --quiet -- "$manifest"; then emit "$SHA"; exit 0; fi
           git -c user.name="github-actions[bot]" \
               -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
               commit -am "chore(release): bump docs manifest to $ver"
@@ -214,7 +217,7 @@ jobs:
     if: needs.docs-check.outputs.has_docs == 'true'
     permissions:
       contents: write
-    uses: oxidean/docs-manifest/.github/workflows/release.yml@v0.1.5
+    uses: oxidean/docs-manifest/.github/workflows/release.yml@v0.1.6
     with:
       tag: ${{ needs.version.outputs.tag }}
       product: oxl

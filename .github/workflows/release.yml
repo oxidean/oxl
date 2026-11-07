@@ -141,3 +141,19 @@ jobs:
           tag_name: ${{ needs.version.outputs.tag }}
           files: dist/oxl-toolchain-linux-x86_64.tar.gz
           generate_release_notes: true
+
+  # Docs pack runs as a job in this workflow rather than its own push.tags
+  # trigger: tags created here via the API (github.token) never fire tag-push
+  # workflows, and running after the release job guarantees the Release the
+  # bundle attaches to already exists — for both API-created and manually
+  # pushed tags.
+  docs:
+    needs: [version, release]
+    permissions:
+      contents: write
+    uses: oxidean/docs-manifest/.github/workflows/release.yml@v0.1.4
+    with:
+      tag: ${{ needs.version.outputs.tag }}
+      product: oxl
+    secrets:
+      site_dispatch_token: ${{ secrets.DOCS_SITE_DISPATCH_TOKEN }}

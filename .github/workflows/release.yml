@@ -64,6 +64,11 @@ jobs:
           tag=$(git tag --points-at "$SHA" | grep -xE 'v[0-9]+\.[0-9]+\.[0-9]+' | sort -V | tail -1 || true)
           if [ -z "$tag" ]; then
             for child in $(git rev-list --all --children | awk -v s="$SHA" '$1==s {$1=""; print}'); do
+              # Only the manifest-bump commit this flow creates is a valid
+              # recovery target — a tagged child on another branch would
+              # publish an unrelated tree under this tag.
+              git merge-base --is-ancestor "$child" origin/main 2>/dev/null || continue
+              git log -1 --format=%s "$child" | grep -q '^chore(release): bump docs manifest to ' || continue
               tag=$(git tag --points-at "$child" | grep -xE 'v[0-9]+\.[0-9]+\.[0-9]+' | sort -V | tail -1 || true)
               [ -n "$tag" ] && { SHA=$child; break; }
             done
@@ -97,12 +102,17 @@ jobs:
             emit "$SHA"; exit 0
           fi
           ver="${TAG#v}"
-          current="$(sed -nE 's/^version:[[:space:]]*"?([^"[:space:]]*)"?[[:space:]]*$/\1/p' "$manifest" | head -1)"
+          current="$(sed -nE 's/^version[[:space:]]*:[[:space:]]*"?([^"[:space:]]*)"?[[:space:]]*$/\1/p' "$manifest" | head -1)"
           if [ "$current" = "$ver" ]; then emit "$SHA"; exit 0; fi
-          sed -i -E "s/^version: .*/version: \"$ver\"/" "$manifest"
-          # A no-op rewrite (already-matching or unparsable line) must not
-          # hard-fail the release — the pack version gate is the real check.
-          if git diff --quiet -- "$manifest"; then emit "$SHA"; exit 0; fi
+          sed -i -E "s/^version[[:space:]]*:.*/version: \"$ver\"/" "$manifest"
+          # The version line exists but can't be parsed or rewritten — the
+          # tag would carry a stale manifest and the docs pack fails later.
+          # Stop here, before the tag/publish steps, instead of shipping
+          # the toolchain without its docs bundle.
+          if git diff --quiet -- "$manifest"; then
+            echo "::error::could not set docs manifest version to $ver (missing or unparseable version line)"
+            exit 1
+          fi
           git -c user.name="github-actions[bot]" \
               -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
               commit -am "chore(release): bump docs manifest to $ver"
@@ -212,11 +222,16 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.version.outputs.tag }}
         run: |
-          if gh api "repos/$GITHUB_REPOSITORY/contents/docs/site/manifest.yaml?ref=$TAG" >/dev/null 2>&1; then
+          err="$(mktemp)"
+          if gh api "repos/$GITHUB_REPOSITORY/contents/docs/site/manifest.yaml?ref=$TAG" >/dev/null 2>"$err"; then
             echo "has_docs=true" >> "$GITHUB_OUTPUT"
-          else
+          elif grep -qE 'HTTP 404' "$err"; then
             echo "has_docs=false" >> "$GITHUB_OUTPUT"
             echo "::notice::$TAG predates docs/site — skipping docs pack"
+          else
+            cat "$err" >&2
+            echo "::error::docs/site probe failed for $TAG (not a 404) — refusing to guess; retry the release"
+            exit 1
           fi
 
   docs:

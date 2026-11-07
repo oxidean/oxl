@@ -1,0 +1,129 @@
+---
+title: The oxl language
+description: "The v0 surface: types, ownership, structured concurrency, modules, and the shipped standard library."
+---
+
+A taste of v0:
+
+```text title="surface.oxl"
+package main
+
+struct Point { x: int, y: int }
+
+fn fail(b: bool) -> [int, err] {
+    if b { return 0, 1 }
+    return 42, nil
+}
+
+fn main() {
+    [v, err] = fail(false)
+    if err != nil { return }
+    println(itoa(v))
+
+    ch := mkchan()
+    scope {
+        spawn send(ch, 7)
+        println(itoa(recv(ch)))
+    }
+}
+```
+
+## The surface
+
+- **Types**: `int float bool byte str cstr err chan`, user `struct`s,
+  `enum` tagged unions with `match`, slices `[]T`, function values and
+  closures, and methods `fn (r T) m`. `byte` is a distinct `u8` with
+  char-literal sugar and `as` conversions.
+- **Ownership**: `own T` / `ref T` / `mut T` handles with runtime borrow
+  checks and compile-time move tracking; `defer` for cleanup; `extern fn`
+  for C FFI.
+- **Errors**: `[v, err]` returns; a dropped error is a compile error.
+  Errors carry text through an interned message registry
+  (`errors.new(msg)`, `errors.msg(e)`, `errors.code(e)`).
+- **Concurrency**: `scope`/`spawn`/`go` plus `spawnBlocking` on a worker
+  and blocking pool; suspend-capable functions compile to stackless state
+  machines; buffered channels `mkchan(n)` and `select` multi-channel wait.
+- **Generics**: `fn f[T any]` and `fn g[T cmp.Ordered]` with dotted
+  interface constraints (`interface` op constraints), monomorphized per
+  call site.
+- **Control flow**: `if`/`match`/`for`, `break`/`continue`, top-level
+  `let` globals (process-wide state, initialized before `main`).
+- **Builtins**: `print`, `itoa`, string ops, `mkbuf`/`poke*`,
+  `argc`/`argv`, `readfile`/`writefile`, `exit`,
+  `mkshared`/`sget`/`sset`/`scas`/`sadd`, `now`/`now_ms`/`usleep`, sqlite3
+  shims, `assert`.
+
+## The standard library
+
+`std/` ships next to the toolchain binary; pull in a package with
+`import "std/<pkg>"` (`as` aliases and `.{name, ...}` selection
+supported). v0.4.0 ships 36 packages:
+
+- **Text**: `std/strings` (`startswith`/`contains`, `trim`, `split`,
+  `join`, case ops), `std/strconv`, `std/unicode/utf8`, `std/regexp`
+  (Thompson NFA engine, linear-time matching)
+- **I/O and files**: `std/io`, `std/bytes`, `std/bufio`, `std/fmt`,
+  `std/errors`, `std/path`, `std/path/filepath`, `std/os` (args, files,
+  fs primitives, env), `std/os/exec` (process `cmd`/`run`/`output`)
+- **Tooling**: `std/flag`, `std/log`, `std/testing` (assertions for
+  `oxl test`), `std/time`, `std/sync`
+- **Data and algorithms**: `std/collections`, `std/sort`, `std/slices`,
+  `std/maps`, `std/cmp` (the `Ordered` constraint generics bind on),
+  `std/math`, `std/math/rand`
+- **Encoding and crypto**: `std/encoding/{json,base64,hex,binary,csv}`,
+  `std/hash`, `std/crypto/{sha256,md5,hmac}`
+- **Networking**: `std/net` (dial/listen), `std/net/http` (server plus
+  client get/post)
+
+## Modules
+
+Packages are directories of `.oxl` files that share a `package` clause;
+`package main` marks an executable. A project opts into module mode by
+placing an `oxl.mod` manifest at its root; the toolchain walks up from
+the entry file to the nearest one, and without it only `std/` imports
+resolve:
+
+```text title="oxl.mod"
+module github.com/me/app
+
+oxl 0.3
+
+require github.com/oxidean/widget v1.4.2
+replace github.com/oxidean/widget => ../widget
+```
+
+Directives: `module` (this module's path), `oxl` (minimum toolchain
+version), `require` (a dependency at a version, also in a parenthesized
+block), and `replace` (pin a dependency to a local directory).
+
+Import resolution order: `std/...` (the shipped standard library) → this
+module's path (resolved under the manifest's directory) → required modules
+(longest path wins; `replace` directories first, then the module cache at
+`$OXLMODCACHE` or `~/.oxl/mod`). Packages under `internal/` may only be
+imported by code beneath the `internal` directory's parent, import cycles
+are a compile error that prints the cycle chain, and an import the file
+never references doesn't build either.
+
+`oxl get <path>@<query>` fetches a module through `git`, doing a bare
+clone plus `git archive` of the resolved commit (canonical tree bytes,
+never a checkout), into a read-only content-addressed cache, upserts the
+`require` line, and pins `h1:` hashes in `oxl.sum`. Every build verifies
+cached modules against `oxl.sum`; queries are `@latest`, `@vX.Y.Z`, or a
+branch/SHA recorded as a pseudo-version `v0.0.0-<timestamp>-<sha>`.
+`replace` directories bypass cache and sums by design, and private repos
+work through git's own auth.
+
+`oxl mod` keeps `oxl.mod`/`oxl.sum` in sync so neither is edited by hand:
+`oxl mod init <path>` writes a skeleton manifest (refusing to overwrite),
+`oxl mod tidy` walks the import graph and rewrites surgically (comments,
+replaces, and untouched lines survive; unimported requires drop),
+`oxl mod verify` re-hashes every required module's cache slot against
+`oxl.sum`, and `oxl mod list` prints the MVS-selected build list like
+`oxl list -m all`.
+
+The references live in the repository:
+[`docs/semantics/`](https://github.com/oxidean/oxl/tree/v0.4.0/docs/semantics)
+covers ownership, concurrency, and the per-feature contracts everything is
+built against, and the
+[approved design spec](https://github.com/oxidean/oxl/blob/v0.4.0/docs/specs/2026-11-03-language-design.md)
+is what everything traces back to.

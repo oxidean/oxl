@@ -2378,11 +2378,15 @@ int64_t rt_open_write_mode(OxlStr path, int64_t mode) {
     sa.nLength = sizeof(sa);
     sa.bInheritHandle = FALSE;
     sa.lpSecurityDescriptor = NULL;
-    if (ConvertStringSecurityDescriptorToSecurityDescriptorA(
-            "D:P(A;;GA;;;OW)", SDDL_REVISION_1, &rsd, NULL))
-        sa.lpSecurityDescriptor = rsd;
-    HANDLE h = CreateFileA(cp, GENERIC_WRITE, 0,
-                           sa.lpSecurityDescriptor ? &sa : NULL,
+    /* Fail closed: a stage created under default security would
+     * reopen the inherited-ACE window this create exists to close. */
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorA(
+            "D:P(A;;GA;;;OW)", SDDL_REVISION_1, &rsd, NULL)) {
+        DWORD ce = GetLastError();
+        return ce ? -((int64_t)ce | RT_GLE_TAG) : -(int64_t)EACCES;
+    }
+    sa.lpSecurityDescriptor = rsd;
+    HANDLE h = CreateFileA(cp, GENERIC_WRITE, 0, &sa,
                            CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
     if (rsd) LocalFree((HLOCAL)rsd);
     if (h == INVALID_HANDLE_VALUE) {

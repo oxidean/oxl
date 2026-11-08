@@ -2415,58 +2415,69 @@ int64_t rt_open_write_mode(OxlStr path, int64_t mode, OxlStr src) {
     if (fd < 0) { CloseHandle(h); return -(int64_t)EIO; }
     return fd;
 #else
+    /* Born restricted: the stage carries the creator's owner and
+     * group until rt_copy_acl applies the source's — 0600 keeps
+     * staged contents private for that window regardless of how
+     * permissive the source's mode is. Owner-write is implicit. */
     (void)src;
-    int fd = open(cp, O_WRONLY | O_CREAT | O_EXCL | O_TRUNC,
-                  (mode_t)((mode | 0200) & 0777));
+    (void)mode;
+    int fd = open(cp, O_WRONLY | O_CREAT | O_EXCL | O_TRUNC, 0600);
     return fd < 0 ? -(int64_t)errno : fd;
 #endif
 }
 
-/* copy_acl: carry src's DACL onto dst — a staged replacement born
- * with an inherited default DACL would loosen a private source's
- * access on replace. POSIX mode bits already cover this (the caller
- * chmods before rename); the call is a no-op there. A NULL source
- * DACL is left alone rather than propagated — it means world access,
- * and the inherited default errs stricter. The source's
- * SE_DACL_PROTECTED state is preserved: copying a protected DACL
- * without the matching flag would leave dst inheriting parent ACEs
- * on top of it. */
+/* copy_acl: carry src's security onto dst — a staged replacement
+ * born under the creator's identity would otherwise rewrite who the
+ * file belongs to: OWNER RIGHTS ACEs would bind to the formatter's
+ * SID, a null source DACL (world access) would collapse into the
+ * stage's owner-only DACL, and on POSIX a 0660 source in a shared
+ * directory would grant the creator's group while stripping the
+ * real owner. Windows applies owner and DACL in one call — a NULL
+ * source DACL is propagated as a NULL DACL, and SE_DACL_PROTECTED
+ * travels with it so dst doesn't keep inheriting parent ACEs.
+ * POSIX carries owner and group via chown(2); the caller chmods
+ * the source mode after, per the preserve-before-mode contract.
+ * A caller without privilege to restore a foreign owner/group
+ * fails here, so the replacement is rejected rather than silently
+ * re-owning the file. */
 int64_t rt_copy_acl(OxlStr src, OxlStr dst) {
-#ifdef _WIN32
     if (src.n > 0 && memchr(src.p, 0, (size_t)src.n)) return -EINVAL;
     if (dst.n > 0 && memchr(dst.p, 0, (size_t)dst.n)) return -EINVAL;
     const char *cs = rt_cstr(src);
     const char *cd = rt_cstr(dst);
+#ifdef _WIN32
+    PSID owner = NULL;
     PACL dacl = NULL;
     PSECURITY_DESCRIPTOR sd = NULL;
     DWORD r = GetNamedSecurityInfoA(cs, SE_FILE_OBJECT,
+                                    OWNER_SECURITY_INFORMATION |
                                     DACL_SECURITY_INFORMATION,
-                                    NULL, NULL, &dacl, NULL, &sd);
+                                    &owner, NULL, &dacl, NULL, &sd);
     if (r != ERROR_SUCCESS) return -((int64_t)r | RT_GLE_TAG);
     int64_t rc = 0;
-    if (dacl) {
-        SECURITY_DESCRIPTOR_CONTROL ctl = 0;
-        DWORD rev = 0;
-        if (!GetSecurityDescriptorControl(sd, &ctl, &rev)) {
-            rc = RT_GLE();
-        } else {
-            DWORD prot = (ctl & SE_DACL_PROTECTED)
-                             ? PROTECTED_DACL_SECURITY_INFORMATION
-                             : UNPROTECTED_DACL_SECURITY_INFORMATION;
-            /* MinGW spells the name param LPSTR; the API does not
-             * write it — the cast also keeps the build warning-free
-             * so compile output stays byte-stable across runs. */
-            r = SetNamedSecurityInfoA((char *)cd, SE_FILE_OBJECT,
-                                      DACL_SECURITY_INFORMATION | prot,
-                                      NULL, NULL, dacl, NULL);
-            if (r != ERROR_SUCCESS) rc = -((int64_t)r | RT_GLE_TAG);
-        }
+    SECURITY_DESCRIPTOR_CONTROL ctl = 0;
+    DWORD rev = 0;
+    if (!GetSecurityDescriptorControl(sd, &ctl, &rev)) {
+        rc = RT_GLE();
+    } else {
+        DWORD prot = (ctl & SE_DACL_PROTECTED)
+                         ? PROTECTED_DACL_SECURITY_INFORMATION
+                         : UNPROTECTED_DACL_SECURITY_INFORMATION;
+        /* MinGW spells the name param LPSTR; the API does not
+         * write it — the cast also keeps the build warning-free
+         * so compile output stays byte-stable across runs. */
+        r = SetNamedSecurityInfoA((char *)cd, SE_FILE_OBJECT,
+                                  OWNER_SECURITY_INFORMATION |
+                                  DACL_SECURITY_INFORMATION | prot,
+                                  owner, NULL, dacl, NULL);
+        if (r != ERROR_SUCCESS) rc = -((int64_t)r | RT_GLE_TAG);
     }
     if (sd) LocalFree((HLOCAL)sd);
     return rc;
 #else
-    (void)src;
-    (void)dst;
+    struct stat ss;
+    if (stat(cs, &ss) != 0) return -(int64_t)errno;
+    if (chown(cd, ss.st_uid, ss.st_gid) != 0) return -(int64_t)errno;
     return 0;
 #endif
 }

@@ -1059,6 +1059,24 @@ rc=0
 "$SELFOXL" fmt --check "$scratch/unfmt.oxl" >"$scratch/unfmt.out" 2>&1 || rc=$?
 [ "$rc" -eq 1 ] || { echo "FAIL fmt --check: expected exit 1, got $rc"; cat "$scratch/unfmt.out"; exit 1; }
 grep -q "not formatted" "$scratch/unfmt.out" || { echo "FAIL fmt --check missing diagnostic"; cat "$scratch/unfmt.out"; exit 1; }
+# fmt -w stages then renames: the replacement must carry the source's
+# owner/group and access mode — not the creator's — and must still
+# succeed on a read-only source. POSIX-only; Windows maps this
+# through ACLs the suite can't stat the same way.
+case "$(uname -s)" in
+MINGW*|MSYS*|CYGWIN*) ;;
+*)
+cp "$scratch/unfmt.oxl" "$scratch/modekeep.oxl"
+chmod 640 "$scratch/modekeep.oxl"
+"$SELFOXL" fmt -w "$scratch/modekeep.oxl" || { echo "FAIL fmt -w modekeep"; exit 1; }
+[ -n "$(find "$scratch/modekeep.oxl" -perm 0640 -print)" ] || { echo "FAIL fmt -w: mode not preserved"; stat "$scratch/modekeep.oxl"; exit 1; }
+grep -q 'a + b' "$scratch/modekeep.oxl" || { echo "FAIL fmt -w: not formatted"; cat "$scratch/modekeep.oxl"; exit 1; }
+printf 'package main\n\nfn z(a:int)->int{return a}\n' > "$scratch/ro.oxl"
+chmod 444 "$scratch/ro.oxl"
+"$SELFOXL" fmt -w "$scratch/ro.oxl" || { echo "FAIL fmt -w read-only source"; exit 1; }
+[ -n "$(find "$scratch/ro.oxl" -perm 0444 -print)" ] || { echo "FAIL fmt -w: read-only mode not preserved"; stat "$scratch/ro.oxl"; exit 1; }
+;;
+esac
 # fmt output parity: the port must reproduce the seed's output
 # byte-for-byte on a corpus slice — round-trip, not a reformat
 for f in std/strings/strings.oxl std/io/io.oxl std/errors/errors.oxl \

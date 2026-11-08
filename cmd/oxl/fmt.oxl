@@ -3602,12 +3602,13 @@ fn cmd_fmt() {
                             os.remove(tmp)
                             bad = 1
                         } else {
-                            // drop the owner-write bit the stage
-                            // forced on for read-only sources, then
-                            // carry the source's ACL onto the stage —
-                            // a rename replaces the inode wholesale
-                            rt_chmod(tmp, mode)
+                            // carry the source's owner + access
+                            // onto the stage first — a rename
+                            // replaces the inode wholesale — then
+                            // apply its mode, so permissions never
+                            // bind to the creator's identity
                             ac := rt_copy_acl(file, tmp)
+                            rt_chmod(tmp, mode)
                             if ac != 0 {
                                 eprintln(file + ": write failed")
                                 os.remove(tmp)

@@ -584,6 +584,10 @@ fi
 mkdir -p "$scratch/workfm"
 printf 'oxlwork 0.3\nuse ./nonexistent\n' > "$scratch/workfm/oxl.work"
 printf 'package main\n\nfn main() {}\n' > "$scratch/workfm/main.oxl"
+# DBG: what the native binary actually receives/canonicalizes on Windows
+printf 'package main\nimport "std/os"\nimport "std/path"\n\nfn main() {\n    println("ARGV1=" + argv(1))\n    println("FP=" + os.fullpath(argv(1)))\n    println("DIR=" + path.dir(argv(1)))\n    println("FPDIR=" + os.fullpath(path.dir(argv(1))))\n    println("CWD=" + os.fullpath("."))\n}\n' > "$scratch/probe.oxl"
+"$SELFOXL" run "$scratch/probe.oxl" -- "$scratch/workfm/main.oxl" 2>&1 | sed 's/^/DBG /' || true
+echo "DBG scratch=$scratch"
 seed_out=$("$SEEDOXL" build "$scratch/workfm/main.oxl" -o "$scratch/workfmbin" 2>&1 | sed 's/^[^:]*:[0-9][0-9]*:[0-9][0-9]*: //') && seed_rc=0 || seed_rc=1
 self_out=$("$scratch/selfcheck$EXE" "$scratch/workfm/main.oxl" 2>&1) && self_rc=0 || self_rc=1
 if [ "$seed_rc" != 0 ] || [ "$self_rc" != 0 ] || [ "$self_out" != ok ]; then

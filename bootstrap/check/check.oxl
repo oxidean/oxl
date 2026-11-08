@@ -2713,7 +2713,7 @@ fn field_expr(ck: mut Ck, obj: ref parser.Node, name: str, fhi: int, env: mut En
         hd = substr(base, 0, hi)
     }
     if len(base) > 0 && len(alias_stem(ck, hd)) > 0 {
-        return ident(ck, base + "." + name, parser.nlo(obj), fhi, env)
+        return ident(ck, base + "." + name, fhi - len(name), fhi, env)
     }
     t := expr(ck, obj, env)
     sn := ""

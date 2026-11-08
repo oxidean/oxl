@@ -86,7 +86,9 @@ echo "== self-built product driver (t6) =="
 # product driver once (gen 1), the product driver rebuilds itself
 # (gen 2), and the C each generation emits for the driver sources must
 # be byte-identical (the fixpoint — not a binary hash: build-ids and
-# embedded paths legitimately differ). Every section below then runs
+# embedded paths legitimately differ) — seed emit included, so the
+# seed-vs-self spec criterion is checked directly, not just via
+# output parity. Every section below then runs
 # under the product driver; SEEDOXL stays only where a seed-vs-self
 # output comparison needs it.
 SEEDOXL="$OXL"
@@ -94,9 +96,11 @@ SEEDOXL="$OXL"
 SELFOXL="$PWD/target/oxl-self$EXE"
 "$SELFOXL" build cmd/oxl -o "target/oxl-self2$EXE" || { echo "FAIL gen2 driver build"; exit 1; }
 SELFOXL2="$PWD/target/oxl-self2$EXE"
+"$SEEDOXL" run bootstrap/cmd/codegen -- cmd/oxl > "$scratch/drv0.c" || { echo "FAIL seed emit"; exit 1; }
 "$SELFOXL" run bootstrap/cmd/codegen -- cmd/oxl > "$scratch/drv1.c" || { echo "FAIL gen1 emit"; exit 1; }
 "$SELFOXL2" run bootstrap/cmd/codegen -- cmd/oxl > "$scratch/drv2.c" || { echo "FAIL gen2 emit"; exit 1; }
-diff "$scratch/drv1.c" "$scratch/drv2.c" >/dev/null || { echo "FAIL driver C fixpoint"; diff "$scratch/drv1.c" "$scratch/drv2.c" | head -20; exit 1; }
+diff "$scratch/drv0.c" "$scratch/drv1.c" >/dev/null || { echo "FAIL driver C fixpoint (seed vs gen1)"; diff "$scratch/drv0.c" "$scratch/drv1.c" | head -20; exit 1; }
+diff "$scratch/drv1.c" "$scratch/drv2.c" >/dev/null || { echo "FAIL driver C fixpoint (gen1 vs gen2)"; diff "$scratch/drv1.c" "$scratch/drv2.c" | head -20; exit 1; }
 OXL="$SELFOXL"
 
 echo "== hello =="

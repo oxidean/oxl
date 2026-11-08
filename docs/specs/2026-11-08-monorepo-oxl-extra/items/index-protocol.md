@@ -8,14 +8,21 @@ index/github.com~oxidean~oxl~extra.json   # see path encoding below
 {"version":"v0.2.0","commit":"<sha>","h1":"<sum>","tag":"extra/v0.2.0"}
 ```
 
-The filename is derived mechanically — `index/` + the module path
-with each `/` replaced by `~`, then `.json`. Module path segments
-are restricted to `[a-zA-Z0-9._-]` (the existing git-derived-path
-rule), which cannot contain `~`, so the mapping is injective:
-`github.com/acme/lib` → `index/github.com~acme~lib.json` and
+The filename is derived mechanically. First apply the module-cache
+case escaping (`oxl/src/modcache.rs` `escape_path`: every uppercase
+letter becomes `!` + its lowercase form) to the whole module path —
+index repos must check out on case-insensitive filesystems, and
+paths differing only by case (`acme/Lib` vs `acme/lib`) must not
+collide. Then replace each `/` with `~`, prefix `index/`, and add
+`.json`. Module path segments are restricted to `[a-zA-Z0-9._-]`
+(the existing git-derived-path rule), which contain neither `~` nor
+`!`, so the mapping is injective and unambiguous:
+`github.com/acme/lib` → `index/github.com~acme~lib.json`,
+`github.com/Acme/lib` → `index/github.com~!acme~lib.json`, and
 `github.com/acme/lib.json/extra` → `index/github.com~acme~lib.json~
-extra.json` never collide. Publish and lookup share the same
-derivation, so they can never disagree on the key.
+extra.json` never collide — even on Windows/macOS checkouts.
+Publish and lookup share the same derivation, so they can never
+disagree on the key.
 
 Rules:
 - Entries are append-only; each line is one published version.

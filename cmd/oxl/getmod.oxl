@@ -37,12 +37,7 @@ extern fn rt_chmod(path: str, mode: int) -> int
 // ---------- fetch: the git veneer (fetch.rs) ----------
 // `git` is a documented toolchain dependency for get only; auth rides
 // git's own mechanisms (ssh agent, credential helpers).
-
-struct Fetched {
-    ver: str,
-    tar: []byte,
-    manifest: []byte,
-}
+struct Fetched { ver: str, tar: []byte, manifest: []byte }
 
 fn git_env() -> own []str {
     e := mkslice(str, 2)
@@ -160,7 +155,7 @@ fn sanitize(s: str) -> str {
     i := 0
     for i < len(s) {
         b := byteat(s, i)
-        if (b >= 97 && b <= 122) || (b >= 65 && b <= 90) || (b >= 48 && b <= 57) {
+        if b >= 97 && b <= 122 || b >= 65 && b <= 90 || b >= 48 && b <= 57 {
             r = r + substr(s, i, i + 1)
         } else {
             r = r + "_"
@@ -177,7 +172,7 @@ fn sanitize_tag(s: str) -> str {
     i := 0
     for i < len(s) {
         b := byteat(s, i)
-        if (b >= 97 && b <= 122) || (b >= 65 && b <= 90) || (b >= 48 && b <= 57) || b == 46 || b == 45 {
+        if b >= 97 && b <= 122 || b >= 65 && b <= 90 || b >= 48 && b <= 57 || b == 46 || b == 45 {
             r = r + substr(s, i, i + 1)
         } else {
             r = r + "_"
@@ -214,7 +209,15 @@ fn fetch_tags(tmp: str) -> own TagEnt {
 }
 
 fn rev_parse(tmp: str, r: str) -> [str, err] {
-    return git_text(tmp, args3("rev-parse", "--verify", r + "^{commit}"))
+    if strings.startswith(r, "-") {
+        return "", errors.new("invalid revision " + r)
+    }
+    a := mkslice(str, 4)
+    a[0] = "rev-parse"
+    a[1] = "--verify"
+    a[2] = "--end-of-options"
+    a[3] = r + "^{commit}"
+    return git_text(tmp, a)
 }
 
 // pseudo-version: the nearest semver tag ancestor bumps its patch and
@@ -234,7 +237,7 @@ fn pseudo(tmp: str, sha: str) -> [str, err] {
     s[0] = "show"
     s[1] = "-s"
     s[2] = "--format=%cd"
-    s[3] = "--date=format:%Y%m%d%H%M%S"
+    s[3] = "--date=format-local:%Y%m%d%H%M%S"
     s = push(s, sha)
     [ts, te] = git_text(tmp, s)
     if te != nil {
@@ -329,7 +332,8 @@ fn fetch_in(tmp: str, url: str, path: str, query: str) -> [own Fetched, err] {
     a[0] = "clone"
     a[1] = "--bare"
     a[2] = "--quiet"
-    a[3] = url
+    a[3] = "--"
+    a = push(a, url)
     a = push(a, tmp)
     cmd := exec.cmd_env("git", a, git_env())
     [o, ge] = cmd.output()
@@ -360,6 +364,9 @@ fn fetch_in(tmp: str, url: str, path: str, query: str) -> [own Fetched, err] {
 // names a different path than the one they were fetched as — mis-
 // pinned forks have to be replaced explicitly
 fn fetch_mod(mp: str, query: str) -> [own Fetched, err] {
+    if strings.startswith(mp, "-") {
+        return nil, errors.new("invalid module path " + mp)
+    }
     [f, fe] = fetch(repo_url(mp), mp, query)
     if fe != nil {
         return nil, fe
@@ -499,7 +506,7 @@ fn untar(b: []byte, dest: str) -> [int, err] {
         if body_end > len(b) {
             return 0, errors.new("truncated tar archive")
         }
-        if typeflag == 120 || typeflag == 103 { // x / g — pax extended header; honor path= only
+        if typeflag == 120 { // x — pax extended header; honor path= only
             txt := bytes.tostr(b[pos:body_end])
             lines := strings.split(txt, "\n")
             for lines != nil {
@@ -523,6 +530,7 @@ fn untar(b: []byte, dest: str) -> [int, err] {
             continue
         }
         if typeflag != 48 && typeflag != 0 && typeflag != 53 { // '0' / NUL / '5' only
+            pax_path = ""
             pos = body_end + (512 - body_end % 512) % 512
             continue // links, devices, fifos — never materialize
         }
@@ -601,10 +609,8 @@ fn seal(dir: str) -> err {
             if rt_chmod(p, 365) != 0 { // 0555
                 return errors.new("seal " + p)
             }
-        } else {
-            if rt_chmod(p, 292) != 0 { // 0444
-                return errors.new("seal " + p)
-            }
+        } else if rt_chmod(p, 292) != 0 { // 0444
+            return errors.new("seal " + p)
         }
         i = i + 1
     }
@@ -913,7 +919,6 @@ fn pin_require(mtext: str, sums: own check.SumEnt, mp: str, f: ref Fetched, slot
 }
 
 // ---------- oxl get ----------
-
 fn cmd_get() {
     if argc() != 3 || strings.startswith(argv(2), "-") {
         eprintln("usage: oxl get <path>@<query>")
@@ -999,7 +1004,6 @@ fn cmd_get() {
 }
 
 // ---------- oxl mod ----------
-
 fn cmd_mod() {
     cwd := os.fullpath(".")
     if argc() < 3 {
@@ -1199,9 +1203,10 @@ fn print_build_list(ck: ref check.Ck) {
 // sync oxl.mod/oxl.sum with what the source imports: walk the import
 // graph, fetch+require providers for missing imports, drop requires
 // nothing imports, rewrite both files surgically.
+struct UnEnt { imp: str, root: str, next: own UnEnt } // unresolved import; root "" = main module
 
-struct UnEnt { imp: str, root: str, next: own UnEnt }   // unresolved import; root "" = main module
 struct ProbeEnt { m: str, f: own Fetched, ok: int, next: own ProbeEnt }
+
 struct WantEnt { mp: str, ver: str, ind: int, next: own WantEnt }
 
 // a ModCtx built from in-memory manifest state (tidy rewrites before
@@ -1469,6 +1474,7 @@ struct SatState {
     sums: own check.SumEnt,
     probed: own ProbeEnt,
     asked: own collections.Set,
+    done: own collections.Set,
     report: []str,
 }
 
@@ -1662,7 +1668,13 @@ fn tidy_satisfy(imp: str, dep_root: str, ck: ref check.Ck, st: mut SatState) -> 
             key := mp + "|" + mv
             if collections.set_has(st.asked, key) {
                 if len(rest) == 0 || os.isdir(slot + "/" + rest) {
-                    return 1, nil
+                    // progress is reported for a resolved slot once —
+                    // on later passes keep checking other candidates
+                    // so an unresolvable import can't spin forever
+                    if collections.set_has(st.done, key) == false {
+                        collections.set_add(st.done, key)
+                        return 1, nil
+                    }
                 }
             }
             continue
@@ -2060,7 +2072,6 @@ fn tok_at(t: Toks, i: int) -> str {
 }
 
 // ---------- mod tidy driver ----------
-
 fn mod_tidy(cwd: str) {
     if argc() != 3 {
         eprintln("usage: oxl mod tidy")
@@ -2094,7 +2105,7 @@ fn mod_tidy(cwd: str) {
     }
     sums := sck.mod_sums
     main_files := main_mod_files(root)
-    st := new(SatState{mtext: mtext, sums: sums, probed: nil, asked: collections.set_new(), report: mkslice(str, 0)})
+    st := new(SatState{mtext: mtext, sums: sums, probed: nil, asked: collections.set_new(), done: collections.set_new(), report: mkslice(str, 0)})
     // fixpoint: fetch/require changes alter resolution, so re-walk
     // until a pass leaves nothing unresolved
     let ctx: own check.Ck = nil

@@ -1081,6 +1081,83 @@ for f in std/strings/strings.oxl std/io/io.oxl std/errors/errors.oxl std/bytes/b
     diff "$scratch/doc.seed" "$scratch/doc.self" >/dev/null || { echo "FAIL driver doc parity $f"; diff "$scratch/doc.seed" "$scratch/doc.self" | head -20; exit 1; }
 done
 
+echo "== v4 self driver get/mod =="
+# the .oxl driver's get/mod run the same git veneer + sealed
+# content-addressed cache + manifest rewrite the seed driver does —
+# replay the v2/v3 fixtures end to end under $SELFOXL. POSIX-only for
+# the same reason: file:// module paths can't form Windows slot names.
+case "$(uname -s)" in
+MINGW*|MSYS*|CYGWIN*) ;;
+*)
+sw="$scratch/sgetwork"
+mkdir -p "$sw/dep/util" "$sw/app/app" "$sw/cache"
+( cd "$sw/dep" && git init -q . && git config user.email t@t && git config user.name t
+  printf 'module file://%s/dep\noxl 0.3\n' "$sw" > oxl.mod
+  printf 'package util\nfn answer() -> int { return 42 }\n' > util/u.oxl
+  git add -A && git commit -qm init && git tag v1.0.0
+  printf 'package util\nfn answer() -> int { return 43 }\n' > util/u.oxl
+  git add -A && git commit -qm bump && git tag v1.1.0 )
+printf 'module local/app\noxl 0.3\n' > "$sw/app/oxl.mod"
+printf 'package main\nimport "file://%s/dep/util"\n\nfn main() { println("answer=" + itoa(util.answer())) }\n' "$sw" > "$sw/app/app/main.oxl"
+# get pins require + both h1 lines and seals the slot read-only
+( cd "$sw/app" && OXLMODCACHE="$sw/cache" "$SELFOXL" get "file://$sw/dep@v1.0.0" ) > "$sw/get1" 2>&1 || { echo "FAIL self get rc"; cat "$sw/get1"; exit 1; }
+grep -q 'added file://' "$sw/get1" || { echo "FAIL self get report"; cat "$sw/get1"; exit 1; }
+grep -q "require file://$sw/dep v1.0.0" "$sw/app/oxl.mod" || { echo "FAIL self get require"; cat "$sw/app/oxl.mod"; exit 1; }
+[ "$(grep -c ' h1:' "$sw/app/oxl.sum")" = 2 ] || { echo "FAIL self get sum"; cat "$sw/app/oxl.sum"; exit 1; }
+slot=$(find "$sw/cache" -name '*@v1.0.0' -type d)
+[ -n "$slot" ] || { echo "FAIL self cache slot missing"; exit 1; }
+touch "$slot/probe" 2>/dev/null && { echo "FAIL self cache not read-only"; exit 1; }
+# resolve + run purely from the sealed slot (dep repo moved away)
+mv "$sw/dep" "$sw/dep-gone"
+( cd "$sw/app" && OXLMODCACHE="$sw/cache" "$SELFOXL" build app -o "$sw/appbin" ) || { echo "FAIL self offline build"; exit 1; }
+[ "$("$sw/appbin")" = "answer=42" ] || { echo "FAIL self offline run"; "$sw/appbin"; exit 1; }
+mv "$sw/dep-gone" "$sw/dep"
+# @latest upgrade rewrites require+sums; re-get reports unchanged
+( cd "$sw/app" && OXLMODCACHE="$sw/cache" "$SELFOXL" get "file://$sw/dep@latest" ) > "$sw/get2" 2>&1 || { echo "FAIL self latest rc"; cat "$sw/get2"; exit 1; }
+grep -q 'upgraded file://' "$sw/get2" || { echo "FAIL self upgrade"; cat "$sw/get2"; exit 1; }
+grep -q "require file://$sw/dep v1.1.0" "$sw/app/oxl.mod" || { echo "FAIL self upgrade require"; cat "$sw/app/oxl.mod"; exit 1; }
+( cd "$sw/app" && OXLMODCACHE="$sw/cache" "$SELFOXL" get "file://$sw/dep@v1.1.0" ) > "$sw/get3" 2>&1 || { echo "FAIL self reget rc"; cat "$sw/get3"; exit 1; }
+grep -q 'unchanged file://' "$sw/get3" || { echo "FAIL self reget"; cat "$sw/get3"; exit 1; }
+# mod init writes a skeleton; a second init refuses to overwrite
+mkdir "$sw/fresh" && ( cd "$sw/fresh" && "$SELFOXL" mod init example.com/fresh ) > "$sw/init1" 2>&1 || { echo "FAIL self init rc"; cat "$sw/init1"; exit 1; }
+grep -q '^module example.com/fresh$' "$sw/fresh/oxl.mod" || { echo "FAIL self init manifest"; cat "$sw/fresh/oxl.mod"; exit 1; }
+( cd "$sw/fresh" && "$SELFOXL" mod init example.com/other ) > "$sw/init2" 2>&1 && { echo "FAIL self re-init accepted"; cat "$sw/init2"; exit 1; }
+grep -q 'already exists' "$sw/init2" || { echo "FAIL self re-init text"; cat "$sw/init2"; exit 1; }
+# mod tidy: fetch the un-required provider, dep's own require lands
+# // indirect, sums rewritten; a second tidy is a no-op
+tv="$scratch/stidywork"
+mkdir -p "$tv/dep/util" "$tv/leafpkg/leaf" "$tv/app/app" "$tv/cache"
+( cd "$tv/dep" && git init -q . && git config user.email t@t && git config user.name t
+  printf 'module file://%s/dep\noxl 0.3\nrequire file://%s/leafpkg v1.0.0\n' "$tv" "$tv" > oxl.mod
+  printf 'package util\nimport "file://%s/leafpkg/leaf"\n\nfn answer() -> int { return leaf.leafval() + 41 }\n' "$tv" > util/util.oxl
+  git add -A && git commit -qm dep && git tag v1.0.0 )
+( cd "$tv/leafpkg" && git init -q . && git config user.email t@t && git config user.name t
+  printf 'module file://%s/leafpkg\noxl 0.3\n' "$tv" > oxl.mod
+  printf 'package leaf\n\nfn leafval() -> int { return 1 }\n' > leaf/leaf.oxl
+  git add -A && git commit -qm leaf && git tag v1.0.0 )
+printf 'package main\nimport "file://%s/dep/util"\n\nfn main() { println("answer=" + itoa(util.answer())) }\n' "$tv" > "$tv/app/app/main.oxl"
+( cd "$tv/app" && printf 'module file://%s/app\noxl 0.3\n' "$tv" > oxl.mod
+  OXLMODCACHE="$tv/cache" "$SELFOXL" mod tidy ) > "$tv/tidy1" 2>&1 || { echo "FAIL self tidy rc"; cat "$tv/tidy1"; exit 1; }
+grep -q "added file://$tv/dep@" "$tv/tidy1" || { echo "FAIL self tidy fetch"; cat "$tv/tidy1"; exit 1; }
+grep -q "file://$tv/leafpkg v1.0.0 // indirect" "$tv/app/oxl.mod" || { echo "FAIL self tidy indirect"; cat "$tv/app/oxl.mod"; exit 1; }
+[ "$(grep -c ' h1:' "$tv/app/oxl.sum")" = 4 ] || { echo "FAIL self tidy sums"; cat "$tv/app/oxl.sum"; exit 1; }
+( cd "$tv/app" && OXLMODCACHE="$tv/cache" "$SELFOXL" build app -o "$tv/appbin" ) || { echo "FAIL self tidy build"; exit 1; }
+[ "$("$tv/appbin")" = "answer=42" ] || { echo "FAIL self tidy run"; "$tv/appbin"; exit 1; }
+cp "$tv/app/oxl.mod" "$tv/m.save" && cp "$tv/app/oxl.sum" "$tv/s.save"
+( cd "$tv/app" && OXLMODCACHE="$tv/cache" "$SELFOXL" mod tidy ) >/dev/null 2>&1 || { echo "FAIL self tidy2 rc"; exit 1; }
+diff "$tv/m.save" "$tv/app/oxl.mod" >/dev/null || { echo "FAIL self tidy idempotent"; diff "$tv/m.save" "$tv/app/oxl.mod"; exit 1; }
+( cd "$tv/app" && OXLMODCACHE="$tv/cache" "$SELFOXL" mod verify ) > "$tv/vfy" 2>&1 || { echo "FAIL self verify rc"; cat "$tv/vfy"; exit 1; }
+grep -q 'all modules verified' "$tv/vfy" || { echo "FAIL self verify text"; cat "$tv/vfy"; exit 1; }
+( cd "$tv/app" && OXLMODCACHE="$tv/cache" "$SELFOXL" mod list ) > "$tv/mlist" 2>&1 || { echo "FAIL self mod list rc"; cat "$tv/mlist"; exit 1; }
+grep -q "file://$tv/leafpkg v1.0.0" "$tv/mlist" || { echo "FAIL self list leafpkg"; cat "$tv/mlist"; exit 1; }
+# unresolvable import reports the get hint with a nonzero exit
+printf 'package main\nimport "file://%s/nosuch/pkg"\n\nfn main() {}\n' "$tv" > "$tv/app/app/main.oxl"
+( cd "$tv/app" && printf 'module file://%s/app\noxl 0.3\n' "$tv" > oxl.mod && rm -f oxl.sum
+  OXLMODCACHE="$tv/cache" "$SELFOXL" mod tidy ) > "$tv/tidy5" 2>&1 && { echo "FAIL self tidy5 accepted"; cat "$tv/tidy5"; exit 1; }
+grep -q 'no required module provides package' "$tv/tidy5" || { echo "FAIL self tidy5 text"; cat "$tv/tidy5"; exit 1; }
+;;
+esac
+
 echo "== a1 coroutine scale =="
 # spec bar: 10k spawned tasks parked on recv must cost heap frames,
 # not OS threads — assert on the per-task delta over this binary's

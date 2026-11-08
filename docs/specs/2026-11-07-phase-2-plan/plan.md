@@ -1,11 +1,16 @@
 # Phase 2 — Milestone Map
 
-Four active milestones, four parked. Each active entry gives a scope
-sketch, entry criteria (what must be true to start), and exit criteria
-(what "done" means). Implementation specs are written when a milestone
+Milestones as scheduled. Each active entry gives a scope sketch,
+entry criteria (what must be true to start), and exit criteria (what
+"done" means). Implementation specs are written when a milestone
 starts; this map is the schedule, not the design.
 
-## T — toolchain-in-oxl
+*Amended 2026-11-08 (WI-0004, ADR-0008): T shipped. The remaining
+work regroups into **E** (monorepo + `extra/` + git-index + polish —
+absorbs R and P) then **G** (GUI as an `extra/` citizen). Spec:
+`../2026-11-08-monorepo-oxl-extra/`.*
+
+## T — toolchain-in-oxl — SHIPPED
 
 *Renamed from "Full self-hosting" — see `shape.md` and ADR-0003.*
 
@@ -36,13 +41,30 @@ from the build path (retained only as historical seed, if at all);
 full `tests/run.sh` green under the self-built driver including the
 bootstrap/diag gates.
 
-**Likely tracks:** T1 driver skeleton + cmd dispatch, T2 module
-machinery, T3 test runner, T4 fmt/doc, T5 LSP, T6 cargo removal +
-dogfood CI.
+**Shipped as:** T0–T6 merged (WI-0003); `cmd/oxl` is `.oxl` end to
+end, cargo is out of the build path.
 
 **Detailed spec + staged plan:**
 [`docs/specs/2026-11-07-toolchain-in-oxl/`](../2026-11-07-toolchain-in-oxl/spec.md)
 (WI-0003).
+
+## E — monorepo: `extra/` + workspace + git-index + polish
+
+*Added 2026-11-08 — absorbs R (rescoped to a git-backed index) and P
+(issues placed in a stage). Spec: `../2026-11-08-monorepo-oxl-extra/`.*
+
+**Scope sketch:** `extra/` subdirectory module
+(`github.com/oxidean/oxl/extra`) for packages outside `std`;
+`oxl.work` workspace resolution; tag-prefix subdir-module fetch;
+git-backed index + `oxl publish`/`get`; `extra/v*` release lane;
+P-track issues #26–#30 (#28 parks); `extra/testutil` first citizen.
+
+**Entry:** none — starts now.
+
+**Exit:** workspace + fetch + index verified end-to-end in the
+suite; `extra/testutil` published and consumed on workspace and
+cache paths; #26/#27/#29/#30 closed, #28 parked; first `extra/v*`
+release.
 
 ## G — portable GUI layer
 
@@ -54,34 +76,29 @@ layout model, event dispatch into `scope`/`select` concurrency,
 platform backend interface with GTK4 as the first backend. The
 widget tree must stay DOM-mappable — it is the agreed guardrail that
 keeps the web target open (`docs/specs/2026-11-04-0132-v0-2-forward/items/parked-web.md` in the v0.2 spec).
+Lands as `extra/gui` + `extra/gui/gtk` — the first real consumer of
+E's monorepo machinery.
 
-**Entry:** after T (dogfoods the self-built driver; GUI work also
-stresses LSP). Can run parallel if T is mid-flight.
+**Entry:** G0 spec after E0 lands; G1 (core) needs E2 (extra layout
++ workspace).
 
 **Exit:** a reference app with real widgets (beyond the pilot's
 raw FFI calls); a second backend sketched or an honest written case
 for why the abstraction doesn't foreclose one.
 
-## R — package registry
+## R — package registry — FOLDED INTO E
 
-Central index + `oxl publish`/`oxl get` round-trip.
+*2026-11-08:* rescoped to a **git-backed index** and folded into
+milestone E (stages E3–E5). `oxl get` consults the index via
+`OXLMODINDEX` with direct-git fallback; `oxl publish` appends index
+entries + pushes `<prefix>/v*` tags. Namespace = index-repo write
+access. A hosted service stays parked in `parked.md` — adopting one
+later is an `OXLMODINDEX` URL scheme, not a redesign.
 
-**Scope sketch:** index protocol (git-backed index or minimal HTTP
-service), namespace rules, publish flow (auth, semver enforcement,
-`oxl.sum` integration), `oxl get` preferring the registry with git
-fallback. `oxl.mod`/`oxl.sum`/MVS already exist — this is
-infrastructure, not a language change.
+## P — polish — FOLDED INTO E
 
-**Entry:** module system stable (done). Realistically waits until
-there are packages worth publishing — likely post-G.
-
-**Exit:** publish → fetch round-trip on a hosted instance; lockfile
-verify path unchanged.
-
-## P — polish
-
-Ongoing bucket for small tracked debt. Each item is a GitHub issue,
-pulled into whichever release fits:
+*2026-11-08:* no longer opportunistic — all five issues are placed
+in E's stage E6. Filed items:
 
 - `std/encoding/json`: `\uXXXX` surrogate-pair decode edge cases —
   [#26](https://github.com/oxidean/oxl/issues/26)
@@ -103,6 +120,6 @@ scheduled.
 ## Sequence
 
 ```
-T ──► G ──► R        P (continuous, alongside)
+T (shipped) ──► E ──► G        (R, P absorbed into E)
 └── LLVM, web, D4, stdlib-list: parked on triggers
 ```

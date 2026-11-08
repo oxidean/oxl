@@ -32,4 +32,9 @@ Rules:
   `oxlwork` floor (`oxl.work: missing oxlwork directive`) and the
   floor-vs-toolchain check
   (`oxl.work: requires oxlwork <v>, toolchain is <v>`).
+- A third line-less case exists only on the seed: an unreadable
+  `oxl.work` (I/O error or invalid UTF-8) reports
+  `error [check] <full-path>: <io error>` — the self-hosted driver
+  degrades the same condition to the missing-directive diagnostic
+  above.
 - File mode (no `oxl.mod` found): `oxl.work` is ignored entirely.

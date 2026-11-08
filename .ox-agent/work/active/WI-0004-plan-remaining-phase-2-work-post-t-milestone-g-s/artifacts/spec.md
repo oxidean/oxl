@@ -31,9 +31,9 @@ this milestone dogfoods T's port.
    plumbing, no publishing needed for in-repo consumers. Parse is
    the existing manifest grammar extended; diagnostics use the
    `error [check] oxl.work:<line>: <msg>` form on both drivers,
-   with two line-less file-level exceptions (missing `oxlwork`
-   directive; `oxlwork` floor vs toolchain — see
-   items/workspace-semantics.md).
+   with three line-less file-level exceptions (missing `oxlwork`
+   directive; `oxlwork` floor vs toolchain; seed-only unreadable-
+   file path diagnostic — see items/workspace-semantics.md).
    File-mode (no manifest) behavior unchanged.
 3. **Subdirectory-module fetch + tag-prefix versions**: module
    cache entries for `…/extra@vX.Y.Z` come from tag `extra/vX.Y.Z`

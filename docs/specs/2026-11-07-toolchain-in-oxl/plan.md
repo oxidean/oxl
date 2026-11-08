@@ -45,7 +45,7 @@ AST consumers, and the fetch/cache write paths.
   section; Windows leg exercises the veneer.
 - Deps: none. Gate: suite green incl. windows.
 
-## Stage T1 — codegen lib split
+## Stage T1 — codegen lib split (done)
 
 - Move emitter from `bootstrap/cmd/codegen/main.oxl` (5327) to
   `bootstrap/codegen/codegen.oxl` (`package codegen`); cmd becomes a
@@ -55,7 +55,7 @@ AST consumers, and the fetch/cache write paths.
 - Deps: none (parallel-safe vs T0, order them anyway — T0 keeps the
   diff narrative clean).
 
-## Stage T2 — cmd/oxl core: build/run/test
+## Stage T2 — cmd/oxl core: build/run/test (done)
 
 - `cmd/oxl/` (root, `package main`): argv dispatch; `pkg_args`/
   `pkg_src`; manifest discover/parse for the *driver* surface
@@ -73,7 +73,7 @@ AST consumers, and the fetch/cache write paths.
   parity corpus green.
 - Deps: T0, T1.
 
-## Stage T3 — fmt + doc
+## Stage T3 — fmt + doc (done)
 
 - `fmt [--check] [-w]`: port `fmt.rs` (984) over `parser.Node` AST —
   the one place ASTs differ; preserve comment attachment + canonical
@@ -83,7 +83,7 @@ AST consumers, and the fetch/cache write paths.
   `doc` output byte-identical vs seed on std corpus.
 - Deps: T2 (driver skeleton exists).
 
-## Stage T4 — get/mod subcommands
+## Stage T4 — get/mod subcommands (done)
 
 - `get`: git veneer via `exec.output` — `clone --bare` tmp + `git
   archive` extract (port `fetch.rs`, 171); `OXLMODCACHE` honored.
@@ -94,7 +94,7 @@ AST consumers, and the fetch/cache write paths.
   in scratch → `oxl get path@ref` → build → `mod verify`) — no network.
 - Deps: T0 (exec), T2.
 
-## Stage T5 — LSP
+## Stage T5 — LSP (done)
 
 - `check` pkg: port `check::Index` — `uses` use-site records +
   `decls` scope-parallel binding spans (Rust `check.rs:119-160`,
@@ -113,7 +113,7 @@ AST consumers, and the fetch/cache write paths.
   run stays green per the spec's contingency.
 - Deps: T2 (uses module machinery + analyze path).
 
-## Stage T6 — dogfood CI + docs
+## Stage T6 — dogfood CI + docs (done)
 
 - `run.sh` self-build section: seed builds `cmd/oxl` → suite runs
   under the product driver end-to-end (the milestone exit gate).

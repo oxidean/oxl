@@ -3244,6 +3244,24 @@ int64_t rt_chmod(OxlStr path, int64_t mode) {
 #endif
 }
 
+/* fmode: access-mode bits of path — callers staging a temp+rename
+ * carry the source's mode over the replace (a fresh inode would
+ * otherwise take umask defaults). Windows has only the read-only
+ * attribute, mirroring rt_chmod's two-state mapping. */
+int64_t rt_fmode(OxlStr path) {
+    if (path.n > 0 && memchr(path.p, 0, (size_t)path.n)) return -EINVAL;
+    const char *cp = rt_cstr(path);
+#ifdef _WIN32
+    DWORD a = GetFileAttributesA(cp);
+    if (a == INVALID_FILE_ATTRIBUTES) return RT_GLE();
+    return (a & FILE_ATTRIBUTE_READONLY) ? 0444 : 0666;
+#else
+    struct stat st;
+    if (stat(cp, &st) != 0) return -(int64_t)errno;
+    return (int64_t)(st.st_mode & 0777);
+#endif
+}
+
 #ifndef _WIN32
 static int64_t child_status(pid_t pid) {
     int st;

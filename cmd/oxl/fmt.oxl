@@ -27,6 +27,12 @@ extern fn rt_ftoa_p(v: float, prec: int) -> str
 // mkbuf frees itself into the copied string via bufstr
 extern fn rt_free(p: own void)
 
+// access-mode bits of a path (fmt -w carries the source's mode over
+// the staging rename); chmod applies a mode to the staged file
+extern fn rt_fmode(path: str) -> int
+
+extern fn rt_chmod(path: str, mode: int) -> int
+
 // ---------- diagnostics ----------
 // the seed pushes lex+parse diagnostics and aborts fmt on the first
 // error; the fail/ok boundary itself is parity-relevant
@@ -3519,12 +3525,27 @@ fn cmd_fmt() {
                     }
                 } else if w == 1 {
                     if res.out != src {
-                        tmp := file + ".fmt-tmp"
+                        // unpredictable staging name — a shared
+                        // predictable path can be pre-created as a
+                        // symlink or clobbered by a concurrent fmt
+                        tmp := file + ".fmt-tmp-" + itoa(now_ms())
+                        tries := 0
+                        for os.exists(tmp) && tries < 8 {
+                            tries = tries + 1
+                            tmp = file + ".fmt-tmp-" + itoa(now_ms()) + "-" + itoa(tries)
+                        }
                         if writefile(tmp, res.out) != 0 {
                             eprintln(file + ": write failed")
                             os.remove(tmp)
                             bad = 1
                         } else {
+                            // carry the source's mode onto the staged
+                            // file — a fresh inode would otherwise take
+                            // umask defaults and broaden a private file
+                            m := rt_fmode(file)
+                            if m >= 0 {
+                                rt_chmod(tmp, m)
+                            }
                             re := os.rename(tmp, file)
                             if re != nil {
                                 eprintln(file + ": " + errors.msg(re))

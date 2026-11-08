@@ -26,6 +26,7 @@
 #include <sys/stat.h>
 #ifdef _WIN32
 #include <aclapi.h>
+#include <sddl.h>
 #endif
 
 #define ARENA_CAP (1 << 20)
@@ -2365,13 +2366,39 @@ int64_t rt_open_write_mode(OxlStr path, int64_t mode) {
     const char *cp = rt_cstr(path);
 #ifdef _WIN32
     (void)mode;
-    int fd = _open(cp, _O_WRONLY | _O_CREAT | _O_EXCL | _O_BINARY,
-                   _S_IREAD | _S_IWRITE);
+    /* Born restrictive: an owner-only DACL on the staging file
+     * closes the window where inherited parent ACEs could expose
+     * staged contents before the caller's rt_copy_acl carries the
+     * source DACL across. CREATE_NEW keeps the exclusive-create
+     * contract; share mode 0 holds the stage closed to other opens
+     * for the write's duration. "OW" is the owner-rights SID — the
+     * creating account keeps full access on every setup. */
+    SECURITY_ATTRIBUTES sa;
+    PSECURITY_DESCRIPTOR rsd = NULL;
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = FALSE;
+    sa.lpSecurityDescriptor = NULL;
+    if (ConvertStringSecurityDescriptorToSecurityDescriptorA(
+            "D:P(A;;GA;;;OW)", SDDL_REVISION_1, &rsd, NULL))
+        sa.lpSecurityDescriptor = rsd;
+    HANDLE h = CreateFileA(cp, GENERIC_WRITE, 0,
+                           sa.lpSecurityDescriptor ? &sa : NULL,
+                           CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (rsd) LocalFree((HLOCAL)rsd);
+    if (h == INVALID_HANDLE_VALUE) {
+        DWORD e = GetLastError();
+        return e == ERROR_FILE_EXISTS
+                   ? -(int64_t)EEXIST
+                   : -((int64_t)e | RT_GLE_TAG);
+    }
+    int fd = _open_osfhandle((intptr_t)h, _O_WRONLY | _O_BINARY);
+    if (fd < 0) { CloseHandle(h); return -(int64_t)EIO; }
+    return fd;
 #else
     int fd = open(cp, O_WRONLY | O_CREAT | O_EXCL | O_TRUNC,
                   (mode_t)((mode | 0200) & 0777));
-#endif
     return fd < 0 ? -(int64_t)errno : fd;
+#endif
 }
 
 /* copy_acl: carry src's DACL onto dst — a staged replacement born

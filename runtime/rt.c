@@ -2156,8 +2156,10 @@ OxlStr rt_ftoa(double v) {
    Display semantics), which the fixed %.15g of rt_ftoa can't reach */
 OxlStr rt_ftoa_p(double v, int64_t prec) {
     int n = snprintf(NULL, 0, "%.*g", (int)prec, v);
+    if (n < 0) return rt_str("");          /* snprintf size failure (huge prec / alloc) */
     char *p = rt_alloc(n + 1);
-    snprintf(p, n + 1, "%.*g", (int)prec, v);
+    int w = snprintf(p, n + 1, "%.*g", (int)prec, v);
+    if (w < 0) { p[0] = 0; return rt_str(""); }
     return rt_str(p);
 }
 

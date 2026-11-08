@@ -1051,11 +1051,14 @@ echo "== toolchain driver fmt + doc (t3) =="
 if ! "$SELFOXL" fmt --check $(find std bootstrap tests examples cmd -name '*.oxl' | sort); then
     echo "FAIL self driver fmt --check: corpus not canonical"; exit 1
 fi
-# a valid but unformatted file must fail --check with exit 1
+# a valid but unformatted file must fail --check with exit 1 and the
+# `not formatted` diagnostic — a crash or parse reject would also exit
+# nonzero, so assert both the code and the message
 printf 'package main\n\nfn add(a:int,b:int) -> int {\n  return a+b\n}\n' > "$scratch/unfmt.oxl"
-if "$SELFOXL" fmt --check "$scratch/unfmt.oxl" >/dev/null 2>&1; then
-    echo "FAIL fmt --check: accepted unformatted input"; exit 1
-fi
+rc=0
+"$SELFOXL" fmt --check "$scratch/unfmt.oxl" >"$scratch/unfmt.out" 2>&1 || rc=$?
+[ "$rc" -eq 1 ] || { echo "FAIL fmt --check: expected exit 1, got $rc"; cat "$scratch/unfmt.out"; exit 1; }
+grep -q "not formatted" "$scratch/unfmt.out" || { echo "FAIL fmt --check missing diagnostic"; cat "$scratch/unfmt.out"; exit 1; }
 # fmt output parity: the port must reproduce the seed's output
 # byte-for-byte on a corpus slice — round-trip, not a reformat
 for f in std/strings/strings.oxl std/io/io.oxl std/errors/errors.oxl \

@@ -208,10 +208,16 @@ fn mkdir_all(path: str) -> err {
             }
             continue
         }
-        if strings.endswith(p, ":") {
-            // drive prefix (C:) — not a creatable dir, always a root
-            cur = cur + p
-            continue
+        if len(p) == 2 && byteat(p, 1) == 58 && len(cur) == 0 {
+            // drive prefix (C:) — a single letter + colon at the path
+            // start is a root, not a creatable dir. Anything longer
+            // ending in ':' (e.g. "file:" from file:// module paths)
+            // is an ordinary directory name.
+            a := byteat(p, 0)
+            if a >= 65 && a <= 90 || a >= 97 && a <= 122 {
+                cur = cur + p
+                continue
+            }
         }
         if len(cur) == 0 || strings.endswith(cur, "/") {
             cur = cur + p

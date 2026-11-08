@@ -17,8 +17,6 @@ import "std/os"
 
 import "std/os/exec"
 
-import "std/sort"
-
 import "std/strings"
 
 // raw fs/process primitives the os package doesn't shape the way
@@ -568,56 +566,7 @@ fn cmd_list() {
         eprintln("error [check] not a module — no oxl.mod found above " + check.native_path(cwd))
         exit(1)
     }
-    // the seed's build list is a BTreeMap — sorted by module path;
-    // mod_sel is the same set front-pushed, so re-sort
-    mps := mkslice(str, 0)
-    l := ck.mod_sel
-    for l != nil {
-        mps = push(mps, l.alias)
-        l = l.next
-    }
-    sort.sort(mps)
-    println(ck.mod_path)
-    i = 0
-    for i < len(mps) {
-        mp := mps[i]
-        mv := ""
-        l = ck.mod_sel
-        for l != nil {
-            if l.alias == mp {
-                mv = l.stem
-                break
-            }
-            l = l.next
-        }
-        // `=> dir` only when a replace actually matched this version:
-        // an exact (path, version) replace, else the unversioned one
-        rep := ""
-        l2 := ck.mod_reps
-        for l2 != nil {
-            if l2.alias == mp && l2.ver == mv {
-                rep = l2.stem
-                break
-            }
-            l2 = l2.next
-        }
-        if len(rep) == 0 {
-            l2 = ck.mod_reps
-            for l2 != nil {
-                if l2.alias == mp && len(l2.ver) == 0 {
-                    rep = l2.stem
-                    break
-                }
-                l2 = l2.next
-            }
-        }
-        line := mp + " " + mv
-        if len(rep) > 0 {
-            line = line + " => " + check.verbatim_path(rep)
-        }
-        println(line)
-        i = i + 1
-    }
+    print_build_list(ck)
 }
 
 fn main() {
@@ -634,10 +583,14 @@ fn main() {
         cmd_test()
     } else if c == "list" {
         cmd_list()
+    } else if c == "get" {
+        cmd_get()
+    } else if c == "mod" {
+        cmd_mod()
     } else if c == "lsp" {
         cmd_lsp()
-    } else if c == "fmt" || c == "doc" || c == "get" || c == "mod" {
-        // T3/T4 fill these — the dispatch is shaped for them
+    } else if c == "fmt" || c == "doc" {
+        // T3 fills these — the dispatch is shaped for them
         eprintln("oxl " + c + ": not yet implemented in cmd/oxl")
         exit(2)
     } else {

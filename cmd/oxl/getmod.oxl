@@ -1,0 +1,2352 @@
+package main
+
+// oxl get + oxl mod — toolchain-in-oxl stage T4: the fetch/cache write
+// side of the module system. Ports fetch.rs (the git veneer:
+// clone --bare into a private dir, rev-parse/describe/archive/show in
+// it), modcache.rs's write path (untar with ustar+pax support, seal,
+// remove_tree, install), and main.rs's cmd_get/cmd_mod block
+// (pin_require/upsert_require/sums_text, mod_init/verify/list, and
+// mod_tidy's fixpoint walk).
+//
+// Everything reads through the check package's module machinery —
+// escape_path/modcache_dir/module_dir/dir_h1/mod_h1/verify_slot/
+// sver_parse/sver_cmp — so the driver never carries a second copy of
+// the resolution rules.
+import "oxl/bootstrap/check"
+
+import "oxl/bootstrap/lexlib"
+
+import "oxl/bootstrap/parser"
+
+import "std/bytes"
+
+import "std/collections"
+
+import "std/errors"
+
+import "std/os"
+
+import "std/os/exec"
+
+import "std/sort"
+
+import "std/strings"
+
+extern fn rt_chmod(path: str, mode: int) -> int
+
+// ---------- fetch: the git veneer (fetch.rs) ----------
+// `git` is a documented toolchain dependency for get only; auth rides
+// git's own mechanisms (ssh agent, credential helpers).
+struct Fetched { ver: str, tar: []byte, manifest: []byte }
+
+// repository-location vars are stripped, not overridden — an inherited
+// GIT_DIR et al would retarget our git invocations at a foreign repo and
+// cache sums for the wrong content. auth/config vars (GIT_SSH*,
+// GIT_ASKPASS, GIT_CONFIG_*) stay, so credential helpers still work.
+fn git_env() -> own []str {
+    e := mkslice(str, 14)
+    e[0] = "GIT_DIR"
+    e[1] = "GIT_WORK_TREE"
+    e[2] = "GIT_INDEX_FILE"
+    e[3] = "GIT_OBJECT_DIRECTORY"
+    e[4] = "GIT_ALTERNATE_OBJECT_DIRECTORIES"
+    e[5] = "GIT_COMMON_DIR"
+    e[6] = "GIT_NAMESPACE"
+    e[7] = "GIT_PREFIX"
+    e[8] = "GIT_CEILING_DIRECTORIES"
+    e[9] = "GIT_DISCOVERY_ACROSS_FILESYSTEM"
+    e[10] = "GIT_GRAFT_FILE"
+    e[11] = "GIT_SHALLOW_FILE"
+    e[12] = "TZ=UTC"
+    e[13] = "GIT_TERMINAL_PROMPT=0"
+    return new(e)
+}
+
+// run git argv (dir becomes -C, the seed's current_dir) and capture
+// stdout as bytes; the error mirrors "git <args>: <stderr>"
+fn git_run(dir: str, args: []str) -> [own exec.Out, err] {
+    argv := mkslice(str, 0)
+    if len(dir) > 0 {
+        argv = push(argv, "-C")
+        argv = push(argv, dir)
+    }
+    i := 0
+    for i < len(args) {
+        argv = push(argv, args[i])
+        i = i + 1
+    }
+    cmd := exec.cmd_env("git", argv, git_env())
+    [o, ge] = cmd.output()
+    if ge != nil {
+        return nil, errors.new("git " + join_ws(argv) + ": " + errors.msg(ge))
+    }
+    if o.status != 0 {
+        return nil, errors.new("git " + join_ws(argv) + ": " + strings.trim(bytes.tostr(o.stderr)))
+    }
+    return new(o), nil
+}
+
+// stdout as trimmed text — the common case for ref queries
+fn git_text(dir: str, args: []str) -> [str, err] {
+    [o, ge] = git_run(dir, args)
+    if ge != nil {
+        return "", ge
+    }
+    return strings.trim(bytes.tostr(o.stdout)), nil
+}
+
+// ASCII lowercase — the fold for tar-path case-collision detection
+// and the device-name check (std/strings only ships upper today)
+fn lwr(s: str) -> str {
+    r := ""
+    i := 0
+    for i < len(s) {
+        c := byteat(s, i)
+        if c >= 65 && c <= 90 {
+            // one-char append of the folded byte — components are
+            // short, no extern needed
+            lb := mkslice(byte, 1)
+            lb[0] = c + 32
+            r = r + bytes.tostr(lb)
+        } else {
+            r = r + substr(s, i, i + 1)
+        }
+        i = i + 1
+    }
+    return r
+}
+
+fn join_ws(a: []str) -> str {
+    s := ""
+    i := 0
+    for i < len(a) {
+        if i > 0 {
+            s = s + " "
+        }
+        s = s + a[i]
+        i = i + 1
+    }
+    return s
+}
+
+fn args1(a: str) -> own []str {
+    v := mkslice(str, 1)
+    v[0] = a
+    return new(v)
+}
+
+fn args2(a: str, b: str) -> own []str {
+    v := mkslice(str, 2)
+    v[0] = a
+    v[1] = b
+    return new(v)
+}
+
+fn args3(a: str, b: str, c: str) -> own []str {
+    v := mkslice(str, 3)
+    v[0] = a
+    v[1] = b
+    v[2] = c
+    return new(v)
+}
+
+// module path -> repo URL: an explicit scheme or scp-style git@ passes
+// through; a bare host/path gets https:// (fetch.rs repo_url)
+fn repo_url(path: str) -> str {
+    i := 0
+    for i + 2 < len(path) {
+        if byteat(path, i) == 58 && byteat(path, i + 1) == 47 && byteat(path, i + 2) == 47 {
+            return path // "://"
+        }
+        i = i + 1
+    }
+    if strings.startswith(path, "git@") {
+        return path
+    }
+    return "https://" + path
+}
+
+fn sanitize(s: str) -> str {
+    r := ""
+    i := 0
+    for i < len(s) {
+        b := byteat(s, i)
+        if b >= 97 && b <= 122 || b >= 65 && b <= 90 || b >= 48 && b <= 57 {
+            r = r + substr(s, i, i + 1)
+        } else {
+            r = r + "_"
+        }
+        i = i + 1
+    }
+    return r
+}
+
+// filename-safe fragment for tmp extraction dirs (sanitize_tag — also
+// keeps . and -)
+fn sanitize_tag(s: str) -> str {
+    r := ""
+    i := 0
+    for i < len(s) {
+        b := byteat(s, i)
+        if b >= 97 && b <= 122 || b >= 65 && b <= 90 || b >= 48 && b <= 57 || b == 46 || b == 45 {
+            r = r + substr(s, i, i + 1)
+        } else {
+            r = r + "_"
+        }
+        i = i + 1
+    }
+    return r
+}
+
+// every v* tag, as (semver, tag-text) pairs — the tag text is kept so
+// the selected version preserves any build metadata byte-for-byte
+struct TagEnt { ver: check.SVer, tag: str, next: own TagEnt }
+
+fn fetch_tags(tmp: str) -> own TagEnt {
+    [out, ge] = git_text(tmp, args3("tag", "--list", "v*"))
+    if ge != nil {
+        return nil
+    }
+    lines := strings.split(out, "\n")
+    let tags: own TagEnt = nil
+    for lines != nil {
+        t := strings.trim(lines.v)
+        lines = lines.next
+        if len(t) == 0 {
+            continue
+        }
+        v := check.sver_parse(t)
+        if v.ok == 0 {
+            continue
+        }
+        tags = new(TagEnt{ver: v, tag: t, next: tags})
+    }
+    return tags
+}
+
+fn rev_parse(tmp: str, r: str) -> [str, err] {
+    if strings.startswith(r, "-") {
+        return "", errors.new("invalid revision " + r)
+    }
+    a := mkslice(str, 4)
+    a[0] = "rev-parse"
+    a[1] = "--verify"
+    a[2] = "--end-of-options"
+    a[3] = r + "^{commit}"
+    return git_text(tmp, a)
+}
+
+// pseudo-version: the nearest semver tag ancestor bumps its patch and
+// gains -0.<yyyymmddhhmmss>-<sha12>; no ancestor tag starts from v0.0.0
+fn pseudo(tmp: str, sha: str) -> [str, err] {
+    a := mkslice(str, 5)
+    a[0] = "describe"
+    a[1] = "--tags"
+    a[2] = "--abbrev=0"
+    a[3] = "--match=v*"
+    a[4] = sha
+    [base, be] = git_text(tmp, a) // ok to fail — no ancestor tag
+    if be != nil {
+        base = ""
+    }
+    s := mkslice(str, 4)
+    s[0] = "show"
+    s[1] = "-s"
+    s[2] = "--format=%cd"
+    s[3] = "--date=format-local:%Y%m%d%H%M%S"
+    s = push(s, sha)
+    [ts, te] = git_text(tmp, s)
+    if te != nil {
+        return "", te
+    }
+    sh := sha
+    if len(sh) > 12 {
+        sh = substr(sh, 0, 12)
+    }
+    maj := 0
+    min := 0
+    pat := 0
+    v := check.sver_parse(base)
+    if v.ok == 1 {
+        maj = v.maj
+        min = v.min
+        pat = v.pat + 1
+    }
+    return "v" + itoa(maj) + "." + itoa(min) + "." + itoa(pat) + "-0." + ts + "-" + sh, nil
+}
+
+// pseudo_sha extracts the embedded commit hash from a pseudo-version
+// query ("v<semver>-0.<yyyymmddhhmmss>-<sha12>"), or "" when the query
+// isn't pseudo-shaped. the tail layout is fixed: -0. + 14 digits + - +
+// 12 lowercase hex = 30 bytes.
+fn pseudo_sha(query: str) -> str {
+    if len(query) < 32 || byteat(query, 0) != 118 {
+        return ""
+    }
+    tail := substr(query, len(query) - 30, len(query))
+    if byteat(tail, 0) != 45 || byteat(tail, 1) != 48 || byteat(tail, 2) != 46 {
+        return ""
+    }
+    i := 3
+    for i < 17 {
+        c := byteat(tail, i)
+        if c < 48 || c > 57 {
+            return ""
+        }
+        i = i + 1
+    }
+    if byteat(tail, 17) != 45 {
+        return ""
+    }
+    i = 18
+    for i < 30 {
+        c := byteat(tail, i)
+        if !(c >= 48 && c <= 57 || c >= 97 && c <= 102) {
+            return ""
+        }
+        i = i + 1
+    }
+    return substr(tail, 18, 30)
+}
+
+struct ShaVer { sha: str, ver: str }
+
+fn fetch_resolve(tmp: str, query: str) -> [own ShaVer, err] {
+    if query == "latest" || len(query) == 0 {
+        tags := fetch_tags(tmp)
+        bv := check.SVer{ok: 0, maj: 0, min: 0, pat: 0, pre: ""}
+        btag := ""
+        l := tags
+        for l != nil {
+            if len(btag) == 0 || check.sver_cmp(l.ver, bv) > 0 {
+                bv = l.ver
+                btag = l.tag
+            }
+            l = l.next
+        }
+        if len(btag) > 0 {
+            [sha, e] = rev_parse(tmp, btag)
+            if e != nil {
+                return nil, e
+            }
+            return new(ShaVer{sha: sha, ver: btag}), nil
+        }
+        [sha, e] = rev_parse(tmp, "HEAD")
+        if e != nil {
+            return nil, e
+        }
+        [v, e2] = pseudo(tmp, sha)
+        if e2 != nil {
+            return nil, e2
+        }
+        return new(ShaVer{sha: sha, ver: v}), nil
+    }
+    if byteat(query, 0) == 118 && check.sver_parse(query).ok == 1 {
+        [sha, e] = rev_parse(tmp, "refs/tags/" + query)
+        if e == nil {
+            return new(ShaVer{sha: sha, ver: query}), nil
+        }
+        // no such tag — a pinned pseudo-version still resolves by its
+        // embedded commit hash, so tidy can rebuild a missing cache slot
+        ph := pseudo_sha(query)
+        if len(ph) > 0 {
+            [psha, pe] = rev_parse(tmp, ph)
+            if pe == nil && strings.startswith(psha, ph) {
+                return new(ShaVer{sha: psha, ver: query}), nil
+            }
+        }
+        return nil, errors.new("unknown revision " + query)
+    }
+    // a branch name first, then a raw commit-ish
+    [sha, e] = rev_parse(tmp, "refs/heads/" + query)
+    if e == nil {
+        [v, e2] = pseudo(tmp, sha)
+        if e2 != nil {
+            return nil, e2
+        }
+        return new(ShaVer{sha: sha, ver: v}), nil
+    }
+    [sha2, e3] = rev_parse(tmp, query)
+    if e3 != nil {
+        return nil, errors.new("unknown revision " + query)
+    }
+    [v, e4] = pseudo(tmp, sha2)
+    if e4 != nil {
+        return nil, e4
+    }
+    return new(ShaVer{sha: sha2, ver: v}), nil
+}
+
+// clone --bare into a private dir, resolve the query, git archive the
+// selected tree, read its oxl.mod — one clone serves all three
+fn fetch(url: str, path: str, query: str) -> [own Fetched, err] {
+    tmp := mk_scratch_dir("oxl-get-" + sanitize(path))
+    [f, fe] = fetch_in(tmp, url, path, query)
+    os.remove_all(tmp)
+    return f, fe
+}
+
+fn fetch_in(tmp: str, url: str, path: str, query: str) -> [own Fetched, err] {
+    a := mkslice(str, 4)
+    a[0] = "clone"
+    a[1] = "--bare"
+    a[2] = "--quiet"
+    a[3] = "--"
+    a = push(a, url)
+    a = push(a, tmp)
+    cmd := exec.cmd_env("git", a, git_env())
+    [o, ge] = cmd.output()
+    if ge != nil {
+        return nil, errors.new("git clone " + url + ": " + errors.msg(ge))
+    }
+    if o.status != 0 {
+        return nil, errors.new("git clone " + url + ": " + strings.trim(bytes.tostr(o.stderr)))
+    }
+    [sv, re] = fetch_resolve(tmp, query)
+    if re != nil {
+        return nil, re
+    }
+    sha := sv.sha
+    ver := sv.ver
+    [tar, te] = git_run(tmp, args3("archive", "--format=tar", sha))
+    if te != nil {
+        return nil, te
+    }
+    [man, me] = git_run(tmp, args2("show", sha + ":oxl.mod"))
+    if me != nil {
+        return nil, errors.new(path + "@" + ver + ": no oxl.mod at repo root")
+    }
+    return new(Fetched{ver: ver, tar: tar.stdout, manifest: man.stdout}), nil
+}
+
+// fetch + the self-declared-path check: refuse modules whose oxl.mod
+// names a different path than the one they were fetched as — mis-
+// pinned forks have to be replaced explicitly
+fn fetch_mod(mp: str, query: str) -> [own Fetched, err] {
+    if strings.startswith(mp, "-") {
+        return nil, errors.new("invalid module path " + mp)
+    }
+    [f, fe] = fetch(repo_url(mp), mp, query)
+    if fe != nil {
+        return nil, fe
+    }
+    ck := check.ck_new()
+    if check.parse_manifest(ck, bytes.tostr(f.manifest)) == 0 {
+        msg := "malformed oxl.mod"
+        if len(ck.diags) > 0 {
+            msg = ck.diags[0].msg
+        }
+        return nil, errors.new(mp + "@" + f.ver + ": parsing oxl.mod: " + msg)
+    }
+    if ck.mod_path != mp {
+        return nil, errors.new(mp + "@" + f.ver + ": parsing oxl.mod: module declares its path as: " + ck.mod_path + ", but was required as: " + mp)
+    }
+    return f, nil
+}
+
+// ---------- modcache write path (modcache.rs) ----------
+
+// a tar path component must survive every supported filesystem —
+// Windows rules are the binding set (trailing dot/space, device names,
+// <>:"|?* bytes, control bytes)
+fn check_component(c: str) -> err {
+    if len(c) == 0 || c == "." || c == ".." {
+        return errors.new("unsafe path component \"" + c + "\"")
+    }
+    i := 0
+    for i < len(c) {
+        b := byteat(c, i)
+        if b == 92 || b == 47 {
+            return errors.new("unsafe path component \"" + c + "\"")
+        }
+        i = i + 1
+    }
+    last := byteat(c, len(c) - 1)
+    if last == 46 || last == 32 {
+        return errors.new("unsafe path component \"" + c + "\" (trailing dot/space)")
+    }
+    i = 0
+    for i < len(c) {
+        b := byteat(c, i)
+        if b < 32 || b == 60 || b == 62 || b == 58 || b == 34 || b == 124 || b == 63 || b == 42 {
+            return errors.new("unsafe path component \"" + c + "\" (illegal character)")
+        }
+        i = i + 1
+    }
+    stem := lwr(c)
+    d := -1
+    i = 0
+    for i < len(stem) {
+        if byteat(stem, i) == 46 {
+            d = i
+            break
+        }
+        i = i + 1
+    }
+    if d >= 0 {
+        stem = substr(stem, 0, d)
+    }
+    devs := mkslice(str, 22)
+    devs[0] = "con"
+    devs[1] = "prn"
+    devs[2] = "aux"
+    devs[3] = "nul"
+    i = 0
+    for i < 9 {
+        devs[4 + i] = "com" + itoa(i + 1)
+        devs[13 + i] = "lpt" + itoa(i + 1)
+        i = i + 1
+    }
+    i = 0
+    for i < 22 {
+        if stem == devs[i] {
+            return errors.new("unsafe path component \"" + c + "\" (reserved device name)")
+        }
+        i = i + 1
+    }
+    return nil
+}
+
+fn tar_octal(b: []byte, off: int, n: int) -> int {
+    r := 0
+    i := 0
+    for i < n {
+        c := b[off + i]
+        if c >= 48 && c <= 55 {
+            r = r * 8 + (c - 48)
+        } else {
+            break
+        }
+        i = i + 1
+    }
+    return r
+}
+
+fn tar_field(b: []byte, off: int, n: int) -> str {
+    end := 0
+    for end < n && b[off + end] != 0 {
+        end = end + 1
+    }
+    return bytes.tostr(b[off:off + end])
+}
+
+// extract a `git archive` tar into dest: ustar + pax `path=`
+// overrides, regular files and dirs only, every name validated and
+// case-collision checked, no absolute/parent escapes. Returns the
+// number of files written.
+fn untar(b: []byte, dest: str) -> [int, err] {
+    nfiles := 0
+    seen := collections.set_new()
+    pos := 0
+    pax_path := ""
+    for pos + 512 <= len(b) {
+        allzero := 1
+        i := 0
+        for i < 512 {
+            if b[pos + i] != 0 {
+                allzero = 0
+                break
+            }
+            i = i + 1
+        }
+        if allzero == 1 {
+            break
+        }
+        size := tar_octal(b, pos + 124, 12)
+        typeflag := b[pos + 156]
+        name := tar_field(b, pos, 100)
+        prefix := tar_field(b, pos + 345, 155)
+        if len(prefix) > 0 {
+            name = prefix + "/" + name
+        }
+        mode := tar_octal(b, pos + 100, 8)
+        pos = pos + 512
+        body_end := pos + size
+        if body_end > len(b) {
+            return 0, errors.new("truncated tar archive")
+        }
+        if typeflag == 120 { // x — pax extended header; honor path= only
+            txt := bytes.tostr(b[pos:body_end])
+            lines := strings.split(txt, "\n")
+            for lines != nil {
+                rec := lines.v
+                lines = lines.next
+                sp := bytes.index(rec as []byte, " " as []byte)
+                if sp < 0 {
+                    continue
+                }
+                kv := substr(rec, sp + 1, len(rec))
+                if strings.startswith(kv, "path=") {
+                    v := substr(kv, 5, len(kv))
+                    // trim trailing NULs
+                    for len(v) > 0 && byteat(v, len(v) - 1) == 0 {
+                        v = substr(v, 0, len(v) - 1)
+                    }
+                    pax_path = v
+                }
+            }
+            pos = body_end + (512 - body_end % 512) % 512
+            continue
+        }
+        if typeflag != 48 && typeflag != 0 && typeflag != 53 { // '0' / NUL / '5' only
+            pax_path = ""
+            pos = body_end + (512 - body_end % 512) % 512
+            continue // links, devices, fifos — never materialize
+        }
+        if len(pax_path) > 0 {
+            name = pax_path
+            pax_path = ""
+        }
+        // normalize: split on /, drop empty and . components
+        comps := strings.split(name, "/")
+        folded := ""
+        out := dest
+        ncomp := 0
+        bad := 0
+        for comps != nil {
+            c := comps.v
+            comps = comps.next
+            if len(c) == 0 || c == "." {
+                continue
+            }
+            ce := check_component(c)
+            if ce != nil {
+                return 0, ce
+            }
+            if len(folded) > 0 {
+                folded = folded + "/"
+            }
+            folded = folded + lwr(c)
+            out = out + "/" + c
+            ncomp = ncomp + 1
+        }
+        if ncomp == 0 {
+            pos = body_end + (512 - body_end % 512) % 512
+            continue
+        }
+        if collections.set_has(seen, folded) {
+            return 0, errors.new("archive has case-colliding paths (" + name + ")")
+        }
+        collections.set_add(seen, folded)
+        is_dir := typeflag == 53 || strings.endswith(name, "/")
+        if is_dir {
+            de := os.mkdir_all(out)
+            if de != nil {
+                return 0, errors.new(out + ": " + errors.msg(de))
+            }
+            pos = body_end + (512 - body_end % 512) % 512
+            continue
+        }
+        pe := os.mkdir_all(check.dir_of(out))
+        if pe != nil {
+            return 0, errors.new(check.dir_of(out) + ": " + errors.msg(pe))
+        }
+        wn := write_text(out, bytes.tostr(b[pos:body_end]))
+        if wn != 0 {
+            return 0, errors.new(out + ": write failed (errno " + itoa(wn) + ")")
+        }
+        rt_chmod(out, mode)
+        nfiles = nfiles + 1
+        pos = body_end + (512 - body_end % 512) % 512
+    }
+    return nfiles, nil
+}
+
+// strip write permission everywhere below dir — a cache slot is
+// immutable once sealed (corruption-by-edit is a real failure mode).
+// Files -> 0444, dirs -> 0555 (the x bit stays needed to traverse).
+fn seal(dir: str) -> err {
+    ents := os.ls(dir)
+    i := 0
+    for i < len(ents) {
+        p := dir + "/" + ents[i]
+        if os.isdir(p) {
+            se := seal(p)
+            if se != nil {
+                return se
+            }
+            if rt_chmod(p, 365) != 0 { // 0555
+                return errors.new("seal " + p)
+            }
+        } else if rt_chmod(p, 292) != 0 { // 0444
+            return errors.new("seal " + p)
+        }
+        i = i + 1
+    }
+    // the slot dir itself goes read-only last — children sealed first
+    // so a sealed tree never holds an unsealed parent
+    if rt_chmod(dir, 365) != 0 {
+        return errors.new("seal " + dir)
+    }
+    return nil
+}
+
+// best-effort removal of a possibly-sealed tree: re-add write
+// permission top-down, then remove_all — a plain remove fails on
+// read-only dirs
+fn remove_tree(dir: str) {
+    if os.isdir(dir) == false {
+        return
+    }
+    unro(dir)
+    os.remove_all(dir)
+}
+
+fn unro(dir: str) {
+    rt_chmod(dir, 493) // 0755 — traversal + write on the dir itself
+    ents := os.ls(dir)
+    i := 0
+    for i < len(ents) {
+        p := dir + "/" + ents[i]
+        if os.isdir(p) {
+            unro(p)
+        } else {
+            rt_chmod(p, 420) // 0644
+        }
+        i = i + 1
+    }
+}
+
+// does the cached slot's tree hash equal the fetched archive's? The
+// check re-extracts fresh — a hand-edited slot must not be re-pinned
+// as trustworthy
+fn slot_matches(slot: str, f: ref Fetched) -> [int, err] {
+    tmp := check.dir_of(slot) + "/.verify-" + itoa(now_ms()) + "-" + sanitize_tag(f.ver)
+    os.remove_all(tmp)
+    e := os.mkdir_all(tmp)
+    if e != nil {
+        return 0, e
+    }
+    [_, ue] = untar(f.tar, tmp)
+    if ue != nil {
+        remove_tree(tmp)
+        return 0, ue
+    }
+    fresh := check.dir_h1(tmp)
+    cached := check.dir_h1(slot)
+    remove_tree(tmp)
+    if fresh == cached {
+        return 1, nil
+    }
+    return 0, nil
+}
+
+// extract a fetched module into a tmp sibling of its slot — the
+// caller inspects the tree, then commit_tmp()s it into place or
+// remove_tree()s it
+fn stage_tmp(cache: str, ver: str, f: ref Fetched) -> [str, err] {
+    tmp := cache + "/.tmp-" + itoa(now_ms()) + "-" + sanitize_tag(ver)
+    os.remove_all(tmp)
+    e := os.mkdir_all(tmp)
+    if e != nil {
+        return "", e
+    }
+    [_, ue] = untar(f.tar, tmp)
+    if ue != nil {
+        remove_tree(tmp)
+        return "", ue
+    }
+    return tmp, nil
+}
+
+// move a staged tree into its slot and seal it. The rename happens
+// while the tree is still writable (a dir's .. is rewritten on move,
+// so a read-only dir can't be renamed at all), then it seals in
+// place. Consumers can't see the module before its oxl.sum line
+// exists anyway — the sum, not the permission bit, is the integrity
+// mechanism.
+fn commit_tmp(tmp: str, slot: str) -> err {
+    par := check.dir_of(slot)
+    if len(par) > 0 {
+        e := os.mkdir_all(par)
+        if e != nil {
+            remove_tree(tmp)
+            return e
+        }
+    }
+    re := os.rename(tmp, slot)
+    if re != nil {
+        // a concurrent get may have won the race — the slot is
+        // content-addressed so theirs is identical; reuse it
+        if os.isdir(slot) == false {
+            remove_tree(tmp)
+            return errors.new(slot + ": " + errors.msg(re))
+        }
+        remove_tree(tmp)
+    }
+    return seal(slot)
+}
+
+// make a fetched module available in the cache: reuse an identical
+// slot, or stage + commit a fresh extraction
+fn install(cache: str, mp: str, f: ref Fetched) -> [str, err] {
+    slot := cache + "/" + check.escape_path(mp) + "@" + check.escape_path(f.ver)
+    if os.isdir(slot) {
+        [same, me] = slot_matches(slot, f)
+        if me != nil {
+            return "", me
+        }
+        if same == 0 {
+            return "", errors.new("cached " + mp + "@" + f.ver + " does not match the fetched archive — remove the slot and get again")
+        }
+        return slot, nil
+    }
+    [tmp, se] = stage_tmp(cache, f.ver, f)
+    if se != nil {
+        return "", se
+    }
+    ce := commit_tmp(tmp, slot)
+    if ce != nil {
+        return "", ce
+    }
+    return slot, nil
+}
+
+// ---------- manifest write side (main.rs get/mod block) ----------
+
+// serialize a SumEnt list the seed's way: lines sorted by
+// (path, ver, is_mod). Sorting the formatted lines is the same order —
+// paths/vers hold no spaces, the /mod suffix sorts after the bare
+// version at the same path+version.
+fn sums_text(sums: ref check.SumEnt) -> str {
+    lines := mkslice(str, 0)
+    l := sums
+    for l != nil {
+        suf := ""
+        if l.is_mod == 1 {
+            suf = "/mod"
+        }
+        lines = push(lines, l.path + " " + l.ver + suf + " " + l.h1)
+        l = l.next
+    }
+    sort.sort(lines)
+    out := ""
+    i := 0
+    for i < len(lines) {
+        out = out + lines[i] + "\n"
+        i = i + 1
+    }
+    return out
+}
+
+fn sums_find(sums: ref check.SumEnt, path: str, ver: str, is_mod: int) -> str {
+    l := sums
+    for l != nil {
+        if l.path == path && l.ver == ver && l.is_mod == is_mod {
+            return l.h1
+        }
+        l = l.next
+    }
+    return ""
+}
+
+// drop every line for (path, ver) — pin_sums' retain() equivalent
+fn sums_drop(sums: own check.SumEnt, path: str, ver: str) -> own check.SumEnt {
+    if sums == nil {
+        return nil
+    }
+    rest := sums_drop(sums.next, path, ver)
+    if sums.path == path && sums.ver == ver {
+        return rest
+    }
+    sums.next = rest
+    return sums
+}
+
+fn sums_push(sums: own check.SumEnt, path: str, ver: str, is_mod: int, h1: str) -> own check.SumEnt {
+    return new(check.SumEnt{path: path, ver: ver, is_mod: is_mod, h1: h1, next: sums})
+}
+
+// record the two oxl.sum lines for a fetched module — split from
+// pin_require so tidy's restore branch can refresh sums without
+// moving the require floor
+fn pin_sums(sums: own check.SumEnt, mp: str, f: ref Fetched, slot: str) -> [own check.SumEnt, err] {
+    sums = sums_drop(sums, mp, f.ver)
+    sums = sums_push(sums, mp, f.ver, 0, check.dir_h1(slot))
+    sums = sums_push(sums, mp, f.ver, 1, check.mod_h1(mp, f.ver, bytes.tostr(f.manifest)))
+    return sums, nil
+}
+
+// upsert `require <path> <ver>` in manifest text: an existing require
+// (single-line or inside a `require (` block) has its version swapped
+// in place; absent gets an appended single-line form. Returns the new
+// text and the previous version when one was already pinned.
+struct UpsRes { text: str, old: str }
+
+fn upsert_require(mtext: str, path: str, ver: str) -> [own UpsRes, err] {
+    out := ""
+    in_block := 0
+    found := ""
+    lines := strings.split(mtext, "\n")
+    for lines != nil {
+        // a trailing "" element is the text's own final newline —
+        // Rust's lines() drops it; mirror by stopping before it
+        if lines.next == nil && len(lines.v) == 0 {
+            break
+        }
+        line := lines.v
+        lines = lines.next
+        t := strings.trim(line)
+        if in_block == 1 {
+            if strings.startswith(t, ")") {
+                in_block = 0
+            } else if len(found) == 0 {
+                toks := strings.split(t, " ")
+                ft := first_tok(toks)
+                if ft == path {
+                    old := second_tok(toks)
+                    if len(old) > 0 {
+                        found = old
+                        line = replace_first(line, old, ver)
+                    }
+                }
+            }
+        } else if strings.startswith(t, "require") {
+            rest := strings.trim(substr(t, 7, len(t)))
+            if strings.startswith(rest, "(") {
+                in_block = 1
+            } else {
+                toks := strings.split(rest, " ")
+                ft := first_tok(toks)
+                if ft == path {
+                    old := second_tok(toks)
+                    if len(old) > 0 {
+                        found = old
+                        line = replace_first(line, old, ver)
+                    }
+                }
+            }
+        }
+        out = out + line + "\n"
+    }
+    if len(found) == 0 {
+        out = out + "require " + path + " " + ver + "\n"
+    }
+    return new(UpsRes{text: out, old: found}), nil
+}
+
+fn first_tok(toks: ref strings.StrList) -> str {
+    for toks != nil {
+        t := strings.trim(toks.v)
+        if len(t) > 0 {
+            return t
+        }
+        toks = toks.next
+    }
+    return ""
+}
+
+fn second_tok(toks: ref strings.StrList) -> str {
+    seen := 0
+    for toks != nil {
+        t := strings.trim(toks.v)
+        if len(t) > 0 {
+            if seen == 1 {
+                return t
+            }
+            seen = 1
+        }
+        toks = toks.next
+    }
+    return ""
+}
+
+// s.replacen(old, ver, 1) — first occurrence only
+fn replace_first(s: str, old: str, new: str) -> str {
+    i := bytes.index(s as []byte, old as []byte)
+    if i < 0 {
+        return s
+    }
+    return substr(s, 0, i) + new + substr(s, i + len(old), len(s))
+}
+
+// in-memory require + oxl.sum pin: upserts `require <mp> <ver>` in the
+// manifest text and refreshes the module's two h1 lines in the sums
+// list. Returns the previous required version, if any.
+struct PinRes { mtext: str, sums: own check.SumEnt, old: str }
+
+fn pin_require(mtext: str, sums: own check.SumEnt, mp: str, f: ref Fetched, slot: str) -> [own PinRes, err] {
+    [ur, ue] = upsert_require(mtext, mp, f.ver)
+    if ue != nil {
+        return nil, ue
+    }
+    [ns, se] = pin_sums(sums, mp, f, slot)
+    if se != nil {
+        return nil, se
+    }
+    return new(PinRes{mtext: ur.text, sums: ns, old: ur.old}), nil
+}
+
+// ---------- oxl get ----------
+fn cmd_get() {
+    if argc() != 3 || strings.startswith(argv(2), "-") {
+        eprintln("usage: oxl get <path>@<query>")
+        exit(2)
+    }
+    spec := argv(2)
+    mpath := spec
+    query := "latest"
+    // rsplit_once(@): last @ splits path from query; bare path = latest
+    at := -1
+    i := 0
+    for i < len(spec) {
+        if byteat(spec, i) == 64 {
+            at = i
+        }
+        i = i + 1
+    }
+    if at >= 0 && at > 0 {
+        mpath = substr(spec, 0, at)
+        if at + 1 < len(spec) {
+            query = substr(spec, at + 1, len(spec))
+        }
+    } else if at == 0 {
+        mpath = spec // spec[0]=='@' is not a valid split — treat whole as path
+    }
+    cwd := os.fullpath(".")
+    root := check.find_root(cwd)
+    if len(root) == 0 {
+        eprintln("error: no oxl.mod in current directory or any parent")
+        exit(1)
+    }
+    [f, fe] = fetch_mod(mpath, query)
+    if fe != nil {
+        eprintln("error: " + errors.msg(fe))
+        exit(1)
+    }
+    cache := check.modcache_dir()
+    [slot, ie] = install(cache, mpath, f)
+    if ie != nil {
+        eprintln("error: " + errors.msg(ie))
+        exit(1)
+    }
+    // oxl.mod: replace the existing require's version or append one
+    mpath_file := root + "/oxl.mod"
+    mtext := readfile(mpath_file)
+    // oxl.sum: drop stale lines for the module, add the fresh pair
+    spath := root + "/oxl.sum"
+    stext := ""
+    if os.exists(spath) {
+        stext = readfile(spath)
+    }
+    ck := check.ck_new()
+    if check.parse_sums(ck, stext) == 0 {
+        msg := "malformed oxl.sum"
+        if len(ck.diags) > 0 {
+            msg = ck.diags[0].msg
+        }
+        eprintln("error: " + msg)
+        exit(1)
+    }
+    [pin, pe] = pin_require(mtext, ck.mod_sums, mpath, f, slot)
+    if pe != nil {
+        eprintln("error: " + errors.msg(pe))
+        exit(1)
+    }
+    if write_text(mpath_file, pin.mtext) != 0 {
+        eprintln("error: " + mpath_file + ": write failed")
+        exit(1)
+    }
+    if write_text(spath, sums_text(pin.sums)) != 0 {
+        eprintln("error: " + spath + ": write failed")
+        exit(1)
+    }
+    if len(pin.old) > 0 {
+        if pin.old == f.ver {
+            println("unchanged " + mpath + "@" + f.ver)
+        } else {
+            println("upgraded " + mpath + "@" + pin.old + " => " + f.ver)
+        }
+    } else {
+        println("added " + mpath + "@" + f.ver)
+    }
+}
+
+// ---------- oxl mod ----------
+fn cmd_mod() {
+    cwd := os.fullpath(".")
+    if argc() < 3 {
+        eprintln("usage: oxl mod <init <path>|tidy|verify|list>")
+        exit(2)
+    }
+    sub := argv(2)
+    if sub == "init" {
+        mod_init(cwd)
+    } else if sub == "tidy" {
+        mod_tidy(cwd)
+    } else if sub == "verify" {
+        mod_verify(cwd)
+    } else if sub == "list" {
+        mod_list(cwd)
+    } else {
+        eprintln("usage: oxl mod <init <path>|tidy|verify|list>")
+        exit(2)
+    }
+}
+
+// `oxl mod init <path>` — skeleton manifest in cwd; refuses to
+// overwrite (init semantics)
+fn mod_init(cwd: str) {
+    if argc() != 4 || strings.startswith(argv(3), "-") {
+        eprintln("usage: oxl mod init <module path>")
+        exit(2)
+    }
+    path := argv(3)
+    body := path
+    if strings.startswith(body, "file:///") {
+        body = substr(body, 8, len(body))
+    }
+    bad := len(body) == 0 || strings.endswith(path, "/") || strings.startswith(body, "/")
+    if bad == false {
+        i := 0
+        for i < len(path) {
+            b := byteat(path, i)
+            if b == 32 || b == 9 || b == 10 || b == 13 || b == 64 {
+                bad = true
+            }
+            i = i + 1
+        }
+        if bytes.index(body as []byte, "//" as []byte) >= 0 {
+            bad = true
+        }
+    }
+    if bad {
+        eprintln("error: malformed module path \"" + path + "\"")
+        exit(1)
+    }
+    f := cwd + "/oxl.mod"
+    if os.exists(f) {
+        eprintln("error: oxl.mod already exists")
+        exit(1)
+    }
+    if write_text(f, "module " + path + "\n\noxl " + check.tool_ver() + "\n") != 0 {
+        eprintln("error: " + f + ": write failed")
+        exit(1)
+    }
+    println("created oxl.mod: module " + path)
+}
+
+// `oxl mod verify` — every required module's selected cache slot
+// re-hashes against oxl.sum (verify semantics)
+fn mod_verify(cwd: str) {
+    if argc() != 3 {
+        eprintln("usage: oxl mod verify")
+        exit(2)
+    }
+    ck := check.ck_new()
+    if check.mod_ctx_load(ck, cwd) == 0 {
+        report_diags(ck.diags)
+        exit(1)
+    }
+    if ck.mod_on == 0 {
+        eprintln("error: no oxl.mod in current directory or any parent")
+        exit(1)
+    }
+    bad := 0
+    l := ck.mod_reqs
+    for l != nil {
+        mp := l.alias
+        mv := check.selected_ver(ck, mp)
+        if len(mv) == 0 {
+            l = l.next
+            continue
+        }
+        if replace_covers(ck, mp, mv) == 1 {
+            l = l.next
+            continue
+        }
+        d := ck.modcache + "/" + check.escape_path(mp) + "@" + check.escape_path(mv)
+        if os.isdir(d) == false {
+            eprintln("error: " + mp + "@" + mv + ": not in module cache")
+            bad = 1
+            l = l.next
+            continue
+        }
+        e := check.verify_slot(ck, d, mp, mv)
+        if len(e) > 0 {
+            eprintln("error: " + e)
+            bad = 1
+        }
+        l = l.next
+    }
+    if bad == 1 {
+        exit(1)
+    }
+    println("all modules verified")
+}
+
+// a replace directive covers (mp, mv): an exact (path, version)
+// replace, else the unversioned one — seed replace_covers
+fn replace_covers(ck: ref check.Ck, mp: str, mv: str) -> int {
+    l := ck.mod_reps
+    for l != nil {
+        if l.alias == mp && (len(l.ver) == 0 || l.ver == mv) {
+            return 1
+        }
+        l = l.next
+    }
+    return 0
+}
+
+// `oxl mod list` — the build list; same output as `oxl list -m all`
+fn mod_list(cwd: str) {
+    if argc() != 3 {
+        eprintln("usage: oxl mod list")
+        exit(2)
+    }
+    ck := check.ck_new()
+    if check.mod_ctx_load(ck, cwd) == 0 {
+        report_diags(ck.diags)
+        exit(1)
+    }
+    if ck.mod_on == 0 {
+        eprintln("error [check] not a module — no oxl.mod found above " + check.native_path(cwd))
+        exit(1)
+    }
+    print_build_list(ck)
+}
+
+// print the MVS build list exactly like the seed: the module path,
+// then `mp ver` lines sorted by path, with `=> dir` when a replace
+// matched (shared by `oxl list -m all` and `oxl mod list`)
+fn print_build_list(ck: ref check.Ck) {
+    mps := mkslice(str, 0)
+    l := ck.mod_sel
+    for l != nil {
+        mps = push(mps, l.alias)
+        l = l.next
+    }
+    sort.sort(mps)
+    println(ck.mod_path)
+    i := 0
+    for i < len(mps) {
+        mp := mps[i]
+        mv := ""
+        l = ck.mod_sel
+        for l != nil {
+            if l.alias == mp {
+                mv = l.stem
+                break
+            }
+            l = l.next
+        }
+        rep := ""
+        l2 := ck.mod_reps
+        for l2 != nil {
+            if l2.alias == mp && l2.ver == mv {
+                rep = l2.stem
+                break
+            }
+            l2 = l2.next
+        }
+        if len(rep) == 0 {
+            l2 = ck.mod_reps
+            for l2 != nil {
+                if l2.alias == mp && len(l2.ver) == 0 {
+                    rep = l2.stem
+                    break
+                }
+                l2 = l2.next
+            }
+        }
+        line := mp + " " + mv
+        if len(rep) > 0 {
+            line = line + " => " + check.verbatim_path(rep)
+        }
+        println(line)
+        i = i + 1
+    }
+}
+
+// ---------- oxl mod tidy ----------
+// sync oxl.mod/oxl.sum with what the source imports: walk the import
+// graph, fetch+require providers for missing imports, drop requires
+// nothing imports, rewrite both files surgically.
+struct UnEnt { imp: str, root: str, next: own UnEnt } // unresolved import; root "" = main module
+
+struct ProbeEnt { m: str, f: own Fetched, ok: int, next: own ProbeEnt }
+
+struct WantEnt { mp: str, ver: str, ind: int, next: own WantEnt }
+
+// a ModCtx built from in-memory manifest state (tidy rewrites before
+// it writes) — same normalization mod_ctx_load applies to disk state:
+// replaces resolve against mod_root, sums come in through the text
+// form, the build list is recomputed
+fn mk_ctx(root: str, mtext: str, sums: ref check.SumEnt) -> [own check.Ck, err] {
+    ck := check.ck_new()
+    ck.mod_root = root
+    ck.modcache = check.modcache_dir()
+    if check.parse_manifest(ck, mtext) == 0 {
+        msg := "malformed oxl.mod"
+        if len(ck.diags) > 0 {
+            msg = ck.diags[0].msg
+        }
+        return nil, errors.new(msg)
+    }
+    if check.parse_sums(ck, sums_text(sums)) == 0 {
+        return nil, errors.new("malformed oxl.sum")
+    }
+    check.mod_build_list(ck)
+    ck.mod_on = 1
+    return ck, nil
+}
+
+// recursive .oxl walk of the main module — skips nested module roots
+// (dirs holding their own oxl.mod), dot/underscore dirs, and
+// testdata, matching the package-enumeration rules
+fn main_mod_files(root: str) -> own []str {
+    out := mkslice(str, 0)
+    stack := mkslice(str, 1)
+    stack[0] = root
+    for len(stack) > 0 {
+        d := stack[len(stack) - 1]
+        stack = stack[0:len(stack) - 1]
+        ents := os.ls(d)
+        i := 0
+        for i < len(ents) {
+            nm := ents[i]
+            p := d + "/" + nm
+            if os.isdir(p) {
+                if byteat(nm, 0) == 46 || byteat(nm, 0) == 95 || nm == "testdata" || os.exists(p + "/oxl.mod") {
+                    i = i + 1
+                    continue
+                }
+                stack = push(stack, p)
+            } else if strings.endswith(nm, ".oxl") {
+                out = push(out, p)
+            }
+            i = i + 1
+        }
+    }
+    sort.sort(out)
+    return new(out)
+}
+
+// the module a source file belongs to: its nearest oxl.mod dir.
+// "" = the main module itself (find_root walks to ctx root)
+fn dep_root_of(f: str, ck: ref check.Ck) -> str {
+    r := check.find_root(check.dir_of(f))
+    if r == ck.mod_root {
+        return ""
+    }
+    return r
+}
+
+// longest require-prefix covering imp whose selected module dir
+// actually contains the package — the provider of record, same
+// longest-match rule resolve_imp applies
+struct Prov { mp: str, dir: str }
+
+fn provider(ck: ref check.Ck, imp: str) -> own Prov {
+    best := ""
+    bdir := ""
+    l := ck.mod_reqs
+    for l != nil {
+        mp := l.alias
+        if imp == mp || strings.startswith(imp, mp + "/") {
+            if len(mp) > len(best) {
+                mv := check.selected_ver(ck, mp)
+                if len(mv) > 0 {
+                    dr := check.module_dir(ck, mp, mv)
+                    if len(dr.err) == 0 && len(dr.dir) > 0 {
+                        rest := ""
+                        if imp != mp {
+                            rest = substr(imp, len(mp) + 1, len(imp))
+                        }
+                        d := dr.dir
+                        if len(rest) > 0 {
+                            d = dr.dir + "/" + rest
+                        }
+                        if os.isdir(d) {
+                            best = mp
+                            bdir = d
+                        }
+                    }
+                }
+            }
+        }
+        l = l.next
+    }
+    if len(best) == 0 {
+        return nil
+    }
+    return new(Prov{mp: best, dir: bdir})
+}
+
+// sorted .oxl files in one dir (pkg_dir_files)
+fn pkg_dir_files(dir: str) -> own []str {
+    out := mkslice(str, 0)
+    ents := os.ls(dir)
+    i := 0
+    for i < len(ents) {
+        if strings.endswith(ents[i], ".oxl") {
+            out = push(out, dir + "/" + ents[i])
+        }
+        i = i + 1
+    }
+    sort.sort(out)
+    return new(out)
+}
+
+// the import paths one file declares — nil-able via the parser, like
+// the seed's parse_pkg_file().ok()
+struct WalkRes { needed: own WantEnt, unresolved: own UnEnt }
+
+fn tidy_walk(ck: ref check.Ck, main_files: []str) -> own WalkRes {
+    let needed: own WantEnt = nil
+    let unresolved: own UnEnt = nil
+    seen := collections.set_new()
+    queue := mkslice(str, 0)
+    i := 0
+    for i < len(main_files) {
+        queue = push(queue, check.dir_of(main_files[i]))
+        i = i + 1
+    }
+    qi := 0
+    for qi < len(queue) {
+        dir := queue[qi]
+        qi = qi + 1
+        canon := os.fullpath(dir)
+        if len(canon) == 0 {
+            canon = dir
+        }
+        if collections.set_has(seen, canon) {
+            continue
+        }
+        collections.set_add(seen, canon)
+        files := pkg_dir_files(dir)
+        fi := 0
+        for fi < len(files) {
+            f := files[fi]
+            fi = fi + 1
+            main := 0
+            if len(dep_root_of(f, ck)) == 0 {
+                main = 1
+            }
+            src := readfile(f)
+            if len(src) == 0 {
+                continue
+            }
+            ast := parser.parse(lexlib.lex(src))
+            if ast == nil {
+                continue
+            }
+            let body: own parser.NList = nil
+            match ast {
+                parser.Node.Root{items} => {
+                    body = items
+                }
+                _ => {
+                }
+            }
+            if body == nil {
+                continue
+            }
+            it := body
+            for it != nil {
+                imp := ""
+                match it.v {
+                    parser.Node.Import{path} => {
+                        imp = path
+                    }
+                    _ => {
+                    }
+                }
+                it = it.next
+                if len(imp) == 0 || strings.startswith(imp, "std/") {
+                    continue
+                }
+                if imp == ck.mod_path || strings.startswith(imp, ck.mod_path + "/") {
+                    rest := ""
+                    if imp != ck.mod_path {
+                        rest = substr(imp, len(ck.mod_path) + 1, len(imp))
+                    }
+                    d := ck.mod_root
+                    if len(rest) > 0 {
+                        d = ck.mod_root + "/" + rest
+                    }
+                    if os.isdir(d) {
+                        queue = push(queue, d)
+                    }
+                    continue
+                }
+                pv := provider(ck, imp)
+                if pv != nil {
+                    needed = want_set(needed, pv.mp, "", 0)
+                    if main == 1 {
+                        needed = want_set(needed, pv.mp, "", 1)
+                    }
+                    queue = push(queue, pv.dir)
+                } else {
+                    // prepended; reversed at the end for first-seen order
+                    unresolved = new(UnEnt{imp: imp, root: dep_root_of(f, ck), next: unresolved})
+                }
+            }
+        }
+    }
+    let rev: own UnEnt = nil
+    for unresolved != nil {
+        n := unresolved.next
+        unresolved.next = rev
+        rev = unresolved
+        unresolved = n
+    }
+    return new(WalkRes{needed: needed, unresolved: rev})
+}
+
+// want-list helpers: lookup by module path, and an upsert that only
+// upgrades fields when the caller supplies them
+struct WantSnap { mp: str, ver: str, ind: int }
+
+fn want_find(l: ref WantEnt, mp: str) -> own WantSnap {
+    for l != nil {
+        if l.mp == mp {
+            return new(WantSnap{mp: l.mp, ver: l.ver, ind: l.ind})
+        }
+        l = l.next
+    }
+    return nil
+}
+
+fn want_set(l: own WantEnt, mp: str, ver: str, ind: int) -> own WantEnt {
+    if l == nil {
+        return new(WantEnt{mp: mp, ver: ver, ind: ind, next: nil})
+    }
+    if l.mp == mp {
+        if len(ver) > 0 {
+            l.ver = ver
+        }
+        if ind == 1 {
+            l.ind = 1
+        }
+        return l
+    }
+    l.next = want_set(l.next, mp, ver, ind)
+    return l
+}
+
+// mutable state tidy_satisfy threads through the fixpoint: the
+// manifest + sums being rewritten, the fetch probes, the (mp,ver)
+// pairs already asked this run, and the report lines
+struct SatState {
+    mtext: str,
+    sums: own check.SumEnt,
+    probed: own ProbeEnt,
+    asked: own collections.Set,
+    done: own collections.Set,
+    report: []str,
+}
+
+struct ProbeSnap { ok: int, ver: str, tar: []byte, manifest: []byte }
+
+fn probe_get(l: ref ProbeEnt, m: str) -> own ProbeSnap {
+    for l != nil {
+        if l.m == m {
+            if l.ok == 0 {
+                return new(ProbeSnap{ok: 0, ver: "", tar: mkslice(byte, 0), manifest: mkslice(byte, 0)})
+            }
+            return new(ProbeSnap{ok: 1, ver: l.f.ver, tar: l.f.tar, manifest: l.f.manifest})
+        }
+        l = l.next
+    }
+    return nil
+}
+
+// satisfy one unresolved import — mutates the manifest/sums in
+// memory and installs cache slots. Returns whether state changed
+// (the fixpoint driver: no change + still unresolved = hard error).
+fn tidy_satisfy(imp: str, dep_root: str, ck: ref check.Ck, st: mut SatState) -> [int, err] {
+    cache := ck.modcache
+    // dep manifest coverage: a dep package's import resolves through
+    // ITS module's require — add it to ours at the asked version
+    // (MVS picks the max if several deps ask)
+    if len(dep_root) > 0 {
+        dtext := readfile(dep_root + "/oxl.mod")
+        if len(dtext) > 0 {
+            dck := check.ck_new()
+            dck.mod_root = dep_root
+            dck.modcache = cache
+            if check.parse_manifest(dck, dtext) == 1 {
+                best := ""
+                bestv := ""
+                l := dck.mod_reqs
+                for l != nil {
+                    if (imp == l.alias || strings.startswith(imp, l.alias + "/")) && len(l.alias) > len(best) {
+                        best = l.alias
+                        bestv = l.stem
+                    }
+                    l = l.next
+                }
+                if len(best) > 0 {
+                    has := 0
+                    l = ck.mod_reqs
+                    for l != nil {
+                        if l.alias == best {
+                            has = 1
+                        }
+                        l = l.next
+                    }
+                    if has == 0 {
+                        key := best + "|" + bestv
+                        if collections.set_has(st.asked, key) {
+                            return 0, nil
+                        }
+                        collections.set_add(st.asked, key)
+                        // fetch the dep's asked tag — MVS never selects
+                        // below it
+                        [f, fe] = fetch_mod(best, bestv)
+                        if fe != nil {
+                            return 0, fe
+                        }
+                        [slot, ie] = install(cache, best, f)
+                        if ie != nil {
+                            return 0, ie
+                        }
+                        // an earlier import this pass may already have
+                        // written the require at a deliberate floor —
+                        // keep it and pin only the sums
+                        has_req := 0
+                        mck := check.ck_new()
+                        mck.mod_root = ck.mod_root
+                        if check.parse_manifest(mck, st.mtext) == 1 {
+                            l = mck.mod_reqs
+                            for l != nil {
+                                if l.alias == best {
+                                    has_req = 1
+                                }
+                                l = l.next
+                            }
+                        }
+                        if has_req == 1 {
+                            [ns, se] = pin_sums(st.sums, best, f, slot)
+                            if se != nil {
+                                return 0, se
+                            }
+                            st.sums = ns
+                        } else {
+                            [pin, pe] = pin_require(st.mtext, st.sums, best, f, slot)
+                            if pe != nil {
+                                return 0, pe
+                            }
+                            st.mtext = pin.mtext
+                            st.sums = pin.sums
+                        }
+                        st.report = push(st.report, "added " + best + "@" + f.ver + " // indirect")
+                        return 1, nil
+                    }
+                }
+            }
+        }
+    }
+    // standalone replace coverage: a replace LHS covers imp and its
+    // dir holds the package — the import works once a require exists
+    // (local-replace placeholder version)
+    best_rep := ""
+    best_rv := ""
+    best_rd := ""
+    l := ck.mod_reps
+    for l != nil {
+        if (imp == l.alias || strings.startswith(imp, l.alias + "/")) && len(l.alias) > len(best_rep) {
+            best_rep = l.alias
+            best_rv = l.ver
+            best_rd = l.stem
+        }
+        l = l.next
+    }
+    if len(best_rep) > 0 {
+        rest := ""
+        if imp != best_rep {
+            rest = substr(imp, len(best_rep) + 1, len(imp))
+        }
+        d := best_rd
+        if len(rest) > 0 {
+            d = best_rd + "/" + rest
+        }
+        if os.isdir(d) {
+            has := 0
+            l = ck.mod_reqs
+            for l != nil {
+                if l.alias == best_rep {
+                    has = 1
+                }
+                l = l.next
+            }
+            if has == 0 {
+                [ur2, ue] = upsert_require(st.mtext, best_rep, "v0.0.0-00010101000000-000000000000")
+                if ue != nil {
+                    return 0, ue
+                }
+                st.mtext = ur2.text
+                st.report = push(st.report, "added " + best_rep + " (replace)")
+                return 1, nil
+            }
+        }
+    }
+    // restore: a require already covers imp but its selected
+    // version's slot is absent — fetch THAT version (the pinned one,
+    // never @latest), verify it against the sums, keep the floor.
+    cov := mkslice(str, 0)
+    l = ck.mod_reqs
+    for l != nil {
+        if imp == l.alias || strings.startswith(imp, l.alias + "/") {
+            cov = push(cov, l.alias)
+        }
+        l = l.next
+    }
+    // longest-first: sort desc by length (insertion — covers are few)
+    i := 0
+    for i < len(cov) {
+        j := i + 1
+        for j < len(cov) {
+            if len(cov[j]) > len(cov[i]) {
+                t := cov[i]
+                cov[i] = cov[j]
+                cov[j] = t
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    i = 0
+    for i < len(cov) {
+        mp := cov[i]
+        i = i + 1
+        mv := check.selected_ver(ck, mp)
+        if len(mv) == 0 || replace_covers(ck, mp, mv) == 1 {
+            continue
+        }
+        slot := cache + "/" + check.escape_path(mp) + "@" + check.escape_path(mv)
+        rest := ""
+        if imp != mp {
+            rest = substr(imp, len(mp) + 1, len(imp))
+        }
+        if os.isdir(slot) {
+            // a slot fetched earlier in this tidy run wasn't visible
+            // to the walk — providing the package here resolves the
+            // import on the next pass
+            key := mp + "|" + mv
+            if collections.set_has(st.asked, key) {
+                if len(rest) == 0 || os.isdir(slot + "/" + rest) {
+                    // progress is reported for a resolved slot once —
+                    // on later passes keep checking other candidates
+                    // so an unresolvable import can't spin forever
+                    if collections.set_has(st.done, key) == false {
+                        collections.set_add(st.done, key)
+                        return 1, nil
+                    }
+                }
+            }
+            continue
+        }
+        collections.set_add(st.asked, mp + "|" + mv)
+        [f, fe] = fetch_mod(mp, mv)
+        if fe != nil {
+            return 0, fe
+        }
+        [nslot, ie] = install(cache, mp, f)
+        if ie != nil {
+            return 0, ie
+        }
+        // a pinned version already carries sums — refresh them only
+        // when the file lost the lines, never to mask a real mismatch
+        has_sums := 0
+        if len(sums_find(st.sums, mp, mv, 0)) > 0 && len(sums_find(st.sums, mp, mv, 1)) > 0 {
+            has_sums = 1
+        }
+        if has_sums == 1 {
+            sck := check.ck_new()
+            sck.mod_sums = st.sums
+            ve := check.verify_slot(sck, nslot, mp, mv)
+            sck.mod_sums = nil
+            if len(ve) > 0 {
+                return 0, errors.new(ve)
+            }
+        } else {
+            [ns, se] = pin_sums(st.sums, mp, f, nslot)
+            if se != nil {
+                return 0, se
+            }
+            st.sums = ns
+        }
+        st.report = push(st.report, "fetched " + mp + "@" + mv)
+        if len(rest) == 0 || os.isdir(nslot + "/" + rest) {
+            return 1, nil
+        }
+    }
+    // generic probe: try each prefix of the import path as a module,
+    // longest first — a required module that lacks the package gets
+    // re-probed at @latest (the upgrade path); a deeper path may be
+    // its own nested module
+    segs := strings.split(imp, "/")
+    nseg := 0
+    for segs != nil {
+        nseg = nseg + 1
+        segs = segs.next
+    }
+    for nseg > 0 {
+        // join the first nseg segments back into the module candidate
+        m := ""
+        segs = strings.split(imp, "/")
+        k := 0
+        for segs != nil && k < nseg {
+            if k > 0 {
+                m = m + "/"
+            }
+            m = m + segs.v
+            segs = segs.next
+            k = k + 1
+        }
+        nseg = nseg - 1
+        ps := probe_get(st.probed, m)
+        let f: own Fetched = nil
+        if ps != nil {
+            if ps.ok == 0 {
+                continue
+            }
+            f = new(Fetched{ver: ps.ver, tar: ps.tar, manifest: ps.manifest})
+        } else {
+            [nf, nfe] = fetch_mod(m, "latest")
+            if nfe != nil {
+                st.probed = new(ProbeEnt{m: m, f: nil, ok: 0, next: st.probed})
+                continue
+            }
+            f = new(Fetched{ver: nf.ver, tar: nf.tar, manifest: nf.manifest})
+            st.probed = new(ProbeEnt{m: m, f: nf, ok: 1, next: st.probed})
+        }
+        rest := ""
+        if imp != m {
+            rest = substr(imp, len(m) + 1, len(imp))
+        }
+        // check the package dir against an installed slot or a fresh
+        // staging of the fetched archive
+        slot := cache + "/" + check.escape_path(m) + "@" + check.escape_path(f.ver)
+        base := slot
+        tmp := ""
+        if os.isdir(slot) == false {
+            [t, se] = stage_tmp(cache, f.ver, f)
+            if se != nil {
+                return 0, se
+            }
+            tmp = t
+            base = t
+        }
+        contains := 0
+        if len(rest) == 0 || os.isdir(base + "/" + rest) {
+            contains = 1
+        }
+        if contains == 0 {
+            if len(tmp) > 0 {
+                remove_tree(tmp)
+            }
+            // mark probed-miss so later prefixes don't re-fetch it
+            st.probed = new(ProbeEnt{m: m, f: nil, ok: 0, next: st.probed})
+            continue
+        }
+        installing := 0
+        if len(tmp) > 0 {
+            installing = 1
+            ce := commit_tmp(tmp, slot)
+            if ce != nil {
+                return 0, ce
+            }
+        } else {
+            [same, me] = slot_matches(slot, f)
+            if me != nil {
+                return 0, me
+            }
+            if same == 0 {
+                return 0, errors.new("cached " + m + "@" + f.ver + " does not match the fetched archive — remove the slot and get again")
+            }
+        }
+        had_sums := 0
+        if len(sums_find(st.sums, m, f.ver, 0)) > 0 && len(sums_find(st.sums, m, f.ver, 1)) > 0 {
+            had_sums = 1
+        }
+        [pin, pe2] = pin_require(st.mtext, st.sums, m, f, slot)
+        if pe2 != nil {
+            return 0, pe2
+        }
+        st.mtext = pin.mtext
+        st.sums = pin.sums
+        moved := 0
+        if pin.old != f.ver {
+            moved = 1
+        }
+        if len(pin.old) > 0 {
+            if pin.old != f.ver {
+                st.report = push(st.report, "upgraded " + m + "@" + pin.old + " => " + f.ver)
+            }
+        } else {
+            st.report = push(st.report, "added " + m + "@" + f.ver)
+        }
+        // progress = installed a slot, moved the floor, or filled in
+        // missing sums — a pure no-op must not keep the fixpoint alive
+        if installing == 1 || had_sums == 0 || moved == 1 {
+            return 1, nil
+        }
+        return 0, nil
+    }
+    return 0, errors.new("no required module provides package \"" + imp + "\"; to add it: oxl get " + imp)
+}
+
+// ---------- require rewrite (rewrite_requires) ----------
+
+// render one require entry: `<indent>[require ]path ver` plus the
+// managed `// indirect` marker and any preserved user comment
+fn render_require(indent: str, kw: int, path: str, ver: str, indirect: int, comment: str) -> str {
+    l := indent
+    if kw == 1 {
+        l = l + "require "
+    }
+    l = l + path + " " + ver
+    if indirect == 1 {
+        l = l + " // indirect"
+    }
+    if len(comment) > 0 {
+        if indirect == 0 {
+            l = l + " //"
+        }
+        l = l + " " + comment
+    }
+    return l
+}
+
+// the trailing comment of a manifest line, excluding a managed
+// `// indirect` marker — user text is preserved verbatim
+fn user_comment(raw: str) -> str {
+    code := check.strip_comment(raw)
+    c := strings.trim(substr(raw, len(code), len(raw)))
+    if strings.startswith(c, "// indirect") {
+        c = strings.trim(substr(c, 11, len(c)))
+    }
+    for strings.startswith(c, "/") {
+        c = strings.trim(substr(c, 1, len(c)))
+    }
+    return strings.trim(c)
+}
+
+// comment per module path, from the pre-rewrite manifest
+struct CmtEnt { mp: str, text: str, next: own CmtEnt }
+
+fn cmt_get(l: ref CmtEnt, mp: str) -> str {
+    for l != nil {
+        if l.mp == mp {
+            return l.text
+        }
+        l = l.next
+    }
+    return ""
+}
+
+// surgical require rewrite: the full require set is re-emitted sorted
+// at the first require directive (canonical block when >1 entry or a
+// block already existed, single line otherwise), dead entries drop,
+// user comments travel with their entries, and every non-require
+// line survives byte-for-byte
+fn rewrite_requires(mtext: str, want: ref WantEnt) -> str {
+    lines := strings.split(mtext, "\n")
+    // index bookkeeping parallel to the seed's consumed/first_req —
+    // linked lists carry the same info
+    let consumed: own IntList = nil
+    first_req := -1
+    had_block := 0
+    let comments: own CmtEnt = nil
+    let hoisted: own strings.StrList = nil
+    // scan: find require blocks/singles, collect user comments.
+    // strings.split keeps the element after a trailing "\n" that
+    // Rust str::lines() drops — shave exactly one
+    i := 0
+    nlines := sl_len_ll(lines)
+    if nlines > 0 && len(ll_at(lines, nlines - 1)) == 0 {
+        nlines = nlines - 1
+    }
+    for i < nlines {
+        line := ll_at(lines, i)
+        t := strings.trim(check.strip_comment(line))
+        toks := split_ws_g(t)
+        if toks.n == 2 && tok_at(toks, 0) == "require" && tok_at(toks, 1) == "(" {
+            had_block = 1
+            if first_req < 0 {
+                first_req = i
+            }
+            consumed = icons(i, consumed)
+            i = i + 1
+            for i < nlines {
+                consumed = icons(i, consumed)
+                t2 := strings.trim(check.strip_comment(ll_at(lines, i)))
+                if t2 == ")" {
+                    i = i + 1
+                    break
+                }
+                b := split_ws_g(t2)
+                if b.n >= 2 && check.sver_parse(tok_at(b, 1)).ok == 1 {
+                    comments = new(CmtEnt{mp: tok_at(b, 0), text: user_comment(ll_at(lines, i)), next: comments})
+                } else if len(strings.trim(ll_at(lines, i))) > 0 {
+                    hoisted = new(strings.StrList{v: ll_at(lines, i), next: hoisted})
+                }
+                i = i + 1
+            }
+            continue
+        }
+        if toks.n >= 2 && tok_at(toks, 0) == "require" {
+            if first_req < 0 {
+                first_req = i
+            }
+            consumed = icons(i, consumed)
+            if toks.n >= 3 {
+                comments = new(CmtEnt{mp: tok_at(toks, 1), text: user_comment(line), next: comments})
+            }
+            i = i + 1
+            continue
+        }
+        i = i + 1
+    }
+    // the final require set, sorted by path for the canonical emit
+    wmps := mkslice(str, 0)
+    l := want
+    for l != nil {
+        wmps = push(wmps, l.mp)
+        l = l.next
+    }
+    sort.sort(wmps)
+    out := ""
+    emitted := 0
+    i = 0
+    for i < nlines {
+        if i == first_req && emitted == 0 {
+            emitted = 1
+            // hoisted prepends — emit tail-first to keep source order
+            hi := sl_len_ll(hoisted) - 1
+            for hi >= 0 {
+                out = out + ll_at(hoisted, hi) + "\n"
+                hi = hi - 1
+            }
+            if len(wmps) == 1 && had_block == 0 {
+                w := want_find(want, wmps[0])
+                out = out + render_require("", 1, w.mp, w.ver, w.ind, cmt_get(comments, w.mp)) + "\n"
+            } else if len(wmps) > 0 {
+                out = out + "require (\n"
+                j := 0
+                for j < len(wmps) {
+                    w := want_find(want, wmps[j])
+                    out = out + render_require("\t", 0, w.mp, w.ver, w.ind, cmt_get(comments, w.mp)) + "\n"
+                    j = j + 1
+                }
+                out = out + ")\n"
+            }
+            i = i + 1
+            continue
+        }
+        if icons_has(consumed, i) == 1 {
+            i = i + 1
+            continue
+        }
+        out = out + ll_at(lines, i) + "\n"
+        i = i + 1
+    }
+    if emitted == 0 && len(wmps) > 0 {
+        if len(wmps) == 1 {
+            w := want_find(want, wmps[0])
+            out = out + render_require("", 1, w.mp, w.ver, w.ind, cmt_get(comments, w.mp)) + "\n"
+        } else {
+            out = out + "require (\n"
+            j := 0
+            for j < len(wmps) {
+                w := want_find(want, wmps[j])
+                out = out + render_require("\t", 0, w.mp, w.ver, w.ind, cmt_get(comments, w.mp)) + "\n"
+                j = j + 1
+            }
+            out = out + ")\n"
+        }
+    }
+    return out
+}
+
+// ---------- small list utilities the rewrite needs ----------
+struct IntList { v: int, next: own IntList }
+
+fn icons(v: int, l: own IntList) -> own IntList {
+    return new(IntList{v: v, next: l})
+}
+
+fn icons_has(l: ref IntList, v: int) -> int {
+    for l != nil {
+        if l.v == v {
+            return 1
+        }
+        l = l.next
+    }
+    return 0
+}
+
+// split on lines with element access — strings.split's strings.StrList plus
+// an indexing shim (rewrite_requires scans by position)
+fn sl_len_ll(l: ref strings.StrList) -> int {
+    n := 0
+    for l != nil {
+        n = n + 1
+        l = l.next
+    }
+    return n
+}
+
+fn ll_at(l: ref strings.StrList, i: int) -> str {
+    for l != nil {
+        if i == 0 {
+            return l.v
+        }
+        i = i - 1
+        l = l.next
+    }
+    return ""
+}
+
+// whitespace tokenize — split_whitespace equivalent (runs collapse,
+// no empty tokens)
+struct Toks { n: int, l: own strings.StrList }
+
+fn split_ws_g(t: str) -> Toks {
+    parts := strings.split(t, " ")
+    let keep: own strings.StrList = nil
+    n := 0
+    for parts != nil {
+        s := strings.trim(parts.v)
+        parts = parts.next
+        if len(s) == 0 {
+            continue
+        }
+        keep = new(strings.StrList{v: s, next: keep})
+        n = n + 1
+    }
+    // reverse to original order
+    let out: own strings.StrList = nil
+    for keep != nil {
+        out = new(strings.StrList{v: keep.v, next: out})
+        keep = keep.next
+    }
+    return Toks{n: n, l: out}
+}
+
+fn tok_at(t: Toks, i: int) -> str {
+    return ll_at(t.l, i)
+}
+
+// ---------- mod tidy driver ----------
+fn mod_tidy(cwd: str) {
+    if argc() != 3 {
+        eprintln("usage: oxl mod tidy")
+        exit(2)
+    }
+    root := check.find_root(cwd)
+    if len(root) == 0 {
+        eprintln("error: no oxl.mod in current directory or any parent")
+        exit(1)
+    }
+    mpath := root + "/oxl.mod"
+    orig_mtext := readfile(mpath)
+    if len(orig_mtext) == 0 && os.exists(mpath) == false {
+        eprintln("error: " + mpath + ": cannot read")
+        exit(1)
+    }
+    mtext := orig_mtext
+    spath := root + "/oxl.sum"
+    orig_stext := ""
+    if os.exists(spath) {
+        orig_stext = readfile(spath)
+    }
+    sck := check.ck_new()
+    if check.parse_sums(sck, orig_stext) == 0 {
+        msg := "malformed oxl.sum"
+        if len(sck.diags) > 0 {
+            msg = sck.diags[0].msg
+        }
+        eprintln("error: " + msg)
+        exit(1)
+    }
+    sums := sck.mod_sums
+    main_files := main_mod_files(root)
+    st := new(SatState{mtext: mtext, sums: sums, probed: nil, asked: collections.set_new(), done: collections.set_new(), report: mkslice(str, 0)})
+    // fixpoint: fetch/require changes alter resolution, so re-walk
+    // until a pass leaves nothing unresolved
+    let ctx: own check.Ck = nil
+    let needed: own WantEnt = nil
+    done := 0
+    for done == 0 {
+        [c, e] = mk_ctx(root, st.mtext, st.sums)
+        if e != nil {
+            eprintln("error [check] " + errors.msg(e))
+            exit(1)
+        }
+        ctx = c
+        w := tidy_walk(ctx, main_files)
+        if w.unresolved == nil {
+            needed = w.needed
+            done = 1
+            break
+        }
+        changed := 0
+        u := w.unresolved
+        for u != nil {
+            [ch, se] = tidy_satisfy(u.imp, u.root, ctx, st)
+            if se != nil {
+                eprintln("error: " + errors.msg(se))
+                exit(1)
+            }
+            if ch == 1 {
+                changed = 1
+            }
+            u = u.next
+        }
+        if changed == 0 {
+            eprintln("error: no required module provides package \"" + w.unresolved.imp + "\"; to add it: oxl get " + w.unresolved.imp)
+            exit(1)
+        }
+    }
+    // final require set: direct providers keep their floor, indirect
+    // ones record the MVS-selected version with the marker
+    let want: own WantEnt = nil
+    nl := needed
+    for nl != nil {
+        ver := ""
+        if nl.ind == 1 { // direct in `needed` (1 = imported by main)
+            // keep the require's floor when present, else the
+            // selected version, else the placeholder
+            l := ctx.mod_reqs
+            for l != nil {
+                if l.alias == nl.mp {
+                    ver = l.stem
+                }
+                l = l.next
+            }
+            if len(ver) == 0 {
+                ver = check.selected_ver(ctx, nl.mp)
+            }
+            if len(ver) == 0 {
+                ver = "v0.0.0-00010101000000-000000000000"
+            }
+        } else {
+            ver = check.selected_ver(ctx, nl.mp)
+            if len(ver) == 0 {
+                ver = "v0.0.0-00010101000000-000000000000"
+            }
+        }
+        want = want_set(want, nl.mp, ver, 0)
+        if nl.ind == 0 {
+            want = want_set(want, nl.mp, "", 1)
+        }
+        nl = nl.next
+    }
+    l := ctx.mod_reqs
+    for l != nil {
+        if want_find(needed, l.alias) == nil {
+            st.report = push(st.report, "dropped " + l.alias)
+        }
+        l = l.next
+    }
+    new_text := rewrite_requires(st.mtext, want)
+    // dropping an unused require takes its MVS edges with it — a
+    // needed module whose selection a dropped raiser held up falls
+    // back to its floor. Any module the rewrite lowers gets its floor
+    // moved to the version the walk actually checked; floors only
+    // ever rise, so it terminates
+    bump := 1
+    for bump == 1 {
+        bump = 0
+        [fc, mce] = mk_ctx(root, new_text, st.sums)
+        if mce != nil || fc == nil {
+            break
+        }
+        nl = needed
+        for nl != nil {
+            checked := check.selected_ver(ctx, nl.mp)
+            fin := check.selected_ver(fc, nl.mp)
+            if len(checked) > 0 && len(fin) > 0 {
+                cv := check.sver_parse(checked)
+                fv := check.sver_parse(fin)
+                if cv.ok == 1 && fv.ok == 1 && check.sver_cmp(fv, cv) < 0 {
+                    w := want_find(want, nl.mp)
+                    old := w.ver
+                    if old != checked {
+                        want = want_set(want, nl.mp, checked, 0)
+                        st.report = push(st.report, "upgraded " + nl.mp + "@" + old + " => " + checked)
+                    }
+                    bump = 1
+                }
+            }
+            nl = nl.next
+        }
+        if bump == 1 {
+            new_text = rewrite_requires(st.mtext, want)
+        }
+    }
+    // the sums the new require set needs: every non-replaced
+    // require's selected version gets its h1 pair — kept lines carry
+    // over, missing ones hash from the cache slot
+    [final_ctx, fce] = mk_ctx(root, new_text, st.sums)
+    if fce != nil {
+        eprintln("error [check] " + errors.msg(fce))
+        exit(1)
+    }
+    let new_sums: own check.SumEnt = nil
+    l = final_ctx.mod_reqs
+    for l != nil {
+        mp := l.alias
+        mv := check.selected_ver(final_ctx, mp)
+        if len(mv) == 0 || replace_covers(final_ctx, mp, mv) == 1 {
+            l = l.next
+            continue
+        }
+        i := 0
+        for i < 2 {
+            ism := i
+            i = i + 1
+            h := sums_find(st.sums, mp, mv, ism)
+            if len(h) > 0 {
+                new_sums = new(check.SumEnt{path: mp, ver: mv, is_mod: ism, h1: h, next: new_sums})
+                continue
+            }
+            slot := ctx.modcache + "/" + check.escape_path(mp) + "@" + check.escape_path(mv)
+            if ism == 1 {
+                mf := slot + "/oxl.mod"
+                if os.exists(mf) == false {
+                    eprintln("error: " + mf + ": cannot read")
+                    exit(1)
+                }
+                new_sums = new(check.SumEnt{path: mp, ver: mv, is_mod: 1, h1: check.mod_h1(mp, mv, readfile(mf)), next: new_sums})
+            } else {
+                new_sums = new(check.SumEnt{path: mp, ver: mv, is_mod: 0, h1: check.dir_h1(slot), next: new_sums})
+            }
+        }
+        l = l.next
+    }
+    // a concurrent `oxl get` or editor save between our read and this
+    // write would be silently lost — re-read both files and abort
+    // when either moved
+    disk_m := readfile(mpath)
+    disk_s := ""
+    if os.exists(spath) {
+        disk_s = readfile(spath)
+    }
+    if disk_m != orig_mtext || disk_s != orig_stext {
+        eprintln("error: oxl.mod/oxl.sum changed during tidy — re-run oxl mod tidy")
+        exit(1)
+    }
+    if new_text != orig_mtext {
+        if write_text(mpath, new_text) != 0 {
+            eprintln("error: " + mpath + ": write failed")
+            exit(1)
+        }
+    }
+    nst := sums_text(new_sums)
+    if nst != orig_stext {
+        if write_text(spath, nst) != 0 {
+            eprintln("error: " + spath + ": write failed")
+            exit(1)
+        }
+    }
+    i := 0
+    for i < len(st.report) {
+        println(st.report[i])
+        i = i + 1
+    }
+}

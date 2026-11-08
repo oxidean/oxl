@@ -3,6 +3,8 @@ package exec
 // std/os/exec — run external processes. argv is passed through as an
 // array, never a shell string; env entries are "K=V" overrides merged
 // onto the inherited environment (cmd_env only — cmd inherits as-is).
+// An entry with no '=' is a bare key: it strips that variable from the
+// inherited environment rather than setting it.
 // Contract: a nonzero child exit is a status, never an err — err covers
 // spawn/pipe/wait failures only, so callers can propagate exit codes
 // losslessly and read stderr even from failed commands.
@@ -27,7 +29,8 @@ fn cmd(name: str, args: []str) -> Cmd {
 }
 
 /// cmd_env prepares name with args under env overrides — "K=V" pairs
-/// that replace or extend the inherited environment.
+/// that replace or extend the inherited environment; a bare "K" entry
+/// strips that variable instead.
 fn cmd_env(name: str, args: []str, env: []str) -> Cmd {
     argv := mkslice(str, len(args) + 1)
     argv[0] = name

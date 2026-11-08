@@ -5989,12 +5989,8 @@ fn dep_manifest_reqs(text: str) -> own ModEnt {
     lines := strings.split(text, "\n")
     block := ""
     for lines != nil && bad == 0 {
-        t := lines.v
+        t := strip_comment(lines.v)
         lines = lines.next
-        ci := find(t, "//")
-        if ci >= 0 {
-            t = substr(t, 0, ci)
-        }
         t = strings.trim(t)
         if len(t) == 0 {
             continue

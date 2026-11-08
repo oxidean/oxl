@@ -27,4 +27,9 @@ Rules:
   two `use`d modules declaring the *same* module path. Nested
   module paths (`example.org/a` and `example.org/a/b`) are valid —
   longest-path-wins already disambiguates them.
+- Two diagnostics carry no `<line>` on both drivers, by design —
+  they are about the file as a whole, not a directive: a missing
+  `oxlwork` floor (`oxl.work: missing oxlwork directive`) and the
+  floor-vs-toolchain check
+  (`oxl.work: requires oxlwork <v>, toolchain is <v>`).
 - File mode (no `oxl.mod` found): `oxl.work` is ignored entirely.

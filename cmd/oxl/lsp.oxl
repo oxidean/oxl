@@ -1,0 +1,784 @@
+package main
+
+// oxl lsp — stdio JSON-RPC language server (T5). Ports the seed's
+// cmd_lsp from oxl/src/main.rs: Content-Length framing, the naive
+// first-hit field extractors (json_str/json_num/extract_id — same
+// semantics, same edge cases), per-package analyses keyed on the doc's
+// dir, open-buffer overrides, and scoped publishDiagnostics so one
+// package's analysis never clears another's diagnostics.
+import "oxl/bootstrap/check"
+
+import "std/os"
+
+import "std/strings"
+
+// an open buffer — its wire text is the analyze-time authority over disk
+struct LDoc { uri: str, path: str, text: str }
+
+// one published diagnostic: file + 1-based line/UTF-16 col + "[kind] msg"
+struct LDiag { f: str, l: int, c: int, m: str }
+
+// an analysis of one package dir — keeps the check result alive for
+// hover/definition until the next didOpen/didChange re-runs it
+struct Anl { key: str, res: own check.CkRes, diags: []LDiag }
+
+// a (dir_key, uri) pair — URIs that currently hold published diagnostics
+struct PubU { key: str, uri: str }
+
+// server state — the tables grow inside an own object so arena slices
+// can live in it (same shape as Ck's slice fields)
+struct Lsp { docs: []LDoc, ans: []Anl, pubs: []PubU }
+
+struct LC { l: int, c: int }
+
+// ---------- utf8/utf-16 units ----------
+// byte-length of the utf8 sequence starting with lead byte b
+fn u8len(b: int) -> int {
+    if b < 128 {
+        return 1
+    }
+    if b < 224 {
+        return 2
+    }
+    if b < 240 {
+        return 3
+    }
+    return 4
+}
+
+// LSP position (0-based line, 0-based char col in UTF-16 units) -> byte
+// offset. `initialize` doesn't negotiate positionEncoding, so cols are
+// the LSP default — UTF-16 code units, not chars
+fn lsp_offset(src: str, line: int, col: int) -> int {
+    l := 0
+    i := 0
+    for i < len(src) {
+        if l == line {
+            off := i
+            k := 0
+            j := i
+            for j < len(src) {
+                c := byteat(src, j)
+                n := u8len(c)
+                if k == col || c == 10 {
+                    return off
+                }
+                k = k + 1
+                if n == 4 {
+                    k = k + 1
+                }
+                off = off + n
+                j = j + n
+            }
+            return off
+        }
+        if byteat(src, i) == 10 {
+            l = l + 1
+        }
+        i = i + u8len(byteat(src, i))
+    }
+    return len(src)
+}
+
+// byte offset -> LSP (0-based line, 0-based UTF-16-unit col)
+fn lsp_line_col(src: str, off: int) -> LC {
+    l := 0
+    c := 0
+    i := 0
+    for i < len(src) && i < off {
+        ch := byteat(src, i)
+        if ch == 10 {
+            l = l + 1
+            c = 0
+        } else {
+            c = c + 1
+            if u8len(ch) == 4 {
+                c = c + 1
+            }
+        }
+        i = i + u8len(ch)
+    }
+    return LC{l: l, c: c}
+}
+
+// ---------- naive json (seed-parity extractors) ----------
+fn is_alpha(c: int) -> bool {
+    return c >= 65 && c <= 90 || c >= 97 && c <= 122
+}
+
+fn is_alnum(c: int) -> bool {
+    return is_alpha(c) || c >= 48 && c <= 57
+}
+
+fn hexval(c: int) -> int {
+    if c >= 48 && c <= 57 {
+        return c - 48
+    }
+    if c >= 97 && c <= 102 {
+        return c - 87
+    }
+    if c >= 65 && c <= 70 {
+        return c - 55
+    }
+    return -1
+}
+
+// one byte -> one-byte str
+fn bstr(b: int) -> str {
+    p := mkbuf(1)
+    poke8(p, 0, b)
+    return bufstr(p, 1)
+}
+
+// codepoint -> utf8 str
+fn utf8enc(cp: int) -> str {
+    if cp < 128 {
+        return bstr(cp)
+    }
+    if cp < 2048 {
+        return bstr(192 + cp / 64) + bstr(128 + cp % 64)
+    }
+    if cp < 65536 {
+        return bstr(224 + cp / 4096) + bstr(128 + cp / 64 % 64) + bstr(128 + cp % 64)
+    }
+    return bstr(240 + cp / 262144) + bstr(128 + cp / 4096 % 64) + bstr(128 + cp / 64 % 64) + bstr(128 + cp % 64)
+}
+
+fn hex4of(s: str, i: int) -> int {
+    if i + 4 > len(s) {
+        return -1
+    }
+    v := 0
+    k := 0
+    for k < 4 {
+        h := hexval(byteat(s, i + k))
+        if h < 0 {
+            return -1
+        }
+        v = v * 16 + h
+        k = k + 1
+    }
+    return v
+}
+
+// naive JSON string-field extraction (seed json_str: first hit, tolerates
+// `"k": "v"` and `"k":"v"` spacing). "" doubles as absent — presence
+// checks use find() like the seed's Option does
+fn json_str(body: str, key: str) -> str {
+    pat := "\"" + key + "\":"
+    at := find(body, pat)
+    if at < 0 {
+        return ""
+    }
+    at = at + len(pat)
+    q := find(substr(body, at, len(body)), "\"")
+    if q < 0 {
+        return ""
+    }
+    i := at + q + 1
+    out := ""
+    for i < len(body) {
+        c := byteat(body, i)
+        if c == 34 {
+            return out
+        }
+        if c == 92 {
+            if i + 1 >= len(body) {
+                return out
+            }
+            e := byteat(body, i + 1)
+            if e == 110 {
+                out = out + "\n"
+                i = i + 2
+            } else if e == 116 {
+                out = out + "\t"
+                i = i + 2
+            } else if e == 114 {
+                out = out + "\r"
+                i = i + 2
+            } else if e == 98 {
+                out = out + bstr(8)
+                i = i + 2
+            } else if e == 102 {
+                out = out + bstr(12)
+                i = i + 2
+            } else if e == 117 {
+                cp := hex4of(body, i + 2)
+                if cp < 0 {
+                    return out
+                }
+                i = i + 6
+                if cp >= 55296 && cp < 56320 {
+                    // high surrogate — pair with a following \uDC00..\uDFFF
+                    if i + 6 <= len(body) && byteat(body, i) == 92 && byteat(body, i + 1) == 117 {
+                        lo := hex4of(body, i + 2)
+                        if lo >= 56320 && lo < 57344 {
+                            cp = 65536 + (cp - 55296) * 1024 + (lo - 56320)
+                            i = i + 6
+                        }
+                    }
+                }
+                out = out + utf8enc(cp)
+            } else {
+                out = out + bstr(e)
+                i = i + 2
+            }
+        } else {
+            out = out + substr(body, i, i + 1)
+            i = i + 1
+        }
+    }
+    return out
+}
+
+// naive JSON number-field extraction (first hit; seed json_num)
+fn json_num(body: str, key: str) -> int {
+    pat := "\"" + key + "\":"
+    at := find(body, pat)
+    if at < 0 {
+        return 0
+    }
+    rest := substr(body, at + len(pat), len(body))
+    end := len(rest)
+    i := 0
+    for i < len(rest) {
+        c := byteat(rest, i)
+        if c == 44 || c == 125 || c == 93 {
+            end = i
+            i = len(rest)
+        }
+        i = i + 1
+    }
+    return atoi(strings.trim(substr(rest, 0, end)))
+}
+
+fn extract_id(body: str) -> str {
+    at := find(body, "\"id\":")
+    if at < 0 {
+        return "0"
+    }
+    rest := substr(body, at + 5, len(body))
+    end := len(rest)
+    i := 0
+    for i < len(rest) {
+        c := byteat(rest, i)
+        if c == 44 || c == 125 {
+            end = i
+            i = len(rest)
+        }
+        i = i + 1
+    }
+    return strings.trim(substr(rest, 0, end))
+}
+
+// escape for embedding in a JSON string literal — every control char,
+// not just backslash and quote (diagnostics and hover text containing
+// newlines/tabs must not break the wire)
+fn json_escape(s: str) -> str {
+    out := ""
+    i := 0
+    for i < len(s) {
+        c := byteat(s, i)
+        if c == 92 {
+            out = out + "\\\\"
+        } else if c == 34 {
+            out = out + "\\\""
+        } else if c == 10 {
+            out = out + "\\n"
+        } else if c == 13 {
+            out = out + "\\r"
+        } else if c == 9 {
+            out = out + "\\t"
+        } else if c < 32 {
+            h := "0123456789abcdef"
+            out = out + "\\u00" + substr(h, c / 16, c / 16 + 1) + substr(h, c % 16, c % 16 + 1)
+        } else {
+            out = out + substr(s, i, i + 1)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ---------- uri <-> path ----------
+// `file://` URI -> filesystem path (clients percent-encode)
+fn uri_to_path(uri: str) -> str {
+    s := uri
+    if strings.startswith(s, "file://") {
+        s = substr(s, 7, len(s))
+    }
+    out := ""
+    i := 0
+    for i < len(s) {
+        c := byteat(s, i)
+        if c == 37 && i + 2 < len(s) {
+            h := hexval(byteat(s, i + 1))
+            l := hexval(byteat(s, i + 2))
+            if h >= 0 && l >= 0 {
+                out = out + bstr(h * 16 + l)
+                i = i + 3
+            } else {
+                out = out + "%"
+                i = i + 1
+            }
+        } else {
+            out = out + substr(s, i, i + 1)
+            i = i + 1
+        }
+    }
+    // a Windows file URI carries the drive behind the authority slash
+    // (file:///D:/a/b) — POSIX paths actually start with that slash
+    if len(out) >= 3 && byteat(out, 0) == 47 && is_alpha(byteat(out, 1)) && byteat(out, 2) == 58 {
+        out = substr(out, 1, len(out))
+    }
+    return out
+}
+
+fn path_to_uri(p: str) -> str {
+    out := "file://"
+    s := p
+    // Windows paths need unix separators and the authority-form slash:
+    // D:\a\b -> file:///D:/a/b (POSIX /a/b already has one)
+    if len(s) >= 2 && is_alpha(byteat(s, 0)) && byteat(s, 1) == 58 {
+        out = out + "/" + substr(s, 0, 2)
+        s = substr(s, 2, len(s))
+    }
+    i := 0
+    for i < len(s) {
+        b := byteat(s, i)
+        if b == 92 {
+            b = 47
+        }
+        if is_alnum(b) || b == 45 || b == 46 || b == 95 || b == 126 || b == 47 {
+            out = out + bstr(b)
+        } else {
+            h := "0123456789ABCDEF"
+            out = out + "%" + substr(h, b / 16, b / 16 + 1) + substr(h, b % 16, b % 16 + 1)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ---------- wire ----------
+fn lsp_write(s: str) {
+    o := os.stdout()
+    b := s as []byte
+    off := 0
+    for off < len(b) {
+        [n, werr] = o.write(b[off:])
+        if n <= 0 {
+            exit(1) // the protocol stream is dead either way
+        }
+        off = off + n
+    }
+}
+
+fn lsp_frame(s: str) {
+    lsp_write("Content-Length: " + itoa(len(s)) + "\r\n\r\n" + s)
+}
+
+// publish the file's diagnostics — the seed keeps the client-supplied
+// URI verbatim for the open doc and re-encodes siblings from paths
+fn publish_diags(uri: str, list: []LDiag) {
+    ds := ""
+    i := 0
+    for i < len(list) {
+        if i > 0 {
+            ds = ds + ","
+        }
+        d := list[i]
+        l0 := d.l - 1
+        if l0 < 0 {
+            l0 = 0
+        }
+        c0 := d.c - 1
+        if c0 < 0 {
+            c0 = 0
+        }
+        ds = ds + "{\"range\":{\"start\":{\"line\":" + itoa(l0) + ",\"character\":" + itoa(c0) + "},\"end\":{\"line\":" + itoa(l0) + ",\"character\":" + itoa(c0 + 1) + "}},\"severity\":1,\"message\":\"" + json_escape(d.m) + "\"}"
+        i = i + 1
+    }
+    notif := "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":\"" + uri + "\",\"diagnostics\":[" + ds + "]}}"
+    lsp_frame(notif)
+}
+
+// ---------- doc/analysis/publish tables ----------
+fn has_str(ss: []str, s: str) -> bool {
+    i := 0
+    for i < len(ss) {
+        if ss[i] == s {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn doc_put(ls: mut Lsp, uri: str, p: str, text: str) {
+    i := 0
+    for i < len(ls.docs) {
+        if ls.docs[i].uri == uri {
+            ls.docs[i].path = p
+            ls.docs[i].text = text
+            return
+        }
+        i = i + 1
+    }
+    ls.docs = push(ls.docs, LDoc{uri: uri, path: p, text: text})
+}
+
+fn doc_drop(ls: mut Lsp, uri: str) {
+    i := 0
+    for i < len(ls.docs) {
+        if ls.docs[i].uri == uri {
+            ls.docs[i] = ls.docs[len(ls.docs) - 1]
+            ls.docs = ls.docs[0:len(ls.docs) - 1]
+            return
+        }
+        i = i + 1
+    }
+}
+
+// the open doc's buffer text by URI (hover/def positions map against it)
+fn doc_text_by_uri(docs: []LDoc, uri: str) -> str {
+    i := 0
+    for i < len(docs) {
+        if docs[i].uri == uri {
+            return docs[i].text
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// a file's text by path — open buffers win over disk
+fn doc_text_by_path(docs: []LDoc, p: str) -> str {
+    i := 0
+    for i < len(docs) {
+        if docs[i].path == p {
+            return docs[i].text
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn dir_key(p: str) -> str {
+    d := check.dir_of(p)
+    if len(d) == 0 {
+        return "."
+    }
+    return d
+}
+
+fn anl_at(ans: []Anl, key: str) -> int {
+    i := 0
+    for i < len(ans) {
+        if ans[i].key == key {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+fn anl_put(ls: mut Lsp, a: own Anl) {
+    i := 0
+    for i < len(ls.ans) {
+        if ls.ans[i].key == a.key {
+            ls.ans[i].res = a.res
+            ls.ans[i].diags = a.diags
+            return
+        }
+        i = i + 1
+    }
+    ls.ans = push(ls.ans, Anl{key: a.key, res: a.res, diags: a.diags})
+}
+
+// pubs[key] := current — drop the key's pairs in place, then append
+fn pub_rebuild(ls: mut Lsp, key: str, current: []str) {
+    i := 0
+    for i < len(ls.pubs) {
+        if ls.pubs[i].key == key {
+            ls.pubs[i] = ls.pubs[len(ls.pubs) - 1]
+            ls.pubs = ls.pubs[0:len(ls.pubs) - 1]
+        } else {
+            i = i + 1
+        }
+    }
+    i = 0
+    for i < len(current) {
+        ls.pubs = push(ls.pubs, PubU{key: key, uri: current[i]})
+        i = i + 1
+    }
+}
+
+// a closed doc's URIs leave every scope's published set — the client
+// won't show its diagnostics anymore
+fn pub_drop_uri(ls: mut Lsp, uri: str) {
+    i := 0
+    for i < len(ls.pubs) {
+        if ls.pubs[i].uri == uri {
+            ls.pubs[i] = ls.pubs[len(ls.pubs) - 1]
+            ls.pubs = ls.pubs[0:len(ls.pubs) - 1]
+        } else {
+            i = i + 1
+        }
+    }
+}
+
+// every open buffer is authoritative over its path — an unsaved
+// sibling's decls must resolve too, not just the analyzed doc's
+fn build_over(docs: []LDoc, p: str, text: str) -> own check.OverEnt {
+    e := new(check.OverEnt)
+    e.path = p
+    e.text = text
+    e.next = nil
+    i := 0
+    for i < len(docs) {
+        if docs[i].path != p {
+            n := new(check.OverEnt)
+            n.path = docs[i].path
+            n.text = docs[i].text
+            n.next = e
+            e = n
+        }
+        i = i + 1
+    }
+    return e
+}
+
+// run the checker over the doc's package and map its diags to
+// (file, 1-based line, 1-based UTF-16 col, "[kind] msg") — line/col
+// computed against each diag file's own text like the seed's analyze
+fn analyze_lsp(path: str, over: own check.OverEnt, docs: []LDoc) -> own Anl {
+    res := check.lsp_analyze(path, over)
+    a := new(Anl)
+    a.key = dir_key(path)
+    a.diags = mkslice(LDiag, 0)
+    i := 0
+    for i < len(res.ck.diags) {
+        d := res.ck.diags[i]
+        f := d.file
+        if len(f) == 0 {
+            f = path
+        }
+        src := doc_text_by_path(docs, f)
+        if len(src) == 0 {
+            src = readfile(f)
+        }
+        lc := lsp_line_col(src, d.off)
+        a.diags = push(a.diags, LDiag{f: f, l: lc.l + 1, c: lc.c + 1, m: "[" + d.kind + "] " + d.msg})
+        i = i + 1
+    }
+    a.res = res
+    return a
+}
+
+// the index entry with the smallest span containing `off`
+fn index_at(us: []check.UseRec, file: str, off: int) -> int {
+    best := -1
+    bestsz := 0
+    i := 0
+    for i < len(us) {
+        if us[i].file == file && us[i].lo <= off && off < us[i].hi {
+            sz := us[i].hi - us[i].lo
+            if best < 0 || sz < bestsz {
+                best = i
+                bestsz = sz
+            }
+        }
+        i = i + 1
+    }
+    return best
+}
+
+// Content-Length out of the header block (buf[..h] is headers)
+fn lsp_len(buf: str, h: int) -> int {
+    at := find(substr(buf, 0, h), "Content-Length:")
+    if at < 0 {
+        return 0
+    }
+    return atoi(strings.trim(substr(buf, at + 15, h)))
+}
+
+// ---------- the stdio loop ----------
+fn cmd_lsp() {
+    in := os.stdin()
+    buf := ""
+    chunk := mkslice(byte, 8192)
+    ls := new(Lsp)
+    ls.docs = mkslice(LDoc, 0)
+    ls.ans = mkslice(Anl, 0)
+    ls.pubs = mkslice(PubU, 0)
+    for true {
+        // read headers + one full body
+        body := ""
+        for len(body) == 0 {
+            h := find(buf, "\r\n\r\n")
+            if h >= 0 {
+                ml := lsp_len(buf, h)
+                if ml > 0 && len(buf) >= h + 4 + ml {
+                    body = substr(buf, h + 4, h + 4 + ml)
+                    buf = substr(buf, h + 4 + ml, len(buf))
+                } else if ml <= 0 {
+                    // header block with no usable length — drop it like
+                    // the seed's `if len == 0 { continue }`
+                    buf = substr(buf, h + 4, len(buf))
+                }
+            }
+            if len(body) > 0 {
+                break
+            }
+            [n, rerr] = in.read(chunk)
+            if n <= 0 {
+                return
+            }
+            buf = buf + chunk[0:n] as str
+        }
+        method := json_str(body, "method")
+        if method == "exit" {
+            return
+        }
+        if method == "textDocument/didOpen" || method == "textDocument/didChange" {
+            if find(body, "\"uri\":") >= 0 && find(body, "\"text\":") >= 0 {
+                uri := json_str(body, "uri")
+                text := json_str(body, "text")
+                p := uri_to_path(uri)
+                over := build_over(ls.docs, p, text)
+                a := analyze_lsp(p, over, ls.docs)
+                key := dir_key(p)
+                // group diags by file in first-seen order; the open doc
+                // always publishes first — even an empty list clears
+                // stale diagnostics and a client reads one response per
+                // didOpen
+                order := mkslice(str, 0)
+                i := 0
+                for i < len(a.diags) {
+                    if !has_str(order, a.diags[i].f) {
+                        order = push(order, a.diags[i].f)
+                    }
+                    i = i + 1
+                }
+                ordered := mkslice(str, 0)
+                ordered = push(ordered, p)
+                i = 0
+                for i < len(order) {
+                    if order[i] != p {
+                        ordered = push(ordered, order[i])
+                    }
+                    i = i + 1
+                }
+                sent := mkslice(str, 0)
+                current := mkslice(str, 0)
+                i = 0
+                for i < len(ordered) {
+                    f := ordered[i]
+                    u := uri
+                    if f != p {
+                        u = path_to_uri(f)
+                    }
+                    ds := mkslice(LDiag, 0)
+                    j := 0
+                    for j < len(a.diags) {
+                        if a.diags[j].f == f {
+                            ds = push(ds, a.diags[j])
+                        }
+                        j = j + 1
+                    }
+                    publish_diags(u, ds)
+                    sent = push(sent, u)
+                    if len(ds) > 0 {
+                        current = push(current, u)
+                    }
+                    i = i + 1
+                }
+                // a file whose last diagnostic cleared still needs an
+                // explicit empty publish — only URIs this scope already
+                // published get cleared (other packages' survive)
+                i = 0
+                for i < len(ls.pubs) {
+                    if ls.pubs[i].key == key && !has_str(current, ls.pubs[i].uri) && !has_str(sent, ls.pubs[i].uri) {
+                        publish_diags(ls.pubs[i].uri, mkslice(LDiag, 0))
+                    }
+                    i = i + 1
+                }
+                pub_rebuild(ls, key, current)
+                doc_put(ls, uri, p, text)
+                anl_put(ls, a)
+            }
+            continue
+        }
+        if method == "textDocument/didClose" {
+            if find(body, "\"uri\":") >= 0 {
+                uri := json_str(body, "uri")
+                doc_drop(ls, uri)
+                // a closed doc's URIs leave every scope's published set —
+                // the client won't show its diagnostics anymore
+                pub_drop_uri(ls, uri)
+            }
+            continue
+        }
+        resp := ""
+        handled := 1
+        if method == "initialize" {
+            resp = "{\"jsonrpc\":\"2.0\",\"id\":" + extract_id(body) + ",\"result\":{\"capabilities\":{\"textDocumentSync\":1,\"hoverProvider\":true,\"definitionProvider\":true}}}"
+        } else if method == "shutdown" {
+            resp = "{\"jsonrpc\":\"2.0\",\"id\":" + extract_id(body) + ",\"result\":null}"
+        } else if method == "textDocument/hover" || method == "textDocument/definition" {
+            id := extract_id(body)
+            uri := json_str(body, "uri")
+            line := json_num(body, "line")
+            col := json_num(body, "character")
+            file := uri_to_path(uri)
+            key := dir_key(file)
+            resp = "{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"result\":null}"
+            src := doc_text_by_uri(ls.docs, uri)
+            if len(src) > 0 {
+                off := lsp_offset(src, line, col)
+                ai := anl_at(ls.ans, key)
+                if ai >= 0 {
+                    u := index_at(ls.ans[ai].res.ck.usev, file, off)
+                    if u >= 0 {
+                        if method == "textDocument/hover" {
+                            sig := ls.ans[ai].res.ck.usev[u].sig
+                            resp = "{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"result\":{\"contents\":{\"kind\":\"plaintext\",\"value\":\"" + json_escape(sig) + "\"}}}"
+                        } else {
+                            df := ls.ans[ai].res.ck.usev[u].def_file
+                            dl := ls.ans[ai].res.ck.usev[u].def_lo
+                            dh := ls.ans[ai].res.ck.usev[u].def_hi
+                            // def spans index into their own file's
+                            // source — the open doc's buffer wins, then
+                            // the disk copy
+                            dsrc := doc_text_by_path(ls.docs, df)
+                            if len(dsrc) == 0 {
+                                dsrc = readfile(df)
+                            }
+                            lc0 := lsp_line_col(dsrc, dl)
+                            lc1 := lsp_line_col(dsrc, dh)
+                            uri2 := ""
+                            if len(df) > 0 && byteat(df, 0) == 47 {
+                                uri2 = path_to_uri(df)
+                            } else {
+                                // relative decl paths resolve against
+                                // the open doc's dir
+                                base := check.dir_of(file)
+                                if len(base) == 0 {
+                                    base = "."
+                                }
+                                uri2 = path_to_uri(check.canon_or(base + "/" + df))
+                            }
+                            resp = "{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"result\":{\"uri\":\"" + json_escape(uri2) + "\",\"range\":{\"start\":{\"line\":" + itoa(lc0.l) + ",\"character\":" + itoa(lc0.c) + "},\"end\":{\"line\":" + itoa(lc1.l) + ",\"character\":" + itoa(lc1.c) + "}}}}"
+                        }
+                    }
+                }
+            }
+        } else {
+            handled = 0
+        }
+        if handled == 1 {
+            lsp_frame(resp)
+        }
+    }
+}

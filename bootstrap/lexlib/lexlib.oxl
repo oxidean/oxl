@@ -37,7 +37,10 @@ fn k_err() -> int {
     return 7
 }
 
-struct Tok { kind: int, text: str, ln: int, next: own Tok }
+// off/eoff are the token's byte span in src — [off, eoff). The LSP's
+// position index needs byte offsets; text alone can't supply them
+// (char literals decode, strings drop their quotes).
+struct Tok { kind: int, text: str, ln: int, off: int, eoff: int, next: own Tok }
 
 fn is_alpha(c: int) -> bool {
     return c >= 97 && c <= 122 || c >= 65 && c <= 90 || c == 95
@@ -55,12 +58,14 @@ fn is_kw(w: str) -> bool {
     return w == "fn" || w == "struct" || w == "extern" || w == "return" || w == "if" || w == "else" || w == "for" || w == "let" || w == "scope" || w == "spawn" || w == "go" || w == "own" || w == "ref" || w == "mut" || w == "unsafe" || w == "nil" || w == "true" || w == "false" || w == "import" || w == "package" || w == "chan" || w == "break" || w == "continue" || w == "interface" || w == "spawnBlocking"
 }
 
-fn push(tail: own Tok, kind: int, text: str, ln: int) -> own Tok {
+fn push(tail: own Tok, kind: int, text: str, ln: int, off: int, eoff: int) -> own Tok {
     tail.next = new(Tok)
     tail = tail.next
     tail.kind = kind
     tail.text = text
     tail.ln = ln
+    tail.off = off
+    tail.eoff = eoff
     tail.next = nil
     return tail
 }
@@ -70,6 +75,8 @@ fn lex(src: str) -> own Tok {
     head.kind = 0
     head.text = ""
     head.ln = 0
+    head.off = 0
+    head.eoff = 0
     head.next = nil
     tail := head
     i := 0
@@ -102,7 +109,7 @@ fn lex(src: str) -> own Tok {
             // as an err token so the parser/checker fail instead of
             // silently parsing a truncated stream
             if i + 1 >= len(src) {
-                tail = push(tail, k_err(), "unterminated block comment", ln)
+                tail = push(tail, k_err(), "unterminated block comment", ln, i, len(src))
                 i = len(src)
             } else {
                 i = i + 2
@@ -119,7 +126,7 @@ fn lex(src: str) -> own Tok {
             if is_kw(w) {
                 k = k_kw()
             }
-            tail = push(tail, k, w, ln)
+            tail = push(tail, k, w, ln, a, i)
             continue
         }
         if is_digit(c) {
@@ -134,16 +141,17 @@ fn lex(src: str) -> own Tok {
                 for i < len(src) && is_digit(byteat(src, i)) {
                     i = i + 1
                 }
-                tail = push(tail, k_float(), substr(src, a, i), ln)
+                tail = push(tail, k_float(), substr(src, a, i), ln, a, i)
                 continue
             }
-            tail = push(tail, k_int(), substr(src, a, i), ln)
+            tail = push(tail, k_int(), substr(src, a, i), ln, a, i)
             continue
         }
         if c == 39 { // 'c' — char literal: sugar for its scalar value;
             // emits an int token so parsers/codegens see no new node.
             // One char exactly (after escape decoding); escapes mirror
             // strings. Multi-byte chars decode as their UTF-8 scalar.
+            a := i
             i = i + 1
             v := 0
             count := 0
@@ -185,18 +193,18 @@ fn lex(src: str) -> own Tok {
                 count = count + 1
             }
             if !closed {
-                tail = push(tail, k_err(), "unterminated char literal", ln)
+                tail = push(tail, k_err(), "unterminated char literal", ln, a, i)
             }
             if closed && count != 1 {
-                tail = push(tail, k_err(), "char literal must hold exactly one character", ln)
+                tail = push(tail, k_err(), "char literal must hold exactly one character", ln, a, i)
             }
             if closed && count == 1 {
-                tail = push(tail, k_int(), itoa(v), ln)
+                tail = push(tail, k_int(), itoa(v), ln, a, i)
             }
             continue
         }
         if c == 34 { // "..."
-            a := i + 1
+            a := i
             i = i + 1
             for i < len(src) && byteat(src, i) != 34 {
                 if byteat(src, i) == 92 {
@@ -205,9 +213,9 @@ fn lex(src: str) -> own Tok {
                 i = i + 1
             }
             if i >= len(src) {
-                tail = push(tail, k_err(), "unterminated string", ln)
+                tail = push(tail, k_err(), "unterminated string", ln, a, i)
             } else {
-                tail = push(tail, k_str(), substr(src, a, i), ln)
+                tail = push(tail, k_str(), substr(src, a + 1, i), ln, a, i + 1)
                 i = i + 1
             }
             continue
@@ -215,15 +223,15 @@ fn lex(src: str) -> own Tok {
         // two-char punct first (:= == != <= >= && || ->)
         n := byteat(src, i + 1)
         if c == 58 && n == 61 || c == 61 && n == 61 || c == 33 && n == 61 || c == 60 && n == 61 || c == 62 && n == 61 || c == 38 && n == 38 || c == 124 && n == 124 || c == 45 && n == 62 {
-            tail = push(tail, k_punct(), substr(src, i, i + 2), ln)
+            tail = push(tail, k_punct(), substr(src, i, i + 2), ln, i, i + 2)
             i = i + 2
             continue
         }
         // single-char punct
-        tail = push(tail, k_punct(), substr(src, i, i + 1), ln)
+        tail = push(tail, k_punct(), substr(src, i, i + 1), ln, i, i + 1)
         i = i + 1
     }
-    tail = push(tail, k_eof(), "", ln)
+    tail = push(tail, k_eof(), "", ln, len(src), len(src))
     return head.next
 }
 

@@ -228,8 +228,11 @@ fn runtime_dir(entry: str) -> str {
     if len(exe) > 0 {
         d = runtime_at(check.canon_or(check.dir_of(exe)))
     }
-    if len(d) == 0 {
-        d = runtime_at(check.canon_or(check.dir_of(argv(0))))
+    // bare argv(0) (PATH invocation) carries no dir component —
+    // dir_of yields "." which canon_or turns into the cwd
+    av := argv(0)
+    if len(d) == 0 && strings.contains(av, "/") {
+        d = runtime_at(check.canon_or(check.dir_of(av)))
     }
     if len(d) == 0 {
         d = runtime_at(check.canon_or(entry))

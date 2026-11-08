@@ -6587,8 +6587,12 @@ fn resolve_imp(ck: mut Ck, imp: str) -> RRes {
         if len(exe) > 0 {
             r.dir = std_at(canon_or(dir_of(exe)), rest)
         }
-        if len(r.dir) == 0 {
-            r.dir = std_at(canon_or(dir_of(argv(0))), rest)
+        // a bare argv(0) (PATH invocation) has no dir component —
+        // dir_of yields "." which canon_or turns into the cwd, so the
+        // probe is skipped unless argv(0) actually carries a path
+        av := argv(0)
+        if len(r.dir) == 0 && strings.contains(av, "/") {
+            r.dir = std_at(canon_or(dir_of(av)), rest)
         }
         if len(r.dir) == 0 {
             r.dir = std_at(ck.entry_dir, rest)

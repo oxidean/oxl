@@ -60,8 +60,11 @@ from the repository (a Rust toolchain plus `cc`):
 
 ```bash
 git clone https://github.com/oxidean/oxl && cd oxl
-git checkout "$(gh release view --json tagName --jq .tagName)"   # latest published release (or stay on main)
-cargo build --release --manifest-path oxl/Cargo.toml
+# resolve the latest published release tag via /releases/latest (curl
+# only, no auth); skip the checkout to build `main` instead:
+TAG=$(curl -sL -o /dev/null -w '%{url_effective}' \
+  https://github.com/oxidean/oxl/releases/latest | xargs basename)
+git checkout "$TAG" && cargo build --release --manifest-path oxl/Cargo.toml
 # binary: oxl/target/release/oxl; put it on PATH with std/ alongside
 ```
 

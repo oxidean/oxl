@@ -1044,6 +1044,35 @@ grep -q "test_loops ... ok" <<<"$out" || { echo "FAIL self driver stdlib: $out";
 out=$("$OXL" run cmd/oxl -- run examples/hello.oxl)
 [ "$out" = "hello, world" ] || { echo "FAIL oxl-run driver hello: $out"; exit 1; }
 
+echo "== toolchain driver fmt + doc (t3) =="
+# `fmt --check` under the self driver across the same corpus the
+# seed covers below — every tracked .oxl is canonically formatted,
+# so both drivers must agree the tree is clean
+if ! "$SELFOXL" fmt --check $(find std bootstrap tests examples cmd -name '*.oxl' | sort); then
+    echo "FAIL self driver fmt --check: corpus not canonical"; exit 1
+fi
+# fmt output parity: the port must reproduce the seed's output
+# byte-for-byte on a corpus slice — round-trip, not a reformat
+for f in std/strings/strings.oxl std/io/io.oxl std/errors/errors.oxl \
+         bootstrap/parser/parser.oxl bootstrap/check/check.oxl \
+         bootstrap/codegen/codegen.oxl std/net/http/http.oxl \
+         cmd/oxl/main.oxl cmd/oxl/fmt.oxl examples/hello.oxl tests/util_test.oxl; do
+    "$OXL" fmt "$f" > "$scratch/fmt.seed" 2>&1 || { echo "FAIL seed fmt $f"; cat "$scratch/fmt.seed"; exit 1; }
+    "$SELFOXL" fmt "$f" > "$scratch/fmt.self" 2>&1 || { echo "FAIL self fmt $f"; cat "$scratch/fmt.self"; exit 1; }
+    diff "$scratch/fmt.seed" "$scratch/fmt.self" >/dev/null || { echo "FAIL driver fmt parity $f"; diff "$scratch/fmt.seed" "$scratch/fmt.self" | head -20; exit 1; }
+done
+# idempotent: formatting a formatted file is a no-op — a second
+# pass must not move anything
+"$SELFOXL" fmt cmd/oxl/fmt.oxl > "$scratch/fmt1.oxl"
+"$SELFOXL" fmt "$scratch/fmt1.oxl" > "$scratch/fmt2.oxl"
+diff "$scratch/fmt1.oxl" "$scratch/fmt2.oxl" >/dev/null || { echo "FAIL fmt idempotency"; exit 1; }
+# `doc` output is byte-identical vs the seed on the std corpus
+for f in std/strings/strings.oxl std/io/io.oxl std/errors/errors.oxl std/bytes/bytes.oxl; do
+    "$OXL" doc "$f" > "$scratch/doc.seed" 2>&1 || { echo "FAIL seed doc $f"; exit 1; }
+    "$SELFOXL" doc "$f" > "$scratch/doc.self" 2>&1 || { echo "FAIL self doc $f"; exit 1; }
+    diff "$scratch/doc.seed" "$scratch/doc.self" >/dev/null || { echo "FAIL driver doc parity $f"; diff "$scratch/doc.seed" "$scratch/doc.self" | head -20; exit 1; }
+done
+
 echo "== a1 coroutine scale =="
 # spec bar: 10k spawned tasks parked on recv must cost heap frames,
 # not OS threads — assert on the per-task delta over this binary's

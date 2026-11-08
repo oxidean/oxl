@@ -1,12 +1,12 @@
 package main
 
-// oxl — the toolchain driver, in .oxl (toolchain-in-oxl stage T2).
-// Ports the seed driver's build/run/test/list from oxl/src/main.rs:
-// argv dispatch, the pkg-args/file-list rule, compile orchestration
-// over bootstrap/check + bootstrap/codegen, scratch-dir emission, and
-// the cc invocation with its proven flag order. fmt/doc/get/mod/lsp
-// land in T3–T5 — they dispatch here as stubs so the command surface
-// is already shaped like the seed's.
+// oxl — the toolchain driver, in .oxl (toolchain-in-oxl stages T2–T3).
+// Ports the seed driver's build/run/test/list/fmt/doc from
+// oxl/src/main.rs + fmt.rs: argv dispatch, the pkg-args/file-list
+// rule, compile orchestration over bootstrap/check + bootstrap/codegen,
+// scratch-dir emission, and the cc invocation with its proven flag
+// order. fmt/doc live in fmt.oxl (its own span-faithful lex+parse —
+// the shared AST carries no spans). get/mod/lsp land in T4–T5.
 import "oxl/bootstrap/check"
 
 import "oxl/bootstrap/codegen"
@@ -634,8 +634,12 @@ fn main() {
         cmd_test()
     } else if c == "list" {
         cmd_list()
-    } else if c == "fmt" || c == "doc" || c == "get" || c == "mod" || c == "lsp" {
-        // T3/T4/T5 fill these — the dispatch is shaped for them
+    } else if c == "fmt" {
+        cmd_fmt()
+    } else if c == "doc" {
+        cmd_doc()
+    } else if c == "get" || c == "mod" || c == "lsp" {
+        // T4/T5 fill these — the dispatch is shaped for them
         eprintln("oxl " + c + ": not yet implemented in cmd/oxl")
         exit(2)
     } else {

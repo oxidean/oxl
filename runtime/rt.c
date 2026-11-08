@@ -2358,14 +2358,30 @@ int64_t rt_open_write(OxlStr path) {
  * chmods the real mode after the write completes. Windows pmode
  * collapses to the read-only attribute — create writable there and
  * let the post-write chmod set the read-only flag.
+ * `src` names the file being replaced: on Windows an EFS-encrypted
+ * source puts FILE_ATTRIBUTE_ENCRYPTED on the create so the stage
+ * is born encrypted — a default create would leave content written
+ * plaintext, and the rename would carry the loss onto the source.
+ * EFS needs NTFS, so an encrypted source implies the same-volume
+ * stage can take the attribute; an attribute read failure fails the
+ * open rather than silently creating the stage unencrypted.
  * O_EXCL/_O_EXCL make the create atomic: an occupied pathname fails
  * -EEXIST instead of truncating through a symlink planted between a
  * caller's existence check and the open. */
-int64_t rt_open_write_mode(OxlStr path, int64_t mode) {
+int64_t rt_open_write_mode(OxlStr path, int64_t mode, OxlStr src) {
     if (path.n > 0 && memchr(path.p, 0, (size_t)path.n)) return -EINVAL;
+    if (src.n > 0 && memchr(src.p, 0, (size_t)src.n)) return -EINVAL;
     const char *cp = rt_cstr(path);
 #ifdef _WIN32
     (void)mode;
+    const char *csp = rt_cstr(src);
+    DWORD sattr = GetFileAttributesA(csp);
+    if (sattr == INVALID_FILE_ATTRIBUTES) {
+        DWORD se = GetLastError();
+        return -((int64_t)se | RT_GLE_TAG);
+    }
+    DWORD cflags = FILE_ATTRIBUTE_NORMAL;
+    if (sattr & FILE_ATTRIBUTE_ENCRYPTED) cflags = FILE_ATTRIBUTE_ENCRYPTED;
     /* Born restrictive: an owner-only DACL on the staging file
      * closes the window where inherited parent ACEs could expose
      * staged contents before the caller's rt_copy_acl carries the
@@ -2378,12 +2394,16 @@ int64_t rt_open_write_mode(OxlStr path, int64_t mode) {
     sa.nLength = sizeof(sa);
     sa.bInheritHandle = FALSE;
     sa.lpSecurityDescriptor = NULL;
-    if (ConvertStringSecurityDescriptorToSecurityDescriptorA(
-            "D:P(A;;GA;;;OW)", SDDL_REVISION_1, &rsd, NULL))
-        sa.lpSecurityDescriptor = rsd;
-    HANDLE h = CreateFileA(cp, GENERIC_WRITE, 0,
-                           sa.lpSecurityDescriptor ? &sa : NULL,
-                           CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+    /* Fail closed: a stage created under default security would
+     * reopen the inherited-ACE window this create exists to close. */
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorA(
+            "D:P(A;;GA;;;OW)", SDDL_REVISION_1, &rsd, NULL)) {
+        DWORD ce = GetLastError();
+        return ce ? -((int64_t)ce | RT_GLE_TAG) : -(int64_t)EACCES;
+    }
+    sa.lpSecurityDescriptor = rsd;
+    HANDLE h = CreateFileA(cp, GENERIC_WRITE, 0, &sa,
+                           CREATE_NEW, cflags, NULL);
     if (rsd) LocalFree((HLOCAL)rsd);
     if (h == INVALID_HANDLE_VALUE) {
         DWORD e = GetLastError();
@@ -2395,6 +2415,7 @@ int64_t rt_open_write_mode(OxlStr path, int64_t mode) {
     if (fd < 0) { CloseHandle(h); return -(int64_t)EIO; }
     return fd;
 #else
+    (void)src;
     int fd = open(cp, O_WRONLY | O_CREAT | O_EXCL | O_TRUNC,
                   (mode_t)((mode | 0200) & 0777));
     return fd < 0 ? -(int64_t)errno : fd;

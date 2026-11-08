@@ -27,11 +27,19 @@ extern fn rt_ftoa_p(v: float, prec: int) -> str
 // mkbuf frees itself into the copied string via bufstr
 extern fn rt_free(p: own void)
 
-// access-mode bits of a path (fmt -w carries the source's mode over
-// the staging rename); chmod applies a mode to the staged file
+// access-mode bits of a path (fmt -w carries the source's mode onto
+// the staging file); open_write_mode creates the staging file under
+// that mode at birth — no window where staged content sits readable
+// looser than the source it will replace
 extern fn rt_fmode(path: str) -> int
 
 extern fn rt_chmod(path: str, mode: int) -> int
+
+extern fn rt_open_write_mode(path: str, mode: int) -> int
+
+extern fn rt_fd_write(fd: int, b: []byte) -> int
+
+extern fn rt_fd_close(fd: int) -> int
 
 // ---------- diagnostics ----------
 // the seed pushes lex+parse diagnostics and aborts fmt on the first
@@ -3471,6 +3479,40 @@ fn read_src(file: str) -> [str, err] {
     return src, nil
 }
 
+// stage_write creates path with access mode and writes s — the
+// mode lands at create time (open_write_mode forces owner-write on
+// so a read-only source still accepts its content); callers chmod
+// the final mode after the write completes
+fn stage_write(path: str, mode: int, s: str) -> int {
+    fd := rt_open_write_mode(path, mode)
+    if fd < 0 {
+        return fd
+    }
+    b := s as []byte
+    off := 0
+    rc := 0
+    for off < len(b) {
+        w := rt_fd_write(fd, b[off:])
+        if w <= 0 {
+            if w < 0 {
+                rc = w
+            } else {
+                rc = -5
+            }
+            break
+        }
+        off = off + w
+    }
+    c := rt_fd_close(fd)
+    if rc != 0 {
+        return rc
+    }
+    if c < 0 {
+        return c
+    }
+    return 0
+}
+
 fn fmt_read_err(file: str) {
     if os.isdir(file) {
         eprintln(file + ": Is a directory (os error 21)")
@@ -3534,18 +3576,22 @@ fn cmd_fmt() {
                             tries = tries + 1
                             tmp = file + ".fmt-tmp-" + itoa(now_ms()) + "-" + itoa(tries)
                         }
-                        if writefile(tmp, res.out) != 0 {
+                        // stage under the source's mode from birth —
+                        // a default-umask create would sit readable
+                        // looser than a private source until chmod
+                        m := rt_fmode(file)
+                        mode := 384
+                        if m >= 0 {
+                            mode = m
+                        }
+                        if stage_write(tmp, mode, res.out) != 0 {
                             eprintln(file + ": write failed")
                             os.remove(tmp)
                             bad = 1
                         } else {
-                            // carry the source's mode onto the staged
-                            // file — a fresh inode would otherwise take
-                            // umask defaults and broaden a private file
-                            m := rt_fmode(file)
-                            if m >= 0 {
-                                rt_chmod(tmp, m)
-                            }
+                            // drop the owner-write bit the stage
+                            // forced on for read-only sources
+                            rt_chmod(tmp, mode)
                             re := os.rename(tmp, file)
                             if re != nil {
                                 eprintln(file + ": " + errors.msg(re))

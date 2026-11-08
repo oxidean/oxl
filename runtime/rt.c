@@ -2346,6 +2346,28 @@ int64_t rt_open_write(OxlStr path) {
     return fd < 0 ? -(int64_t)errno : fd;
 }
 
+/* open_write_mode: create|trunc with an explicit access mode — staged
+ * replacements (fmt -w) are born under the source's mode instead of
+ * umask defaults, so contents are never exposed looser than the file
+ * they will replace. Owner-write is forced on so a read-only source
+ * still accepts its staged content; the caller chmods the real mode
+ * after the write completes. Windows pmode collapses to the read-only
+ * attribute — create writable there and let the post-write chmod set
+ * the read-only flag. */
+int64_t rt_open_write_mode(OxlStr path, int64_t mode) {
+    if (path.n > 0 && memchr(path.p, 0, (size_t)path.n)) return -EINVAL;
+    const char *cp = rt_cstr(path);
+#ifdef _WIN32
+    (void)mode;
+    int fd = _open(cp, _O_WRONLY | _O_CREAT | _O_TRUNC | _O_BINARY,
+                   _S_IREAD | _S_IWRITE);
+#else
+    int fd = open(cp, O_WRONLY | O_CREAT | O_TRUNC,
+                  (mode_t)((mode | 0200) & 0777));
+#endif
+    return fd < 0 ? -(int64_t)errno : fd;
+}
+
 /* the read window is the slice's LEN — `b[:n]` sub-slices keep the
  * parent's cap, and the Read contract is len(p) bytes max */
 int64_t rt_fd_read(int64_t fd, RtSlice b) {

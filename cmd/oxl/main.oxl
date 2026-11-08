@@ -220,7 +220,14 @@ fn runtime_at(base: str) -> str {
 }
 
 fn runtime_dir(entry: str) -> str {
-    d := runtime_at(check.canon_or(check.dir_of(rt_exepath())))
+    // exe-dir probe first — a PATH-invoked oxl finds its shipped
+    // runtime/. Skipped when exepath fails: dir_of("") is "." and
+    // canon_or would silently anchor the probe at the cwd.
+    d := ""
+    exe := rt_exepath()
+    if len(exe) > 0 {
+        d = runtime_at(check.canon_or(check.dir_of(exe)))
+    }
     if len(d) == 0 {
         d = runtime_at(check.canon_or(check.dir_of(argv(0))))
     }

@@ -6580,8 +6580,13 @@ fn resolve_imp(ck: mut Ck, imp: str) -> RRes {
         rest := substr(imp, 4, len(imp))
         // exe ancestors first (shipped-tree std beside the binary),
         // then the entry's ancestors — a self-hosted checker compiled
-        // into a scratch dir still finds the SOURCE tree's std
-        r.dir = std_at(canon_or(dir_of(rt_exepath())), rest)
+        // into a scratch dir still finds the SOURCE tree's std. The
+        // probe is skipped when exepath fails: dir_of("") is "." and
+        // canon_or would silently anchor the search at the cwd.
+        exe := rt_exepath()
+        if len(exe) > 0 {
+            r.dir = std_at(canon_or(dir_of(exe)), rest)
+        }
         if len(r.dir) == 0 {
             r.dir = std_at(canon_or(dir_of(argv(0))), rest)
         }

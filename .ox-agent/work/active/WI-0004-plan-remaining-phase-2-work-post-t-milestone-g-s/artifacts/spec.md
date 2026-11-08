@@ -29,8 +29,9 @@ this milestone dogfoods T's port.
    (`use ./`, `use ./extra`). When present, imports resolving under a
    `use` module's path resolve to that local tree — no `replace`
    plumbing, no publishing needed for in-repo consumers. Parse is
-   the existing manifest grammar extended; diagnostics reuse
-   `mod_*` codes. File-mode (no manifest) behavior unchanged.
+   the existing manifest grammar extended; diagnostics use the
+   `error [check] oxl.work:<line>: <msg>` form on both drivers.
+   File-mode (no manifest) behavior unchanged.
 3. **Subdirectory-module fetch + tag-prefix versions**: module
    cache entries for `…/extra@vX.Y.Z` come from tag `extra/vX.Y.Z`
    of the host repo. `modfetch` maps module-path suffix -> tag

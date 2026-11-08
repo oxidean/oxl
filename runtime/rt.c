@@ -2402,8 +2402,12 @@ int64_t rt_open_write_mode(OxlStr path, int64_t mode, OxlStr src) {
         return ce ? -((int64_t)ce | RT_GLE_TAG) : -(int64_t)EACCES;
     }
     sa.lpSecurityDescriptor = rsd;
-    HANDLE h = CreateFileA(cp, GENERIC_WRITE, 0, &sa,
-                           CREATE_NEW, cflags, NULL);
+    /* GENERIC_WRITE alone denies SetSecurityInfo — the stage's
+     * handle must also carry WRITE_DAC|WRITE_OWNER so the caller's
+     * rt_clone_attrs can land the source DACL/owner. The stage is
+     * created by us, so the rights are granted. */
+    HANDLE h = CreateFileA(cp, GENERIC_WRITE | WRITE_DAC | WRITE_OWNER,
+                           0, &sa, CREATE_NEW, cflags, NULL);
     if (rsd) LocalFree((HLOCAL)rsd);
     if (h == INVALID_HANDLE_VALUE) {
         DWORD e = GetLastError();
@@ -2475,8 +2479,8 @@ int64_t rt_clone_attrs(int64_t sfd, int64_t dfd) {
     if (sd) LocalFree((HLOCAL)sd);
     if (rc != 0) return rc;
     FILE_BASIC_INFO sbi;
-    if (!GetFileInformationByHandle(sh, FileBasicInfo, &sbi,
-                                    sizeof(sbi)))
+    if (!GetFileInformationByHandleEx(sh, FileBasicInfo, &sbi,
+                                      sizeof(sbi)))
         return RT_GLE();
     FILE_BASIC_INFO dbi;
     /* -1 in a FILE_BASIC_INFO time member leaves the value

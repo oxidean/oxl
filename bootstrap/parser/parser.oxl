@@ -20,7 +20,10 @@ struct PCur {
     t: own lexlib.Tok,
     nolit: int, // 1 while parsing if/for conditions — `{` is a block, not a literal
     pln: int, // line of the last consumed token — `x[i]` only binds when adjacent
+    plo: int, // byte offset of the last consumed token
+    phi: int, // byte offset just past it — node `hi` marks
     lex_err: int, // 1 once an err token was consumed — parse() returns nil
+    hush: int, // 1 to silence lex/parse error printlns (stdio-protocol callers)
 }
 
 // ---------- typed AST ----------
@@ -29,21 +32,24 @@ struct PCur {
 // `own NList` cons cells; optional children are `own Node` = nil.
 struct NList { v: own Node, next: own NList }
 
+// Nodes carrying a source span append `lo`/`hi` byte offsets ([lo, hi)
+// of the tokens that formed them) — the checker's LSP index resolves
+// hover/definition positions through them. Spans never enter to_json.
 enum Node {
     JInt(int), // {"int": i}
     JFloat(str), // {"float": s}
     JStr(str), // {"str": s}
-    Name(str), // {"name": s}
-    Ty(str), // {"ty": s}
+    Name { n: str, lo: int, hi: int }, // {"name": s}
+    Ty { f0: str, lo: int, hi: int }, // {"ty": s}
     NamedField { name: str, val: own Node }, // {"name": s, "val": <v>}
-    Param { name: str, ty: own Node }, // {"name": s} (+"ty")
-    FieldDef { name: str, ty: own Node }, // {"name": s} (+"ty")
-    Lit { obj: own Node, fields: own NList }, // {"lit": <o>, "fields": [...]}
+    Param { name: str, ty: own Node, lo: int, hi: int }, // {"name": s} (+"ty")
+    FieldDef { name: str, ty: own Node, lo: int, hi: int }, // {"name": s} (+"ty")
+    Lit { obj: own Node, fields: own NList, lo: int, hi: int }, // {"lit": <o>, "fields": [...]}
     Call { f: own Node, args: own NList }, // {"call": <f>, "args": [...]}
-    Field { obj: own Node, name: str }, // {"field": <o>, "name": s}
+    Field { obj: own Node, name: str, lo: int, hi: int }, // {"field": <o>, "name": s}
     Un { op: str, e: own Node }, // {"un": s, "e": <e>}
     Bin { op: str, l: own Node, r: own Node }, // {"bin": s, "l": <l>, "r": <r>}
-    Let { name: str, ty: own Node, init: own Node }, // {"let": s} (+"ty","init")
+    Let { name: str, ty: own Node, init: own Node, lo: int, hi: int }, // {"let": s} (+"ty","init")
     Ret { vals: own NList }, // {"return": [...]}
     Break, // {"break": null}
     Continue, // {"continue": null}
@@ -51,31 +57,31 @@ enum Node {
     Spawn { e: own Node }, // {"spawn": <e>}
     SpawnBlocking { e: own Node }, // {"spawnBlocking": <e>}
     Go { e: own Node }, // {"go": <e>}
-    Let2 { names: str, call: own Node }, // {"let2": s} (+"call")
-    Bind { name: str, init: own Node }, // {"bind": s, "init": <init>}
+    Let2 { names: str, call: own Node, lo: int, hi: int }, // {"let2": s} (+"call")
+    Bind { name: str, init: own Node, lo: int, hi: int }, // {"bind": s, "init": <init>}
     ExprStmt { e: own Node }, // {"expr": <e>}
     If { cond: own Node, then: own Node, els: own Node }, // {"if","then",(+"else")}
     For { cond: own Node, body: own Node }, // {"for": <cond>, "body": <body>}
     List { items: own NList }, // bare [...] array node
-    Fn { ex: bool, name: str, recv: own Node, typarams: own NList, params: own NList, ret: own Node, body: own Node },
+    Fn { ex: bool, name: str, recv: own Node, typarams: own NList, params: own NList, ret: own Node, body: own Node, lo: int, hi: int },
     TyParam { name: str, constraint: str }, // {"typaram": s, "constraint": s}
     Import { path: str, alias: str, names: own NList }, // {"import": s} (+"as","names")
-    Struct { name: str, fields: own NList }, // {"struct": s, "fields": [...]}
-    Interface { name: str, ops: own NList, methods: own NList }, // {"interface": s}
-    Method { name: str, params: own NList, ret: own Node }, // {"method": s}
+    Struct { name: str, fields: own NList, lo: int, hi: int }, // {"struct": s, "fields": [...]}
+    Interface { name: str, ops: own NList, methods: own NList, lo: int, hi: int }, // {"interface": s}
+    Method { name: str, params: own NList, ret: own Node, lo: int, hi: int }, // {"method": s}
     Skip { text: str }, // {"skip": s}
     Root { items: own NList }, // {"items": [...]}
-    Enum { name: str, vars: own NList }, // {"enum": s, "variants": [...]}
-    Variant { name: str, args: own NList }, // {"variant": s, "args": [...]}
+    Enum { name: str, vars: own NList, lo: int, hi: int }, // {"enum": s, "variants": [...]}
+    Variant { name: str, args: own NList, lo: int, hi: int }, // {"variant": s, "args": [...]}
     As { e: own Node, ty: own Node }, // {"as": <e>, "ty": <t>}
     Match { e: own Node, arms: own NList }, // {"match": <e>, "arms": [...]}
-    MArm { pat: own Node, body: own Node }, // {"pat": <p>, "body": <b>}
+    MArm { pat: own Node, body: own Node, lo: int, hi: int }, // {"pat": <p>, "body": <b>}
     Pat { path: str, binds: own NList }, // {"pat": s} (+"binds")
     PatWild, // {"pat": "_"}
     PatLit { v: own Node }, // {"patlit": <v>}
     PatBind { name: str }, // {"patbind": s} — bare ident binds
     Assign { target: own Node, val: own Node }, // {"assign": <t>, "val": <v>}
-    Select { arms: own NList }, // {"select": [...]}
+    Select { arms: own NList, lo: int, hi: int }, // {"select": [...]}
     SArm { kind: str, ch: own Node, bind: str, ms: own Node, body: own Node },
     Closure { params: own NList, body: own Node }, // {"closure": [...], "body": <list>}
     Index { obj: own Node, idx: own Node }, // {"index": <o>, "idx": <i>}
@@ -139,11 +145,11 @@ fn to_json(n: own Node) -> own json.Json {
         Node.JStr(s) => {
             json.jadd(o, "str", json.jstr(s))
         }
-        Node.Name(s) => {
-            json.jadd(o, "name", json.jstr(s))
+        Node.Name{n} => {
+            json.jadd(o, "name", json.jstr(n))
         }
-        Node.Ty(s) => {
-            json.jadd(o, "ty", json.jstr(s))
+        Node.Ty{f0} => {
+            json.jadd(o, "ty", json.jstr(f0))
         }
         Node.NamedField{name, val} => {
             json.jadd(o, "name", json.jstr(name))
@@ -393,15 +399,85 @@ fn pkind(c: mut PCur) -> int {
     return c.t.kind
 }
 
+// byte offset of the current token — a node's `lo` is captured here
+// before its first token is consumed
+fn coff(c: mut PCur) -> int {
+    if c.t == nil {
+        return 0
+    }
+    return c.t.off
+}
+
+// a name node's byte span — node `lo`/`hi` accessors used when a
+// node's own span is needed after the cursor has moved on
+fn nlo(n: ref Node) -> int {
+    i := match n {
+        Node.Name{lo} => lo
+        Node.Ty{lo} => lo
+        Node.Param{lo} => lo
+        Node.FieldDef{lo} => lo
+        Node.Lit{lo} => lo
+        Node.Field{lo} => lo
+        Node.Let{lo} => lo
+        Node.Let2{lo} => lo
+        Node.Bind{lo} => lo
+        Node.Fn{lo} => lo
+        Node.Struct{lo} => lo
+        Node.Interface{lo} => lo
+        Node.Method{lo} => lo
+        Node.Enum{lo} => lo
+        Node.Variant{lo} => lo
+        Node.MArm{lo} => lo
+        Node.Select{lo} => lo
+        _ => -1
+    }
+    return i
+}
+
+fn nhi(n: ref Node) -> int {
+    i := match n {
+        Node.Name{hi} => hi
+        Node.Ty{hi} => hi
+        Node.Param{hi} => hi
+        Node.FieldDef{hi} => hi
+        Node.Lit{hi} => hi
+        Node.Field{hi} => hi
+        Node.Let{hi} => hi
+        Node.Let2{hi} => hi
+        Node.Bind{hi} => hi
+        Node.Fn{hi} => hi
+        Node.Struct{hi} => hi
+        Node.Interface{hi} => hi
+        Node.Method{hi} => hi
+        Node.Enum{hi} => hi
+        Node.Variant{hi} => hi
+        Node.MArm{hi} => hi
+        Node.Select{hi} => hi
+        _ => -1
+    }
+    return i
+}
+
+// consume one token as a Name node — shared by import-name lists and
+// pattern binds
+fn p_name(c: mut PCur) -> own Node {
+    m := coff(c)
+    nm := peek(c)
+    next(c)
+    return b(Node.Name{n: nm, lo: m, hi: c.phi})
+}
+
 fn next(c: mut PCur) {
     if c.t != nil {
         c.pln = c.t.ln
+        c.plo = c.t.off
+        c.phi = c.t.eoff
         c.t = c.t.next
         // lexical errors arrive as err tokens (kind 7) — report once and
         // truncate the stream: parsing a truncated tail as real tokens
         // silently mis-shapes the AST (kind-agnostic token reads)
         if c.t != nil && c.t.kind == lexlib.k_err() {
-            if c.lex_err == 0 {
+            if c.lex_err == 0 && c.hush == 0 {
                 println("lex: " + c.t.text + " (line " + itoa(c.t.ln) + ")")
             }
             c.lex_err = 1
@@ -468,8 +544,10 @@ fn p_primary(c: mut PCur) -> own Node {
         return e
     }
     // ident / keyword literals
-    e := b(Node.Name(peek(c)))
+    nm := peek(c)
+    m := coff(c)
     next(c)
+    e := b(Node.Name{n: nm, lo: m, hi: c.phi})
     // struct literal: Name { f: v, ... } — suppressed in cond position
     if at(c, "{") && c.nolit == 0 {
         next(c)
@@ -482,7 +560,7 @@ fn p_primary(c: mut PCur) -> own Node {
             eat(c, ",")
         }
         eat(c, "}")
-        return b(Node.Lit{obj: e, fields: nrev(fields)})
+        return b(Node.Lit{obj: e, fields: nrev(fields), lo: m, hi: c.phi})
     }
     return e
 }
@@ -496,6 +574,7 @@ fn p_match(c: mut PCur) -> own Node {
     eat(c, "{")
     let arms: own NList = nil
     for !at(c, "}") && !eof(c) {
+        am := coff(c)
         pat := p_pat(c)
         eat(c, "=")
         eat(c, ">")
@@ -505,7 +584,7 @@ fn p_match(c: mut PCur) -> own Node {
         } else {
             body = p_expr(c)
         }
-        arms = ncons(b(Node.MArm{pat: pat, body: body}), arms)
+        arms = ncons(b(Node.MArm{pat: pat, body: body, lo: am, hi: c.phi}), arms)
         eat(c, ",")
     }
     eat(c, "}")
@@ -514,6 +593,7 @@ fn p_match(c: mut PCur) -> own Node {
 
 // select { [v :=] recv(ch) => {...} | timeout(ms) => {...} | else => {...} }
 fn p_select(c: mut PCur) -> own Node {
+    m := coff(c)
     next(c)
     eat(c, "{")
     let arms: own NList = nil
@@ -528,12 +608,18 @@ fn p_select(c: mut PCur) -> own Node {
         bind := ""
         if pkind(c) == 1 {
             save := c.t
+            splo := c.plo
+            sphi := c.phi
+            spln := c.pln
             nm := peek(c)
             next(c)
             if eat(c, ":=") {
                 bind = nm
             } else {
                 c.t = save
+                c.plo = splo
+                c.phi = sphi
+                c.pln = spln
             }
         }
         e := p_expr(c)
@@ -543,7 +629,7 @@ fn p_select(c: mut PCur) -> own Node {
         match e {
             Node.Call{f, args} => {
                 head := match f {
-                    Node.Name(v) => v
+                    Node.Name{n} => n
                     _ => ""
                 }
                 if head == "recv" {
@@ -570,7 +656,7 @@ fn p_select(c: mut PCur) -> own Node {
         eat(c, ",")
     }
     eat(c, "}")
-    return b(Node.Select{arms: nrev(arms)})
+    return b(Node.Select{arms: nrev(arms), lo: m, hi: c.phi})
 }
 
 // arm body: `{...}` block or a single stmt (wrapped in a List, like the seed)
@@ -594,10 +680,11 @@ fn p_closure(c: mut PCur) -> own Node {
     }
     let ps: own NList = nil
     for !empty && !at(c, "|") && !eof(c) {
+        pm := coff(c)
         nm := peek(c)
         next(c)
         eat(c, ":")
-        ps = ncons(b(Node.Param{name: nm, ty: p_ty(c)}), ps)
+        ps = ncons(b(Node.Param{name: nm, ty: p_ty(c), lo: pm, hi: c.phi}), ps)
         if !eat(c, ",") {
             break
         }
@@ -625,8 +712,9 @@ fn p_pat(c: mut PCur) -> own Node {
     // true/false/nil literal patterns
     if peek(c) == "true" || peek(c) == "false" || peek(c) == "nil" {
         nm := peek(c)
+        nmoff := coff(c)
         next(c)
-        return b(Node.PatLit{v: b(Node.Name(nm))})
+        return b(Node.PatLit{v: b(Node.Name{n: nm, lo: nmoff, hi: c.phi})})
     }
     path := peek(c)
     next(c)
@@ -644,8 +732,7 @@ fn p_pat(c: mut PCur) -> own Node {
         next(c)
         let binds: own NList = nil
         for !at(c, close) && !eof(c) {
-            binds = ncons(b(Node.Name(peek(c))), binds)
-            next(c)
+            binds = ncons(p_name(c), binds)
             eat(c, ",")
         }
         eat(c, close)
@@ -675,13 +762,16 @@ fn p_postfix(c: mut PCur) -> own Node {
         }
         if at(c, ".") {
             next(c)
-            e = b(Node.Field{obj: e, name: peek(c)})
+            fname := peek(c)
             next(c)
+            elo := nlo(e)
+            e = b(Node.Field{obj: e, name: fname, lo: elo, hi: c.phi})
             continue
         }
         // `E.V{...}`/`a.b{...}` — lit on a postfix expr (bare `Name{...}`
         // is handled in p_primary)
         if at(c, "{") && c.nolit == 0 {
+            elo := nlo(e)
             next(c)
             let fields: own NList = nil
             for !at(c, "}") && !eof(c) {
@@ -692,7 +782,7 @@ fn p_postfix(c: mut PCur) -> own Node {
                 eat(c, ",")
             }
             eat(c, "}")
-            e = b(Node.Lit{obj: e, fields: nrev(fields)})
+            e = b(Node.Lit{obj: e, fields: nrev(fields), lo: elo, hi: c.phi})
             continue
         }
         // `e[i]` / `e[a:b]` — only when `[` sits on the same line as e's
@@ -813,6 +903,7 @@ fn p_expr(c: mut PCur) -> own Node {
 
 // ---------- statements ----------
 fn p_stmt(c: mut PCur) -> own Node {
+    m := coff(c)
     if eat(c, "let") {
         name := peek(c)
         next(c)
@@ -824,7 +915,7 @@ fn p_stmt(c: mut PCur) -> own Node {
         if eat(c, "=") {
             init = p_expr(c)
         }
-        return b(Node.Let{name: name, ty: ty, init: init})
+        return b(Node.Let{name: name, ty: ty, init: init, lo: m, hi: c.phi})
     }
     if eat(c, "return") {
         let vals: own NList = nil
@@ -883,13 +974,13 @@ fn p_stmt(c: mut PCur) -> own Node {
         if eat(c, "=") {
             call = p_expr(c)
         }
-        return b(Node.Let2{names: n1 + "," + n2, call: call})
+        return b(Node.Let2{names: n1 + "," + n2, call: call, lo: m, hi: c.phi})
     }
     // ident := expr | target = expr | call/field stmt
     name := peek(c)
     e := p_postfix(c)
     if eat(c, ":=") {
-        return b(Node.Bind{name: name, init: p_expr(c)})
+        return b(Node.Bind{name: name, init: p_expr(c), lo: m, hi: c.phi})
     }
     if eat(c, "=") {
         return b(Node.Assign{target: e, val: p_expr(c)})
@@ -947,13 +1038,14 @@ fn p_dotted(c: mut PCur) -> str {
 }
 
 fn p_ty(c: mut PCur) -> own Node {
+    m := coff(c)
     txt := peek(c)
     // []T — the inner Ty node carries its own text
     if at(c, "[") {
         next(c)
         eat(c, "]")
         inner := p_ty(c) as Node.Ty
-        return b(Node.Ty("[]" + inner.f0))
+        return b(Node.Ty{f0: "[]" + inner.f0, lo: m, hi: c.phi})
     }
     // fn(a, b) -> r — kept as a canonical string for the checker
     if at(c, "fn") {
@@ -984,7 +1076,7 @@ fn p_ty(c: mut PCur) -> own Node {
             rt := p_ty(c) as Node.Ty
             s = s + " -> " + rt.f0
         }
-        return b(Node.Ty(s))
+        return b(Node.Ty{f0: s, lo: m, hi: c.phi})
     }
     // own/ref/mut [own/ref/mut] dotted.name
     if txt == "own" || txt == "ref" || txt == "mut" {
@@ -996,22 +1088,23 @@ fn p_ty(c: mut PCur) -> own Node {
             it := p_ty(c) as Node.Ty
             inner = it.f0
         }
-        return b(Node.Ty(txt + " " + inner))
+        return b(Node.Ty{f0: txt + " " + inner, lo: m, hi: c.phi})
     }
-    return b(Node.Ty(p_dotted(c)))
+    return b(Node.Ty{f0: p_dotted(c), lo: m, hi: c.phi})
 }
 
 fn p_params(c: mut PCur) -> own NList {
     let items: own NList = nil
     eat(c, "(")
     for !at(c, ")") && !eof(c) {
+        pm := coff(c)
         name := peek(c)
         next(c)
         let ty: own Node = nil
         if eat(c, ":") {
             ty = p_ty(c)
         }
-        items = ncons(b(Node.Param{name: name, ty: ty}), items)
+        items = ncons(b(Node.Param{name: name, ty: ty, lo: pm, hi: c.phi}), items)
         eat(c, ",")
     }
     eat(c, ")")
@@ -1022,11 +1115,12 @@ fn p_params(c: mut PCur) -> own NList {
 // interface method sigs
 fn p_ret(c: mut PCur) -> own Node {
     let ret: own Node = nil
+    rm := coff(c)
     if eat(c, "->") {
         if eat(c, "[") { // multi-return [v, err] — or `[]T` slice ret
             if eat(c, "]") {
                 inner := p_ty(c) as Node.Ty
-                ret = b(Node.Ty("[]" + inner.f0))
+                ret = b(Node.Ty{f0: "[]" + inner.f0, lo: rm, hi: c.phi})
             } else {
                 let tys: own NList = nil
                 for !at(c, "]") && !eof(c) {
@@ -1043,18 +1137,25 @@ fn p_ret(c: mut PCur) -> own Node {
     return ret
 }
 
-fn p_fn(c: mut PCur, ex: bool) -> own Node {
+// m0 marks the item's leading keyword (`fn` or `extern`) — the Fn
+// node's span starts there; -1 falls back to the current token
+fn p_fn(c: mut PCur, ex: bool, m0: int) -> own Node {
+    m := m0
+    if m < 0 {
+        m = coff(c)
+    }
     eat(c, "fn")
     // method receiver: `fn (r T) m(..)` — `fn (r: T)` also accepted
     let recv: own Node = nil
     if at(c, "(") {
         next(c)
+        rm := coff(c)
         rname := peek(c)
         next(c)
         eat(c, ":")
         rty := p_ty(c)
         eat(c, ")")
-        recv = b(Node.Param{name: rname, ty: rty})
+        recv = b(Node.Param{name: rname, ty: rty, lo: rm, hi: c.phi})
     }
     name := peek(c)
     next(c)
@@ -1086,11 +1187,12 @@ fn p_fn(c: mut PCur, ex: bool) -> own Node {
     if at(c, "{") {
         body = p_block(c)
     }
-    return b(Node.Fn{ex: ex, name: name, recv: recv, typarams: typs, params: params, ret: ret, body: body})
+    return b(Node.Fn{ex: ex, name: name, recv: recv, typarams: typs, params: params, ret: ret, body: body, lo: m, hi: c.phi})
 }
 
 // enum variant: `V`, `V(t, ..)`, `V { n: t, .. }`
 fn p_variant(c: mut PCur) -> own Node {
+    m := coff(c)
     name := peek(c)
     next(c)
     let args: own NList = nil
@@ -1103,21 +1205,23 @@ fn p_variant(c: mut PCur) -> own Node {
     }
     if eat(c, "{") {
         for !at(c, "}") && !eof(c) {
+            pm := coff(c)
             fname := peek(c)
             next(c)
             let ty: own Node = nil
             if eat(c, ":") {
                 ty = p_ty(c)
             }
-            args = ncons(b(Node.Param{name: fname, ty: ty}), args)
+            args = ncons(b(Node.Param{name: fname, ty: ty, lo: pm, hi: c.phi}), args)
             eat(c, ",")
         }
         eat(c, "}")
     }
-    return b(Node.Variant{name: name, args: nrev(args)})
+    return b(Node.Variant{name: name, args: nrev(args), lo: m, hi: c.phi})
 }
 
 fn p_item(c: mut PCur) -> own Node {
+    m := coff(c)
     if eat(c, "import") {
         path := peek(c)
         next(c)
@@ -1130,8 +1234,7 @@ fn p_item(c: mut PCur) -> own Node {
         let names: own NList = nil
         if eat(c, ".") && eat(c, "{") {
             for !at(c, "}") && !eof(c) {
-                names = ncons(b(Node.Name(peek(c))), names)
-                next(c)
+                names = ncons(p_name(c), names)
                 eat(c, ",")
             }
             eat(c, "}")
@@ -1148,20 +1251,21 @@ fn p_item(c: mut PCur) -> own Node {
         let ops: own NList = nil
         let methods: own NList = nil
         for !at(c, "}") && !eof(c) {
+            mm := coff(c)
             mname := peek(c)
             next(c)
             if at(c, "(") {
                 mparams := p_params(c)
                 mret := p_ret(c)
-                methods = ncons(b(Node.Method{name: mname, params: mparams, ret: mret}), methods)
+                methods = ncons(b(Node.Method{name: mname, params: mparams, ret: mret, lo: mm, hi: c.phi}), methods)
             } else {
-                ops = ncons(b(Node.Name(mname)), ops)
+                ops = ncons(b(Node.Name{n: mname, lo: mm, hi: c.phi}), ops)
             }
             eat(c, ",")
             eat(c, ";")
         }
         eat(c, "}")
-        return b(Node.Interface{name: name, ops: nrev(ops), methods: nrev(methods)})
+        return b(Node.Interface{name: name, ops: nrev(ops), methods: nrev(methods), lo: m, hi: c.phi})
     }
     if eat(c, "struct") {
         name := peek(c)
@@ -1169,18 +1273,19 @@ fn p_item(c: mut PCur) -> own Node {
         let fields: own NList = nil
         if eat(c, "{") {
             for !at(c, "}") && !eof(c) {
+                fm := coff(c)
                 fname := peek(c)
                 next(c)
                 let ty: own Node = nil
                 if eat(c, ":") {
                     ty = p_ty(c)
                 }
-                fields = ncons(b(Node.FieldDef{name: fname, ty: ty}), fields)
+                fields = ncons(b(Node.FieldDef{name: fname, ty: ty, lo: fm, hi: c.phi}), fields)
                 eat(c, ",")
             }
             eat(c, "}")
         }
-        return b(Node.Struct{name: name, fields: nrev(fields)})
+        return b(Node.Struct{name: name, fields: nrev(fields), lo: m, hi: c.phi})
     }
     if eat(c, "enum") {
         name := peek(c)
@@ -1193,15 +1298,15 @@ fn p_item(c: mut PCur) -> own Node {
             }
             eat(c, "}")
         }
-        return b(Node.Enum{name: name, vars: nrev(vars)})
+        return b(Node.Enum{name: name, vars: nrev(vars), lo: m, hi: c.phi})
     }
     if eat(c, "extern") {
-        f := p_fn(c, true)
+        f := p_fn(c, true, m)
         eat(c, ";")
         return f
     }
     if at(c, "fn") {
-        return p_fn(c, false)
+        return p_fn(c, false, m)
     }
     if at(c, "let") {
         return p_stmt(c)
@@ -1213,22 +1318,35 @@ fn p_item(c: mut PCur) -> own Node {
 }
 
 fn parse(toks: own lexlib.Tok) -> own Node {
+    return parse2(toks, 0)
+}
+
+// parse with the error printlns silenced — the LSP feeds unsaved
+// buffers through here and must keep stdout protocol-clean
+fn parse2(toks: own lexlib.Tok, hush: int) -> own Node {
     c := new(PCur)
     c.t = toks
     c.nolit = 0
     c.pln = 0
+    c.plo = 0
+    c.phi = 0
     c.lex_err = 0
+    c.hush = hush
     // an err token in FIRST position is never reached by next()'s check
     // (that fires on c.t.next) — a file starting with a lex error would
     // silently parse as a Skip node and exit 0
     if c.t != nil && c.t.kind == lexlib.k_err() {
-        println("lex: " + c.t.text + " (line " + itoa(c.t.ln) + ")")
+        if c.hush == 0 {
+            println("lex: " + c.t.text + " (line " + itoa(c.t.ln) + ")")
+        }
         return nil
     }
     // the package clause is the mandatory first item of every file —
     // the seed parser emits `expected package clause` when it's absent
     if !eat(c, "package") {
-        println("parse: expected package clause")
+        if c.hush == 0 {
+            println("parse: expected package clause")
+        }
         return nil
     }
     let items: own NList = ncons(b(Node.Package{name: peek(c)}), nil)

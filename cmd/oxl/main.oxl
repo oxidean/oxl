@@ -634,8 +634,10 @@ fn main() {
         cmd_test()
     } else if c == "list" {
         cmd_list()
-    } else if c == "fmt" || c == "doc" || c == "get" || c == "mod" || c == "lsp" {
-        // T3/T4/T5 fill these — the dispatch is shaped for them
+    } else if c == "lsp" {
+        cmd_lsp()
+    } else if c == "fmt" || c == "doc" || c == "get" || c == "mod" {
+        // T3/T4 fill these — the dispatch is shaped for them
         eprintln("oxl " + c + ": not yet implemented in cmd/oxl")
         exit(2)
     } else {

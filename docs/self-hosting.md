@@ -98,9 +98,19 @@ bootstrap/check/       (done — typechecks .oxl, self-checks clean)
 bootstrap/cmd/codegen  (done — emits C, self-compiles byte-identical)
 ```
 
-The shipped `oxl` toolchain is the seed implementation — it
-*first-compiles* the self-hosted compiler, closing the classic
-bootstrap chain. `codegen.oxl` now lowers the full language surface,
+## The toolchain: seed and product
+
+The `oxl/` crate (Rust) is the **seed** — the bootstrap input that
+compiles the first `.oxl`-written toolchain. The **product** driver is
+`cmd/oxl`, written in `.oxl`: argv dispatch, `oxl.mod` resolution,
+get/mod, fmt, doc, and LSP over `bootstrap/check` + `bootstrap/codegen`.
+`tests/run.sh` builds the product driver with the seed, has it rebuild
+itself, and asserts the C each generation emits for the driver sources
+is byte-identical (the fixpoint — ADR-0006); the suite then runs under
+the product driver end-to-end. Cargo stays in the *bootstrap* path
+only.
+
+`codegen.oxl` now lowers the full language surface,
 including `RtIface`/vtable pairs for interface values and
 monomorphized generic instantiations; emitted programs using generics,
 interfaces, or methods compile through either pipeline. The interim C

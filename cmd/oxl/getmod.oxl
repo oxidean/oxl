@@ -2015,10 +2015,11 @@ fn rewrite_requires(mtext: str, want: ref WantEnt) -> str {
     for i < nlines {
         if i == first_req && emitted == 0 {
             emitted = 1
-            hl := hoisted
-            for hl != nil {
-                out = out + hl.v + "\n"
-                hl = hl.next
+            // hoisted prepends — emit tail-first to keep source order
+            hi := sl_len_ll(hoisted) - 1
+            for hi >= 0 {
+                out = out + ll_at(hoisted, hi) + "\n"
+                hi = hi - 1
             }
             if len(wmps) == 1 && had_block == 0 {
                 w := want_find(want, wmps[0])

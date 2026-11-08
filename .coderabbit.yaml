@@ -1,13 +1,6 @@
 # CodeRabbit configuration — see https://docs.coderabbit.ai/reference/configuration
 reviews:
   profile: chill
-  path_filters:
-    # fmt.oxl is a 3.7k-line faithful port whose diff exceeds
-    # CodeRabbit's reviewable size — every pass reports "incomplete
-    # coverage" and auto-approval can never fire. Its correctness is
-    # enforced by byte-parity tests vs the seed driver (run.sh fmt
-    # section) rather than review.
-    - "!cmd/oxl/fmt.oxl"
   auto_approvals:
     enabled: true
   auto_review:

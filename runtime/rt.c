@@ -2405,7 +2405,10 @@ int64_t rt_copy_acl(OxlStr src, OxlStr dst) {
             DWORD prot = (ctl & SE_DACL_PROTECTED)
                              ? PROTECTED_DACL_SECURITY_INFORMATION
                              : UNPROTECTED_DACL_SECURITY_INFORMATION;
-            r = SetNamedSecurityInfoA(cd, SE_FILE_OBJECT,
+            /* MinGW spells the name param LPSTR; the API does not
+             * write it — the cast also keeps the build warning-free
+             * so compile output stays byte-stable across runs. */
+            r = SetNamedSecurityInfoA((char *)cd, SE_FILE_OBJECT,
                                       DACL_SECURITY_INFORMATION | prot,
                                       NULL, NULL, dacl, NULL);
             if (r != ERROR_SUCCESS) rc = -((int64_t)r | RT_GLE_TAG);

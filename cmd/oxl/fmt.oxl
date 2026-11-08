@@ -35,7 +35,11 @@ extern fn rt_fmode(path: str) -> int
 
 extern fn rt_chmod(path: str, mode: int) -> int
 
-extern fn rt_open_write_mode(path: str, mode: int) -> int
+// open_write_mode takes the source path too: on Windows a source
+// carrying EFS (FILE_ATTRIBUTE_ENCRYPTED) makes the create encrypt
+// the stage at birth — content never lands plaintext, and the
+// attribute survives the rename that replaces the source
+extern fn rt_open_write_mode(path: str, mode: int, src: str) -> int
 
 // copy the source's DACL onto the staged replacement (Windows; a
 // no-op under POSIX where the chmod above carries the permissions)
@@ -3487,8 +3491,8 @@ fn read_src(file: str) -> [str, err] {
 // mode lands at create time (open_write_mode forces owner-write on
 // so a read-only source still accepts its content); callers chmod
 // the final mode after the write completes
-fn stage_write(path: str, mode: int, s: str) -> int {
-    fd := rt_open_write_mode(path, mode)
+fn stage_write(path: str, mode: int, src: str, s: str) -> int {
+    fd := rt_open_write_mode(path, mode, src)
     if fd < 0 {
         return fd
     }
@@ -3584,14 +3588,14 @@ fn cmd_fmt() {
                         if m >= 0 {
                             mode = m
                         }
-                        wr := stage_write(tmp, mode, res.out)
+                        wr := stage_write(tmp, mode, file, res.out)
                         // -EEXIST: the name was occupied — rotate a
                         // few times before giving up
                         tries := 0
                         for wr == -17 && tries < 8 {
                             tries = tries + 1
                             tmp = file + ".fmt-tmp-" + itoa(now_ms()) + "-" + itoa(tries)
-                            wr = stage_write(tmp, mode, res.out)
+                            wr = stage_write(tmp, mode, file, res.out)
                         }
                         if wr != 0 {
                             eprintln(file + ": write failed")

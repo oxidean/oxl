@@ -577,6 +577,21 @@ if [ "$seed_rc" = 0 ] || [ "$self_rc" = 0 ] || [ "$seed_out" != "$self_out" ]; t
     echo "-- self --"; printf '%s\n' "$self_out"
     exit 1
 fi
+# file mode: a lone oxl.work with no oxl.mod is ignored entirely —
+# the `use` dir doesn't even exist, so honoring it would diagnose
+# (no std import: the scratch-built selfcheck lives outside the tree
+# and its exe-anchored std walk can't reach it)
+mkdir -p "$scratch/workfm"
+printf 'oxlwork 0.3\nuse ./nonexistent\n' > "$scratch/workfm/oxl.work"
+printf 'package main\n\nfn main() {}\n' > "$scratch/workfm/main.oxl"
+seed_out=$("$SEEDOXL" build "$scratch/workfm/main.oxl" -o "$scratch/workfmbin" 2>&1 | sed 's/^[^:]*:[0-9][0-9]*:[0-9][0-9]*: //') && seed_rc=0 || seed_rc=1
+self_out=$("$scratch/selfcheck$EXE" "$scratch/workfm/main.oxl" 2>&1) && self_rc=0 || self_rc=1
+if [ "$seed_rc" != 0 ] || [ "$self_rc" != 0 ] || [ "$self_out" != ok ]; then
+    echo "FAIL work-filemode: work file not ignored"
+    echo "-- seed --"; printf '%s\n' "$seed_out"
+    echo "-- self --"; printf '%s\n' "$self_out"
+    exit 1
+fi
 unset OXLMODCACHE
 
 echo "== v1 build list (oxl list -m all) =="

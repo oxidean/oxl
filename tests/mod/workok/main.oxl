@@ -1,0 +1,13 @@
+package main
+
+import "ex.org/lib/util"
+
+import "ex.org/nested/plain"
+
+import "ex.org/nested/deep/sub"
+
+import "std/strings"
+
+fn main() {
+    println(itoa(util.answer()) + " " + itoa(plain.mark()) + " " + itoa(sub.mark()) + " " + strings.split("a,b", ",").v)
+}

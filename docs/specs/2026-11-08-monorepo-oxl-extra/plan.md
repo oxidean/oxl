@@ -6,8 +6,8 @@ every stage lands with the suite green.
 
 - [ ] **E0 — planning docs** — this directory, ADR-0008, phase-2 map
       + roadmap update, parked-stdlib cross-referenced for `fmt %v` (#28 — already listed). *(this PR)*
-- [ ] **E1 — `oxl.work` + workspace resolution** — `use` directive in
-      the manifest grammar; workspace resolution ahead of
+- [done] **E1 — `oxl.work` + workspace resolution** — `use` directive
+      in the manifest grammar; workspace resolution ahead of
       requires/cache; diag corpus rows (malformed work file, missing
       dir, module-path conflict); file mode untouched.
       Gate: corpus byte-parity both drivers; suite green.

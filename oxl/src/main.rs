@@ -95,6 +95,13 @@ struct ModCtx {
     /// (max) version — resolution reads dirs at THESE versions, not
     /// the raw require lines
     selected: Vec<(String, String)>,
+    /// workspace root holding `oxl.work` when one extends module
+    /// discovery upward from the module root (None = no workspace)
+    work_root: Option<PathBuf>,
+    /// `use`d module path -> its local tree dir. Resolves ahead of
+    /// requires/cache — a use'd module shadows a require on the same
+    /// path (the require still documents the published floor)
+    uses: Vec<(String, PathBuf)>,
 }
 
 /// nearest ancestor of `dir` holding `oxl.mod`, if any — nearest wins,
@@ -108,6 +115,23 @@ fn find_root(dir: &Path) -> Option<PathBuf> {
     };
     while let Some(x) = d {
         if x.join("oxl.mod").is_file() {
+            return Some(x);
+        }
+        d = x.parent().map(Path::to_path_buf);
+    }
+    None
+}
+
+/// nearest ancestor of `dir` holding `oxl.work` — same walk as
+/// find_root; only ever consulted in module mode (a lone work file
+/// with no oxl.mod above the entry is file mode and ignored)
+fn find_work(dir: &Path) -> Option<PathBuf> {
+    let mut d = match std::fs::canonicalize(dir) {
+        Ok(p) => Some(p),
+        Err(_) => std::env::current_dir().ok(),
+    };
+    while let Some(x) = d {
+        if x.join("oxl.work").is_file() {
             return Some(x);
         }
         d = x.parent().map(Path::to_path_buf);
@@ -241,6 +265,70 @@ fn parse_manifest(
     Ok((module, floor, requires, replaces))
 }
 
+/// parse oxl.work text -> (`oxlwork` floor as written, [(line, use
+/// dir argument)]). Grammar mirrors the manifest parser — directive
+/// per line, same comment/block rules; `use` accepts one dir inline
+/// or per block line. Errors come back ready to print:
+/// `oxl.work:<line>: <msg>`.
+fn parse_work(src: &str) -> Result<(Option<String>, Vec<(usize, String)>), String> {
+    let mut floor: Option<String> = None;
+    let mut dirs: Vec<(usize, String)> = Vec::new();
+    let mut lines = src.lines().enumerate().peekable();
+    while let Some((ln, raw)) = lines.next() {
+        let line_no = ln + 1;
+        let text = strip_comment(raw).trim();
+        if text.is_empty() {
+            continue;
+        }
+        let toks: Vec<&str> = text.split_whitespace().collect();
+        let err = |m: String| format!("oxl.work:{line_no}: {m}");
+        match toks[0] {
+            "oxlwork" => {
+                if floor.is_some() {
+                    return Err(err("duplicate directive \"oxlwork\"".into()));
+                }
+                if toks.len() != 2 || ver_tuple(toks[1]).is_none() {
+                    return Err(err("expected version".into()));
+                }
+                floor = Some(toks[1].to_string());
+            }
+            "use" => {
+                let mut body: Vec<(usize, Vec<String>)> = Vec::new();
+                if toks.len() == 2 && toks[1] == "(" {
+                    let mut closed = false;
+                    for (ln2, raw2) in lines.by_ref() {
+                        let t2 = strip_comment(raw2).trim();
+                        if t2.is_empty() {
+                            continue;
+                        }
+                        if t2 == ")" {
+                            closed = true;
+                            break;
+                        }
+                        body.push((ln2 + 1, t2.split_whitespace().map(String::from).collect()));
+                    }
+                    if !closed {
+                        return Err(err("unterminated use block".into()));
+                    }
+                } else {
+                    body.push((line_no, toks[1..].iter().map(|s| s.to_string()).collect()));
+                }
+                for (bln, bt) in body {
+                    if bt.len() != 1 {
+                        return Err(format!("oxl.work:{bln}: expected `dir`"));
+                    }
+                    dirs.push((bln, bt[0].clone()));
+                }
+            }
+            _ => return Err(err(format!("unknown directive \"{}\"", toks[0]))),
+        }
+    }
+    if floor.is_none() {
+        return Err("oxl.work: missing oxlwork directive".into());
+    }
+    Ok((floor, dirs))
+}
+
 /// the module context for a compile entry: nearest oxl.mod above
 /// `start`, parsed and floor-checked. Ok(None) = module-off mode —
 /// only `std/` imports resolve. Err = manifest found but malformed or
@@ -308,7 +396,98 @@ fn mod_ctx(start: &Path, loud: bool) -> Result<Option<ModCtx>, ()> {
         modcache: modcache_dir(),
         sums,
         selected: Vec::new(),
+        work_root: None,
+        uses: Vec::new(),
     };
+    // a found oxl.work extends — does not replace — module discovery:
+    // its `use`d trees resolve ahead of requires/cache. File mode never
+    // reaches here (no oxl.mod above the entry → work file ignored).
+    ctx.work_root = find_work(start);
+    if let Some(wr) = ctx.work_root.clone() {
+        let wpath = wr.join("oxl.work");
+        let wtext = match std::fs::read_to_string(&wpath) {
+            Ok(t) => t,
+            Err(e) => {
+                if loud {
+                    eprintln!("error [check] {}: {e}", wpath.display());
+                }
+                return Err(());
+            }
+        };
+        let (wfloor, wdirs) = match parse_work(&wtext) {
+            Ok(w) => w,
+            Err(e) => {
+                if loud {
+                    eprintln!("error [check] {e}");
+                }
+                return Err(());
+            }
+        };
+        if let Some(fv) = wfloor {
+            let cur = ver_tuple(OXL_VERSION).unwrap_or((0, 0, 0));
+            if ver_tuple(&fv).map_or(false, |f| f > cur) {
+                if loud {
+                    eprintln!("error [check] oxl.work: requires oxlwork {fv}, toolchain is {}", tool_ver());
+                }
+                return Err(());
+            }
+        }
+        let root_canon = ctx
+            .root
+            .canonicalize()
+            .unwrap_or_else(|_| ctx.root.clone());
+        for (lineno, arg) in wdirs {
+            // `use` dirs anchor at the work file's dir, not the module root
+            let dir = {
+                let d = PathBuf::from(&arg);
+                if d.is_absolute() {
+                    d
+                } else {
+                    wr.join(&d)
+                }
+            };
+            let canon = dir.canonicalize().unwrap_or_else(|_| dir.clone());
+            if ctx.uses.iter().any(|(_, ud)| *ud == canon) {
+                if loud {
+                    eprintln!("error [check] oxl.work:{lineno}: duplicate use \"{arg}\"");
+                }
+                return Err(());
+            }
+            let mpath2 = dir.join("oxl.mod");
+            let mtext = std::fs::read_to_string(&mpath2).unwrap_or_default();
+            if !mpath2.is_file() {
+                if loud {
+                    eprintln!("error [check] oxl.work:{lineno}: use dir \"{arg}\" has no oxl.mod");
+                }
+                return Err(());
+            }
+            match parse_manifest(&mtext) {
+                Err(e) => {
+                    if loud {
+                        eprintln!("error [check] oxl.work:{lineno}: use dir \"{arg}\": {e}");
+                    }
+                    return Err(());
+                }
+                Ok((mp, _, _, _)) => {
+                    // `use ./` at the main module's own root — same
+                    // tree, nothing to add
+                    if canon == root_canon {
+                        continue;
+                    }
+                    // a different tree declaring an already-seen path —
+                    // another `use` or the main module's own — is an
+                    // ambiguity, not shadowing
+                    if mp == ctx.path || ctx.uses.iter().any(|(up, _)| *up == mp) {
+                        if loud {
+                            eprintln!("error [check] oxl.work:{lineno}: duplicate use module \"{mp}\"");
+                        }
+                        return Err(());
+                    }
+                    ctx.uses.push((mp, canon));
+                }
+            }
+        }
+    }
     ctx.selected = build_list(&ctx);
     Ok(Some(ctx))
 }
@@ -377,6 +556,19 @@ fn build_list(ctx: &ModCtx) -> Vec<(String, String)> {
     for (mp, mv) in &ctx.requires {
         offer(&mut sel, &mut queue, mp, mv);
     }
+    // `use`d modules contribute their own requirements to selection —
+    // go.work semantics: the workspace build list covers every tree
+    for (_, udir) in &ctx.uses {
+        let Ok(text) = std::fs::read_to_string(udir.join("oxl.mod")) else {
+            continue;
+        };
+        let Ok((_, _, reqs, _)) = parse_manifest(&text) else {
+            continue;
+        };
+        for (mp, mv) in reqs {
+            offer(&mut sel, &mut queue, &mp, &mv);
+        }
+    }
     while let Some((mp, mv)) = queue.pop_front() {
         if !seen.insert((mp.clone(), mv.clone())) {
             continue;
@@ -420,16 +612,75 @@ fn selected_ver<'a>(ctx: &'a ModCtx, mp: &str) -> Option<&'a str> {
         .or_else(|| ctx.requires.iter().find(|(p, _)| p == mp).map(|(_, v)| v.as_str()))
 }
 
-/// resolve an import path to a package directory under the module
-/// rules: `std/` from beside the toolchain executable, then the main
-/// module's own path, then the longest require-prefix match through
-/// replace or the module cache. NotFound = cannot find.
-fn resolve_pkg(ctx: Option<&ModCtx>, entry: &Path, imp: &str) -> Resolve {
+/// resolve an import path to a package directory. Module mode runs one
+/// longest-path-prefix competition over every known tree — the main
+/// module, `use`d workspace trees, then requires — ties keep the
+/// earlier candidate (a `use`d tree shadows a require on the same
+/// path; the require still documents the published floor). `std/` is
+/// the final anchor: toolchain std beside the exe, or the entry's
+/// ancestors for a scratch-built self-hosted checker. NotFound =
+/// cannot find.
+fn resolve_pkg<'m>(ctx: Option<&'m ModCtx>, entry: &Path, imp: &str) -> Resolve {
+    enum Src<'a> {
+        Main,
+        Use(&'a str, &'a Path),
+        Req(&'a str),
+    }
+    if let Some(ctx) = ctx {
+        let mut best_len = 0usize;
+        let mut best: Option<Src> = None;
+        let offer = |imp: &str, mp: &str, cand: Src<'m>, blen: &mut usize, best: &mut Option<Src<'m>>| {
+            if (imp == mp || imp.starts_with(&format!("{mp}/"))) && mp.len() > *blen {
+                *blen = mp.len();
+                *best = Some(cand);
+            }
+        };
+        offer(imp, &ctx.path, Src::Main, &mut best_len, &mut best);
+        for (mp, dir) in &ctx.uses {
+            offer(imp, mp, Src::Use(mp, dir), &mut best_len, &mut best);
+        }
+        for (mp, _) in &ctx.requires {
+            offer(imp, mp, Src::Req(mp), &mut best_len, &mut best);
+        }
+        match best {
+            Some(Src::Main) => {
+                let rest = imp[ctx.path.len()..].trim_start_matches('/');
+                let p = ctx.root.join(rest);
+                return if p.is_dir() {
+                    Resolve::Dir(p)
+                } else {
+                    Resolve::NotFound
+                };
+            }
+            Some(Src::Use(mp, dir)) => {
+                let rest = imp[mp.len()..].trim_start_matches('/');
+                let p = dir.join(rest);
+                return if p.is_dir() {
+                    Resolve::Dir(p)
+                } else {
+                    Resolve::NotFound
+                };
+            }
+            Some(Src::Req(mp)) => {
+                let rest = imp[mp.len()..].trim_start_matches('/');
+                let v = selected_ver(ctx, mp).unwrap_or("");
+                match module_dir(ctx, mp, v) {
+                    Ok(Some(base)) => {
+                        let d = base.join(rest);
+                        return if d.is_dir() {
+                            Resolve::Dir(d)
+                        } else {
+                            Resolve::NotFound
+                        };
+                    }
+                    Ok(None) => return Resolve::Missing(format!("{mp}@{v}")),
+                    Err(e) => return Resolve::Tampered(e),
+                }
+            }
+            None => {}
+        }
+    }
     if let Some(rest) = imp.strip_prefix("std/") {
-        // toolchain std ships beside the binary; a self-hosted checker
-        // compiled into a scratch dir still finds the SOURCE tree's
-        // std via the entry package's ancestors (only ever the root —
-        // dep files can't shadow std through it)
         for base in [
             std::env::current_exe().ok(),
             Some(entry.to_path_buf()),
@@ -445,45 +696,6 @@ fn resolve_pkg(ctx: Option<&ModCtx>, entry: &Path, imp: &str) -> Resolve {
                 }
                 d = x.parent().map(Path::to_path_buf);
             }
-        }
-        return Resolve::NotFound;
-    }
-    let Some(ctx) = ctx else {
-        return Resolve::NotFound;
-    };
-    if imp == ctx.path || imp.starts_with(&format!("{}/", ctx.path)) {
-        let rest = imp[ctx.path.len()..].trim_start_matches('/');
-        let p = ctx.root.join(rest);
-        return if p.is_dir() {
-            Resolve::Dir(p)
-        } else {
-            Resolve::NotFound
-        };
-    }
-    // requires — longest path prefix wins (module-path boundaries only);
-    // the build list's selection decides which version dir resolves
-    let mut best: Option<&String> = None;
-    for (mp, _) in &ctx.requires {
-        if (imp == *mp || imp.starts_with(&format!("{mp}/")))
-            && best.map_or(true, |b| mp.len() > b.len())
-        {
-            best = Some(mp);
-        }
-    }
-    if let Some(mp) = best {
-        let rest = imp[mp.len()..].trim_start_matches('/');
-        let v = selected_ver(ctx, mp).unwrap_or("");
-        match module_dir(ctx, mp, v) {
-            Ok(Some(base)) => {
-                let d = base.join(rest);
-                return if d.is_dir() {
-                    Resolve::Dir(d)
-                } else {
-                    Resolve::NotFound
-                };
-            }
-            Ok(None) => return Resolve::Missing(format!("{mp}@{v}")),
-            Err(e) => return Resolve::Tampered(e),
         }
     }
     Resolve::NotFound
@@ -2102,6 +2314,8 @@ fn mk_ctx(root: &Path, mtext: &str, sums: Vec<modcache::SumLine>) -> Result<ModC
         modcache: modcache_dir(),
         sums,
         selected: Vec::new(),
+        work_root: None,
+        uses: Vec::new(),
     };
     ctx.selected = build_list(&ctx);
     Ok(ctx)

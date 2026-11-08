@@ -545,9 +545,8 @@ fn rec_local(ck: mut Ck, lo: int, hi: int, n: str, t: int, env: ref Env) {
 // member, not the receiver): `x.m` -> m's span, `f` -> f's span
 fn member_span(f: ref parser.Node) -> own Span {
     match f {
-        parser.Node.Field{obj, name} => {
-            lo := parser.nhi(obj) + 1
-            return new(Span{lo: lo, hi: lo + len(name)})
+        parser.Node.Field{name, hi} => {
+            return new(Span{lo: hi - len(name), hi: hi})
         }
         parser.Node.Name{n, lo, hi} => {
             d := last_dot(n)
@@ -2597,14 +2596,17 @@ fn expr(ck: mut Ck, e: ref parser.Node, env: mut Env) -> int {
     if e == nil {
         return t_unk(ck)
     }
-    ck.dpos = parser.nlo(e)
+    elo := parser.nlo(e)
+    if elo >= 0 {
+        ck.dpos = elo
+    }
     t := match e {
         parser.Node.JInt(_) => t_int(ck)
         parser.Node.JFloat(_) => tk(ck, k_float())
         parser.Node.JStr(_) => t_str(ck)
         parser.Node.Name{n, lo, hi} => ident(ck, n, lo, hi, env)
         parser.Node.Call{f, args} => call(ck, f, args, env)
-        parser.Node.Field{obj, name} => field_expr(ck, obj, name, env)
+        parser.Node.Field{obj, name, hi} => field_expr(ck, obj, name, hi, env)
         parser.Node.Un{op, e} => un_expr(ck, op, e, env)
         parser.Node.Bin{op, l, r} => bin_expr(ck, op, l, r, env)
         parser.Node.Lit{obj, fields} => lit_expr(ck, obj, fields, env)
@@ -2675,7 +2677,7 @@ fn ident(ck: mut Ck, n: str, lo: int, hi: int, env: mut Env) -> int {
     return t_unk(ck)
 }
 
-fn field_expr(ck: mut Ck, obj: ref parser.Node, name: str, env: mut Env) -> int {
+fn field_expr(ck: mut Ck, obj: ref parser.Node, name: str, fhi: int, env: mut Env) -> int {
     // unit enum variant `E.V` — obj flattens to a path, not a value
     base := callee_name(obj)
     if len(base) > 0 {
@@ -2711,7 +2713,7 @@ fn field_expr(ck: mut Ck, obj: ref parser.Node, name: str, env: mut Env) -> int 
         hd = substr(base, 0, hi)
     }
     if len(base) > 0 && len(alias_stem(ck, hd)) > 0 {
-        return ident(ck, base + "." + name, parser.nlo(obj), parser.nhi(obj) + 1 + len(name), env)
+        return ident(ck, base + "." + name, parser.nlo(obj), fhi, env)
     }
     t := expr(ck, obj, env)
     sn := ""
@@ -2743,7 +2745,7 @@ fn field_expr(ck: mut Ck, obj: ref parser.Node, name: str, env: mut Env) -> int 
         diag(ck, "type", "`" + sn + "` has no field `" + name + "`")
         return t_unk(ck)
     }
-    mlo := parser.nhi(obj) + 1
+    mlo := fhi - len(name)
     rec_use(ck, mlo, mlo + len(name), sn + "." + name)
     return ft
 }
@@ -3880,7 +3882,10 @@ fn block_node(ck: mut Ck, body: ref parser.Node, env: mut Env) {
 
 fn stmt(ck: mut Ck, s: ref parser.Node, env: mut Env) {
     if s != nil {
-        ck.dpos = parser.nlo(s)
+        slo := parser.nlo(s)
+        if slo >= 0 {
+            ck.dpos = slo
+        }
     }
     match s {
         parser.Node.Let{name, ty, init, lo, hi} => {

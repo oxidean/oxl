@@ -60,7 +60,7 @@ from the repository (a Rust toolchain plus `cc`):
 
 ```bash
 git clone https://github.com/oxidean/oxl && cd oxl
-git checkout "$(git describe --tags --abbrev=0)"   # latest release tag (or stay on main)
+git checkout "$(gh release view --json tagName --jq .tagName)"   # latest published release (or stay on main)
 cargo build --release --manifest-path oxl/Cargo.toml
 # binary: oxl/target/release/oxl; put it on PATH with std/ alongside
 ```

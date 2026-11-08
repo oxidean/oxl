@@ -24,6 +24,13 @@
 #include <unistd.h>
 #endif
 #include <sys/stat.h>
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#endif
+#ifdef _WIN32
+#include <aclapi.h>
+#include <sddl.h>
+#endif
 
 #define ARENA_CAP (1 << 20)
 
@@ -2151,6 +2158,17 @@ OxlStr rt_ftoa(double v) {
     snprintf(p, 40, "%.15g", v);
     return rt_str(p);
 }
+/* %.*g at a caller-chosen precision — fmt's float printer walks
+   precisions to find the shortest repr that round-trips (Rust
+   Display semantics), which the fixed %.15g of rt_ftoa can't reach */
+OxlStr rt_ftoa_p(double v, int64_t prec) {
+    int n = snprintf(NULL, 0, "%.*g", (int)prec, v);
+    if (n < 0) return rt_str("");          /* snprintf size failure (huge prec / alloc) */
+    char *p = rt_alloc(n + 1);
+    int w = snprintf(p, n + 1, "%.*g", (int)prec, v);
+    if (w < 0) { p[0] = 0; return rt_str(""); }
+    return rt_str(p);
+}
 
 void *rt_mkbuf(int64_t size) { return rt_alloc_own(size); }
 OxlStr rt_bufstr(void *buf, int64_t n) {
@@ -2225,6 +2243,57 @@ OxlStr rt_fullpath(OxlStr path) {
     out[n] = 0;
     free(r);
     return (OxlStr){ out, (int64_t)n };
+}
+
+/* exepath: the running binary's canonical path — argv(0) is a bare
+ * name under PATH lookup, so exe-anchored walks (driver's runtime/
+ * probe, checker's std/ probe) resolve here first, mirroring the
+ * seed's std::env::current_exe */
+OxlStr rt_exepath(void) {
+#if defined(_WIN32)
+    DWORD cap = 512;
+    char *buf = rt_alloc(cap);
+    DWORD n;
+    for (;;) {
+        n = GetModuleFileNameA(NULL, buf, cap);
+        if (n == 0) return rt_str("");
+        if (n < cap - 1) break;
+        cap *= 2;
+        buf = rt_alloc(cap);
+    }
+    for (DWORD i = 0; i < n; i++) buf[i] = buf[i] == '\\' ? '/' : buf[i];
+    return (OxlStr){ buf, (int64_t)n };
+#elif defined(__APPLE__)
+    uint32_t cap = 4096;
+    char *buf = rt_alloc(cap);
+    if (_NSGetExecutablePath(buf, &cap) != 0) {
+        buf = rt_alloc(cap);
+        if (_NSGetExecutablePath(buf, &cap) != 0) return rt_str("");
+    }
+    /* the returned path may carry symlinks — realpath it so the
+     * exe-walk anchors at the true install dir */
+    char *r = realpath(buf, NULL);
+    if (!r) return (OxlStr){ buf, (int64_t)strlen(buf) };
+    size_t n = strlen(r);
+    char *out = rt_alloc((int64_t)n + 1);
+    memcpy(out, r, n);
+    out[n] = 0;
+    free(r);
+    return (OxlStr){ out, (int64_t)n };
+#else
+    ssize_t cap = 4096;
+    char *buf = rt_alloc(cap);
+    ssize_t n = readlink("/proc/self/exe", buf, (size_t)cap - 1);
+    if (n <= 0) return rt_str("");
+    if (n >= cap - 1) {
+        cap = (ssize_t)n + 1;
+        buf = rt_alloc(cap);
+        n = readlink("/proc/self/exe", buf, (size_t)cap - 1);
+        if (n <= 0) return rt_str("");
+    }
+    buf[n] = 0;
+    return (OxlStr){ buf, (int64_t)n };
+#endif
 }
 
 OxlStr rt_readfile(OxlStr path) {
@@ -2333,6 +2402,161 @@ int64_t rt_open_write(OxlStr path) {
     int fd = open(cp, O_WRONLY | O_CREAT | O_TRUNC, 0666);
 #endif
     return fd < 0 ? -(int64_t)errno : fd;
+}
+
+/* open_write_mode: exclusive create under a caller-chosen access
+ * mode — POSIX creates with (mode|0200)&0777, umask-masked by
+ * open(2) per the usual create contract. Owner-write is forced on
+ * so a read-only source's stage still accepts its staged content;
+ * the caller lands the real mode after the write completes.
+ * Windows has no DACL translation for a POSIX mode, so the stage is
+ * always born under an owner-only DACL regardless of mode — the
+ * read-only attribute rides in via rt_clone_attrs. `src` names the
+ * file being replaced: on Windows an EFS-encrypted
+ * source puts FILE_ATTRIBUTE_ENCRYPTED on the create so the stage
+ * is born encrypted — a default create would leave content written
+ * plaintext, and the rename would carry the loss onto the source.
+ * EFS needs NTFS, so an encrypted source implies the same-volume
+ * stage can take the attribute; an attribute read failure fails the
+ * open rather than silently creating the stage unencrypted.
+ * O_EXCL/_O_EXCL make the create atomic: an occupied pathname fails
+ * -EEXIST instead of truncating through a symlink planted between a
+ * caller's existence check and the open. */
+int64_t rt_open_write_mode(OxlStr path, int64_t mode, OxlStr src) {
+    if (path.n > 0 && memchr(path.p, 0, (size_t)path.n)) return -EINVAL;
+    if (src.n > 0 && memchr(src.p, 0, (size_t)src.n)) return -EINVAL;
+    const char *cp = rt_cstr(path);
+#ifdef _WIN32
+    (void)mode;
+    const char *csp = rt_cstr(src);
+    DWORD sattr = GetFileAttributesA(csp);
+    if (sattr == INVALID_FILE_ATTRIBUTES) {
+        DWORD se = GetLastError();
+        return -((int64_t)se | RT_GLE_TAG);
+    }
+    DWORD cflags = FILE_ATTRIBUTE_NORMAL;
+    if (sattr & FILE_ATTRIBUTE_ENCRYPTED) cflags = FILE_ATTRIBUTE_ENCRYPTED;
+    /* Born restrictive: an owner-only DACL on the staging file
+     * closes the window where inherited parent ACEs could expose
+     * staged contents before the caller's rt_clone_attrs carries the
+     * source DACL across. CREATE_NEW keeps the exclusive-create
+     * contract; share mode 0 holds the stage closed to other opens
+     * for the write's duration. "OW" is the owner-rights SID — the
+     * creating account keeps full access on every setup. */
+    SECURITY_ATTRIBUTES sa;
+    PSECURITY_DESCRIPTOR rsd = NULL;
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = FALSE;
+    sa.lpSecurityDescriptor = NULL;
+    /* Fail closed: a stage created under default security would
+     * reopen the inherited-ACE window this create exists to close. */
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorA(
+            "D:P(A;;GA;;;OW)", SDDL_REVISION_1, &rsd, NULL)) {
+        DWORD ce = GetLastError();
+        return ce ? -((int64_t)ce | RT_GLE_TAG) : -(int64_t)EACCES;
+    }
+    sa.lpSecurityDescriptor = rsd;
+    /* GENERIC_WRITE alone denies SetSecurityInfo — the stage's
+     * handle must also carry WRITE_DAC|WRITE_OWNER so the caller's
+     * rt_clone_attrs can land the source DACL/owner. The stage is
+     * created by us, so the rights are granted. */
+    HANDLE h = CreateFileA(cp, GENERIC_WRITE | WRITE_DAC | WRITE_OWNER,
+                           0, &sa, CREATE_NEW, cflags, NULL);
+    if (rsd) LocalFree((HLOCAL)rsd);
+    if (h == INVALID_HANDLE_VALUE) {
+        DWORD e = GetLastError();
+        return e == ERROR_FILE_EXISTS
+                   ? -(int64_t)EEXIST
+                   : -((int64_t)e | RT_GLE_TAG);
+    }
+    int fd = _open_osfhandle((intptr_t)h, _O_WRONLY | _O_BINARY);
+    if (fd < 0) { CloseHandle(h); return -(int64_t)EIO; }
+    return fd;
+#else
+    /* Caller-chosen create mode, umask-masked by open(2) itself.
+     * fmt -w passes 0600: the stage carries the creator's owner and
+     * group until rt_clone_attrs applies the source's, and 0600
+     * keeps staged contents private for that window regardless of
+     * how permissive the source's mode is. Owner-write is forced
+     * so a read-only source's stage still accepts its content. */
+    (void)src;
+    int fd = open(cp, O_WRONLY | O_CREAT | O_EXCL | O_TRUNC,
+                  (int)(mode | 0200) & 0777);
+    return fd < 0 ? -(int64_t)errno : fd;
+#endif
+}
+
+/* clone_attrs: carry the *open* source's security onto the *open*
+ * stage — a staged replace (fmt -w) must clone attrs from the same
+ * file it read, not whatever the source path resolves to later:
+ * fstat/fchown/fchmod close the check-to-use race where a swapped
+ * source in a shared directory would lend the stage a
+ * replacement's owner/group. POSIX fchown lands owner+group first,
+ * then fchmod the source mode — the window between them grants
+ * nothing beyond the source owner's access, and a caller without
+ * privilege to restore a foreign owner/group fails here rather
+ * than silently re-owning the file. Windows works the descriptors'
+ * handles: GetSecurityInfo/SetSecurityInfo carry owner and DACL in
+ * one call — a NULL source DACL (world access) is propagated as a
+ * NULL DACL, and SE_DACL_PROTECTED travels with it so dst doesn't
+ * keep inheriting parent ACEs — and the read-only attribute rides
+ * over via FILE_BASIC_INFO with times pinned to -1 (unchanged). */
+int64_t rt_clone_attrs(int64_t sfd, int64_t dfd) {
+#ifdef _WIN32
+    HANDLE sh = (HANDLE)_get_osfhandle((int)sfd);
+    HANDLE dh = (HANDLE)_get_osfhandle((int)dfd);
+    if (sh == INVALID_HANDLE_VALUE || dh == INVALID_HANDLE_VALUE)
+        return -(int64_t)EBADF;
+    PSID owner = NULL;
+    PACL dacl = NULL;
+    PSECURITY_DESCRIPTOR sd = NULL;
+    DWORD r = GetSecurityInfo(sh, SE_FILE_OBJECT,
+                              OWNER_SECURITY_INFORMATION |
+                              DACL_SECURITY_INFORMATION,
+                              &owner, NULL, &dacl, NULL, &sd);
+    if (r != ERROR_SUCCESS) return -((int64_t)r | RT_GLE_TAG);
+    int64_t rc = 0;
+    SECURITY_DESCRIPTOR_CONTROL ctl = 0;
+    DWORD rev = 0;
+    if (!GetSecurityDescriptorControl(sd, &ctl, &rev)) {
+        rc = RT_GLE();
+    } else {
+        DWORD prot = (ctl & SE_DACL_PROTECTED)
+                         ? PROTECTED_DACL_SECURITY_INFORMATION
+                         : UNPROTECTED_DACL_SECURITY_INFORMATION;
+        r = SetSecurityInfo(dh, SE_FILE_OBJECT,
+                            OWNER_SECURITY_INFORMATION |
+                            DACL_SECURITY_INFORMATION | prot,
+                            owner, NULL, dacl, NULL);
+        if (r != ERROR_SUCCESS) rc = -((int64_t)r | RT_GLE_TAG);
+    }
+    if (sd) LocalFree((HLOCAL)sd);
+    if (rc != 0) return rc;
+    FILE_BASIC_INFO sbi;
+    if (!GetFileInformationByHandleEx(sh, FileBasicInfo, &sbi,
+                                      sizeof(sbi)))
+        return RT_GLE();
+    FILE_BASIC_INFO dbi;
+    /* -1 in a FILE_BASIC_INFO time member leaves the value
+     * unchanged — only FileAttributes is carried */
+    dbi.CreationTime.QuadPart = dbi.LastAccessTime.QuadPart =
+        dbi.LastWriteTime.QuadPart = dbi.ChangeTime.QuadPart = -1;
+    dbi.FileAttributes = sbi.FileAttributes;
+    if (!SetFileInformationByHandle(dh, FileBasicInfo, &dbi,
+                                    sizeof(dbi)))
+        return RT_GLE();
+    return 0;
+#else
+    (void)sfd;
+    (void)dfd;
+    struct stat ss;
+    if (fstat((int)sfd, &ss) != 0) return -(int64_t)errno;
+    if (fchown((int)dfd, ss.st_uid, ss.st_gid) != 0)
+        return -(int64_t)errno;
+    if (fchmod((int)dfd, ss.st_mode & 0777) != 0)
+        return -(int64_t)errno;
+    return 0;
+#endif
 }
 
 /* the read window is the slice's LEN — `b[:n]` sub-slices keep the

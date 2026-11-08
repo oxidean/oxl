@@ -2,9 +2,11 @@
 
 oxl is a young language — the toolchain works end to end and the
 compiler's own components are written in oxl, but expect rough edges.
-The seed compiler (in `oxl/`, Rust) emits C11 through `runtime/` into a
-native binary; the self-hosted components under `bootstrap/` must stay
-byte-for-byte in step with it.
+The product driver (`cmd/oxl`, written in `.oxl`) emits C11 through
+`runtime/` into a native binary; the Rust crate in `oxl/` is the seed
+toolchain that bootstraps it, and the self-hosted components under
+`bootstrap/` must stay byte-for-byte in step with the seed's compiler
+passes.
 
 ## Build & test
 
@@ -21,7 +23,10 @@ so have Python 3 on `PATH` before running the suite.
 
 ## Layout
 
-- `oxl/` — the seed compiler: `lexer → parser → check → codegen(C) → cc`
+- `cmd/oxl/` — the product toolchain driver, written in `.oxl`:
+  `build`/`run`/`test`/`fmt`/`doc`/`get`/`mod`/`list`/`lsp`
+- `oxl/` — the seed compiler (Rust), the bootstrap input only:
+  `lexer → parser → check → codegen(C) → cc`
 - `runtime/` — rt.h/rt.c: arenas, ownership checks, scopes, pool executor
 - `std/` — standard library, written in the language (`std/strings`,
   `std/io`, `std/net/http`, …)

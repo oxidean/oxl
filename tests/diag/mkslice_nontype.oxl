@@ -1,0 +1,12 @@
+package main
+
+struct P { x: int }
+
+fn f() -> own P {
+    return new(P)
+}
+
+fn main() {
+    // non-flattenable Field arg — the expr path, not a type name
+    s := mkslice(f().x, 4)
+}

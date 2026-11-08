@@ -1,12 +1,12 @@
 package main
 
-// oxl — the toolchain driver, in .oxl (toolchain-in-oxl stage T2).
-// Ports the seed driver's build/run/test/list from oxl/src/main.rs:
-// argv dispatch, the pkg-args/file-list rule, compile orchestration
-// over bootstrap/check + bootstrap/codegen, scratch-dir emission, and
-// the cc invocation with its proven flag order. fmt/doc/get/mod/lsp
-// land in T3–T5 — they dispatch here as stubs so the command surface
-// is already shaped like the seed's.
+// oxl — the toolchain driver, in .oxl (toolchain-in-oxl stages T2–T3).
+// Ports the seed driver's build/run/test/list/fmt/doc from
+// oxl/src/main.rs + fmt.rs: argv dispatch, the pkg-args/file-list
+// rule, compile orchestration over bootstrap/check + bootstrap/codegen,
+// scratch-dir emission, and the cc invocation with its proven flag
+// order. fmt/doc live in fmt.oxl (its own span-faithful lex+parse —
+// the shared AST carries no spans). get/mod/lsp land in T4–T5.
 import "oxl/bootstrap/check"
 
 import "oxl/bootstrap/codegen"
@@ -27,6 +27,11 @@ extern fn rt_mkdir(path: str) -> int
 extern fn rt_errstr(code: int) -> str
 
 extern fn rt_is_windows() -> int
+
+// the running binary's canonical path — PATH lookup hands us a bare
+// argv(0), so exe-anchored probes (runtime/, std/) must anchor here
+// to find a shipped toolchain from another project
+extern fn rt_exepath() -> str
 
 extern fn rt_open_write(path: str) -> int
 
@@ -215,7 +220,20 @@ fn runtime_at(base: str) -> str {
 }
 
 fn runtime_dir(entry: str) -> str {
-    d := runtime_at(check.canon_or(check.dir_of(argv(0))))
+    // exe-dir probe first — a PATH-invoked oxl finds its shipped
+    // runtime/. Skipped when exepath fails: dir_of("") is "." and
+    // canon_or would silently anchor the probe at the cwd.
+    d := ""
+    exe := rt_exepath()
+    if len(exe) > 0 {
+        d = runtime_at(check.canon_or(check.dir_of(exe)))
+    }
+    // bare argv(0) (PATH invocation) carries no dir component —
+    // dir_of yields "." which canon_or turns into the cwd
+    av := argv(0)
+    if len(d) == 0 && strings.contains(av, "/") {
+        d = runtime_at(check.canon_or(check.dir_of(av)))
+    }
     if len(d) == 0 {
         d = runtime_at(check.canon_or(entry))
     }
@@ -583,16 +601,16 @@ fn main() {
         cmd_test()
     } else if c == "list" {
         cmd_list()
+    } else if c == "fmt" {
+        cmd_fmt()
+    } else if c == "doc" {
+        cmd_doc()
     } else if c == "get" {
         cmd_get()
     } else if c == "mod" {
         cmd_mod()
     } else if c == "lsp" {
         cmd_lsp()
-    } else if c == "fmt" || c == "doc" {
-        // T3 fills these — the dispatch is shaped for them
-        eprintln("oxl " + c + ": not yet implemented in cmd/oxl")
-        exit(2)
     } else {
         eprintln("unknown command `" + c + "`")
         exit(2)

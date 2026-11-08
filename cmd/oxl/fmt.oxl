@@ -1,0 +1,3742 @@
+package main
+
+// cmd/oxl/fmt.oxl — `oxl fmt` + `oxl doc` in .oxl (toolchain-in-oxl T3).
+//
+// Ports the seed's fmt.rs pretty-printer and main.rs's cmd_doc. The
+// shared bootstrap/parser Node AST carries no byte spans, so fmt runs
+// its own seed-faithful lex + parse here: tokens hold exact byte
+// offsets and the AST mirrors ast.rs's span-join conventions (postfix
+// spans overshoot into the next token; structlit/match/closure keep
+// their head token's span; statements and items keep their first
+// token's lo). The formatter's comment re-attachment, blank-line
+// preservation, and brace matching all measure off those spans — get
+// them right and the emitter is a line-for-line port.
+import "std/errors"
+
+import "std/io"
+
+import "std/os"
+
+import "std/strings"
+
+// %.*g at a caller-chosen precision — the float printer walks
+// precisions for the shortest repr that round-trips (seed Display
+// semantics), which fixed-precision ftoa can't reach
+extern fn rt_ftoa_p(v: float, prec: int) -> str
+
+// mkbuf frees itself into the copied string via bufstr
+extern fn rt_free(p: own void)
+
+// open_write_mode creates under (mode|0200)&0777, umask-masked —
+// fmt -w passes 0600 so the stage is born restricted and never
+// sits readable looser than the source it will replace. It takes
+// the source path too: on Windows a source carrying EFS
+// (FILE_ATTRIBUTE_ENCRYPTED) makes the create encrypt the stage at
+// birth — content never lands plaintext, and the attribute
+// survives the rename that replaces the source
+extern fn rt_open_write_mode(path: str, mode: int, src: str) -> int
+
+// clone_attrs carries the *open* source's security onto the *open*
+// stage — owner+group+mode via fstat/fchown/fchmod on POSIX,
+// owner+DACL+FileAttributes via Get/SetSecurityInfo +
+// FILE_BASIC_INFO on Windows. Descriptor-bound, so the attrs clone
+// from the file that was read — path-based stat/chown would race a
+// source swap in a shared directory and lend the stage a
+// replacement's owner/group
+extern fn rt_clone_attrs(sfd: int, dfd: int) -> int
+
+extern fn rt_fd_write(fd: int, b: []byte) -> int
+
+extern fn rt_fd_close(fd: int) -> int
+
+// ---------- diagnostics ----------
+// the seed pushes lex+parse diagnostics and aborts fmt on the first
+// error; the fail/ok boundary itself is parity-relevant
+struct FDiag { lo: int, code: str, msg: str }
+
+// ---------- fmt tokens ----------
+// kind ints mirror lexlib: 0 eof 1 ident 2 kw 3 int 4 str 5 punct
+// 6 float. txt is the decoded value for str tokens, the digit text
+// (underscores stripped) for int/float, itoa(v) for char literals,
+// the lexeme otherwise
+struct FTok { kind: int, lo: int, hi: int, txt: str }
+
+struct FPar { toks: []FTok, src: str, i: int, nolit: int, diags: []FDiag }
+
+fn ferr(p: mut FPar, lo: int, code: str, msg: str) {
+    p.diags = push(p.diags, FDiag{lo: lo, code: code, msg: msg})
+}
+
+fn fis_alpha(c: int) -> bool {
+    return c >= 97 && c <= 122 || c >= 65 && c <= 90 || c == 95
+}
+
+fn fis_digit(c: int) -> bool {
+    return c >= 48 && c <= 57
+}
+
+fn futf8_len(b0: int) -> int {
+    if b0 < 128 {
+        return 1
+    }
+    if b0 < 224 {
+        return 2
+    }
+    if b0 < 240 {
+        return 3
+    }
+    return 4
+}
+
+fn futf8_val(src: str, i: int) -> int {
+    b0 := byteat(src, i)
+    if b0 < 128 {
+        return b0
+    }
+    if b0 < 224 {
+        return (b0 - 192) * 64 + (byteat(src, i + 1) - 128)
+    }
+    if b0 < 240 {
+        return (b0 - 224) * 4096 + (byteat(src, i + 1) - 128) * 64 + (byteat(src, i + 2) - 128)
+    }
+    return (b0 - 240) * 262144 + (byteat(src, i + 1) - 128) * 64 + (byteat(src, i + 2) - 128) * 64 + (byteat(src, i + 3) - 128)
+}
+
+// the seed's keyword set — wider than lexlib's (defer/select/enum/match
+// are keywords there)
+fn fis_kw(w: str) -> bool {
+    return w == "fn" || w == "struct" || w == "extern" || w == "return" || w == "if" || w == "else" || w == "for" || w == "let" || w == "scope" || w == "spawn" || w == "go" || w == "own" || w == "ref" || w == "mut" || w == "unsafe" || w == "nil" || w == "true" || w == "false" || w == "import" || w == "package" || w == "chan" || w == "break" || w == "defer" || w == "continue" || w == "interface" || w == "spawnBlocking" || w == "select" || w == "enum" || w == "match"
+}
+
+fn fstrip_us(s: str) -> str {
+    if find(s, "_") < 0 {
+        return s
+    }
+    out := ""
+    i := 0
+    for i < len(s) {
+        if byteat(s, i) != 95 {
+            out = out + substr(s, i, i + 1)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// `0x` + two-digit lowercase hex — the seed lexer's unexpected-byte text
+fn fhexbyte(c: int) -> str {
+    d := "0123456789abcdef"
+    hi := c / 16
+    return "0x" + substr(d, hi, hi + 1) + substr(d, c - hi * 16, c - hi * 16 + 1)
+}
+
+fn ftok_push(p: mut FPar, kind: int, lo: int, hi: int, txt: str) {
+    p.toks = push(p.toks, FTok{kind: kind, lo: lo, hi: hi, txt: txt})
+}
+
+// digits-only s fits i64? strip leading zeros first (Rust parse::<i64>
+// accepts them), then length-then-lexicographic compare against MAX
+fn fi64_ok(s: str) -> bool {
+    j := 0
+    for j + 1 < len(s) && byteat(s, j) == 48 {
+        j = j + 1
+    }
+    d := substr(s, j, len(s))
+    if len(d) > 19 {
+        return false
+    }
+    if len(d) == 19 && d > "9223372036854775807" {
+        return false
+    }
+    return true
+}
+
+// lexer.rs — same token boundaries and spans, comments skipped
+fn flex(p: mut FPar, src: str) {
+    i := 0
+    n := len(src)
+    for i < n {
+        c := byteat(src, i)
+        if c == 32 || c == 9 || c == 13 || c == 10 {
+            i = i + 1
+            continue
+        }
+        if c == 47 && i + 1 < n && byteat(src, i + 1) == 47 { // // comment
+            for i < n && byteat(src, i) != 10 {
+                i = i + 1
+            }
+            continue
+        }
+        if c == 47 && i + 1 < n && byteat(src, i + 1) == 42 { // /* ... */
+            lo := i
+            i = i + 2
+            for i + 1 < n && !(byteat(src, i) == 42 && byteat(src, i + 1) == 47) {
+                i = i + 1
+            }
+            if i + 1 >= n {
+                ferr(p, lo, "lex", "unterminated block comment")
+                i = n
+            } else {
+                i = i + 2
+            }
+            continue
+        }
+        if fis_digit(c) {
+            a := i
+            for i < n && (fis_digit(byteat(src, i)) || byteat(src, i) == 95) {
+                i = i + 1
+            }
+            isfloat := 0
+            if i < n && byteat(src, i) == 46 && i + 1 < n && fis_digit(byteat(src, i + 1)) {
+                i = i + 1
+                for i < n && fis_digit(byteat(src, i)) {
+                    i = i + 1
+                }
+                isfloat = 1
+            }
+            s := fstrip_us(substr(src, a, i))
+            if isfloat == 1 {
+                // Rust parse::<f64> never errors on this shape — huge
+                // decimals just become inf, and the token always lands
+                ftok_push(p, 6, a, i, s)
+            } else if fi64_ok(s) {
+                ftok_push(p, 3, a, i, s)
+            } else {
+                // a bad int pushes no token — the stream skips it
+                ferr(p, a, "lex", "integer literal out of range")
+            }
+            continue
+        }
+        if c == 34 { // "..."
+            a := i
+            i = i + 1
+            // decode into scratch: `+` concatenation is strcat-shaped
+            // and can't carry a decoded \0 byte through
+            buf := mkbuf(n)
+            sp := 0
+            closed := false
+            for i < n {
+                cb := byteat(src, i)
+                if cb == 34 {
+                    i = i + 1
+                    closed = true
+                    break
+                }
+                if cb == 92 && i + 1 < n {
+                    x := byteat(src, i + 1)
+                    if x == 110 {
+                        poke8(buf, sp, 10)
+                        sp = sp + 1
+                    } else if x == 116 {
+                        poke8(buf, sp, 9)
+                        sp = sp + 1
+                    } else if x == 114 {
+                        poke8(buf, sp, 13)
+                        sp = sp + 1
+                    } else if x == 48 {
+                        poke8(buf, sp, 0)
+                        sp = sp + 1
+                    } else {
+                        // `\x` decodes to the char itself — `\"`->`"`,
+                        // `\\`->`\`, anything else verbatim
+                        l := futf8_len(x)
+                        k := 0
+                        for k < l {
+                            poke8(buf, sp, byteat(src, i + 1 + k))
+                            sp = sp + 1
+                            k = k + 1
+                        }
+                    }
+                    i = i + 1 + futf8_len(x)
+                    continue
+                }
+                l := futf8_len(cb)
+                k := 0
+                for k < l {
+                    poke8(buf, sp, byteat(src, i + k))
+                    sp = sp + 1
+                    k = k + 1
+                }
+                i = i + l
+            }
+            if !closed {
+                ferr(p, a, "lex", "unterminated string")
+            }
+            s := bufstr(buf, sp)
+            rt_free(buf)
+            ftok_push(p, 4, a, i, s)
+            continue
+        }
+        if c == 39 { // 'c' — char literal, decoded scalar as an int token
+            a := i
+            i = i + 1
+            v := 0
+            count := 0
+            closed := false
+            for i < n {
+                cb := byteat(src, i)
+                if cb == 39 {
+                    i = i + 1
+                    closed = true
+                    break
+                }
+                if cb == 92 && i + 1 < n {
+                    x := byteat(src, i + 1)
+                    if x == 110 {
+                        v = 10
+                    } else if x == 116 {
+                        v = 9
+                    } else if x == 114 {
+                        v = 13
+                    } else if x == 48 {
+                        v = 0
+                    } else {
+                        v = futf8_val(src, i + 1)
+                    }
+                    i = i + 1 + futf8_len(x)
+                    count = count + 1
+                    continue
+                }
+                v = futf8_val(src, i)
+                i = i + futf8_len(cb)
+                count = count + 1
+            }
+            if !closed {
+                ferr(p, a, "lex", "unterminated char literal")
+            }
+            if closed && count != 1 {
+                ferr(p, a, "lex", "char literal must hold exactly one character")
+            }
+            ftok_push(p, 3, a, i, itoa(v))
+            continue
+        }
+        if fis_alpha(c) {
+            a := i
+            for i < n && (fis_alpha(byteat(src, i)) || fis_digit(byteat(src, i))) {
+                i = i + 1
+            }
+            w := substr(src, a, i)
+            if w == "_" {
+                ftok_push(p, 5, a, i, "_")
+            } else if fis_kw(w) {
+                ftok_push(p, 2, a, i, w)
+            } else {
+                ftok_push(p, 1, a, i, w)
+            }
+            continue
+        }
+        // two-char punct first
+        two := -1
+        if i + 1 < n {
+            two = byteat(src, i + 1)
+        }
+        if c == 58 && two == 61 || c == 61 && two == 61 || c == 33 && two == 61 || c == 60 && two == 61 || c == 62 && two == 61 || c == 38 && two == 38 || c == 124 && two == 124 || c == 45 && two == 62 || c == 61 && two == 62 {
+            ftok_push(p, 5, i, i + 2, substr(src, i, i + 2))
+            i = i + 2
+            continue
+        }
+        if c == 38 || c == 124 || c == 94 {
+            ftok_push(p, 5, i, i + 1, substr(src, i, i + 1))
+            i = i + 1
+            continue
+        }
+        if c == 40 || c == 41 || c == 123 || c == 125 || c == 91 || c == 93 || c == 44 || c == 58 || c == 59 || c == 46 || c == 61 || c == 43 || c == 45 || c == 42 || c == 47 || c == 37 || c == 60 || c == 62 || c == 33 {
+            ftok_push(p, 5, i, i + 1, substr(src, i, i + 1))
+            i = i + 1
+            continue
+        }
+        ferr(p, i, "lex", "unexpected byte " + fhexbyte(c))
+        i = i + 1
+    }
+    ftok_push(p, 0, n, n, "")
+}
+
+// ---------- parser cursor ----------
+fn fcur(p: mut FPar) -> int {
+    if p.i < len(p.toks) - 1 {
+        return p.i
+    }
+    return len(p.toks) - 1
+}
+
+fn fcurt(p: mut FPar) -> FTok {
+    return p.toks[fcur(p)]
+}
+
+fn fpeekt(p: mut FPar) -> FTok {
+    j := p.i + 1
+    if j > len(p.toks) - 1 {
+        j = len(p.toks) - 1
+    }
+    return p.toks[j]
+}
+
+fn fspan_lo(p: mut FPar) -> int {
+    return fcurt(p).lo
+}
+
+fn fspan_hi(p: mut FPar) -> int {
+    return fcurt(p).hi
+}
+
+fn fbump(p: mut FPar) -> FTok {
+    t := fcurt(p)
+    if p.i < len(p.toks) - 1 {
+        p.i = p.i + 1
+    }
+    return t
+}
+
+fn fat_eof(p: mut FPar) -> bool {
+    return fcurt(p).kind == 0
+}
+
+fn fat_p(p: mut FPar, w: str) -> bool {
+    t := fcurt(p)
+    return t.kind == 5 && t.txt == w
+}
+
+fn feat_p(p: mut FPar, w: str) -> bool {
+    if fat_p(p, w) {
+        fbump(p)
+        return true
+    }
+    return false
+}
+
+fn fat_kw(p: mut FPar, w: str) -> bool {
+    t := fcurt(p)
+    return t.kind == 2 && t.txt == w
+}
+
+fn feat_kw(p: mut FPar, w: str) -> bool {
+    if fat_kw(p, w) {
+        fbump(p)
+        return true
+    }
+    return false
+}
+
+fn fshow(p: mut FPar) -> str {
+    t := fcurt(p)
+    if t.kind == 0 {
+        return "end of file"
+    }
+    if t.kind == 4 {
+        return "`\"" + t.txt + "\"`"
+    }
+    return "`" + t.txt + "`"
+}
+
+fn fexpect_p(p: mut FPar, w: str, what: str) -> bool {
+    if feat_p(p, w) {
+        return true
+    }
+    ferr(p, fspan_lo(p), "parse", "expected " + what + ", found " + fshow(p))
+    return false
+}
+
+struct FName { v: str, lo: int }
+
+fn fident(p: mut FPar) -> own FName {
+    t := fcurt(p)
+    if t.kind == 1 {
+        fbump(p)
+        r := new(FName)
+        r.v = t.txt
+        r.lo = t.lo
+        return r
+    }
+    ferr(p, fspan_lo(p), "parse", "expected identifier, found " + fshow(p))
+    return nil
+}
+
+fn fskip_item(p: mut FPar) {
+    depth := 0
+    for !fat_eof(p) {
+        t := fcurt(p)
+        if fat_p(p, "{") {
+            depth = depth + 1
+        }
+        if fat_p(p, "}") {
+            if depth == 0 {
+                fbump(p)
+                return
+            }
+            depth = depth - 1
+        }
+        if t.kind == 2 && depth == 0 && (t.txt == "struct" || t.txt == "enum" || t.txt == "interface" || t.txt == "let" || t.txt == "extern" || t.txt == "fn" || t.txt == "import") {
+            return
+        }
+        fbump(p)
+    }
+}
+
+// ---------- AST (mirrors ast.rs; type text is already canonical) ----------
+struct FX { k: own FXK, lo: int, hi: int, kp: int, ka: int, kl: int, kop: int }
+
+struct XL { v: own FX, next: own XL }
+
+struct XField2 { name: str, e: own FX }
+
+struct XFL { v: own XField2, next: own XFL }
+
+struct SSL { v: str, next: own SSL }
+
+struct FBlock { stmts: own SL, lo: int, hi: int }
+
+struct SL { v: own FStmt, next: own SL }
+
+struct MArm { pat: own FPK, be: int, e: own FX, b: own FBlock, lo: int }
+
+struct MAL { v: own MArm, next: own MAL }
+
+struct SArm { kind: int, ch: own FX, bind: str, ms: own FX, body: own FBlock }
+
+struct SAL { v: own SArm, next: own SAL }
+
+struct FParam { name: str, ty: str, lo: int }
+
+struct PL { v: own FParam, next: own PL }
+
+struct FTP { name: str, con: str }
+
+struct TPL { v: own FTP, next: own TPL }
+
+struct FVar { name: str, vk: int, tys: own SSL, fields: own PL, lo: int }
+
+struct VL { v: own FVar, next: own VL }
+
+struct FMethod { name: str, params: own PL, retk: int, retty: str, lo: int }
+
+struct MSL { v: own FMethod, next: own MSL }
+
+struct FFn {
+    ex: int,
+    name: str,
+    recv: own FParam,
+    typarams: own TPL,
+    params: own PL,
+    retk: int,
+    retty: str,
+    body: own FBlock,
+    lo: int,
+}
+
+enum FXK {
+    XInt(str),
+    XFloat(str),
+    XStr(str),
+    XBool(bool),
+    XNil,
+    XIdent(str),
+    XCall { head: own FX, args: own XL },
+    XField { obj: own FX, name: str },
+    XIndex { obj: own FX, idx: own FX },
+    XSlice { obj: own FX, lo: own FX, hi: own FX },
+    XStructLit { name: str, fields: own XFL },
+    XBin { op: int, l: own FX, r: own FX },
+    XUn { op: int, e: own FX },
+    XAs { e: own FX, ty: str },
+    XMatch { e: own FX, arms: own MAL },
+    XClosure { params: own PL, body: own FBlock },
+    XTyLit(str),
+}
+
+enum FSK {
+    SLet { name: str, hasty: int, ty: str, init: own FX },
+    SLet2 { a: str, b: str, call: own FX },
+    SAssign { target: own FX, val: own FX },
+    SExpr { e: own FX },
+    SRet { vals: own XL },
+    SIf { cond: own FX, then: own FBlock, els: own FBlock },
+    SFor { cond: own FX, body: own FBlock },
+    SScope { body: own FBlock },
+    SUnsafe { body: own FBlock },
+    SSpawn { call: own FX, blocking: int },
+    SDefer { call: own FX },
+    SSelect { arms: own SAL },
+    SBreak,
+    SContinue,
+}
+
+enum FPK {
+    PWild,
+    PUnit { path: str },
+    PPos { path: str, binds: own SSL },
+    PNamed { path: str, binds: own SSL },
+    PLit { e: own FX },
+    PBind { name: str },
+}
+
+enum FIK {
+    IFn { ff: own FFn },
+    IStruct { name: str, fields: own PL },
+    IEnum { name: str, vars: own VL },
+    IIface { name: str, ops: own SSL, methods: own MSL },
+    IImport { path: str, alias: str, sel: own SSL },
+    IGlobal { name: str, hasty: int, ty: str, init: own FX },
+}
+
+struct FStmt { k: own FSK, lo: int, isif: int, inl: int }
+
+struct FItem { k: own FIK, lo: int }
+
+struct FIL { v: own FItem, next: own FIL }
+
+struct FRoot { pkg: str, pkg_lo: int, items: own FIL }
+
+fn mkx(k: FXK, lo: int, hi: int) -> own FX {
+    x := new(FX)
+    x.k = new(k)
+    x.lo = lo
+    x.hi = hi
+    x.kp = 12
+    x.ka = 0
+    x.kl = 0
+    x.kop = -1
+    return x
+}
+
+fn mkst(k: FSK, lo: int, isif: int, inl: int) -> own FStmt {
+    s := new(FStmt)
+    s.k = new(k)
+    s.lo = lo
+    s.isif = isif
+    s.inl = inl
+    return s
+}
+
+fn mkit(k: FIK, lo: int) -> own FItem {
+    it := new(FItem)
+    it.k = new(k)
+    it.lo = lo
+    return it
+}
+
+fn mkparam(name: str, ty: str, lo: int) -> own FParam {
+    r := new(FParam)
+    r.name = name
+    r.ty = ty
+    r.lo = lo
+    return r
+}
+
+fn mkblk(stmts: own SL, lo: int, hi: int) -> own FBlock {
+    b := new(FBlock)
+    b.stmts = stmts
+    b.lo = lo
+    b.hi = hi
+    return b
+}
+
+fn xcons(v: own FX, n: own XL) -> own XL {
+    c := new(XL)
+    c.v = v
+    c.next = n
+    return c
+}
+
+fn xrev(l: own XL) -> own XL {
+    let out: own XL = nil
+    for l != nil {
+        n := l.next
+        l.next = out
+        out = l
+        l = n
+    }
+    return out
+}
+
+fn xfcons(v: own XField2, n: own XFL) -> own XFL {
+    c := new(XFL)
+    c.v = v
+    c.next = n
+    return c
+}
+
+fn xfrev(l: own XFL) -> own XFL {
+    let out: own XFL = nil
+    for l != nil {
+        n := l.next
+        l.next = out
+        out = l
+        l = n
+    }
+    return out
+}
+
+fn scons(v: own FStmt, n: own SL) -> own SL {
+    c := new(SL)
+    c.v = v
+    c.next = n
+    return c
+}
+
+fn srev(l: own SL) -> own SL {
+    let out: own SL = nil
+    for l != nil {
+        n := l.next
+        l.next = out
+        out = l
+        l = n
+    }
+    return out
+}
+
+fn sacons(v: own SArm, n: own SAL) -> own SAL {
+    c := new(SAL)
+    c.v = v
+    c.next = n
+    return c
+}
+
+fn sarev(l: own SAL) -> own SAL {
+    let out: own SAL = nil
+    for l != nil {
+        n := l.next
+        l.next = out
+        out = l
+        l = n
+    }
+    return out
+}
+
+fn macons(v: own MArm, n: own MAL) -> own MAL {
+    c := new(MAL)
+    c.v = v
+    c.next = n
+    return c
+}
+
+fn marev(l: own MAL) -> own MAL {
+    let out: own MAL = nil
+    for l != nil {
+        n := l.next
+        l.next = out
+        out = l
+        l = n
+    }
+    return out
+}
+
+fn pcons(v: own FParam, n: own PL) -> own PL {
+    c := new(PL)
+    c.v = v
+    c.next = n
+    return c
+}
+
+fn prev(l: own PL) -> own PL {
+    let out: own PL = nil
+    for l != nil {
+        n := l.next
+        l.next = out
+        out = l
+        l = n
+    }
+    return out
+}
+
+fn tpcons(v: own FTP, n: own TPL) -> own TPL {
+    c := new(TPL)
+    c.v = v
+    c.next = n
+    return c
+}
+
+fn tprev(l: own TPL) -> own TPL {
+    let out: own TPL = nil
+    for l != nil {
+        n := l.next
+        l.next = out
+        out = l
+        l = n
+    }
+    return out
+}
+
+fn vcons(v: own FVar, n: own VL) -> own VL {
+    c := new(VL)
+    c.v = v
+    c.next = n
+    return c
+}
+
+fn vrev(l: own VL) -> own VL {
+    let out: own VL = nil
+    for l != nil {
+        n := l.next
+        l.next = out
+        out = l
+        l = n
+    }
+    return out
+}
+
+fn mscons(v: own FMethod, n: own MSL) -> own MSL {
+    c := new(MSL)
+    c.v = v
+    c.next = n
+    return c
+}
+
+fn msrev(l: own MSL) -> own MSL {
+    let out: own MSL = nil
+    for l != nil {
+        n := l.next
+        l.next = out
+        out = l
+        l = n
+    }
+    return out
+}
+
+fn sscons(v: str, n: own SSL) -> own SSL {
+    c := new(SSL)
+    c.v = v
+    c.next = n
+    return c
+}
+
+fn ssrev(l: own SSL) -> own SSL {
+    let out: own SSL = nil
+    for l != nil {
+        n := l.next
+        l.next = out
+        out = l
+        l = n
+    }
+    return out
+}
+
+fn ficons(v: own FItem, n: own FIL) -> own FIL {
+    c := new(FIL)
+    c.v = v
+    c.next = n
+    return c
+}
+
+fn firev(l: own FIL) -> own FIL {
+    let out: own FIL = nil
+    for l != nil {
+        n := l.next
+        l.next = out
+        out = l
+        l = n
+    }
+    return out
+}
+
+// ---------- types -> canonical text (seed ty() walk, text form) ----------
+struct FTy { s: str }
+
+fn fp_ty(p: mut FPar) -> own FTy {
+    t := fcurt(p)
+    if t.kind == 2 && (t.txt == "own" || t.txt == "ref" || t.txt == "mut") {
+        kw := t.txt
+        fbump(p)
+        inner := "void"
+        t2 := fcurt(p)
+        if t2.kind == 1 || t2.kind == 5 && t2.txt == "[" || t2.kind == 2 && (t2.txt == "own" || t2.txt == "ref" || t2.txt == "mut" || t2.txt == "chan") {
+            it := fp_ty(p)
+            if it == nil {
+                return nil
+            }
+            inner = it.s
+        }
+        r := new(FTy)
+        r.s = kw + " " + inner
+        return r
+    }
+    if fat_kw(p, "chan") {
+        fbump(p)
+        r := new(FTy)
+        r.s = "chan"
+        return r
+    }
+    if fat_kw(p, "fn") {
+        fbump(p)
+        if !fexpect_p(p, "(", "`(`") {
+            return nil
+        }
+        s := "fn("
+        first := true
+        for !feat_p(p, ")") && !fat_eof(p) {
+            t3 := fcurt(p)
+            // optional param name — documentation-only, not in the type
+            if t3.kind == 1 && fpeekt(p).kind == 5 && fpeekt(p).txt == ":" {
+                fbump(p)
+                fbump(p)
+            }
+            pt := fp_ty(p)
+            if pt == nil {
+                return nil
+            }
+            if !first {
+                s = s + ", "
+            }
+            first = false
+            s = s + pt.s
+            if !feat_p(p, ",") {
+                fexpect_p(p, ")", "`)`")
+                break
+            }
+        }
+        s = s + ")"
+        if feat_p(p, "->") {
+            rt := fp_ty(p)
+            if rt == nil {
+                return nil
+            }
+            s = s + " -> " + rt.s
+        }
+        r := new(FTy)
+        r.s = s
+        return r
+    }
+    if feat_p(p, "[") {
+        if !fexpect_p(p, "]", "`]`") {
+            return nil
+        }
+        inner := fp_ty(p)
+        if inner == nil {
+            return nil
+        }
+        r := new(FTy)
+        r.s = "[]" + inner.s
+        return r
+    }
+    nm := fident(p)
+    if nm == nil {
+        return nil
+    }
+    name := nm.v
+    for fat_p(p, ".") {
+        // a dot binds into the name only when an ident follows
+        j := p.i + 1
+        if j < len(p.toks) && p.toks[j].kind == 1 {
+            fbump(p)
+            t4 := fbump(p)
+            name = name + "." + t4.txt
+        } else {
+            break
+        }
+    }
+    r := new(FTy)
+    r.s = name
+    return r
+}
+
+struct FParams { l: own PL }
+
+// `(p: t, ..)` — shared by fns and interface method sigs. Boxed: an
+// empty param list is a value, not the error case's nil
+fn fp_params(p: mut FPar) -> own FParams {
+    if !fexpect_p(p, "(", "`(`") {
+        return nil
+    }
+    let params: own PL = nil
+    for !feat_p(p, ")") && !fat_eof(p) {
+        nm := fident(p)
+        if nm == nil {
+            return nil
+        }
+        if !fexpect_p(p, ":", "`:`") {
+            return nil
+        }
+        ty := fp_ty(p)
+        if ty == nil {
+            return nil
+        }
+        params = pcons(mkparam(nm.v, ty.s, nm.lo), params)
+        if !feat_p(p, ",") {
+            fexpect_p(p, ")", "`)`")
+            break
+        }
+    }
+    r := new(FParams)
+    r.l = prev(params)
+    return r
+}
+
+struct FRet { k: int, s: str }
+
+// `-> t` / `-> [t, err]` / nothing
+fn fp_ret(p: mut FPar) -> own FRet {
+    r := new(FRet)
+    r.k = 0
+    r.s = ""
+    if feat_p(p, "->") {
+        // `[` opens the pair form only when a type follows — `-> []T`
+        // is a plain slice return and goes through ty()
+        if fat_p(p, "[") && fpeekt(p).txt != "]" {
+            fbump(p)
+            t := fp_ty(p)
+            if t == nil {
+                return nil
+            }
+            if !fexpect_p(p, ",", "`,`") {
+                return nil
+            }
+            // err member is fixed
+            e := fcurt(p)
+            if e.kind == 1 {
+                if e.txt == "err" {
+                    fbump(p)
+                } else {
+                    ferr(p, fspan_lo(p), "parse", "second return member must be `err`")
+                }
+            }
+            if !fexpect_p(p, "]", "`]`") {
+                return nil
+            }
+            r.k = 2
+            r.s = t.s
+        } else {
+            t := fp_ty(p)
+            if t == nil {
+                return nil
+            }
+            r.k = 1
+            r.s = t.s
+        }
+    }
+    return r
+}
+
+fn fp_fn_tail(p: mut FPar) -> own FFn {
+    f := new(FFn)
+    f.ex = 0
+    f.name = ""
+    f.recv = nil
+    f.typarams = nil
+    f.params = nil
+    f.retk = 0
+    f.retty = ""
+    f.body = nil
+    f.lo = 0
+    // `fn (r T) m(..)` — receiver; `fn (r: T)` also accepted
+    if fat_p(p, "(") {
+        rlo := fspan_lo(p)
+        fbump(p)
+        rn := fident(p)
+        if rn == nil {
+            return nil
+        }
+        feat_p(p, ":")
+        rt := fp_ty(p)
+        if rt == nil {
+            return nil
+        }
+        if !fexpect_p(p, ")", "`)` after receiver") {
+            return nil
+        }
+        f.recv = mkparam(rn.v, rt.s, rlo)
+    }
+    nm := fident(p)
+    if nm == nil {
+        return nil
+    }
+    f.name = nm.v
+    f.lo = nm.lo
+    // generic params `[T any, U ordered]`
+    if feat_p(p, "[") {
+        let tps: own TPL = nil
+        for !feat_p(p, "]") && !fat_eof(p) {
+            tn := fident(p)
+            if tn == nil {
+                return nil
+            }
+            ct := "any"
+            t := fcurt(p)
+            if t.kind == 1 {
+                fbump(p)
+                ct = t.txt
+                for feat_p(p, ".") {
+                    seg := fident(p)
+                    if seg == nil {
+                        return nil
+                    }
+                    ct = ct + "." + seg.v
+                }
+            }
+            tp := new(FTP)
+            tp.name = tn.v
+            tp.con = ct
+            tps = tpcons(tp, tps)
+            feat_p(p, ",")
+        }
+        f.typarams = tprev(tps)
+    }
+    ps := fp_params(p)
+    if ps == nil {
+        return nil
+    }
+    f.params = ps.l
+    rt := fp_ret(p)
+    if rt == nil {
+        return nil
+    }
+    f.retk = rt.k
+    f.retty = rt.s
+    return f
+}
+
+fn fp_struct(p: mut FPar) -> own FItem {
+    nm := fident(p)
+    if nm == nil {
+        return nil
+    }
+    if !fexpect_p(p, "{", "`{`") {
+        return nil
+    }
+    let fields: own PL = nil
+    for !feat_p(p, "}") && !fat_eof(p) {
+        fn2 := fident(p)
+        if fn2 == nil {
+            return nil
+        }
+        if !fexpect_p(p, ":", "`:`") {
+            return nil
+        }
+        ty := fp_ty(p)
+        if ty == nil {
+            return nil
+        }
+        fields = pcons(mkparam(fn2.v, ty.s, fn2.lo), fields)
+        feat_p(p, ",")
+        feat_p(p, ";")
+    }
+    return mkit(FIK.IStruct{name: nm.v, fields: prev(fields)}, nm.lo)
+}
+
+fn fp_enum(p: mut FPar) -> own FItem {
+    nm := fident(p)
+    if nm == nil {
+        return nil
+    }
+    if !fexpect_p(p, "{", "`{`") {
+        return nil
+    }
+    let vars: own VL = nil
+    for !feat_p(p, "}") && !fat_eof(p) {
+        vn := fident(p)
+        if vn == nil {
+            return nil
+        }
+        v := new(FVar)
+        v.name = vn.v
+        v.lo = vn.lo
+        v.vk = 0
+        v.tys = nil
+        v.fields = nil
+        if feat_p(p, "(") {
+            let tys: own SSL = nil
+            for !feat_p(p, ")") && !fat_eof(p) {
+                t := fp_ty(p)
+                if t == nil {
+                    return nil
+                }
+                tys = sscons(t.s, tys)
+                if !feat_p(p, ",") {
+                    fexpect_p(p, ")", "`)`")
+                    break
+                }
+            }
+            v.vk = 1
+            v.tys = ssrev(tys)
+        } else if feat_p(p, "{") {
+            let fields: own PL = nil
+            for !feat_p(p, "}") && !fat_eof(p) {
+                fn2 := fident(p)
+                if fn2 == nil {
+                    return nil
+                }
+                if !fexpect_p(p, ":", "`:`") {
+                    return nil
+                }
+                ty := fp_ty(p)
+                if ty == nil {
+                    return nil
+                }
+                fields = pcons(mkparam(fn2.v, ty.s, fn2.lo), fields)
+                if !feat_p(p, ",") {
+                    fexpect_p(p, "}", "`}`")
+                    break
+                }
+            }
+            v.vk = 2
+            v.fields = prev(fields)
+        }
+        vars = vcons(v, vars)
+        feat_p(p, ",")
+        feat_p(p, ";")
+    }
+    return mkit(FIK.IEnum{name: nm.v, vars: vrev(vars)}, nm.lo)
+}
+
+fn fp_item(p: mut FPar) -> own FItem {
+    if feat_kw(p, "struct") {
+        return fp_struct(p)
+    }
+    if feat_kw(p, "enum") {
+        return fp_enum(p)
+    }
+    if feat_kw(p, "interface") {
+        nm := fident(p)
+        if nm == nil {
+            return nil
+        }
+        if !fexpect_p(p, "{", "`{`") {
+            return nil
+        }
+        let ops: own SSL = nil
+        let methods: own MSL = nil
+        for !feat_p(p, "}") && !fat_eof(p) {
+            t := fcurt(p)
+            if t.kind == 1 {
+                if fpeekt(p).kind == 5 && fpeekt(p).txt == "(" {
+                    mlo := fspan_lo(p)
+                    mname := t.txt
+                    fbump(p)
+                    mp := fp_params(p)
+                    if mp == nil {
+                        return nil
+                    }
+                    mr := fp_ret(p)
+                    if mr == nil {
+                        return nil
+                    }
+                    m := new(FMethod)
+                    m.name = mname
+                    m.params = mp.l
+                    m.retk = mr.k
+                    m.retty = mr.s
+                    m.lo = mlo
+                    methods = mscons(m, methods)
+                } else {
+                    ops = sscons(t.txt, ops)
+                    fbump(p)
+                }
+            } else {
+                ferr(p, t.lo, "parse", "unexpected " + fshow(p) + " in interface")
+                return nil
+            }
+            feat_p(p, ",")
+            feat_p(p, ";")
+        }
+        return mkit(FIK.IIface{name: nm.v, ops: ssrev(ops), methods: msrev(methods)}, nm.lo)
+    }
+    if feat_kw(p, "let") {
+        nm := fident(p)
+        if nm == nil {
+            return nil
+        }
+        hasty := 0
+        ty := ""
+        if feat_p(p, ":") {
+            t := fp_ty(p)
+            if t == nil {
+                return nil
+            }
+            hasty = 1
+            ty = t.s
+        }
+        if !fexpect_p(p, "=", "`=`") {
+            return nil
+        }
+        init := fp_expr(p, 0, 0)
+        if init == nil {
+            return nil
+        }
+        return mkit(FIK.IGlobal{name: nm.v, hasty: hasty, ty: ty, init: init}, nm.lo)
+    }
+    if feat_kw(p, "extern") {
+        if !feat_kw(p, "fn") {
+            ferr(p, fspan_lo(p), "parse", "expected `fn` after `extern`")
+            return nil
+        }
+        f := fp_fn_tail(p)
+        if f == nil {
+            return nil
+        }
+        if f.recv != nil {
+            ferr(p, f.recv.lo, "parse", "extern fns can't have receivers")
+            return nil
+        }
+        f.ex = 1
+        f.body = nil
+        feat_p(p, ";")
+        flo := f.lo
+        return mkit(FIK.IFn{ff: f}, flo)
+    }
+    if feat_kw(p, "fn") {
+        f := fp_fn_tail(p)
+        if f == nil {
+            return nil
+        }
+        b := fp_block(p)
+        if b == nil {
+            // a missing body is already a parse error; the seed still
+            // attaches an empty block so recovery continues
+            f.body = mkblk(nil, f.lo, f.lo + 1)
+        } else {
+            f.body = b
+        }
+        flo := f.lo
+        return mkit(FIK.IFn{ff: f}, flo)
+    }
+    if feat_kw(p, "import") {
+        sp := fspan_lo(p)
+        t := fcurt(p)
+        if t.kind != 4 {
+            ferr(p, sp, "parse", "expected string after `import`")
+            return nil
+        }
+        fbump(p)
+        path := t.txt
+        alias := ""
+        t2 := fcurt(p)
+        if t2.kind == 1 && t2.txt == "as" {
+            fbump(p)
+            if feat_p(p, "_") {
+                alias = "_"
+            } else {
+                an := fident(p)
+                if an != nil {
+                    alias = an.v
+                }
+            }
+        }
+        let sel: own SSL = nil
+        if feat_p(p, ".") {
+            if fexpect_p(p, "{", "`{`") {
+                for !feat_p(p, "}") && !fat_eof(p) {
+                    sn := fident(p)
+                    if sn != nil {
+                        sel = sscons(sn.v, sel)
+                    }
+                    if !feat_p(p, ",") {
+                        fexpect_p(p, "}", "`}`")
+                        break
+                    }
+                }
+            }
+        }
+        feat_p(p, ";")
+        return mkit(FIK.IImport{path: path, alias: alias, sel: ssrev(sel)}, sp)
+    }
+    ferr(p, fspan_lo(p), "parse", "expected item, found " + fshow(p))
+    return nil
+}
+
+// ---------- blocks + statements ----------
+fn fp_block(p: mut FPar) -> own FBlock {
+    lo := fspan_lo(p)
+    if !fexpect_p(p, "{", "`{`") {
+        return nil
+    }
+    let stmts: own SL = nil
+    for !feat_p(p, "}") && !fat_eof(p) {
+        s := fp_stmt(p)
+        if s != nil {
+            stmts = scons(s, stmts)
+        }
+        feat_p(p, ";")
+    }
+    return mkblk(srev(stmts), lo, fspan_hi(p))
+}
+
+fn fp_bind(p: mut FPar) -> own FName {
+    t := fcurt(p)
+    if fat_p(p, "_") {
+        fbump(p)
+        r := new(FName)
+        r.v = "_"
+        r.lo = t.lo
+        return r
+    }
+    if t.kind == 1 {
+        fbump(p)
+        r := new(FName)
+        r.v = t.txt
+        r.lo = t.lo
+        return r
+    }
+    ferr(p, fspan_lo(p), "parse", "expected name or `_`")
+    return nil
+}
+
+fn fp_stmt(p: mut FPar) -> own FStmt {
+    sp := fspan_lo(p)
+    t := fcurt(p)
+    if t.kind == 2 {
+        if t.txt == "return" {
+            fbump(p)
+            let vals: own XL = nil
+            // `return` / `return v` / `return v, err`
+            if !(fat_p(p, "}") || fat_p(p, ";") || fat_eof(p)) {
+                v := fp_expr(p, 0, 0)
+                if v == nil {
+                    return nil
+                }
+                vals = xcons(v, vals)
+                for feat_p(p, ",") {
+                    v2 := fp_expr(p, 0, 0)
+                    if v2 == nil {
+                        return nil
+                    }
+                    vals = xcons(v2, vals)
+                }
+            }
+            s := mkst(FSK.SRet{vals: xrev(vals)}, sp, 0, 1)
+            return s
+        }
+        if t.txt == "let" {
+            fbump(p)
+            nm := fident(p)
+            if nm == nil {
+                return nil
+            }
+            hasty := 0
+            ty := ""
+            if feat_p(p, ":") {
+                tt := fp_ty(p)
+                if tt == nil {
+                    return nil
+                }
+                hasty = 1
+                ty = tt.s
+            }
+            if !fexpect_p(p, "=", "`=`") {
+                return nil
+            }
+            init := fp_expr(p, 0, 0)
+            if init == nil {
+                return nil
+            }
+            s := mkst(FSK.SLet{name: nm.v, hasty: hasty, ty: ty, init: init}, sp, 0, 1)
+            return s
+        }
+        if t.txt == "if" {
+            fbump(p)
+            cond := fp_cond(p)
+            if cond == nil {
+                return nil
+            }
+            then := fp_block(p)
+            if then == nil {
+                return nil
+            }
+            let els: own FBlock = nil
+            if feat_kw(p, "else") {
+                if fat_kw(p, "if") {
+                    // else-if chains nest as a one-stmt block
+                    inner := fp_stmt(p)
+                    if inner == nil {
+                        return nil
+                    }
+                    els = mkblk(scons(inner, nil), then.lo, then.hi)
+                } else {
+                    els = fp_block(p)
+                    if els == nil {
+                        return nil
+                    }
+                }
+            }
+            s := mkst(FSK.SIf{cond: cond, then: then, els: els}, sp, 1, 0)
+            return s
+        }
+        if t.txt == "for" {
+            fbump(p)
+            cond := fp_cond(p)
+            if cond == nil {
+                return nil
+            }
+            body := fp_block(p)
+            if body == nil {
+                return nil
+            }
+            return mkst(FSK.SFor{cond: cond, body: body}, sp, 0, 0)
+        }
+        if t.txt == "scope" {
+            fbump(p)
+            body := fp_block(p)
+            if body == nil {
+                return nil
+            }
+            return mkst(FSK.SScope{body: body}, sp, 0, 0)
+        }
+        if t.txt == "unsafe" {
+            fbump(p)
+            body := fp_block(p)
+            if body == nil {
+                return nil
+            }
+            return mkst(FSK.SUnsafe{body: body}, sp, 0, 0)
+        }
+        if t.txt == "spawn" || t.txt == "go" {
+            fbump(p)
+            call := fp_expr(p, 0, 1)
+            if call == nil {
+                return nil
+            }
+            return mkst(FSK.SSpawn{call: call, blocking: 0}, sp, 0, 0)
+        }
+        if t.txt == "spawnBlocking" {
+            fbump(p)
+            call := fp_expr(p, 0, 1)
+            if call == nil {
+                return nil
+            }
+            return mkst(FSK.SSpawn{call: call, blocking: 1}, sp, 0, 0)
+        }
+        if t.txt == "select" {
+            return fp_select(p, sp)
+        }
+        if t.txt == "break" {
+            fbump(p)
+            s := mkst(FSK.SBreak, sp, 0, 1)
+            return s
+        }
+        if t.txt == "continue" {
+            fbump(p)
+            s := mkst(FSK.SContinue, sp, 0, 1)
+            return s
+        }
+        if t.txt == "defer" {
+            fbump(p)
+            call := fp_expr(p, 0, 0)
+            if call == nil {
+                return nil
+            }
+            return mkst(FSK.SDefer{call: call}, sp, 0, 0)
+        }
+    }
+    if fat_p(p, "[") {
+        // [a, err] = f()
+        fbump(p)
+        a := fp_bind(p)
+        if a == nil {
+            return nil
+        }
+        if !fexpect_p(p, ",", "`,`") {
+            return nil
+        }
+        b := fp_bind(p)
+        if b == nil {
+            return nil
+        }
+        if !fexpect_p(p, "]", "`]`") {
+            return nil
+        }
+        if !fexpect_p(p, "=", "`=`") {
+            return nil
+        }
+        call := fp_expr(p, 0, 0)
+        if call == nil {
+            return nil
+        }
+        return mkst(FSK.SLet2{a: a.v, b: b.v, call: call}, sp, 0, 0)
+    }
+    if fat_p(p, "_") {
+        ferr(p, sp, "parse", "`_` is only allowed for the value in `[v, err]` bindings")
+        fbump(p)
+        return nil
+    }
+    e := fp_expr(p, 0, 0)
+    if e == nil {
+        return nil
+    }
+    if feat_p(p, ":=") {
+        // x := e2 — the lhs must be a bare name
+        isid := 0
+        inm := ""
+        match e.k {
+            FXK.XIdent(n) => {
+                isid = 1
+                inm = n
+            }
+            _ => {
+            }
+        }
+        if isid == 0 {
+            ferr(p, e.lo, "parse", "left of `:=` must be a name")
+            return nil
+        }
+        init := fp_expr(p, 0, 0)
+        if init == nil {
+            return nil
+        }
+        s := mkst(FSK.SLet{name: inm, hasty: 0, ty: "", init: init}, sp, 0, 1)
+        return s
+    }
+    if feat_p(p, "=") {
+        val := fp_expr(p, 0, 0)
+        if val == nil {
+            return nil
+        }
+        s := mkst(FSK.SAssign{target: e, val: val}, sp, 0, 1)
+        return s
+    }
+    elo := e.lo
+    s := mkst(FSK.SExpr{e: e}, elo, 0, 1)
+    return s
+}
+
+// select { [v :=] recv(ch) => body | timeout(ms) => body | else => body }
+fn fp_select(p: mut FPar, sp: int) -> own FStmt {
+    fbump(p) // select
+    if !fexpect_p(p, "{", "`{`") {
+        return nil
+    }
+    let arms: own SAL = nil
+    for !fat_p(p, "}") && !fat_eof(p) {
+        a := new(SArm)
+        a.kind = 0
+        a.ch = nil
+        a.bind = ""
+        a.ms = nil
+        a.body = nil
+        if feat_kw(p, "else") {
+            a.kind = 2
+        } else {
+            // optional `v :=` recv bind
+            bind := ""
+            t := fcurt(p)
+            if t.kind == 1 && fpeekt(p).kind == 5 && fpeekt(p).txt == ":=" {
+                fbump(p)
+                fbump(p)
+                bind = t.txt
+            }
+            e := fp_expr(p, 0, 1)
+            if e == nil {
+                return nil
+            }
+            hname := ""
+            let carg: own XL = nil
+            match e.k {
+                FXK.XCall{head, args} => {
+                    match head.k {
+                        FXK.XIdent(n) => {
+                            hname = n
+                        }
+                        _ => {
+                        }
+                    }
+                    carg = args
+                }
+                _ => {
+                }
+            }
+            bad := 0
+            if hname == "recv" && carg != nil && carg.next == nil {
+                a.kind = 0
+                a.ch = carg.v
+                a.bind = bind
+            } else if hname == "timeout" && carg != nil && carg.next == nil {
+                a.kind = 1
+                a.ms = carg.v
+            } else if hname == "send" {
+                ferr(p, fspan_lo(p), "parse", "select `send` arms are not in v0.2")
+                bad = 1
+            } else {
+                ferr(p, fspan_lo(p), "parse", "select arm must be `recv(ch)`, `timeout(ms)`, or `else`")
+                bad = 1
+            }
+            if bad == 1 {
+                continue
+            }
+        }
+        if !fexpect_p(p, "=>", "`=>`") {
+            break
+        }
+        if fat_p(p, "{") {
+            b := fp_block(p)
+            if b == nil {
+                return nil
+            }
+            a.body = b
+        } else {
+            bs := fp_stmt(p)
+            if bs == nil {
+                return nil
+            }
+            bslo := bs.lo
+            a.body = mkblk(scons(bs, nil), bslo, bslo + 1)
+        }
+        arms = sacons(a, arms)
+    }
+    if !fexpect_p(p, "}", "`}`") {
+        return nil
+    }
+    if arms == nil {
+        ferr(p, sp, "parse", "select needs at least one arm")
+        return nil
+    }
+    return mkst(FSK.SSelect{arms: sarev(arms)}, sp, 0, 0)
+}
+
+// if/for/match head — no_lit so `{` can't open a struct literal
+fn fp_cond(p: mut FPar) -> own FX {
+    old := p.nolit
+    p.nolit = 1
+    e := fp_expr(p, 0, 0)
+    p.nolit = old
+    return e
+}
+
+// expr with struct literals re-enabled — parens/brackets can't start
+// a block so no_lit must not leak through them
+fn fp_expr_lit(p: mut FPar) -> own FX {
+    old := p.nolit
+    p.nolit = 0
+    e := fp_expr(p, 0, 0)
+    p.nolit = old
+    return e
+}
+
+// ---------- expressions ----------
+// BinOp ints follow the seed enum order so prec/assoc tables port 1:1
+fn fbinop(txt: str) -> int {
+    if txt == "+" {
+        return 0
+    }
+    if txt == "-" {
+        return 1
+    }
+    if txt == "*" {
+        return 2
+    }
+    if txt == "/" {
+        return 3
+    }
+    if txt == "%" {
+        return 4
+    }
+    if txt == "&" {
+        return 5
+    }
+    if txt == "|" {
+        return 6
+    }
+    if txt == "^" {
+        return 7
+    }
+    if txt == "==" {
+        return 8
+    }
+    if txt == "!=" {
+        return 9
+    }
+    if txt == "<" {
+        return 10
+    }
+    if txt == "<=" {
+        return 11
+    }
+    if txt == ">" {
+        return 12
+    }
+    if txt == ">=" {
+        return 13
+    }
+    if txt == "&&" {
+        return 14
+    }
+    if txt == "||" {
+        return 15
+    }
+    return -1
+}
+
+// (lbp, rbp) for the precedence-climbing loop — parser.rs's table
+fn fbindp(op: int) -> int {
+    if op == 15 {
+        return 1 * 100 + 2
+    }
+    if op == 14 {
+        return 3 * 100 + 4
+    }
+    if op == 6 {
+        return 5 * 100 + 6
+    }
+    if op == 7 {
+        return 7 * 100 + 8
+    }
+    if op == 5 {
+        return 9 * 100 + 10
+    }
+    if op == 8 || op == 9 {
+        return 11 * 100 + 12
+    }
+    if op == 10 || op == 11 || op == 12 || op == 13 {
+        return 13 * 100 + 14
+    }
+    if op == 0 || op == 1 {
+        return 15 * 100 + 16
+    }
+    return 17 * 100 + 18
+}
+
+fn fp_expr(p: mut FPar, minbp: int, callonly: int) -> own FX {
+    lhs := fp_unary(p)
+    if lhs == nil {
+        return nil
+    }
+    if callonly == 1 {
+        return lhs
+    }
+    for true {
+        t := fcurt(p)
+        op := -1
+        if t.kind == 5 {
+            op = fbinop(t.txt)
+        }
+        if op < 0 {
+            break
+        }
+        bp := fbindp(op)
+        lbp := bp / 100
+        rbp := bp - lbp * 100
+        if lbp < minbp {
+            break
+        }
+        fbump(p)
+        rhs := fp_expr(p, rbp, 0)
+        if rhs == nil {
+            return nil
+        }
+        lo := lhs.lo
+        if rhs.lo < lo {
+            lo = rhs.lo
+        }
+        hi := lhs.hi
+        if rhs.hi > hi {
+            hi = rhs.hi
+        }
+        lkl := lhs.kl
+        rkl := rhs.kl
+        lhs = mkx(FXK.XBin{op: op, l: lhs, r: rhs}, lo, hi)
+        lhs.kp = fprec(op)
+        lhs.kop = op
+        if lkl == 1 || rkl == 1 {
+            lhs.kl = 1
+        }
+    }
+    return lhs
+}
+
+fn fp_unary(p: mut FPar) -> own FX {
+    lo := fspan_lo(p)
+    hi := fspan_hi(p)
+    if fat_p(p, "-") {
+        fbump(p)
+        e := fp_unary(p)
+        if e == nil {
+            return nil
+        }
+        ekl := e.kl
+        x := mkx(FXK.XUn{op: 0, e: e}, lo, hi)
+        x.kp = 10
+        x.kl = ekl
+        return x
+    }
+    if fat_p(p, "!") {
+        fbump(p)
+        e := fp_unary(p)
+        if e == nil {
+            return nil
+        }
+        ekl := e.kl
+        x := mkx(FXK.XUn{op: 1, e: e}, lo, hi)
+        x.kp = 10
+        x.kl = ekl
+        return x
+    }
+    return fp_postfix(p)
+}
+
+fn fp_postfix(p: mut FPar) -> own FX {
+    e := fp_primary(p)
+    if e == nil {
+        return nil
+    }
+    for true {
+        if fat_p(p, "(") {
+            fbump(p)
+            let args: own XL = nil
+            for !feat_p(p, ")") && !fat_eof(p) {
+                a := fp_expr_lit(p)
+                if a == nil {
+                    return nil
+                }
+                args = xcons(a, args)
+                if !feat_p(p, ",") {
+                    fexpect_p(p, ")", "`)`")
+                    break
+                }
+            }
+            // postfix span overshoots into the token after `)` — the
+            // formatter's brace scanners depend on it
+            elo := e.lo
+            ekl := e.kl
+            e = mkx(FXK.XCall{head: e, args: xrev(args)}, elo, fspan_hi(p))
+            e.kp = 11
+            e.ka = 1
+            e.kl = ekl
+            continue
+        }
+        if fat_p(p, ".") {
+            fbump(p)
+            nm := fident(p)
+            if nm == nil {
+                return nil
+            }
+            elo := e.lo
+            ekl := e.kl
+            e = mkx(FXK.XField{obj: e, name: nm.v}, elo, fspan_hi(p))
+            e.kp = 11
+            e.ka = 1
+            e.kl = ekl
+            continue
+        }
+        t := fcurt(p)
+        if t.kind == 1 && t.txt == "as" {
+            fbump(p)
+            ty := fp_ty(p)
+            if ty == nil {
+                return nil
+            }
+            elo := e.lo
+            ekl := e.kl
+            e = mkx(FXK.XAs{e: e, ty: ty.s}, elo, fspan_hi(p))
+            e.kp = 11
+            e.kl = ekl
+            continue
+        }
+        if fat_p(p, "[") && p.i > 0 && p.toks[p.i - 1].hi == t.lo {
+            // index/slice only binds when `[` hugs the previous token
+            fbump(p)
+            islice := 0
+            let lo: own FX = nil
+            let hi: own FX = nil
+            if fat_p(p, ":") {
+                islice = 1
+            } else if !fat_p(p, "]") {
+                lo = fp_expr_lit(p)
+                if lo == nil {
+                    return nil
+                }
+            }
+            if feat_p(p, ":") {
+                islice = 1
+                if !fat_p(p, "]") {
+                    hi = fp_expr_lit(p)
+                    if hi == nil {
+                        return nil
+                    }
+                }
+            }
+            fexpect_p(p, "]", "`]`")
+            sphi := fspan_hi(p)
+            elo := e.lo
+            ekl := e.kl
+            if islice == 1 {
+                e = mkx(FXK.XSlice{obj: e, lo: lo, hi: hi}, elo, sphi)
+                e.kp = 11
+                e.ka = 1
+                e.kl = ekl
+            } else if lo == nil {
+                ferr(p, fspan_lo(p), "parse", "empty `[]` index")
+            } else {
+                e = mkx(FXK.XIndex{obj: e, idx: lo}, elo, sphi)
+                e.kp = 11
+                e.ka = 1
+                e.kl = ekl
+            }
+            continue
+        }
+        break
+    }
+    return e
+}
+
+fn fp_pattern(p: mut FPar) -> own FPK {
+    t := fcurt(p)
+    if fat_p(p, "_") {
+        fbump(p)
+        return new(FPK.PWild)
+    }
+    if t.kind == 1 {
+        fbump(p)
+        path := t.txt
+        for fat_p(p, ".") {
+            fbump(p)
+            seg := fident(p)
+            if seg == nil {
+                return nil
+            }
+            path = path + "." + seg.v
+        }
+        if feat_p(p, "(") {
+            let binds: own SSL = nil
+            for !feat_p(p, ")") && !fat_eof(p) {
+                b := fcurt(p)
+                if fat_p(p, "_") {
+                    fbump(p)
+                    binds = sscons("_", binds)
+                } else {
+                    bn := fident(p)
+                    if bn == nil {
+                        return nil
+                    }
+                    binds = sscons(bn.v, binds)
+                }
+                if !feat_p(p, ",") {
+                    fexpect_p(p, ")", "`)`")
+                    break
+                }
+            }
+            return new(FPK.PPos{path: path, binds: ssrev(binds)})
+        }
+        if feat_p(p, "{") {
+            let binds: own SSL = nil
+            for !feat_p(p, "}") && !fat_eof(p) {
+                bn := fident(p)
+                if bn == nil {
+                    return nil
+                }
+                binds = sscons(bn.v, binds)
+                if !feat_p(p, ",") {
+                    fexpect_p(p, "}", "`}`")
+                    break
+                }
+            }
+            return new(FPK.PNamed{path: path, binds: ssrev(binds)})
+        }
+        if find(path, ".") >= 0 {
+            return new(FPK.PUnit{path: path})
+        }
+        return new(FPK.PBind{name: path})
+    }
+    if t.kind == 3 || t.kind == 4 || t.kind == 6 || t.kind == 2 && (t.txt == "true" || t.txt == "false") {
+        lit := fp_primary(p)
+        if lit == nil {
+            return nil
+        }
+        return new(FPK.PLit{e: lit})
+    }
+    ferr(p, fspan_lo(p), "parse", "expected pattern, found " + fshow(p))
+    return nil
+}
+
+fn fp_primary(p: mut FPar) -> own FX {
+    t := fcurt(p)
+    slo := t.lo
+    shi := t.hi
+    if t.kind == 3 {
+        fbump(p)
+        x := mkx(FXK.XInt(t.txt), slo, shi)
+        x.ka = 1
+        return x
+    }
+    if t.kind == 6 {
+        fbump(p)
+        x := mkx(FXK.XFloat(t.txt), slo, shi)
+        x.ka = 1
+        return x
+    }
+    if t.kind == 4 {
+        fbump(p)
+        x := mkx(FXK.XStr(t.txt), slo, shi)
+        x.ka = 1
+        return x
+    }
+    if t.kind == 2 {
+        if t.txt == "true" {
+            fbump(p)
+            x := mkx(FXK.XBool(true), slo, shi)
+            x.ka = 1
+            return x
+        }
+        if t.txt == "false" {
+            fbump(p)
+            x := mkx(FXK.XBool(false), slo, shi)
+            x.ka = 1
+            return x
+        }
+        if t.txt == "nil" {
+            fbump(p)
+            x := mkx(FXK.XNil, slo, shi)
+            x.ka = 1
+            return x
+        }
+        if t.txt == "fn" && fpeekt(p).kind == 5 && fpeekt(p).txt == "(" {
+            ty := fp_ty(p)
+            if ty == nil {
+                return nil
+            }
+            return mkx(FXK.XTyLit(ty.s), slo, shi)
+        }
+        if t.txt == "match" {
+            fbump(p)
+            e := fp_cond(p)
+            if e == nil {
+                return nil
+            }
+            if !fexpect_p(p, "{", "`{`") {
+                return nil
+            }
+            let arms: own MAL = nil
+            for !feat_p(p, "}") && !fat_eof(p) {
+                alo := fspan_lo(p)
+                pat := fp_pattern(p)
+                if pat == nil {
+                    return nil
+                }
+                if !fexpect_p(p, "=>", "`=>`") {
+                    return nil
+                }
+                a := new(MArm)
+                a.pat = pat
+                a.lo = alo
+                a.e = nil
+                a.b = nil
+                if fat_p(p, "{") {
+                    b := fp_block(p)
+                    if b == nil {
+                        return nil
+                    }
+                    a.be = 1
+                    a.b = b
+                } else {
+                    ab := fp_expr(p, 0, 0)
+                    if ab == nil {
+                        return nil
+                    }
+                    a.be = 0
+                    a.e = ab
+                }
+                arms = macons(a, arms)
+                feat_p(p, ",")
+            }
+            return mkx(FXK.XMatch{e: e, arms: marev(arms)}, slo, shi)
+        }
+    }
+    if t.kind == 1 {
+        fbump(p)
+        name := t.txt
+        if p.nolit == 0 {
+            // `a.b.T{..}` — a dotted path only binds into a lit name
+            // when it ends at `{`
+            j := p.i
+            for j + 1 < len(p.toks) && p.toks[j].kind == 5 && p.toks[j].txt == "." && p.toks[j + 1].kind == 1 {
+                j = j + 2
+            }
+            if j > p.i && p.toks[j].kind == 5 && p.toks[j].txt == "{" {
+                for p.i < j {
+                    fbump(p) // dot
+                    seg := fbump(p)
+                    name = name + "." + seg.txt
+                }
+            }
+        }
+        if p.nolit == 0 && fat_p(p, "{") {
+            fbump(p)
+            let fields: own XFL = nil
+            for !feat_p(p, "}") && !fat_eof(p) {
+                fn2 := fident(p)
+                if fn2 == nil {
+                    return nil
+                }
+                if !fexpect_p(p, ":", "`:`") {
+                    return nil
+                }
+                fe := fp_expr(p, 0, 0)
+                if fe == nil {
+                    return nil
+                }
+                xfd := new(XField2)
+                xfd.name = fn2.v
+                xfd.e = fe
+                fields = xfcons(xfd, fields)
+                if !feat_p(p, ",") {
+                    fexpect_p(p, "}", "`}`")
+                    break
+                }
+            }
+            // lit span stays at the head ident — that's what the seed
+            // stores and what close_brace is keyed off
+            x := mkx(FXK.XStructLit{name: name, fields: xfrev(fields)}, slo, shi)
+            x.kl = 1
+            return x
+        }
+        x := mkx(FXK.XIdent(name), slo, shi)
+        x.ka = 1
+        return x
+    }
+    if fat_p(p, "(") {
+        fbump(p)
+        e := fp_expr_lit(p)
+        if e == nil {
+            return nil
+        }
+        fexpect_p(p, ")", "`)`")
+        return e
+    }
+    if fat_p(p, "{") {
+        // `{|p: t, ..| stmts}` closure — body block keeps the `{` span
+        fbump(p)
+        if !feat_p(p, "|") {
+            fexpect_p(p, "|", "`|`")
+        }
+        let params: own PL = nil
+        for !feat_p(p, "|") && !fat_eof(p) {
+            pn := fident(p)
+            if pn == nil {
+                return nil
+            }
+            if !fexpect_p(p, ":", "`:`") {
+                return nil
+            }
+            ty := fp_ty(p)
+            if ty == nil {
+                return nil
+            }
+            params = pcons(mkparam(pn.v, ty.s, pn.lo), params)
+            if !feat_p(p, ",") {
+                fexpect_p(p, "|", "`|`")
+                break
+            }
+        }
+        let stmts: own SL = nil
+        for !feat_p(p, "}") && !fat_eof(p) {
+            s := fp_stmt(p)
+            if s != nil {
+                stmts = scons(s, stmts)
+            }
+            feat_p(p, ";")
+        }
+        return mkx(FXK.XClosure{params: prev(params), body: mkblk(srev(stmts), slo, shi)}, slo, shi)
+    }
+    ferr(p, slo, "parse", "expected expression, found " + fshow(p))
+    fbump(p)
+    return nil
+}
+
+// ---------- top level ----------
+fn fparse(p: mut FPar) -> own FRoot {
+    r := new(FRoot)
+    r.pkg = ""
+    r.pkg_lo = 0
+    r.items = nil
+    if feat_kw(p, "package") {
+        plo := p.toks[p.i - 1].lo
+        id := fident(p)
+        if id != nil {
+            r.pkg = id.v
+            r.pkg_lo = plo
+        }
+        feat_p(p, ";")
+    } else {
+        ferr(p, fspan_lo(p), "parse", "expected package clause")
+    }
+    let items: own FIL = nil
+    for !fat_eof(p) {
+        before := p.i
+        it := fp_item(p)
+        if it != nil {
+            items = ficons(it, items)
+        } else {
+            fskip_item(p)
+            if p.i == before {
+                fbump(p)
+            }
+        }
+    }
+    r.items = firev(items)
+    return r
+}
+
+// ---------- comment collection ----------
+// fmt.rs's trivia pass: `//` and `/* */` outside string literals —
+// char literals are NOT tracked (a `"` inside a char literal would
+// flip in_str; same quirk as the seed)
+struct FCmt { lo: int, hi: int }
+
+fn collect_comments(f: mut Fmt2) {
+    i := 0
+    n := len(f.src)
+    ins := false
+    esc := false
+    for i < n {
+        c := byteat(f.src, i)
+        if ins {
+            if esc {
+                esc = false
+            } else if c == 92 {
+                esc = true
+            } else if c == 34 {
+                ins = false
+            }
+            i = i + 1
+            continue
+        }
+        if c == 34 {
+            ins = true
+            i = i + 1
+            continue
+        }
+        if c == 47 && i + 1 < n && byteat(f.src, i + 1) == 47 {
+            lo := i
+            for i < n && byteat(f.src, i) != 10 {
+                i = i + 1
+            }
+            f.comments = push(f.comments, FCmt{lo: lo, hi: i})
+            continue
+        }
+        if c == 47 && i + 1 < n && byteat(f.src, i + 1) == 42 {
+            lo := i
+            i = i + 2
+            for i + 1 < n && !(byteat(f.src, i) == 42 && byteat(f.src, i + 1) == 47) {
+                i = i + 1
+            }
+            i = i + 2
+            if i > n {
+                i = n
+            }
+            f.comments = push(f.comments, FCmt{lo: lo, hi: i})
+            continue
+        }
+        i = i + 1
+    }
+}
+
+// ---------- the emitter ----------
+struct Fmt2 {
+    src: str,
+    toks: []FTok,
+    comments: []FCmt,
+    ci: int,
+    lstarts: []int,
+    out: str,
+    first: int,
+}
+
+struct FBuf { s: str }
+
+struct FMem { lo: int, txt: str }
+
+fn fput(f: mut Fmt2, s: str) {
+    f.out = f.out + s
+}
+
+// which line (0-based) a byte offset sits on — binary search lstarts
+fn fline(f: mut Fmt2, off: int) -> int {
+    lo := 0
+    hi := len(f.lstarts) - 1
+    ans := 0
+    for lo <= hi {
+        mid := (lo + hi) / 2
+        if f.lstarts[mid] <= off {
+            ans = mid
+            lo = mid + 1
+        } else {
+            hi = mid - 1
+        }
+    }
+    return ans
+}
+
+// end offset of the previous non-whitespace byte — Rust's
+// is_ascii_whitespace set (space \t \n \f \r)
+fn fprev_end(f: mut Fmt2, off: int) -> int {
+    i := off
+    if i > len(f.src) {
+        i = len(f.src)
+    }
+    for i > 0 {
+        c := byteat(f.src, i - 1)
+        if c == 32 || c == 9 || c == 10 || c == 12 || c == 13 {
+            i = i - 1
+        } else {
+            break
+        }
+    }
+    return i
+}
+
+fn fnl(f: mut Fmt2, ind: int) {
+    if f.first == 1 {
+        f.first = 0
+    } else {
+        f.out = f.out + "\n"
+    }
+    i := 0
+    for i < ind {
+        f.out = f.out + "    "
+        i = i + 1
+    }
+}
+
+fn fblank(f: mut Fmt2) {
+    if !strings.endswith(f.out, "\n\n") && f.first == 0 {
+        f.out = f.out + "\n"
+    }
+}
+
+// a blank line separated off's line from the previous content line?
+fn fgap(f: mut Fmt2, lo: int) {
+    pe := fprev_end(f, lo)
+    if pe > 0 {
+        pe = pe - 1
+    }
+    if fline(f, lo) > fline(f, pe) + 1 {
+        fblank(f)
+    }
+}
+
+// drain_into — emit pending comments with lo before `lo`. Trailing
+// comments (same line as preceding content) stay inline; others get
+// their own indented line, preserving blank-line separation
+fn fdin(f: mut Fmt2, buf: mut FBuf, lo: int, ind: int, first: int) {
+    for f.ci < len(f.comments) && f.comments[f.ci].hi <= lo {
+        c := f.comments[f.ci]
+        trail := 0
+        if first == 0 {
+            pe := fprev_end(f, c.lo)
+            if pe > 0 && fline(f, c.lo) == fline(f, pe - 1) {
+                trail = 1
+            }
+        }
+        if trail == 1 {
+            buf.s = buf.s + " " + substr(f.src, c.lo, c.hi)
+        } else {
+            pe2 := fprev_end(f, c.lo)
+            if pe2 > 0 {
+                pe2 = pe2 - 1
+            }
+            if len(buf.s) > 0 && byteat(buf.s, len(buf.s) - 1) != 10 && fline(f, c.lo) > fline(f, pe2) + 1 {
+                buf.s = buf.s + "\n"
+            }
+            if len(buf.s) > 0 {
+                buf.s = buf.s + "\n"
+            }
+            i := 0
+            for i < ind {
+                buf.s = buf.s + "    "
+                i = i + 1
+            }
+            buf.s = buf.s + substr(f.src, c.lo, c.hi)
+        }
+        f.ci = f.ci + 1
+    }
+}
+
+fn fdin_str(f: mut Fmt2, s: str, lo: int, ind: int, first: int) -> str {
+    buf := new(FBuf)
+    buf.s = s
+    fdin(f, buf, lo, ind, first)
+    return buf.s
+}
+
+fn fdrain(f: mut Fmt2, lo: int, ind: int) {
+    f.out = fdin_str(f, f.out, lo, ind, f.first)
+    if len(f.out) > 0 {
+        f.first = 0
+    }
+}
+
+// trailing comments only — stops at the first comment that stands on
+// its own line (drained later by the regular pass)
+fn fdrain_trailing(f: mut Fmt2, lo: int) {
+    for f.ci < len(f.comments) && f.comments[f.ci].hi <= lo {
+        c := f.comments[f.ci]
+        pe := fprev_end(f, c.lo)
+        if pe > 0 && fline(f, c.lo) == fline(f, pe - 1) {
+            fput(f, " " + substr(f.src, c.lo, c.hi))
+            f.ci = f.ci + 1
+        } else {
+            break
+        }
+    }
+}
+
+// byte offset just past the `}` that closes the `{` at/after `lo`
+fn fclose_brace(f: mut Fmt2, lo: int) -> int {
+    depth := 0
+    started := 0
+    j := 0
+    for j < len(f.toks) {
+        t := f.toks[j]
+        if t.lo >= lo {
+            if t.txt == "{" {
+                depth = depth + 1
+                started = 1
+            }
+            if t.txt == "}" {
+                depth = depth - 1
+                if started == 1 && depth == 0 {
+                    return t.hi
+                }
+            }
+        }
+        j = j + 1
+    }
+    return lo
+}
+
+// hi of the last token ending before `hi` — token spans overshoot into
+// the following token, so this walks back one step
+fn fprev_tok_end(f: mut Fmt2, hi: int) -> int {
+    j := len(f.toks) - 1
+    for j >= 0 {
+        if f.toks[j].hi <= hi {
+            if j - 1 >= 0 {
+                return f.toks[j - 1].hi
+            }
+            return hi
+        }
+        j = j - 1
+    }
+    return hi
+}
+
+fn find_str(ind: int) -> str {
+    s := ""
+    i := 0
+    for i < ind {
+        s = s + "    "
+        i = i + 1
+    }
+    return s
+}
+
+// ---------- top level ----------
+fn fkrate(f: mut Fmt2, k: own FRoot) {
+    if len(k.pkg) > 0 {
+        fdrain(f, k.pkg_lo, 0)
+        fgap(f, k.pkg_lo)
+        fnl(f, 0)
+        fput(f, "package " + k.pkg)
+        next := 2000000000
+        if k.items != nil {
+            next = k.items.v.lo
+        }
+        fdrain_trailing(f, next)
+        fblank(f)
+    }
+    i := 0
+    l := k.items
+    for l != nil {
+        it := l.v
+        fdrain_trailing(f, it.lo)
+        if i > 0 {
+            fblank(f)
+        }
+        fdrain(f, it.lo, 0)
+        fnl(f, 0)
+        fitem(f, it)
+        l = l.next
+        i = i + 1
+    }
+    fdrain(f, 2000000000, 0)
+    if len(f.out) > 0 && byteat(f.out, len(f.out) - 1) != 10 {
+        fput(f, "\n")
+    }
+}
+
+fn fitem(f: mut Fmt2, it: own FItem) {
+    match it.k {
+        FIK.IImport{path, alias, sel} => {
+            s := "import \"" + path + "\""
+            if len(alias) > 0 {
+                s = s + " as " + alias
+            }
+            if sel != nil {
+                s = s + ".{"
+                l := sel
+                first := true
+                for l != nil {
+                    if !first {
+                        s = s + ", "
+                    }
+                    first = false
+                    s = s + l.v
+                    l = l.next
+                }
+                s = s + "}"
+            }
+            fput(f, s)
+        }
+        FIK.IGlobal{name, hasty, ty, init} => {
+            s := "let " + name
+            if hasty == 1 {
+                s = s + ": " + ty
+            }
+            s = s + " = " + fexpr(f, init, 0)
+            fput(f, s)
+        }
+        FIK.IStruct{name, fields} => {
+            mems := mkslice(FMem, 0)
+            l := fields
+            for l != nil {
+                mems = push(mems, FMem{lo: l.v.lo, txt: l.v.name + ": " + l.v.ty})
+                l = l.next
+            }
+            fmember_list(f, it.lo, "struct " + name, mems, 0)
+        }
+        FIK.IEnum{name, vars} => {
+            mems := mkslice(FMem, 0)
+            l := vars
+            for l != nil {
+                mems = push(mems, FMem{lo: l.v.lo, txt: fvariant_txt(l.v)})
+                l = l.next
+            }
+            fmember_list(f, it.lo, "enum " + name, mems, 1)
+        }
+        FIK.IIface{name, ops, methods} => {
+            mems := mkslice(FMem, 0)
+            l := ops
+            for l != nil {
+                mems = push(mems, FMem{lo: it.lo, txt: l.v})
+                l = l.next
+            }
+            l2 := methods
+            for l2 != nil {
+                mm := l2.v
+                mems = push(mems, FMem{lo: mm.lo, txt: mm.name + "(" + fparams_txt(mm.params) + ")" + fret_txt(mm.retk, mm.retty)})
+                l2 = l2.next
+            }
+            fmember_list(f, it.lo, "interface " + name, mems, 0)
+        }
+        FIK.IFn{ff} => {
+            if ff.ex == 1 {
+                fput(f, "extern " + ffn_sig(f, ff))
+            } else {
+                fput(f, ffn_sig(f, ff))
+                if ff.body != nil {
+                    fput(f, " {")
+                    fblock(f, ff.body, 0)
+                }
+            }
+        }
+    }
+}
+
+fn fvariant_txt(v: own FVar) -> str {
+    if v.vk == 1 {
+        s := v.name + "("
+        l := v.tys
+        first := true
+        for l != nil {
+            if !first {
+                s = s + ", "
+            }
+            first = false
+            s = s + l.v
+            l = l.next
+        }
+        return s + ")"
+    }
+    if v.vk == 2 {
+        s := v.name + " { "
+        l := v.fields
+        first := true
+        for l != nil {
+            if !first {
+                s = s + ", "
+            }
+            first = false
+            s = s + l.v.name + ": " + l.v.ty
+            l = l.next
+        }
+        return s + " }"
+    }
+    return v.name
+}
+
+// `{` ... `}` member block: inline when it fits in 80 and holds no
+// comments; otherwise one member per line at ind 1
+fn fmember_list(f: mut Fmt2, head_lo: int, head: str, mems: []FMem, trail: int) {
+    close := fclose_brace(f, head_lo)
+    commented := 0
+    if len(mems) > 0 && f.ci < len(f.comments) && f.comments[f.ci].hi <= close {
+        commented = 1
+    }
+    inln := head + " { "
+    j := 0
+    for j < len(mems) {
+        if j > 0 {
+            inln = inln + ", "
+        }
+        inln = inln + mems[j].txt
+        j = j + 1
+    }
+    if trail == 1 {
+        inln = inln + ","
+    }
+    inln = inln + " }"
+    if len(mems) == 0 {
+        fput(f, head + " {}")
+        return
+    }
+    if commented == 0 && len(inln) <= 80 {
+        fput(f, inln)
+        return
+    }
+    fput(f, head + " {")
+    j = 0
+    for j < len(mems) {
+        fdrain(f, mems[j].lo, 1)
+        fnl(f, 1)
+        fput(f, mems[j].txt + ",")
+        j = j + 1
+    }
+    fdrain(f, close, 1)
+    fnl(f, 0)
+    fput(f, "}")
+}
+
+fn fparams_txt(ps: own PL) -> str {
+    s := ""
+    l := ps
+    first := true
+    for l != nil {
+        if !first {
+            s = s + ", "
+        }
+        first = false
+        s = s + l.v.name + ": " + l.v.ty
+        l = l.next
+    }
+    return s
+}
+
+fn fret_txt(retk: int, retty: str) -> str {
+    if retk == 1 {
+        return " -> " + retty
+    }
+    if retk == 2 {
+        return " -> [" + retty + ", err]"
+    }
+    return ""
+}
+
+fn ffn_sig(f: mut Fmt2, ff: mut FFn) -> str {
+    s := "fn "
+    if ff.recv != nil {
+        s = s + "(" + ff.recv.name + " " + ff.recv.ty + ") "
+    }
+    s = s + ff.name
+    if ff.typarams != nil {
+        ps := ""
+        l := ff.typarams
+        first := true
+        for l != nil {
+            tp := l.v
+            pt := tp.name
+            if len(tp.con) > 0 {
+                pt = tp.name + " " + tp.con
+            }
+            if !first {
+                ps = ps + ", "
+            }
+            first = false
+            ps = ps + pt
+            l = l.next
+        }
+        s = s + "[" + ps + "]"
+    }
+    s = s + "(" + fparams_txt(ff.params) + ")" + fret_txt(ff.retk, ff.retty)
+    return s
+}
+
+fn fblock(f: mut Fmt2, b: own FBlock, ind: int) {
+    if b.stmts == nil {
+        close := fprev_tok_end(f, b.hi)
+        if f.ci < len(f.comments) && f.comments[f.ci].hi <= close {
+            fdrain(f, close, ind + 1)
+            fnl(f, ind)
+        }
+        fput(f, "}")
+        return
+    }
+    l := b.stmts
+    for l != nil {
+        st := l.v
+        fdrain(f, st.lo, ind + 1)
+        fgap(f, st.lo)
+        fnl(f, ind + 1)
+        fstmt(f, st, ind + 1)
+        l = l.next
+    }
+    fdrain(f, fprev_tok_end(f, b.hi), ind + 1)
+    fnl(f, ind)
+    fput(f, "}")
+}
+
+// a fresh emitter sharing state but starting at the current comment
+// cursor — used for stmt text inside match-arm blocks and closures
+fn fsub(f: mut Fmt2) -> own Fmt2 {
+    sub := new(Fmt2)
+    sub.src = f.src
+    sub.toks = f.toks
+    sub.comments = f.comments
+    sub.ci = f.ci
+    sub.lstarts = f.lstarts
+    sub.out = ""
+    sub.first = 1
+    return sub
+}
+
+fn fstmt(f: mut Fmt2, st: own FStmt, ind: int) {
+    match st.k {
+        FSK.SLet{name, hasty, ty, init} => {
+            if hasty == 1 {
+                fput(f, "let " + name + ": " + ty + " = " + fexpr(f, init, ind))
+            } else {
+                fput(f, name + " := " + fexpr(f, init, ind))
+            }
+        }
+        FSK.SLet2{a, b, call} => {
+            fput(f, "[" + a + ", " + b + "] = " + fexpr(f, call, ind))
+        }
+        FSK.SAssign{target, val} => {
+            fput(f, fexpr(f, target, ind) + " = " + fexpr(f, val, ind))
+        }
+        FSK.SExpr{e} => {
+            fput(f, fexpr(f, e, ind))
+        }
+        FSK.SRet{vals} => {
+            if vals == nil {
+                fput(f, "return")
+            } else {
+                s := "return "
+                l := vals
+                first := true
+                for l != nil {
+                    if !first {
+                        s = s + ", "
+                    }
+                    first = false
+                    s = s + fexpr(f, l.v, ind)
+                    l = l.next
+                }
+                fput(f, s)
+            }
+        }
+        FSK.SIf{cond, then, els} => {
+            fput(f, "if " + fcond(f, cond, ind) + " {")
+            fblock(f, then, ind)
+            if els != nil {
+                if els.stmts != nil && els.stmts.next == nil && els.stmts.v.isif == 1 {
+                    fput(f, " else ")
+                    fstmt(f, els.stmts.v, ind)
+                } else {
+                    fput(f, " else {")
+                    fblock(f, els, ind)
+                }
+            }
+        }
+        FSK.SFor{cond, body} => {
+            fput(f, "for " + fcond(f, cond, ind) + " {")
+            fblock(f, body, ind)
+        }
+        FSK.SScope{body} => {
+            fput(f, "scope {")
+            fblock(f, body, ind)
+        }
+        FSK.SUnsafe{body} => {
+            fput(f, "unsafe {")
+            fblock(f, body, ind)
+        }
+        FSK.SSpawn{call, blocking} => {
+            if blocking == 1 {
+                fput(f, "spawnBlocking " + fexpr(f, call, ind))
+            } else {
+                fput(f, "spawn " + fexpr(f, call, ind))
+            }
+        }
+        FSK.SDefer{call} => {
+            fput(f, "defer " + fexpr(f, call, ind))
+        }
+        FSK.SSelect{arms} => {
+            fput(f, "select {")
+            l := arms
+            for l != nil {
+                a := l.v
+                fnl(f, ind + 1)
+                if a.kind == 0 {
+                    if len(a.bind) > 0 {
+                        fput(f, a.bind + " := ")
+                    }
+                    fput(f, "recv(" + fexpr(f, a.ch, ind) + ")")
+                } else if a.kind == 1 {
+                    fput(f, "timeout(" + fexpr(f, a.ms, ind) + ")")
+                } else {
+                    fput(f, "else")
+                }
+                fput(f, " => {")
+                fblock(f, a.body, ind + 1)
+                l = l.next
+            }
+            fnl(f, ind)
+            fput(f, "}")
+        }
+        FSK.SBreak => {
+            fput(f, "break")
+        }
+        FSK.SContinue => {
+            fput(f, "continue")
+        }
+    }
+}
+
+// seed cond() — a bare struct literal in a head position needs parens
+// to reparse (its `{` would open the block)
+fn fcond(f: mut Fmt2, e: own FX, ind: int) -> str {
+    kl := e.kl
+    s := fexpr(f, e, ind)
+    if kl == 1 {
+        s = "(" + s + ")"
+    }
+    return s
+}
+
+// prec(): fmt.rs's emit-time precedence bands (different ints than the
+// parser's binding powers — these drive re-parenthesization)
+fn fprec(op: int) -> int {
+    if op == 15 {
+        return 1
+    }
+    if op == 14 {
+        return 2
+    }
+    if op == 6 {
+        return 3
+    }
+    if op == 7 {
+        return 4
+    }
+    if op == 5 {
+        return 5
+    }
+    if op == 8 || op == 9 {
+        return 6
+    }
+    if op == 10 || op == 11 || op == 12 || op == 13 {
+        return 7
+    }
+    if op == 0 || op == 1 {
+        return 8
+    }
+    return 9
+}
+
+fn fassoc(op: int) -> int {
+    if op == 5 || op == 6 || op == 7 || op == 14 || op == 15 {
+        return 1
+    }
+    return 0
+}
+
+fn fop_str(op: int) -> str {
+    if op == 0 {
+        return "+"
+    }
+    if op == 1 {
+        return "-"
+    }
+    if op == 2 {
+        return "*"
+    }
+    if op == 3 {
+        return "/"
+    }
+    if op == 4 {
+        return "%"
+    }
+    if op == 5 {
+        return "&"
+    }
+    if op == 6 {
+        return "|"
+    }
+    if op == 7 {
+        return "^"
+    }
+    if op == 8 {
+        return "=="
+    }
+    if op == 9 {
+        return "!="
+    }
+    if op == 10 {
+        return "<"
+    }
+    if op == 11 {
+        return "<="
+    }
+    if op == 12 {
+        return ">"
+    }
+    if op == 13 {
+        return ">="
+    }
+    if op == 14 {
+        return "&&"
+    }
+    return "||"
+}
+
+// escape a decoded string back into literal form
+fn fescape(s: str) -> str {
+    out := ""
+    i := 0
+    for i < len(s) {
+        c := byteat(s, i)
+        if c == 34 {
+            out = out + "\\\""
+        } else if c == 92 {
+            out = out + "\\\\"
+        } else if c == 10 {
+            out = out + "\\n"
+        } else if c == 9 {
+            out = out + "\\t"
+        } else if c == 13 {
+            out = out + "\\r"
+        } else if c == 0 {
+            out = out + "\\0"
+        } else {
+            out = out + substr(s, i, i + 1)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// Rust f64 Display = shortest repr that round-trips. Walk %.*g
+// precisions until atof(result) == v, then expand e-notation (Rust
+// Display never uses it — 1e-5 prints 0.00001, 1e20 prints the digits)
+fn fmt_f64(v: float) -> str {
+    s0 := ftoa(v)
+    if s0 == "inf" {
+        return "inf"
+    }
+    if s0 == "-inf" {
+        return "-inf"
+    }
+    if s0 == "nan" || s0 == "-nan" {
+        return "NaN"
+    }
+    s := ""
+    prec := 1
+    for prec <= 17 {
+        s = rt_ftoa_p(v, prec)
+        if atof(s) == v {
+            break
+        }
+        prec = prec + 1
+    }
+    return g_expand(s)
+}
+
+// expand %g's e-notation into plain decimal — e.g. 1e-05 -> 0.00001,
+// 1.2e+07 -> 12000000
+fn g_expand(s: str) -> str {
+    ei := find(s, "e")
+    if ei < 0 {
+        ei = find(s, "E")
+    }
+    if ei < 0 {
+        return s
+    }
+    mant := substr(s, 0, ei)
+    exp := atoi(substr(s, ei + 1, len(s)))
+    neg := 0
+    if len(mant) > 0 && byteat(mant, 0) == 45 {
+        neg = 1
+        mant = substr(mant, 1, len(mant))
+    }
+    di := find(mant, ".")
+    digits := ""
+    dp := 0
+    if di < 0 {
+        digits = mant
+        dp = len(mant)
+    } else {
+        digits = substr(mant, 0, di) + substr(mant, di + 1, len(mant))
+        dp = di
+    }
+    np := dp + exp
+    out := ""
+    if np <= 0 {
+        out = "0."
+        i := 0
+        for i < 0 - np {
+            out = out + "0"
+            i = i + 1
+        }
+        out = out + digits
+    } else if np >= len(digits) {
+        out = digits
+        i := len(digits)
+        for i < np {
+            out = out + "0"
+            i = i + 1
+        }
+    } else {
+        out = substr(digits, 0, np) + "." + substr(digits, np, len(digits))
+    }
+    if neg == 1 {
+        out = "-" + out
+    }
+    return out
+}
+
+fn fpat(f: mut Fmt2, pat: own FPK, ind: int) -> str {
+    match pat {
+        FPK.PWild => {
+            return "_"
+        }
+        FPK.PUnit{path} => {
+            return path
+        }
+        FPK.PPos{path, binds} => {
+            s := path + "("
+            l := binds
+            first := true
+            for l != nil {
+                if !first {
+                    s = s + ", "
+                }
+                first = false
+                s = s + l.v
+                l = l.next
+            }
+            return s + ")"
+        }
+        FPK.PNamed{path, binds} => {
+            s := path + "{"
+            l := binds
+            first := true
+            for l != nil {
+                if !first {
+                    s = s + ", "
+                }
+                first = false
+                s = s + l.v
+                l = l.next
+            }
+            return s + "}"
+        }
+        FPK.PLit{e} => {
+            return fexpr(f, e, 0)
+        }
+        FPK.PBind{name} => {
+            return name
+        }
+        _ => {
+            return ""
+        }
+    }
+}
+
+fn fexpr(f: mut Fmt2, e: own FX, ind: int) -> str {
+    match e.k {
+        FXK.XInt(txt) => {
+            return itoa(atoi(txt))
+        }
+        FXK.XFloat(txt) => {
+            s := fmt_f64(atof(txt))
+            if find(s, ".") < 0 {
+                s = s + ".0"
+            }
+            return s
+        }
+        FXK.XStr(s) => {
+            return "\"" + fescape(s) + "\""
+        }
+        FXK.XBool(b) => {
+            if b {
+                return "true"
+            }
+            return "false"
+        }
+        FXK.XNil => {
+            return "nil"
+        }
+        FXK.XIdent(n) => {
+            return n
+        }
+        FXK.XTyLit(t) => {
+            return t
+        }
+        FXK.XCall{head, args} => {
+            hka := head.ka
+            fs := fexpr(f, head, ind)
+            if hka == 0 {
+                fs = "(" + fs + ")"
+            }
+            s := fs + "("
+            i := 0
+            l := args
+            for l != nil {
+                a := l.v
+                if i > 0 {
+                    s = s + ", "
+                }
+                ci0 := f.ci
+                s = fdin_str(f, s, a.lo, ind, 0)
+                if f.ci != ci0 {
+                    s = s + "\n" + find_str(ind + 1)
+                }
+                s = s + fexpr(f, a, ind)
+                l = l.next
+                i = i + 1
+            }
+            ci0 := f.ci
+            s = fdin_str(f, s, fprev_tok_end(f, e.hi), ind, 0)
+            if f.ci != ci0 {
+                s = s + "\n" + find_str(ind)
+            }
+            s = s + ")"
+            return s
+        }
+        FXK.XField{obj, name} => {
+            oka := obj.ka
+            o := fexpr(f, obj, ind)
+            if oka == 0 {
+                o = "(" + o + ")"
+            }
+            return o + "." + name
+        }
+        FXK.XIndex{obj, idx} => {
+            oka := obj.ka
+            o := fexpr(f, obj, ind)
+            if oka == 0 {
+                o = "(" + o + ")"
+            }
+            return o + "[" + fexpr(f, idx, ind) + "]"
+        }
+        FXK.XSlice{obj, lo, hi} => {
+            oka := obj.ka
+            o := fexpr(f, obj, ind)
+            if oka == 0 {
+                o = "(" + o + ")"
+            }
+            s := o + "["
+            if lo != nil {
+                s = s + fexpr(f, lo, ind)
+            }
+            s = s + ":"
+            if hi != nil {
+                s = s + fexpr(f, hi, ind)
+            }
+            return s + "]"
+        }
+        FXK.XStructLit{name, fields} => {
+            s := name + "{"
+            i := 0
+            l := fields
+            for l != nil {
+                fd := l.v
+                if i > 0 {
+                    s = s + ", "
+                }
+                ci0 := f.ci
+                s = fdin_str(f, s, fd.e.lo, ind, 0)
+                if f.ci != ci0 {
+                    s = s + "\n" + find_str(ind + 1)
+                }
+                s = s + fd.name + ": " + fexpr(f, fd.e, ind)
+                l = l.next
+                i = i + 1
+            }
+            ci0 := f.ci
+            s = fdin_str(f, s, fclose_brace(f, e.lo), ind, 0)
+            if f.ci != ci0 {
+                s = s + "\n" + find_str(ind)
+            }
+            s = s + "}"
+            return s
+        }
+        FXK.XBin{op, l, r} => {
+            p := fprec(op)
+            lkp := l.kp
+            rkop := r.kop
+            rkp := r.kp
+            ls := fexpr(f, l, ind)
+            rs := fexpr(f, r, ind)
+            if lkp < p {
+                ls = "(" + ls + ")"
+            }
+            if rkop >= 0 && fprec(rkop) == p {
+                if !(fassoc(op) == 1 && fassoc(rkop) == 1) {
+                    rs = "(" + rs + ")"
+                }
+            } else if rkp < p {
+                rs = "(" + rs + ")"
+            }
+            return ls + " " + fop_str(op) + " " + rs
+        }
+        FXK.XUn{op, e} => {
+            ekp := e.kp
+            inner := fexpr(f, e, ind)
+            if ekp < 10 {
+                inner = "(" + inner + ")"
+            }
+            if op == 0 {
+                return "-" + inner
+            }
+            return "!" + inner
+        }
+        FXK.XAs{e, ty} => {
+            ekp := e.kp
+            inner := fexpr(f, e, ind)
+            if ekp < 11 {
+                inner = "(" + inner + ")"
+            }
+            return inner + " as " + ty
+        }
+        FXK.XMatch{e, arms} => {
+            shi := e.hi
+            s := "match " + fcond(f, e, ind) + " {"
+            l := arms
+            for l != nil {
+                a := l.v
+                s = fdin_str(f, s, a.lo, ind + 1, 0)
+                s = s + "\n" + find_str(ind + 1) + fpat(f, a.pat, ind) + " => "
+                if a.be == 0 {
+                    s = s + fexpr(f, a.e, ind)
+                } else {
+                    t := "{"
+                    sl := a.b.stmts
+                    for sl != nil {
+                        st := sl.v
+                        t = fdin_str(f, t, st.lo, ind + 2, 0)
+                        t = t + "\n" + find_str(ind + 2)
+                        sub := fsub(f)
+                        fstmt(sub, st, ind + 2)
+                        f.ci = sub.ci
+                        t = t + sub.out
+                        sl = sl.next
+                    }
+                    t = fdin_str(f, t, fprev_tok_end(f, a.b.hi), ind + 2, 0)
+                    t = t + "\n" + find_str(ind + 1) + "}"
+                    s = s + t
+                }
+                l = l.next
+            }
+            scrut_end := fprev_tok_end(f, shi)
+            open_lo := scrut_end
+            j := 0
+            for j < len(f.toks) {
+                t2 := f.toks[j]
+                if t2.lo >= scrut_end && t2.txt == "{" {
+                    open_lo = t2.lo
+                    break
+                }
+                j = j + 1
+            }
+            s = fdin_str(f, s, fclose_brace(f, open_lo), ind + 1, 0)
+            s = s + "\n" + find_str(ind) + "}"
+            return s
+        }
+        FXK.XClosure{params, body} => {
+            ps := ""
+            l := params
+            first := true
+            for l != nil {
+                if !first {
+                    ps = ps + ", "
+                }
+                first = false
+                ps = ps + l.v.name + ": " + l.v.ty
+                l = l.next
+            }
+            head := "{ |" + ps + "|"
+            inner_comment := 0
+            if f.ci < len(f.comments) && f.comments[f.ci].lo < fclose_brace(f, e.lo) {
+                inner_comment = 1
+            }
+            if body.stmts != nil && body.stmts.next == nil && body.stmts.v.inl == 1 && inner_comment == 0 {
+                sub := fsub(f)
+                fstmt(sub, body.stmts.v, 0)
+                f.ci = sub.ci
+                return head + " " + sub.out + " }"
+            }
+            s := head
+            l2 := body.stmts
+            for l2 != nil {
+                st := l2.v
+                s = fdin_str(f, s, st.lo, ind + 1, 0)
+                s = s + "\n" + find_str(ind + 1)
+                sub := fsub(f)
+                fstmt(sub, st, ind + 1)
+                f.ci = sub.ci
+                s = s + sub.out
+                l2 = l2.next
+            }
+            s = fdin_str(f, s, fclose_brace(f, e.lo), ind + 1, 0)
+            s = s + "\n" + find_str(ind) + "}"
+            return s
+        }
+        _ => {
+            return ""
+        }
+    }
+}
+
+// ---------- driver ----------
+struct FRes { out: str, ok: int }
+
+struct FPos { line: int, col: int }
+
+// 1-based line:col — col counts chars (UTF-8 continuation bytes skip)
+fn fpos(src: str, off: int) -> own FPos {
+    line := 1
+    col := 1
+    i := 0
+    lim := off
+    if lim > len(src) {
+        lim = len(src)
+    }
+    for i < lim {
+        b := byteat(src, i)
+        if b == 10 {
+            line = line + 1
+            col = 1
+        } else if b < 128 || b >= 192 {
+            col = col + 1
+        }
+        i = i + 1
+    }
+    r := new(FPos)
+    r.line = line
+    r.col = col
+    return r
+}
+
+// lex + parse + format one file; diagnostics go to stderr seed-style
+fn format_file(path: str, src: str) -> own FRes {
+    p := new(FPar)
+    p.toks = mkslice(FTok, 0)
+    p.src = src
+    p.i = 0
+    p.nolit = 0
+    p.diags = mkslice(FDiag, 0)
+    flex(p, src)
+    root := fparse(p)
+    r := new(FRes)
+    r.ok = 0
+    r.out = ""
+    if len(p.diags) > 0 {
+        j := 0
+        for j < len(p.diags) {
+            d := p.diags[j]
+            fp := fpos(src, d.lo)
+            eprintln(path + ":" + itoa(fp.line) + ":" + itoa(fp.col) + ": error [" + d.code + "] " + d.msg)
+            j = j + 1
+        }
+        return r
+    }
+    f := new(Fmt2)
+    f.src = src
+    f.toks = p.toks
+    f.comments = mkslice(FCmt, 0)
+    collect_comments(f)
+    f.ci = 0
+    f.lstarts = mkslice(int, 0)
+    f.lstarts = push(f.lstarts, 0)
+    i := 0
+    for i < len(src) {
+        if byteat(src, i) == 10 {
+            f.lstarts = push(f.lstarts, i + 1)
+        }
+        i = i + 1
+    }
+    f.out = ""
+    f.first = 1
+    fkrate(f, root)
+    r.out = f.out
+    r.ok = 1
+    return r
+}
+
+// io::Error display text for the two cases reachable from oxl
+// checked read — the readfile builtin collapses errors to "", which
+// would let fmt rewrite or doc print a truncated source; open+readall
+// keeps a mid-read failure distinct from an empty file
+fn read_src(file: str) -> [str, err] {
+    [f, oe] = os.open(file)
+    if oe != nil {
+        return "", oe
+    }
+    [src, re] = io.readall(f)
+    ce := f.close()
+    if re != nil {
+        return "", re
+    }
+    if ce != nil {
+        return "", ce
+    }
+    return src, nil
+}
+
+// stage_write_hold creates path under mode and writes s, returning
+// the *open* fd on success — the caller clones the source's attrs
+// onto the descriptor (rt_clone_attrs) before closing it, so the
+// attrs land on the inode that was written. On write error the fd
+// is closed and -errno/-EIO(-5) returned.
+fn stage_write_hold(path: str, mode: int, src: str, s: str) -> int {
+    fd := rt_open_write_mode(path, mode, src)
+    if fd < 0 {
+        return fd
+    }
+    b := s as []byte
+    off := 0
+    rc := 0
+    for off < len(b) {
+        w := rt_fd_write(fd, b[off:])
+        if w <= 0 {
+            if w < 0 {
+                rc = w
+            } else {
+                rc = -5
+            }
+            break
+        }
+        off = off + w
+    }
+    if rc != 0 {
+        c := rt_fd_close(fd)
+        if c < 0 {
+            return c
+        }
+        return rc
+    }
+    return fd
+}
+
+fn fmt_read_err(file: str) {
+    if os.isdir(file) {
+        eprintln(file + ": Is a directory (os error 21)")
+    } else {
+        eprintln(file + ": No such file or directory (os error 2)")
+    }
+}
+
+// `oxl fmt [-w|--check] <file.oxl>...`
+fn cmd_fmt() {
+    w := 0
+    ck := 0
+    files := mkslice(str, 0)
+    i := 2
+    for i < argc() {
+        a := argv(i)
+        if a == "-w" {
+            w = 1
+        }
+        if a == "--check" {
+            ck = 1
+        }
+        if !strings.startswith(a, "-") {
+            files = push(files, a)
+        }
+        i = i + 1
+    }
+    if len(files) == 0 {
+        eprintln("usage: oxl fmt [-w|--check] <file.oxl>...")
+        exit(1)
+    }
+    bad := 0
+    i = 0
+    for i < len(files) {
+        file := files[i]
+        if !os.exists(file) || os.isdir(file) {
+            fmt_read_err(file)
+            bad = 1
+        } else if w == 1 && ck == 0 {
+            // -w holds the source's descriptor open across the
+            // read and the staged replace: clone_attrs fstats THAT
+            // descriptor for the stage's owner + mode, so a swapped
+            // source path can't lend the stage a different file's
+            // attrs — reading then re-statting by name would leave a
+            // check-to-use window (check/print paths don't stage and
+            // can let read_src close immediately)
+            [sf, oe] = os.open(file)
+            if oe != nil {
+                eprintln(errors.msg(oe))
+                bad = 1
+            } else {
+                [src, re] = io.readall(sf)
+                if re != nil {
+                    eprintln(errors.msg(re))
+                    ce := sf.close()
+                    if ce != nil {
+                        eprintln(errors.msg(ce))
+                    }
+                    bad = 1
+                } else {
+                    res := format_file(file, src)
+                    if res.ok == 0 {
+                        bad = 1
+                    } else if res.out != src {
+                        // unpredictable staging name + exclusive
+                        // create — the open itself is the
+                        // existence check, so a planted symlink or
+                        // a concurrent fmt loses the race instead
+                        // of being followed
+                        tmp := file + ".fmt-tmp-" + itoa(now_ms())
+                        // born restricted under 0600 — clone_attrs
+                        // lands the source's mode after the write,
+                        // so the stage never sits readable looser
+                        // than the file it replaces
+                        sfd := stage_write_hold(tmp, 384, file, res.out)
+                        // -EEXIST: the name was occupied — rotate
+                        // a few times before giving up
+                        tries := 0
+                        for sfd == -17 && tries < 8 {
+                            tries = tries + 1
+                            tmp = file + ".fmt-tmp-" + itoa(now_ms()) + "-" + itoa(tries)
+                            sfd = stage_write_hold(tmp, 384, file, res.out)
+                        }
+                        if sfd < 0 {
+                            eprintln(file + ": write failed")
+                            os.remove(tmp)
+                            bad = 1
+                        } else {
+                            // clone from the descriptor the
+                            // source was read on: owner+group
+                            // land before mode, so the window
+                            // between them grants nothing beyond
+                            // the source owner's access — then
+                            // the rename replaces the inode
+                            // wholesale
+                            ac := rt_clone_attrs(sf.fd, sfd)
+                            c2 := rt_fd_close(sfd)
+                            if ac != 0 || c2 < 0 {
+                                eprintln(file + ": write failed")
+                                os.remove(tmp)
+                                bad = 1
+                            } else {
+                                re2 := os.rename(tmp, file)
+                                if re2 != nil {
+                                    eprintln(file + ": " + errors.msg(re2))
+                                    os.remove(tmp)
+                                    bad = 1
+                                }
+                            }
+                        }
+                    }
+                    ce := sf.close()
+                    if ce != nil {
+                        eprintln(errors.msg(ce))
+                    }
+                }
+            }
+        } else {
+            [src, serr] = read_src(file)
+            if serr != nil {
+                eprintln(errors.msg(serr))
+                bad = 1
+            } else {
+                res := format_file(file, src)
+                if res.ok == 0 {
+                    bad = 1
+                } else if ck == 1 {
+                    if res.out != src {
+                        eprintln(file + ": not formatted")
+                        bad = 1
+                    }
+                } else {
+                    print(res.out)
+                }
+            }
+        }
+        i = i + 1
+    }
+    if bad == 1 {
+        exit(1)
+    }
+}
+
+// `oxl doc <file.oxl>` — /// markdown extraction, seed cmd_doc
+fn cmd_doc() {
+    if argc() < 3 {
+        eprintln("usage: oxl doc <file.oxl>")
+        exit(2)
+    }
+    file := argv(2)
+    if !os.exists(file) || os.isdir(file) {
+        fmt_read_err(file)
+        exit(1)
+    }
+    [src, serr] = read_src(file)
+    if serr != nil {
+        eprintln(errors.msg(serr))
+        exit(1)
+    }
+    doc := "# API\n"
+    pending := mkslice(str, 0)
+    pos := 0
+    n := len(src)
+    for pos < n {
+        e := pos
+        for e < n && byteat(src, e) != 10 {
+            e = e + 1
+        }
+        line := substr(src, pos, e)
+        if len(line) > 0 && byteat(line, len(line) - 1) == 13 {
+            line = substr(line, 0, len(line) - 1)
+        }
+        pos = e + 1
+        t := strings.trim(line)
+        if strings.startswith(t, "///") {
+            pending = push(pending, strings.trim(substr(t, 3, len(t))))
+            continue
+        }
+        if strings.startswith(t, "fn ") {
+            doc = doc + doc_sig(t, pending)
+        } else if strings.startswith(t, "struct ") {
+            doc = doc + doc_sig(t, pending)
+        } else if strings.startswith(t, "extern fn ") {
+            doc = doc + doc_sig(t, pending)
+        } else if strings.startswith(t, "interface ") {
+            doc = doc + doc_sig(t, pending)
+        }
+        // a decl line attaches (and consumes) pending docs; anything
+        // that isn't exactly `//` drops them
+        if t != "//" {
+            pending = mkslice(str, 0)
+        }
+    }
+    print(doc)
+}
+
+fn doc_sig(t: str, pending: []str) -> str {
+    sig := t
+    ci := find(t, "{")
+    if ci >= 0 {
+        sig = substr(t, 0, ci)
+    }
+    sig = strings.trim(sig)
+    out := "\n## `" + sig + "`\n"
+    if len(pending) > 0 {
+        out = out + "\n"
+        i := 0
+        for i < len(pending) {
+            if i > 0 {
+                out = out + "\n"
+            }
+            out = out + pending[i]
+            i = i + 1
+        }
+        out = out + "\n"
+    }
+    return out
+}

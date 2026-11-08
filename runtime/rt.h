@@ -312,6 +312,7 @@ int64_t rt_find(OxlStr s, OxlStr sub);
 int64_t rt_atoi(OxlStr s);
 double rt_atof(OxlStr s);
 OxlStr rt_ftoa(double v);
+OxlStr rt_ftoa_p(double v, int64_t prec);
 void *rt_mkbuf(int64_t size);
 RtSlice rt_bytes_str(OxlStr s);        /* arena copy -> []byte      */
 OxlStr  rt_str_bytes(RtSlice b);       /* zero-copy view -> str     */
@@ -348,6 +349,7 @@ int64_t rt_htonl(int64_t v);
 OxlStr rt_getenv(OxlStr name);
 int64_t rt_fexists(OxlStr path);
 OxlStr rt_fullpath(OxlStr path);
+OxlStr rt_exepath(void); /* canonical path of the running binary ("" on failure) */
 int64_t rt_open_read(OxlStr path);     /* fd or -1                  */
 int64_t rt_open_write(OxlStr path);    /* create|trunc, fd or -1    */
 int64_t rt_fd_read(int64_t fd, RtSlice b);   /* n or -errno        */
@@ -359,6 +361,8 @@ int64_t rt_mkdir(OxlStr path);       /* mkdir 0777, 0 or -errno/GetLastError */
 int64_t rt_rmdir(OxlStr path);       /* empty-dir remove, 0 or -errno/GLE    */
 int64_t rt_rename(OxlStr a, OxlStr b); /* replace+cross-volume, 0 or -errno/GLE */
 int64_t rt_chmod(OxlStr path, int64_t mode); /* chmod(2) mode&0777; Windows honors owner-write only */
+int64_t rt_open_write_mode(OxlStr path, int64_t mode, OxlStr src); /* O_EXCL create under (mode|0200)&0777 (POSIX; Windows born owner-only) + src EFS attr, fd or -errno */
+int64_t rt_clone_attrs(int64_t sfd, int64_t dfd); /* clone src fd's owner+mode (POSIX) / owner+DACL+attrs (Windows) onto dst fd */
 /* argv/env are []str; argv[0]=program (PATH search), env="K=V" overrides
  * merged onto the inherited env (empty = inherit). Return: >=0 child exit
  * status (128+sig when signaled), <0 negative errno/GLE for spawn/pipe/

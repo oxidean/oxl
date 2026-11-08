@@ -3526,8 +3526,12 @@ fn call(ck: mut Ck, f: ref parser.Node, args: ref parser.NList, env: mut Env) ->
                 // covers both; ty_parse resolves the qualified path
                 if nk(a) == 2 || nk(a) == 9 {
                     an := callee_name(a)
-                    rec_use(ck, parser.nlo(a), parser.nhi(a), resolve_named(ck, an))
-                    et = ty_parse(ck, an)
+                    if len(an) == 0 {
+                        diag(ck, "check", "`mkslice` takes a type name — mkslice(int, 8)")
+                    } else {
+                        rec_use(ck, parser.nlo(a), parser.nhi(a), resolve_named(ck, an))
+                        et = ty_parse(ck, an)
+                    }
                 } else if nk(a) == 3 {
                     match a {
                         parser.Node.Ty{f0, lo, hi} => {

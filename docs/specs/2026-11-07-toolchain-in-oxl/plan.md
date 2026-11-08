@@ -122,10 +122,12 @@ AST consumers, and the fetch/cache write paths.
   gen1 product driver, and gen2 product driver (not binary hash —
   ADR-0006). That covers the spec's seed-vs-self criterion directly;
   seed-vs-self *output* parity is additionally checked in this same
-  section — command-surface stderr/exit codes are byte-identical;
-  diag/module error fixtures compare equal after stripping the
-  seed's `file:line:col:` prefixes (check.oxl diags carry
-  `{kind,msg}` only); passing module fixtures compare exit status.
+  section — command-surface runs compare equal with stdout+stderr
+  combined and trailing newlines normalized (command substitution),
+  plus identical exit codes; diag/module error fixtures compare
+  equal after stripping the seed's `file:line:col:` prefixes
+  (check.oxl diags carry `{kind,msg}` only); passing module
+  fixtures compare exit status.
 - Docs: `docs/self-hosting.md` + CONTRIBUTING updated to describe the
   seed/product split; `oxl/` crate docstring marks it as the seed.
 - Gate: full suite green under self-built driver on all 3 platforms;

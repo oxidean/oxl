@@ -10,8 +10,8 @@ from **dynamic ownership/borrow checking**, structured concurrency
 (`scope`/`spawn`/channels), and ahead-of-time native binaries from a single
 toolchain. MIT-licensed.
 
-<Aside type="caution" title="Status: v0.4.0">
-	v0.4.0 is released: the shipped binary covers `build`/`run`/`test`/
+<Aside type="caution" title="Status: v0.4.x">
+	The v0.4 release line is out: the shipped binary covers `build`/`run`/`test`/
 	`fmt`/`doc`/`lsp` plus the package/module system (`oxl.mod`, `oxl get`,
 	`oxl mod`, MVS build lists), shipped since v0.3.0. The compiler works end
 	to end: the programs in `examples/` compile to native binaries today
@@ -19,7 +19,7 @@ toolchain. MIT-licensed.
 	toolchain's own lexer, parser, checker, and C emitter are written in
 	oxl and compile themselves. Still v0: dynamic checking is not yet
 	unconditional (two documented gaps remain in
-	[`docs/semantics/ownership.md`](https://github.com/oxidean/oxl/blob/v0.4.0/docs/semantics/ownership.md)),
+	[`docs/semantics/ownership.md`](https://github.com/oxidean/oxl/blob/main/docs/semantics/ownership.md)),
 	and the design spec is the source of truth.
 </Aside>
 

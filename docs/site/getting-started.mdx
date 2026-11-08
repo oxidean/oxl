@@ -10,13 +10,13 @@ link through it. Programs that use the sqlite3 shims also need sqlite3 dev
 headers. The release tarball ships for Linux (x86_64); macOS (aarch64) and
 Windows (x86_64, via MinGW gcc or LLVM clang) are supported platforms that
 build from source. See the
-[v0.4.0 README](https://github.com/oxidean/oxl/blob/v0.4.0/README.md#building-the-toolchain).
+[README](https://github.com/oxidean/oxl/blob/main/README.md#building-the-toolchain).
 
 <Steps>
-1. Download and extract the v0.4.0 toolchain:
+1. Download and extract the latest toolchain release:
 
    ```bash
-   curl -LO https://github.com/oxidean/oxl/releases/download/v0.4.0/oxl-toolchain-linux-x86_64.tar.gz
+   curl -LO https://github.com/oxidean/oxl/releases/latest/download/oxl-toolchain-linux-x86_64.tar.gz
    tar xzf oxl-toolchain-linux-x86_64.tar.gz && cd oxl-toolchain
    ```
 
@@ -60,7 +60,7 @@ from the repository (a Rust toolchain plus `cc`):
 
 ```bash
 git clone https://github.com/oxidean/oxl && cd oxl
-git checkout v0.4.0
+git checkout "$(git describe --tags --abbrev=0)"   # latest release tag (or stay on main)
 cargo build --release --manifest-path oxl/Cargo.toml
 # binary: oxl/target/release/oxl; put it on PATH with std/ alongside
 ```
@@ -68,7 +68,7 @@ cargo build --release --manifest-path oxl/Cargo.toml
 `import "std/x"` resolves against `std/` next to the binary, so run it
 from the repo root or copy `std/` next to wherever the binary lands.
 
-## The toolbox (v0.4.0)
+## The toolbox
 
 ```text
 oxl build [<pkg dir>|<file.oxl>...] [-o out]   compile to a native binary
@@ -88,7 +88,7 @@ projects opt in with an `oxl.mod` manifest at the root. The
 the module cache.
 
 <Aside type="tip">
-	The repository's [`examples/`](https://github.com/oxidean/oxl/tree/v0.4.0/examples)
+	The repository's [`examples/`](https://github.com/oxidean/oxl/tree/main/examples)
 	directory, also bundled in the tarball, is the ground truth for what
 	works today, including the HTTP CRUD + SQLite pilot and a GTK4 todo app
 	over `extern fn` FFI. The `bootstrap/` tree holds the self-hosting proof:

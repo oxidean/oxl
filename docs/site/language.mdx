@@ -57,7 +57,7 @@ fn main() {
 
 `std/` ships next to the toolchain binary; pull in a package with
 `import "std/<pkg>"` (`as` aliases and `.{name, ...}` selection
-supported). v0.4.0 ships 36 packages:
+supported). The v0.4 line ships 36 packages:
 
 - **Text**: `std/strings` (`startswith`/`contains`, `trim`, `split`,
   `join`, case ops), `std/strconv`, `std/unicode/utf8`, `std/regexp`
@@ -122,8 +122,8 @@ replaces, and untouched lines survive; unimported requires drop),
 `oxl list -m all`.
 
 The references live in the repository:
-[`docs/semantics/`](https://github.com/oxidean/oxl/tree/v0.4.0/docs/semantics)
+[`docs/semantics/`](https://github.com/oxidean/oxl/tree/main/docs/semantics)
 covers ownership, concurrency, and the per-feature contracts everything is
 built against, and the
-[approved design spec](https://github.com/oxidean/oxl/blob/v0.4.0/docs/specs/2026-11-03-language-design.md)
+[approved design spec](https://github.com/oxidean/oxl/blob/main/docs/specs/2026-11-03-language-design.md)
 is what everything traces back to.

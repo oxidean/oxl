@@ -584,67 +584,6 @@ fi
 mkdir -p "$scratch/workfm"
 printf 'oxlwork 0.3\nuse ./nonexistent\n' > "$scratch/workfm/oxl.work"
 printf 'package main\n\nfn main() {}\n' > "$scratch/workfm/main.oxl"
-# DBG: replay find_root/find_work walks on the raw argv path
-cat > "$scratch/probe.oxl" <<'EOF'
-package main
-import "std/os"
-
-extern fn rt_isfile(path: str) -> int
-extern fn rt_isdir(path: str) -> int
-
-fn last_slash(s: str) -> int {
-    i := find(s, "/")
-    last := -1
-    for i >= 0 {
-        last = i
-        i = find(substr(s, last + 1, len(s)), "/")
-        if i >= 0 {
-            i = i + last + 1
-        }
-    }
-    return last
-}
-fn dir_of(path: str) -> str {
-    ls := last_slash(path)
-    if ls < 0 {
-        return "."
-    }
-    if ls == 0 {
-        return "/"
-    }
-    return substr(path, 0, ls)
-}
-fn main() {
-    p := argv(1)
-    println("ARGV1=" + p)
-    st := p
-    if rt_isdir(st) == 0 {
-        st = dir_of(st)
-    }
-    println("START=" + st)
-    d := os.fullpath(st)
-    if len(d) == 0 {
-        d = os.fullpath(".")
-    }
-    println("CANON=" + d)
-    for len(d) > 0 {
-        hit := rt_isfile(d + "/oxl.mod")
-        wh := rt_isfile(d + "/oxl.work")
-        println("WALK d=" + d + " mod=" + itoa(hit) + " work=" + itoa(wh))
-        if hit == 1 || wh == 1 {
-            break
-        }
-        if d == "." || d == "/" {
-            break
-        }
-        d = dir_of(d)
-    }
-    println("TAILMOD=" + itoa(rt_isfile("/oxl.mod")))
-    println("TAILWORK=" + itoa(rt_isfile("/oxl.work")))
-}
-EOF
-"$SELFOXL" run "$scratch/probe.oxl" -- "$scratch/workfm/main.oxl" 2>&1 | sed 's/^/DBG /' || true
-echo "DBG scratch=$scratch"
 seed_out=$("$SEEDOXL" build "$scratch/workfm/main.oxl" -o "$scratch/workfmbin" 2>&1 | sed 's/^[^:]*:[0-9][0-9]*:[0-9][0-9]*: //') && seed_rc=0 || seed_rc=1
 self_out=$("$scratch/selfcheck$EXE" "$scratch/workfm/main.oxl" 2>&1) && self_rc=0 || self_rc=1
 if [ "$seed_rc" != 0 ] || [ "$self_rc" != 0 ] || [ "$self_out" != ok ]; then

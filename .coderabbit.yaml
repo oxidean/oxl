@@ -1,6 +1,14 @@
 # CodeRabbit configuration — see https://docs.coderabbit.ai/reference/configuration
 reviews:
   profile: chill
+  path_filters:
+    # Materialized ox-agent scaffold (skills/, lifecycle/, pipelines/,
+    # schemas/, workflows/) is synced from the upstream Ox-Agent repo —
+    # in-place edits here are overwritten by the next `ox-agent assets
+    # sync`, so review findings on them belong upstream, not in this
+    # repo's review surface. Work items under work/ stay reviewable.
+    - "!.ox-agent/**"
+    - ".ox-agent/work/**"
   auto_approvals:
     enabled: true
   auto_review:

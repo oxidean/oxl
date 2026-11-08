@@ -85,8 +85,10 @@ this milestone dogfoods T's port.
 - `oxl.work` malformed/missing-dir/conflicting-module diagnostics
   land in `tests/diag/` corpus, both drivers byte-identical.
 - `oxl publish` on a scratch index repo produces the tag + index
-  entry; `oxl get` on a clean `OXLMODCACHE` resolves it; `oxl mod
-  verify` catches a tampered entry (`h1` mismatch).
+  entry; `oxl get` on a clean `OXLMODCACHE` resolves it; a tampered
+  index entry (`h1` edited in the index repo) fails at `oxl get`'s
+  entry-vs-tree comparison, and `oxl mod verify` covers cache-side
+  tampering.
 - Suite green on linux/macos/windows including the extras section;
   `extra/` packages unreachable from `std` unless imported (no
   bloat — the G1 reachability gate applies unchanged).

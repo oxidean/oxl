@@ -293,7 +293,6 @@ fn parse_work(src: &str) -> Result<(Option<String>, Vec<(usize, String)>), Strin
                 floor = Some(toks[1].to_string());
             }
             "use" => {
-                let mut body: Vec<(usize, Vec<String>)> = Vec::new();
                 if toks.len() == 2 && toks[1] == "(" {
                     let mut closed = false;
                     for (ln2, raw2) in lines.by_ref() {
@@ -305,19 +304,21 @@ fn parse_work(src: &str) -> Result<(Option<String>, Vec<(usize, String)>), Strin
                             closed = true;
                             break;
                         }
-                        body.push((ln2 + 1, t2.split_whitespace().map(String::from).collect()));
+                        let bt: Vec<String> =
+                            t2.split_whitespace().map(String::from).collect();
+                        if bt.len() != 1 {
+                            return Err(format!("oxl.work:{}: expected `dir`", ln2 + 1));
+                        }
+                        dirs.push((ln2 + 1, bt[0].clone()));
                     }
                     if !closed {
                         return Err(err("unterminated use block".into()));
                     }
                 } else {
-                    body.push((line_no, toks[1..].iter().map(|s| s.to_string()).collect()));
-                }
-                for (bln, bt) in body {
-                    if bt.len() != 1 {
-                        return Err(format!("oxl.work:{bln}: expected `dir`"));
+                    if toks.len() != 2 {
+                        return Err(err("expected `dir`".into()));
                     }
-                    dirs.push((bln, bt[0].clone()));
+                    dirs.push((line_no, toks[1].to_string()));
                 }
             }
             _ => return Err(err(format!("unknown directive \"{}\"", toks[0]))),

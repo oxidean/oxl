@@ -25,7 +25,13 @@ segment:
   runs during eligibility, before `oxl publish` pushes the tag,
   so an unpublishable path cannot strand a pushed tag
   (`check_component` does not cover it: the module cache is not
-  a git worktree, so the cache rules have no `.git` arm), and
+  a git worktree, so the cache rules have no `.git` arm),
+- does not end in `.json` when it is a *non-leaf* segment — a
+  `lib.json` segment midway must become a directory while the
+  same path `…/lib` derives a *file* `lib.json`, and one name
+  cannot be both. A trailing-segment `.json` is safe (its entry
+  file just gains a second suffix) so the rule is positional;
+  ineligible paths keep the direct-git fallback, and
 - has an *escaped* form (below) of ≤ 200 bytes.
 
 The derived index path (`index/` + components + `.json`) must
@@ -45,12 +51,15 @@ differing only by case (`acme/Lib` vs `acme/lib`) must not
 collide. Each escaped segment becomes a directory component under
 `index/`; the leaf segment gains `.json`. The mapping is
 injective: `!` is produced only by the escape and is outside the
-source alphabet, so segments decode unambiguously, and a file
-`lib.json` vs directory `lib/` cannot collide by construction.
+source alphabet, so segments decode unambiguously. The only
+residual file/directory collision — a non-leaf segment that itself
+ends in `.json` needing to be a directory beside a `…/lib`-derived
+file — is excluded by the positional eligibility rule above, so
 `github.com/acme/lib` → `index/github.com/acme/lib.json`,
 `github.com/Acme/lib` → `index/github.com/!acme/lib.json`, and
-`github.com/acme/lib.json/extra` → `index/github.com/acme/lib.json/
-extra.json` never collide — even on Windows/macOS checkouts.
+`github.com/acme/lib.json` → `index/github.com/acme/lib.json.json`
+never collide — even on Windows/macOS checkouts. (`github.com/
+acme/lib.json/extra` is ineligible and resolves via direct git.)
 Publish and lookup share the same derivation, so they can never
 disagree on the key.
 

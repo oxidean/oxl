@@ -5756,16 +5756,18 @@ fn find_root(d: str) -> str {
         d = c
     }
     for len(d) > 0 {
+        // "." is never a canonical ancestor — dir_of degrades a drive
+        // root ("C:") to "." and a probe would resolve against the cwd
+        if d == "." {
+            break
+        }
         if rt_isfile(d + "/oxl.mod") == 1 {
             return d
         }
-        if d == "." || d == "/" {
+        if d == "/" {
             break
         }
         d = dir_of(d)
-    }
-    if rt_isfile("/oxl.mod") == 1 {
-        return "/"
     }
     return ""
 }
@@ -5781,16 +5783,16 @@ fn find_work(d: str) -> str {
         d = c
     }
     for len(d) > 0 {
+        if d == "." {
+            break
+        }
         if rt_isfile(d + "/oxl.work") == 1 {
             return d
         }
-        if d == "." || d == "/" {
+        if d == "/" {
             break
         }
         d = dir_of(d)
-    }
-    if rt_isfile("/oxl.work") == 1 {
-        return "/"
     }
     return ""
 }
@@ -6438,10 +6440,17 @@ fn mod_ctx_load(ck: mut Ck, start: str) -> int {
 }
 
 // `<base>`-anchored ancestor walk for `std/<rest>` — the exe and the
-// entry dir each get one pass inside resolve_imp
-fn std_at(base: str, rest: str) -> str {
+// entry dir each get one pass inside resolve_imp. `rel` marks a
+// relative base: its "." tail mirrors the seed's "" parent (probed
+// cwd-relative). Canonical bases never legitimately reach "." —
+// dir_of degrades a drive root ("C:") to "." there, and probing it
+// would resolve against an unrelated cwd.
+fn std_at(base: str, rest: str, rel: int) -> str {
     d := base
     for len(d) > 0 {
+        if d == "." && rel == 0 {
+            break
+        }
         p := d + "/std/" + rest
         if rt_isdir(p) == 1 {
             return p
@@ -6904,17 +6913,17 @@ fn resolve_imp(ck: mut Ck, imp: str) -> RRes {
         // canon_or would silently anchor the search at the cwd.
         exe := rt_exepath()
         if len(exe) > 0 {
-            r.dir = std_at(canon_or(dir_of(exe)), rest)
+            r.dir = std_at(canon_or(dir_of(exe)), rest, 0)
         }
         // a bare argv(0) (PATH invocation) has no dir component —
         // dir_of yields "." which canon_or turns into the cwd, so the
         // probe is skipped unless argv(0) actually carries a path
         av := argv(0)
         if len(r.dir) == 0 && strings.contains(av, "/") {
-            r.dir = std_at(canon_or(dir_of(av)), rest)
+            r.dir = std_at(canon_or(dir_of(av)), rest, 0)
         }
         if len(r.dir) == 0 {
-            r.dir = std_at(ck.entry_dir, rest)
+            r.dir = std_at(ck.entry_dir, rest, 1)
         }
     }
     return r

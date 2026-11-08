@@ -2379,7 +2379,10 @@ int64_t rt_open_write_mode(OxlStr path, int64_t mode) {
  * access on replace. POSIX mode bits already cover this (the caller
  * chmods before rename); the call is a no-op there. A NULL source
  * DACL is left alone rather than propagated — it means world access,
- * and the inherited default errs stricter. */
+ * and the inherited default errs stricter. The source's
+ * SE_DACL_PROTECTED state is preserved: copying a protected DACL
+ * without the matching flag would leave dst inheriting parent ACEs
+ * on top of it. */
 int64_t rt_copy_acl(OxlStr src, OxlStr dst) {
 #ifdef _WIN32
     if (src.n > 0 && memchr(src.p, 0, (size_t)src.n)) return -EINVAL;
@@ -2394,10 +2397,19 @@ int64_t rt_copy_acl(OxlStr src, OxlStr dst) {
     if (r != ERROR_SUCCESS) return -((int64_t)r | RT_GLE_TAG);
     int64_t rc = 0;
     if (dacl) {
-        r = SetNamedSecurityInfoA(cd, SE_FILE_OBJECT,
-                                  DACL_SECURITY_INFORMATION,
-                                  NULL, NULL, dacl, NULL);
-        if (r != ERROR_SUCCESS) rc = -((int64_t)r | RT_GLE_TAG);
+        SECURITY_DESCRIPTOR_CONTROL ctl = 0;
+        DWORD rev = 0;
+        if (!GetSecurityDescriptorControl(sd, &ctl, &rev)) {
+            rc = RT_GLE();
+        } else {
+            DWORD prot = (ctl & SE_DACL_PROTECTED)
+                             ? PROTECTED_DACL_SECURITY_INFORMATION
+                             : UNPROTECTED_DACL_SECURITY_INFORMATION;
+            r = SetNamedSecurityInfoA(cd, SE_FILE_OBJECT,
+                                      DACL_SECURITY_INFORMATION | prot,
+                                      NULL, NULL, dacl, NULL);
+            if (r != ERROR_SUCCESS) rc = -((int64_t)r | RT_GLE_TAG);
+        }
     }
     if (sd) LocalFree((HLOCAL)sd);
     return rc;

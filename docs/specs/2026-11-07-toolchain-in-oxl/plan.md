@@ -117,10 +117,13 @@ AST consumers, and the fetch/cache write paths.
 
 - `run.sh` self-build section: seed builds `cmd/oxl` → suite runs
   under the product driver end-to-end (the milestone exit gate).
-- Fixpoint assert (as implemented): self-emitted C for `cmd/oxl`
-  sources is stable across product-driver generations — gen1 vs gen2
-  emit byte-identical C (not binary hash — ADR-0006). Seed-vs-self
-  parity is covered separately by the codegen self-compare section.
+- Fixpoint assert (as implemented): emitted C for `cmd/oxl` sources
+  is byte-identical across all three emission paths — seed driver,
+  gen1 product driver, and gen2 product driver (not binary hash —
+  ADR-0006). That covers the spec's seed-vs-self criterion directly;
+  seed-vs-self *output* parity is additionally checked in this same
+  section (command surface + diag/module corpora byte-identical
+  between the seed and product drivers).
 - Docs: `docs/self-hosting.md` + CONTRIBUTING updated to describe the
   seed/product split; `oxl/` crate docstring marks it as the seed.
 - Gate: full suite green under self-built driver on all 3 platforms;

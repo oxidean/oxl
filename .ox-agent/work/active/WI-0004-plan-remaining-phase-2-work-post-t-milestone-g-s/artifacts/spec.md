@@ -23,7 +23,7 @@ this milestone dogfoods T's port.
    convention — single version series until a package needs its own
    cadence): `module github.com/oxidean/oxl/extra` rooted at `extra/`
    — a *subdirectory module*: repo root != module root.
-   Root `oxl.mod` stays `github.com/oxidean/oxl`.
+   Root `oxl.mod` stays `module oxl` (bare — never fetched).
 2. **Workspace resolution — `oxl.work`**: new file at repo root
    (go.work analog): `use` directive listing module dirs
    (`use ./`, `use ./extra`). When present, imports resolving under a

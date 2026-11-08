@@ -24,6 +24,10 @@
 #include <unistd.h>
 #endif
 #include <sys/stat.h>
+#ifdef _WIN32
+#include <aclapi.h>
+#include <sddl.h>
+#endif
 
 #define ARENA_CAP (1 << 20)
 
@@ -2346,6 +2350,106 @@ int64_t rt_open_write(OxlStr path) {
     return fd < 0 ? -(int64_t)errno : fd;
 }
 
+/* open_write_mode: exclusive create with an explicit access mode —
+ * staged replacements (fmt -w) are born under the source's mode
+ * instead of umask defaults, so contents are never exposed looser
+ * than the file they will replace. Owner-write is forced on so a
+ * read-only source still accepts its staged content; the caller
+ * chmods the real mode after the write completes. Windows pmode
+ * collapses to the read-only attribute — create writable there and
+ * let the post-write chmod set the read-only flag.
+ * O_EXCL/_O_EXCL make the create atomic: an occupied pathname fails
+ * -EEXIST instead of truncating through a symlink planted between a
+ * caller's existence check and the open. */
+int64_t rt_open_write_mode(OxlStr path, int64_t mode) {
+    if (path.n > 0 && memchr(path.p, 0, (size_t)path.n)) return -EINVAL;
+    const char *cp = rt_cstr(path);
+#ifdef _WIN32
+    (void)mode;
+    /* Born restrictive: an owner-only DACL on the staging file
+     * closes the window where inherited parent ACEs could expose
+     * staged contents before the caller's rt_copy_acl carries the
+     * source DACL across. CREATE_NEW keeps the exclusive-create
+     * contract; share mode 0 holds the stage closed to other opens
+     * for the write's duration. "OW" is the owner-rights SID — the
+     * creating account keeps full access on every setup. */
+    SECURITY_ATTRIBUTES sa;
+    PSECURITY_DESCRIPTOR rsd = NULL;
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = FALSE;
+    sa.lpSecurityDescriptor = NULL;
+    if (ConvertStringSecurityDescriptorToSecurityDescriptorA(
+            "D:P(A;;GA;;;OW)", SDDL_REVISION_1, &rsd, NULL))
+        sa.lpSecurityDescriptor = rsd;
+    HANDLE h = CreateFileA(cp, GENERIC_WRITE, 0,
+                           sa.lpSecurityDescriptor ? &sa : NULL,
+                           CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (rsd) LocalFree((HLOCAL)rsd);
+    if (h == INVALID_HANDLE_VALUE) {
+        DWORD e = GetLastError();
+        return e == ERROR_FILE_EXISTS
+                   ? -(int64_t)EEXIST
+                   : -((int64_t)e | RT_GLE_TAG);
+    }
+    int fd = _open_osfhandle((intptr_t)h, _O_WRONLY | _O_BINARY);
+    if (fd < 0) { CloseHandle(h); return -(int64_t)EIO; }
+    return fd;
+#else
+    int fd = open(cp, O_WRONLY | O_CREAT | O_EXCL | O_TRUNC,
+                  (mode_t)((mode | 0200) & 0777));
+    return fd < 0 ? -(int64_t)errno : fd;
+#endif
+}
+
+/* copy_acl: carry src's DACL onto dst — a staged replacement born
+ * with an inherited default DACL would loosen a private source's
+ * access on replace. POSIX mode bits already cover this (the caller
+ * chmods before rename); the call is a no-op there. A NULL source
+ * DACL is left alone rather than propagated — it means world access,
+ * and the inherited default errs stricter. The source's
+ * SE_DACL_PROTECTED state is preserved: copying a protected DACL
+ * without the matching flag would leave dst inheriting parent ACEs
+ * on top of it. */
+int64_t rt_copy_acl(OxlStr src, OxlStr dst) {
+#ifdef _WIN32
+    if (src.n > 0 && memchr(src.p, 0, (size_t)src.n)) return -EINVAL;
+    if (dst.n > 0 && memchr(dst.p, 0, (size_t)dst.n)) return -EINVAL;
+    const char *cs = rt_cstr(src);
+    const char *cd = rt_cstr(dst);
+    PACL dacl = NULL;
+    PSECURITY_DESCRIPTOR sd = NULL;
+    DWORD r = GetNamedSecurityInfoA(cs, SE_FILE_OBJECT,
+                                    DACL_SECURITY_INFORMATION,
+                                    NULL, NULL, &dacl, NULL, &sd);
+    if (r != ERROR_SUCCESS) return -((int64_t)r | RT_GLE_TAG);
+    int64_t rc = 0;
+    if (dacl) {
+        SECURITY_DESCRIPTOR_CONTROL ctl = 0;
+        DWORD rev = 0;
+        if (!GetSecurityDescriptorControl(sd, &ctl, &rev)) {
+            rc = RT_GLE();
+        } else {
+            DWORD prot = (ctl & SE_DACL_PROTECTED)
+                             ? PROTECTED_DACL_SECURITY_INFORMATION
+                             : UNPROTECTED_DACL_SECURITY_INFORMATION;
+            /* MinGW spells the name param LPSTR; the API does not
+             * write it — the cast also keeps the build warning-free
+             * so compile output stays byte-stable across runs. */
+            r = SetNamedSecurityInfoA((char *)cd, SE_FILE_OBJECT,
+                                      DACL_SECURITY_INFORMATION | prot,
+                                      NULL, NULL, dacl, NULL);
+            if (r != ERROR_SUCCESS) rc = -((int64_t)r | RT_GLE_TAG);
+        }
+    }
+    if (sd) LocalFree((HLOCAL)sd);
+    return rc;
+#else
+    (void)src;
+    (void)dst;
+    return 0;
+#endif
+}
+
 /* the read window is the slice's LEN — `b[:n]` sub-slices keep the
  * parent's cap, and the Read contract is len(p) bytes max */
 int64_t rt_fd_read(int64_t fd, RtSlice b) {
@@ -3241,6 +3345,24 @@ int64_t rt_chmod(OxlStr path, int64_t mode) {
         ? RT_GLE() : 0;
 #else
     return chmod(cp, (mode_t)(mode & 0777)) < 0 ? -(int64_t)errno : 0;
+#endif
+}
+
+/* fmode: access-mode bits of path — callers staging a temp+rename
+ * carry the source's mode over the replace (a fresh inode would
+ * otherwise take umask defaults). Windows has only the read-only
+ * attribute, mirroring rt_chmod's two-state mapping. */
+int64_t rt_fmode(OxlStr path) {
+    if (path.n > 0 && memchr(path.p, 0, (size_t)path.n)) return -EINVAL;
+    const char *cp = rt_cstr(path);
+#ifdef _WIN32
+    DWORD a = GetFileAttributesA(cp);
+    if (a == INVALID_FILE_ATTRIBUTES) return RT_GLE();
+    return (a & FILE_ATTRIBUTE_READONLY) ? 0444 : 0666;
+#else
+    struct stat st;
+    if (stat(cp, &st) != 0) return -(int64_t)errno;
+    return (int64_t)(st.st_mode & 0777);
 #endif
 }
 

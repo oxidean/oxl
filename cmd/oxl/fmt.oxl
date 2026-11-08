@@ -13,6 +13,8 @@ package main
 // them right and the emitter is a line-for-line port.
 import "std/errors"
 
+import "std/io"
+
 import "std/os"
 
 import "std/strings"
@@ -24,6 +26,24 @@ extern fn rt_ftoa_p(v: float, prec: int) -> str
 
 // mkbuf frees itself into the copied string via bufstr
 extern fn rt_free(p: own void)
+
+// access-mode bits of a path (fmt -w carries the source's mode onto
+// the staging file); open_write_mode creates the staging file under
+// that mode at birth — no window where staged content sits readable
+// looser than the source it will replace
+extern fn rt_fmode(path: str) -> int
+
+extern fn rt_chmod(path: str, mode: int) -> int
+
+extern fn rt_open_write_mode(path: str, mode: int) -> int
+
+// copy the source's DACL onto the staged replacement (Windows; a
+// no-op under POSIX where the chmod above carries the permissions)
+extern fn rt_copy_acl(src: str, dst: str) -> int
+
+extern fn rt_fd_write(fd: int, b: []byte) -> int
+
+extern fn rt_fd_close(fd: int) -> int
 
 // ---------- diagnostics ----------
 // the seed pushes lex+parse diagnostics and aborts fmt on the first
@@ -3444,6 +3464,59 @@ fn format_file(path: str, src: str) -> own FRes {
 }
 
 // io::Error display text for the two cases reachable from oxl
+// checked read — the readfile builtin collapses errors to "", which
+// would let fmt rewrite or doc print a truncated source; open+readall
+// keeps a mid-read failure distinct from an empty file
+fn read_src(file: str) -> [str, err] {
+    [f, oe] = os.open(file)
+    if oe != nil {
+        return "", oe
+    }
+    [src, re] = io.readall(f)
+    ce := f.close()
+    if re != nil {
+        return "", re
+    }
+    if ce != nil {
+        return "", ce
+    }
+    return src, nil
+}
+
+// stage_write creates path with access mode and writes s — the
+// mode lands at create time (open_write_mode forces owner-write on
+// so a read-only source still accepts its content); callers chmod
+// the final mode after the write completes
+fn stage_write(path: str, mode: int, s: str) -> int {
+    fd := rt_open_write_mode(path, mode)
+    if fd < 0 {
+        return fd
+    }
+    b := s as []byte
+    off := 0
+    rc := 0
+    for off < len(b) {
+        w := rt_fd_write(fd, b[off:])
+        if w <= 0 {
+            if w < 0 {
+                rc = w
+            } else {
+                rc = -5
+            }
+            break
+        }
+        off = off + w
+    }
+    c := rt_fd_close(fd)
+    if rc != 0 {
+        return rc
+    }
+    if c < 0 {
+        return c
+    }
+    return 0
+}
+
 fn fmt_read_err(file: str) {
     if os.isdir(file) {
         eprintln(file + ": Is a directory (os error 21)")
@@ -3483,33 +3556,71 @@ fn cmd_fmt() {
             fmt_read_err(file)
             bad = 1
         } else {
-            src := readfile(file)
-            res := format_file(file, src)
-            if res.ok == 0 {
+            [src, serr] = read_src(file)
+            if serr != nil {
+                eprintln(errors.msg(serr))
                 bad = 1
-            } else if ck == 1 {
-                if res.out != src {
-                    eprintln(file + ": not formatted")
+            } else {
+                res := format_file(file, src)
+                if res.ok == 0 {
                     bad = 1
-                }
-            } else if w == 1 {
-                if res.out != src {
-                    tmp := file + ".fmt-tmp"
-                    if writefile(tmp, res.out) != 0 {
-                        eprintln(file + ": write failed")
-                        os.remove(tmp)
+                } else if ck == 1 {
+                    if res.out != src {
+                        eprintln(file + ": not formatted")
                         bad = 1
-                    } else {
-                        re := os.rename(tmp, file)
-                        if re != nil {
-                            eprintln(file + ": " + errors.msg(re))
+                    }
+                } else if w == 1 {
+                    if res.out != src {
+                        // unpredictable staging name + exclusive
+                        // create — the open itself is the existence
+                        // check, so a planted symlink or a concurrent
+                        // fmt loses the race instead of being followed
+                        tmp := file + ".fmt-tmp-" + itoa(now_ms())
+                        // stage under the source's mode from birth —
+                        // a default-umask create would sit readable
+                        // looser than a private source until chmod
+                        m := rt_fmode(file)
+                        mode := 384
+                        if m >= 0 {
+                            mode = m
+                        }
+                        wr := stage_write(tmp, mode, res.out)
+                        // -EEXIST: the name was occupied — rotate a
+                        // few times before giving up
+                        tries := 0
+                        for wr == -17 && tries < 8 {
+                            tries = tries + 1
+                            tmp = file + ".fmt-tmp-" + itoa(now_ms()) + "-" + itoa(tries)
+                            wr = stage_write(tmp, mode, res.out)
+                        }
+                        if wr != 0 {
+                            eprintln(file + ": write failed")
                             os.remove(tmp)
                             bad = 1
+                        } else {
+                            // drop the owner-write bit the stage
+                            // forced on for read-only sources, then
+                            // carry the source's ACL onto the stage —
+                            // a rename replaces the inode wholesale
+                            rt_chmod(tmp, mode)
+                            ac := rt_copy_acl(file, tmp)
+                            if ac != 0 {
+                                eprintln(file + ": write failed")
+                                os.remove(tmp)
+                                bad = 1
+                            } else {
+                                re := os.rename(tmp, file)
+                                if re != nil {
+                                    eprintln(file + ": " + errors.msg(re))
+                                    os.remove(tmp)
+                                    bad = 1
+                                }
+                            }
                         }
                     }
+                } else {
+                    print(res.out)
                 }
-            } else {
-                print(res.out)
             }
         }
         i = i + 1
@@ -3530,7 +3641,11 @@ fn cmd_doc() {
         fmt_read_err(file)
         exit(1)
     }
-    src := readfile(file)
+    [src, serr] = read_src(file)
+    if serr != nil {
+        eprintln(errors.msg(serr))
+        exit(1)
+    }
     doc := "# API\n"
     pending := mkslice(str, 0)
     pos := 0

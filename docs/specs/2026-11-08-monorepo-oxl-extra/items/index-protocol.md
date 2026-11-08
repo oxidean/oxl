@@ -1,25 +1,38 @@
 # Git-backed index protocol (E4 contract)
 
-Index repo layout — one file per module, JSON Lines:
+Index repo layout — one file per module, JSON Lines, nested
+directories per module-path segment:
 
 ```
-index/github.com~oxidean~oxl~extra.json   # see path encoding below
+index/github.com/oxidean/oxl/extra.json   # see path encoding below
 {"version":"v0.1.0","commit":"<sha>","h1":"<sum>","tag":"extra/v0.1.0"}
 {"version":"v0.2.0","commit":"<sha>","h1":"<sum>","tag":"extra/v0.2.0"}
 ```
 
-The filename is derived mechanically. First apply the module-cache
-case escaping (`oxl/src/modcache.rs` `escape_path`: every uppercase
-letter becomes `!` + its lowercase form) to the whole module path —
-index repos must check out on case-insensitive filesystems, and
-paths differing only by case (`acme/Lib` vs `acme/lib`) must not
-collide. Then replace each `/` with `~`, prefix `index/`, and add
-`.json`. Module path segments are restricted to `[a-zA-Z0-9._-]`
-(the existing git-derived-path rule), which contain neither `~` nor
-`!`, so the mapping is injective and unambiguous:
-`github.com/acme/lib` → `index/github.com~acme~lib.json`,
-`github.com/Acme/lib` → `index/github.com~!acme~lib.json`, and
-`github.com/acme/lib.json/extra` → `index/github.com~acme~lib.json~
+**Index alphabet.** A module path is index-eligible iff every
+segment matches `[a-zA-Z0-9._-]` and its *escaped* form (below) is
+≤ 200 bytes. Eligibility is checked before any key is derived —
+`oxl publish` rejects ineligible paths outright, and `oxl get`
+skips the index and falls back to direct git for them (a path
+containing e.g. `~` or a separator-adjacent byte must never be
+allowed to derive a key that selects another module's entry).
+The 200-byte bound keeps every filesystem component — escaped
+segment or `<leaf>.json` — under the 255-byte limit on all
+supported platforms, no matter how deep the path nests.
+
+**Key derivation.** Apply the module-cache case escaping
+(`oxl/src/modcache.rs` `escape_path`: every uppercase letter
+becomes `!` + its lowercase form) to each segment — index repos
+must check out on case-insensitive filesystems, and paths
+differing only by case (`acme/Lib` vs `acme/lib`) must not
+collide. Each escaped segment becomes a directory component under
+`index/`; the leaf segment gains `.json`. The mapping is
+injective: `!` is produced only by the escape and is outside the
+source alphabet, so segments decode unambiguously, and a file
+`lib.json` vs directory `lib/` cannot collide by construction.
+`github.com/acme/lib` → `index/github.com/acme/lib.json`,
+`github.com/Acme/lib` → `index/github.com/!acme/lib.json`, and
+`github.com/acme/lib.json/extra` → `index/github.com/acme/lib.json/
 extra.json` never collide — even on Windows/macOS checkouts.
 Publish and lookup share the same derivation, so they can never
 disagree on the key.

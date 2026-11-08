@@ -18,7 +18,14 @@ segment:
   modcache.rs`: rejects `.`/`..` — so `.` can never normalize the
   key onto a shorter path and `..` can never escape `index/` —
   no trailing `.` or space, no Windows-reserved device stem such
-  as `con`, `aux`, `nul`, `com1-9`, `lpt1-9`), and
+  as `con`, `aux`, `nul`, `com1-9`, `lpt1-9`),
+- is not `.git` in any letter case — git's path verification
+  refuses `.git` components in index entries, so `git add` of
+  `index/<…>/.git/<leaf>.json` fails at append time. This check
+  runs during eligibility, before `oxl publish` pushes the tag,
+  so an unpublishable path cannot strand a pushed tag
+  (`check_component` does not cover it: the module cache is not
+  a git worktree, so the cache rules have no `.git` arm), and
 - has an *escaped* form (below) of ≤ 200 bytes.
 
 The derived index path (`index/` + components + `.json`) must

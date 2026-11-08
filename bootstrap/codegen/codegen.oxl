@@ -1076,17 +1076,16 @@ fn xty_call(g: mut G, f: ref parser.Node, args: ref parser.NList) -> int {
     if name == "new" {
         if args != nil {
             a := args.v
-            if check.nk(a) == 2 {
-                match a {
-                    parser.Node.Name{n} => {
-                        q := check.resolve_named(g.ck, n)
-                        if collections.map_has(g.ck.structs, q) {
-                            st := check.tn(g.ck, check.k_struct(), q)
-                            return check.ti(g.ck, check.k_own(), st)
-                        }
-                    }
-                    _ => {
-                    }
+            // qualified `pkg.T` arrives as Node.Field — flatten to
+            // the dotted path before the struct lookup (seed Ident)
+            an := check.callee_name(a)
+            if len(an) > 0 {
+                q := check.resolve_named(g.ck, an)
+                // `E.V` sits in structs for `as` payloads but is a value
+                // expression here — gev gates the struct-type shortcut
+                if collections.map_has(g.ck.structs, q) && !gev(g, q).ok {
+                    st := check.tn(g.ck, check.k_struct(), q)
+                    return check.ti(g.ck, check.k_own(), st)
                 }
             }
             at := xty(g, a)
@@ -1731,14 +1730,124 @@ fn gfslot(g: mut G, name: str, ct: str) -> str {
     return "v" + itoa(i)
 }
 
-// LIFO defers for the current fn — consed head-first
+// drain the fn's runtime defer stack down to its entry mark — emitted
+// at every return / fn end (seed emit_defers). Frame fns keep the mark
+// in `fr->_dmark`; plain fns + closure wrappers hold a local `_dmark`.
 fn gdefers(g: mut G) {
+    if g.inframe == 1 {
+        wln(g, "    rt_defer_drain_to(fr->_dmark);")
+    } else {
+        wln(g, "    rt_defer_drain_to(_dmark);")
+    }
+}
+
+// `defer call` — register a thunk on the task's defer stack NOW (per
+// execution: loops accumulate, untaken branches register nothing).
+// Call args evaluate at registration into _da<di>_<i> temps; a
+// generated env captures register-time values so the deferred call
+// reads them at drain (seed stmt_defer).
+fn gdefer(g: mut G, call: own parser.Node) {
+    di := 0
     d := g.defers
     for d != nil {
-        v := gx(g, d.v)
-        wln(g, "    " + v + ";")
+        di = di + 1
         d = d.next
     }
+    // g.defers only counts defers now — marker node per stmt
+    g.defers = parser.ncons(new(parser.Node.Name{n: "", lo: 0, hi: 0}), g.defers)
+    cn := cname(g.cur)
+    denv := "o_denv_" + cn + "_" + itoa(di)
+    thunk := "o_def_" + cn + "_" + itoa(di)
+    // args -> registration temps; the thunk's call reads the temps
+    // through the env capture. Non-call / arg-less `defer` keeps
+    // eval-at-drain (seed stmt_defer).
+    let rewritten: own parser.Node = nil
+    match call {
+        parser.Node.Call{f, args} => {
+            if args != nil {
+                let nargs: own parser.NList = nil
+                i := 0
+                al := args
+                for al != nil {
+                    t := xty(g, al.v)
+                    an := "_da" + itoa(di) + "_" + itoa(i)
+                    v := gx(g, al.v)
+                    wln(g, "    " + gcty(g, t) + " " + an + " = " + v + ";")
+                    check.env_bind(g.env, an, t)
+                    nargs = parser.ncons(new(parser.Node.Name{n: an, lo: 0, hi: 0}), nargs)
+                    i = i + 1
+                    al = al.next
+                }
+                rewritten = new(parser.Node.Call{f: f, args: dnrev(nargs)})
+            } else {
+                rewritten = new(parser.Node.Call{f: f, args: args})
+            }
+        }
+        _ => {
+            rewritten = call
+        }
+    }
+    sc := new(GS)
+    sc.l = nil
+    gscan_e(g, sc, rewritten)
+    let caps: own GBnd = nil
+    u := sc.l
+    for u != nil {
+        t := gx_lookup(g, u.v)
+        if t >= 0 {
+            caps = gbnd(u.v, "", t, caps)
+        }
+        u = u.next
+    }
+    envf := " char _none;"
+    if caps != nil {
+        envf = ""
+        cp := caps
+        for cp != nil {
+            envf = envf + " " + gcty(g, cp.t) + " " + cname(cp.n) + ";"
+            cp = cp.next
+        }
+    }
+    g.clpro = push(g.clpro, "struct " + denv + " {" + envf + " };")
+    g.clpro = push(g.clpro, "static void " + thunk + "(void *);")
+    save_frame := g.inframe
+    g.inframe = 0
+    wpush(g)
+    wln(g, "static void " + thunk + "(void *_env) {")
+    wln(g, "    struct " + denv + " *_e = _env;")
+    check.env_push(g.env)
+    cp2 := caps
+    for cp2 != nil {
+        wln(g, "    " + gcty(g, cp2.t) + " " + cname(cp2.n) + " = _e->" + cname(cp2.n) + ";")
+        check.env_bind(g.env, cp2.n, cp2.t)
+        cp2 = cp2.next
+    }
+    v2 := gx(g, rewritten)
+    wln(g, "    (void)(" + v2 + ");")
+    check.env_pop(g.env)
+    wln(g, "}")
+    wpop(g)
+    g.clbod = push(g.clbod, wjoin(g.wlast))
+    g.inframe = save_frame
+    inits := ""
+    cp3 := caps
+    for cp3 != nil {
+        inits = inits + " _de->" + cname(cp3.n) + " = " + gxname(g, cp3.n) + ";"
+        cp3 = cp3.next
+    }
+    wln(g, "    { struct " + denv + " *_de = malloc(sizeof *_de);" + inits + " rt_defer_push(" + thunk + ", _de); }")
+}
+
+// NList reverse (parser nrev is package-private)
+fn dnrev(l: own parser.NList) -> own parser.NList {
+    let out: own parser.NList = nil
+    for l != nil {
+        n := l.next
+        l.next = out
+        out = l
+        l = n
+    }
+    return out
 }
 
 // susp callee name: bare leaf builtin or qualified oxl fn ("" = not susp)
@@ -2473,17 +2582,13 @@ fn gcall(g: mut G, f: ref parser.Node, args: ref parser.NList) -> str {
         return "close(" + a0 + ")"
     }
     if qn == "new" && args != nil {
-        sn := ""
-        match args.v {
-            parser.Node.Name{n} => {
-                sn = n
-            }
-            _ => {
-            }
-        }
+        // `new(T)` — a qualified `pkg.T` is a Node.Field here, not a
+        // Name; flatten Name and Field chains to the dotted path (the
+        // seed's parser folds both into one Ident)
+        sn := check.callee_name(args.v)
         if len(sn) > 0 {
             q := check.resolve_named(g.ck, sn)
-            if collections.map_has(g.ck.structs, q) {
+            if collections.map_has(g.ck.structs, q) && !gev(g, q).ok {
                 return "({ struct o_s_" + cname(q) + " *_nb = rt_alloc_own(sizeof(struct o_s_" + cname(q) + ")); __builtin_memset(_nb, 0, sizeof(struct o_s_" + cname(q) + ")); _nb; })"
             }
         }
@@ -3267,8 +3372,11 @@ fn gclosure(g: mut G, params: ref parser.NList, body: ref parser.Node) -> str {
     g.retk = 0
     save_cret := g.cret
     g.cret = xclret(g, body)
+    save_cur := g.cur
+    g.cur = "o_cl_" + sid
     wpush(g)
     wln(g, "static " + ret_c + " o_cl_" + sid + "(struct o_env_" + sid + " *_e" + psig + ") {")
+    wln(g, "    RtDefer *_dmark = rt_defer_mark();")
     check.env_push(g.env)
     cp = caps
     for cp != nil {
@@ -3297,6 +3405,7 @@ fn gclosure(g: mut G, params: ref parser.NList, body: ref parser.Node) -> str {
     g.defers = save_def
     g.retk = save_ret
     g.cret = save_cret
+    g.cur = save_cur
     // the value: env populated from the enclosing scope
     inits := ""
     cp = caps
@@ -3404,7 +3513,7 @@ fn gs(g: mut G, s: ref parser.Node) {
             wln(g, "    " + v + ";")
         }
         parser.Node.Defer{call} => {
-            g.defers = parser.ncons(call, g.defers)
+            gdefer(g, call)
         }
         parser.Node.Ret{vals} => {
             gdefers(g)
@@ -3979,7 +4088,7 @@ fn gfstmt(g: mut G, s: ref parser.Node) {
             gfstmt_expr(g, e)
         }
         parser.Node.Defer{call} => {
-            g.defers = parser.ncons(call, g.defers)
+            gdefer(g, call)
         }
         parser.Node.Ret{vals} => {
             // `return suspPair()` forwards [v, err] — desugar via two slots
@@ -4335,6 +4444,7 @@ fn gframe(g: mut G, qn: str, recv: ref parser.Node, params: ref parser.NList, re
     }
     wpush(g)
     check.env_push(g.fsl)
+    wln(g, "    fr->_dmark = rt_defer_mark();")
     gfblk(g, body)
     check.env_pop(g.fsl)
     gdefers(g)
@@ -4360,7 +4470,7 @@ fn gframe(g: mut G, qn: str, recv: ref parser.Node, params: ref parser.NList, re
         i = i + 1
     }
     ce := cname(qn)
-    g.fhead = push(g.fhead, "struct o_frm_" + ce + " { RtScope *cur_scope; int state; RtFrame *child;" + res + pfields + " " + fdj + " " + sdj + "};\nint o_poll_" + ce + "(RtFrame *_f, RtTask *task);\n")
+    g.fhead = push(g.fhead, "struct o_frm_" + ce + " { RtScope *cur_scope; int state; RtFrame *child; RtDefer *_dmark;" + res + pfields + " " + fdj + " " + sdj + "};\nint o_poll_" + ce + "(RtFrame *_f, RtTask *task);\n")
     g.fbody = push(g.fbody, "int o_poll_" + ce + "(RtFrame *_f, RtTask *task) {\n    struct o_frm_" + ce + " *fr = (struct o_frm_" + ce + " *)_f;\n    RtScope *saved = tls_scope;\n    tls_scope = fr->cur_scope;\n    int _p;\n    switch (fr->state) { " + cases + " default: tls_scope = saved; return RT_READY; }\n    s0: ;\n" + bodytxt + "    fr->cur_scope = tls_scope; tls_scope = saved; return RT_READY;\n}\n")
     g.inframe = 0
 }
@@ -4410,6 +4520,7 @@ fn gemit_named_fn(g: mut G, i: int, qn: str, base: str) {
                 return
             }
             wln(g, gret_c(g, ret, qn, true) + " o_f_" + cname(qn) + "(" + gparams2(g, recv, params) + ") {")
+            wln(g, "    RtDefer *_dmark = rt_defer_mark();")
             check.env_push(g.env)
             if recv != nil {
                 match recv {

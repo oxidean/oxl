@@ -1,3 +1,8 @@
+//! oxl — the seed toolchain. This crate is the bootstrap input that
+//! compiles the `.oxl`-written product driver (`cmd/oxl`); it is not the
+//! shipped toolchain. See `docs/self-hosting.md` and ADR-0006 for the
+//! seed/product split and the generational fixpoint gate.
+
 mod ast;
 mod check;
 mod codegen;

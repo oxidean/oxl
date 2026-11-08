@@ -24,6 +24,9 @@
 #include <unistd.h>
 #endif
 #include <sys/stat.h>
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#endif
 #ifdef _WIN32
 #include <aclapi.h>
 #include <sddl.h>
@@ -2240,6 +2243,57 @@ OxlStr rt_fullpath(OxlStr path) {
     out[n] = 0;
     free(r);
     return (OxlStr){ out, (int64_t)n };
+}
+
+/* exepath: the running binary's canonical path — argv(0) is a bare
+ * name under PATH lookup, so exe-anchored walks (driver's runtime/
+ * probe, checker's std/ probe) resolve here first, mirroring the
+ * seed's std::env::current_exe */
+OxlStr rt_exepath(void) {
+#if defined(_WIN32)
+    DWORD cap = 512;
+    char *buf = rt_alloc(cap);
+    DWORD n;
+    for (;;) {
+        n = GetModuleFileNameA(NULL, buf, cap);
+        if (n == 0) return rt_str("");
+        if (n < cap - 1) break;
+        cap *= 2;
+        buf = rt_alloc(cap);
+    }
+    for (DWORD i = 0; i < n; i++) buf[i] = buf[i] == '\\' ? '/' : buf[i];
+    return (OxlStr){ buf, (int64_t)n };
+#elif defined(__APPLE__)
+    uint32_t cap = 4096;
+    char *buf = rt_alloc(cap);
+    if (_NSGetExecutablePath(buf, &cap) != 0) {
+        buf = rt_alloc(cap);
+        if (_NSGetExecutablePath(buf, &cap) != 0) return rt_str("");
+    }
+    /* the returned path may carry symlinks — realpath it so the
+     * exe-walk anchors at the true install dir */
+    char *r = realpath(buf, NULL);
+    if (!r) return (OxlStr){ buf, (int64_t)strlen(buf) };
+    size_t n = strlen(r);
+    char *out = rt_alloc((int64_t)n + 1);
+    memcpy(out, r, n);
+    out[n] = 0;
+    free(r);
+    return (OxlStr){ out, (int64_t)n };
+#else
+    ssize_t cap = 4096;
+    char *buf = rt_alloc(cap);
+    ssize_t n = readlink("/proc/self/exe", buf, (size_t)cap - 1);
+    if (n <= 0) return rt_str("");
+    if (n >= cap - 1) {
+        cap = (ssize_t)n + 1;
+        buf = rt_alloc(cap);
+        n = readlink("/proc/self/exe", buf, (size_t)cap - 1);
+        if (n <= 0) return rt_str("");
+    }
+    buf[n] = 0;
+    return (OxlStr){ buf, (int64_t)n };
+#endif
 }
 
 OxlStr rt_readfile(OxlStr path) {

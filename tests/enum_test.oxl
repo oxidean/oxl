@@ -43,6 +43,15 @@ fn main() {
     assert(bv.r.v == 2)
     println("enum payloads ok")
 
+    // `new(E.V)` heap-boxes a variant expression into `own E` — the
+    // dotted arg is a value, not the `as`-payload struct name. Both
+    // must type as `own ExprKind` (proved by takes_own's parameter).
+    n2 := new(ExprKind.Nil)
+    assert(takes_own(n2) == 3)
+    i2 := new(ExprKind.Int(4))
+    assert(takes_own(i2) == 0)
+    println("enum new-box ok")
+
     // enum values move through fns + own boxing (recursive payload type)
     k := tag_of(b)
     assert(k == 2)
@@ -50,5 +59,9 @@ fn main() {
 }
 
 fn tag_of(e: ExprKind) -> int {
+    return e.kind()
+}
+
+fn takes_own(e: own ExprKind) -> int {
     return e.kind()
 }

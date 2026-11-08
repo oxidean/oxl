@@ -36,6 +36,10 @@ extern fn rt_fexists(path: str) -> int
 // the internal rule compare real ancestors, not lexical ones
 extern fn rt_fullpath(path: str) -> str
 
+// the running binary's canonical path — PATH lookup hands us a bare
+// argv(0), so exe-anchored probes must anchor here first
+extern fn rt_exepath() -> str
+
 extern fn rt_is_windows() -> int
 
 // ---------- interned types ----------
@@ -3465,17 +3469,18 @@ fn call(ck: mut Ck, f: ref parser.Node, args: ref parser.NList, env: mut Env) ->
         if qn == "new" {
             if args != nil {
                 a := args.v
-                if nk(a) == 2 {
-                    match a {
-                        parser.Node.Name{n, lo, hi} => {
-                            sn := resolve_named(ck, n)
-                            rec_use(ck, lo, hi, sn)
-                            if collections.map_has(ck.structs, sn) {
-                                return ti(ck, k_own(), tn(ck, k_struct(), sn))
-                            }
-                        }
-                        _ => {
-                        }
+                // `new(T)` — the seed's arg is a flattened Ident, so a
+                // qualified `pkg.T` arrives here as Node.Field; flatten
+                // Name and Field chains to the dotted path alike
+                an := callee_name(a)
+                if len(an) > 0 {
+                    sn := resolve_named(ck, an)
+                    // `E.V` registers a struct for `as` payloads — but in
+                    // `new(...)` a dotted arg naming a variant is a value
+                    // expression, not a type name (the seed takes expr here)
+                    if collections.map_has(ck.structs, sn) && enum_variant(ck, sn) < 0 {
+                        rec_use(ck, parser.nlo(a), parser.nhi(a), sn)
+                        return ti(ck, k_own(), tn(ck, k_struct(), sn))
                     }
                 }
                 t := expr(ck, a, env)
@@ -3521,14 +3526,15 @@ fn call(ck: mut Ck, f: ref parser.Node, args: ref parser.NList, env: mut Env) ->
             et := t_unk(ck)
             if args != nil {
                 a := args.v
-                if nk(a) == 2 {
-                    match a {
-                        parser.Node.Name{n, lo, hi} => {
-                            rec_use(ck, lo, hi, resolve_named(ck, n))
-                            et = ty_parse(ck, n)
-                        }
-                        _ => {
-                        }
+                // Name or Field (`pkg.T`) — the seed's flattened Ident
+                // covers both; ty_parse resolves the qualified path
+                if nk(a) == 2 || nk(a) == 9 {
+                    an := callee_name(a)
+                    if len(an) == 0 {
+                        diag(ck, "check", "`mkslice` takes a type name — mkslice(int, 8)")
+                    } else {
+                        rec_use(ck, parser.nlo(a), parser.nhi(a), resolve_named(ck, an))
+                        et = ty_parse(ck, an)
                     }
                 } else if nk(a) == 3 {
                     match a {
@@ -6574,8 +6580,20 @@ fn resolve_imp(ck: mut Ck, imp: str) -> RRes {
         rest := substr(imp, 4, len(imp))
         // exe ancestors first (shipped-tree std beside the binary),
         // then the entry's ancestors — a self-hosted checker compiled
-        // into a scratch dir still finds the SOURCE tree's std
-        r.dir = std_at(canon_or(dir_of(argv(0))), rest)
+        // into a scratch dir still finds the SOURCE tree's std. The
+        // probe is skipped when exepath fails: dir_of("") is "." and
+        // canon_or would silently anchor the search at the cwd.
+        exe := rt_exepath()
+        if len(exe) > 0 {
+            r.dir = std_at(canon_or(dir_of(exe)), rest)
+        }
+        // a bare argv(0) (PATH invocation) has no dir component —
+        // dir_of yields "." which canon_or turns into the cwd, so the
+        // probe is skipped unless argv(0) actually carries a path
+        av := argv(0)
+        if len(r.dir) == 0 && strings.contains(av, "/") {
+            r.dir = std_at(canon_or(dir_of(av)), rest)
+        }
         if len(r.dir) == 0 {
             r.dir = std_at(ck.entry_dir, rest)
         }
@@ -6733,18 +6751,10 @@ fn parse_pfile(ck: mut Ck, path: str) -> PFile {
 fn pfile_items(ck: mut Ck, ld: mut Loader, fpath: str, ast: own parser.Node, itemmod: str) {
     match ast {
         parser.Node.Root{items} => {
-            l := items
-            for l != nil {
-                k := nk(l.v)
-                if k != 25 && k != 52 {
-                    ld.items = push(ld.items, It{node: l.v, mod: itemmod, file: fpath})
-                }
-                l = l.next
-            }
             let al: own ModEnt = nil
             let nm: own ModEnt = nil
             let binds: own ImpBind = nil
-            l = items
+            l := items
             for l != nil {
                 match l.v {
                     parser.Node.Import{path, alias, names} => {
@@ -6808,6 +6818,19 @@ fn pfile_items(ck: mut Ck, ld: mut Loader, fpath: str, ast: own parser.Node, ite
                     }
                     _ => {
                     }
+                }
+                l = l.next
+            }
+            // the seed's loader extends the item list with every
+            // import's items before pushing this file's own decls —
+            // imports-first order is what the emitter's decl ordering
+            // relies on (a struct's by-value fields must be defined
+            // before the struct that embeds them)
+            l = items
+            for l != nil {
+                k := nk(l.v)
+                if k != 25 && k != 52 {
+                    ld.items = push(ld.items, It{node: l.v, mod: itemmod, file: fpath})
                 }
                 l = l.next
             }

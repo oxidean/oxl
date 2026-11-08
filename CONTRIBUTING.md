@@ -76,7 +76,10 @@ re-runs the suite, pushes the annotated tag, and publishes the
 toolchain tarball with generated notes. Your subject picks the bump:
 a breaking change typed `fix` ships as a patch release. Manual `v*`
 tag pushes still release, and `workflow_dispatch` re-runs the
-pipeline for `main`.
+pipeline for `main`. The docs bundle follows the same tags:
+`docs/site/manifest.yaml`'s `version:` must equal each released `v*`
+tag minus its prefix; the docs-site release workflow hard-fails on a
+mismatch.
 
 ## Rules of the road
 

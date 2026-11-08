@@ -1,0 +1,58 @@
+---
+title: oxl
+description: "A lean, compiled language for CLI tools and services: memory safety from dynamic ownership checking, no tracing GC."
+---
+
+import { Aside, CardGrid, LinkCard } from "@astrojs/starlight/components";
+
+oxl is a small language for the kind of tools Oxidean builds: memory safety
+from **dynamic ownership/borrow checking**, structured concurrency
+(`scope`/`spawn`/channels), and ahead-of-time native binaries from a single
+toolchain. MIT-licensed.
+
+<Aside type="caution" title="Status: v0.4.0">
+	v0.4.0 is released: the shipped binary covers `build`/`run`/`test`/
+	`fmt`/`doc`/`lsp` plus the package/module system (`oxl.mod`, `oxl get`,
+	`oxl mod`, MVS build lists), shipped since v0.3.0. The compiler works end
+	to end: the programs in `examples/` compile to native binaries today
+	(including an HTTP CRUD + SQLite service and a GTK4 todo app), and the
+	toolchain's own lexer, parser, checker, and C emitter are written in
+	oxl and compile themselves. Still v0: dynamic checking is not yet
+	unconditional (two documented gaps remain in
+	[`docs/semantics/ownership.md`](https://github.com/oxidean/oxl/blob/v0.4.0/docs/semantics/ownership.md)),
+	and the design spec is the source of truth.
+</Aside>
+
+## Design at a glance
+
+- **Ownership without ceremony**: `own` / `ref` / `mut` handles with
+  runtime borrow checks and compile-time move tracking.
+- **Structured concurrency**: `scope`/`spawn` plus channels;
+  suspend-capable functions compile to stackless state machines; tasks are
+  ~96 B frames, not threads.
+- **Errors you can't drop**: `[v, err]` returns; dropping the error is a
+  compile error.
+- **One toolchain**: `oxl build|run|test|fmt|doc|lsp` plus `get`/`mod` for
+  modules, AOT to native through a C backend. The release tarball ships
+  for Linux (x86_64); macOS (aarch64) and Windows (x86_64, MinGW/clang)
+  are supported source builds.
+
+## Where to next
+
+<CardGrid>
+	<LinkCard
+		title="Get the toolchain"
+		href="./getting-started/"
+		description="Download the tarball, PATH, first binary."
+	/>
+	<LinkCard
+		title="The language"
+		href="./language/"
+		description="The v0 surface: types, ownership, concurrency, modules, stdlib."
+	/>
+	<LinkCard
+		title="oxidean/oxl"
+		href="https://github.com/oxidean/oxl"
+		description="Compiler source, examples, and the design spec."
+	/>
+</CardGrid>

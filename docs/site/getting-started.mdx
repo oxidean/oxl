@@ -1,0 +1,97 @@
+---
+title: Get the oxl toolchain
+description: Install the oxl toolchain from a release tarball and run your first program.
+---
+
+import { Aside, Steps } from "@astrojs/starlight/components";
+
+**Requires:** a C compiler (`cc`) and pthreads; `oxl build`/`run` emit C and
+link through it. Programs that use the sqlite3 shims also need sqlite3 dev
+headers. The release tarball ships for Linux (x86_64); macOS (aarch64) and
+Windows (x86_64, via MinGW gcc or LLVM clang) are supported platforms that
+build from source. See the
+[v0.4.0 README](https://github.com/oxidean/oxl/blob/v0.4.0/README.md#building-the-toolchain).
+
+<Steps>
+1. Download and extract the v0.4.0 toolchain:
+
+   ```bash
+   curl -LO https://github.com/oxidean/oxl/releases/download/v0.4.0/oxl-toolchain-linux-x86_64.tar.gz
+   tar xzf oxl-toolchain-linux-x86_64.tar.gz && cd oxl-toolchain
+   ```
+
+2. The tarball bundles the compiler, `std/`, and `examples/`. Try the
+   bundled hello world:
+
+   ```bash
+   ./oxl run examples/hello.oxl    # compile + run (needs cc on PATH)
+   ```
+
+3. Put the toolchain on `PATH`, then write and run your own program.
+   Keep `std/` next to the `oxl` binary: that is where
+   `import "std/x"` resolves. Every file starts with a `package` clause,
+   and `package main` marks an executable:
+
+   ```text title="hello.oxl"
+   package main
+
+   fn main() {
+       println("hello, oxl")
+   }
+   ```
+
+   ```bash
+   export PATH="$PWD:$PATH"
+   oxl run hello.oxl      # compile + run
+   oxl build hello.oxl    # → native binary
+   ```
+</Steps>
+
+`oxl build` and `oxl run` invoke a C compiler for the final link. The
+driver probes `cc` → `gcc` → `clang` (MSVC's `cl` can't take the emitted
+C). Set `LANG_CC` to override, `LANG_LDFLAGS` to append link inputs (FFI
+shim objects, libraries), and `LANG_SQLITE_SRC` to point at an
+amalgamation `sqlite3.c` where no dev package exists.
+
+### Building from source
+
+On macOS, Windows, or any platform without a tarball, build the toolchain
+from the repository (a Rust toolchain plus `cc`):
+
+```bash
+git clone https://github.com/oxidean/oxl && cd oxl
+git checkout v0.4.0
+cargo build --release --manifest-path oxl/Cargo.toml
+# binary: oxl/target/release/oxl; put it on PATH with std/ alongside
+```
+
+`import "std/x"` resolves against `std/` next to the binary, so run it
+from the repo root or copy `std/` next to wherever the binary lands.
+
+## The toolbox (v0.4.0)
+
+```text
+oxl build [<pkg dir>|<file.oxl>...] [-o out]   compile to a native binary
+oxl run [<pkg dir>|<file.oxl>...]              compile + run
+oxl test [<pkg dir>|<file.oxl>...]             run all fn test_*() in a scope each
+oxl fmt <file.oxl>...                          canonical AST pretty-print (comments kept)
+oxl doc <file.oxl>                             /// comments → markdown
+oxl get <path>@<query>                         fetch + pin a dependency (needs git)
+oxl mod <init|tidy|verify|list>                maintain oxl.mod / oxl.sum
+oxl list -m all                                the MVS-selected module build list
+oxl lsp                                        stdio LSP: diagnostics, hover, goto-definition
+```
+
+`oxl get`, `oxl mod`, and `oxl list -m` are the package/module system:
+projects opt in with an `oxl.mod` manifest at the root. The
+[language page](./language/#modules) covers manifests, resolution, and
+the module cache.
+
+<Aside type="tip">
+	The repository's [`examples/`](https://github.com/oxidean/oxl/tree/v0.4.0/examples)
+	directory, also bundled in the tarball, is the ground truth for what
+	works today, including the HTTP CRUD + SQLite pilot and a GTK4 todo app
+	over `extern fn` FFI. The `bootstrap/` tree holds the self-hosting proof:
+	the language's lexer, parser, checker, and C emitter written in the
+	language.
+</Aside>

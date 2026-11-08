@@ -1,0 +1,53 @@
+name: docs site release
+
+# Dispatch-only: the normal path is the `docs` job inside release.yml, which
+# runs after the toolchain release is published (tags created via the API with
+# github.token never fire push.tags workflows, and sequencing removes the
+# upload-before-release race). This workflow remains for one-off re-attach and
+# for bootstrapping docs bundles onto releases that predate docs/site —
+# dispatch it with `tag` = target release and `src_ref` = a ref that carries
+# docs/site (e.g. main).
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to attach the docs bundle to (e.g. v0.4.0)
+        required: true
+        type: string
+      src_ref:
+        description: Ref supplying docs/site content when the tag predates it (default = tag)
+        required: false
+        default: ""
+        type: string
+
+# Minimal default — jobs that need the token declare it themselves.
+permissions: {}
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          TAG: ${{ inputs.tag }}
+          SRC_REF: ${{ inputs.src_ref }}
+        run: |
+          set -euo pipefail
+          # Dispatch inputs reach the reusable call as text — validate the tag
+          # shape before it can carry anything else into a run step.
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::tag must be a stable vX.Y.Z tag"; exit 1; }
+          # Restricted to protected refs: a fork PR ref would pack arbitrary
+          # content into a release asset — the manifest gate checks a version
+          # field, not content provenance.
+          [[ -z "$SRC_REF" || "$SRC_REF" =~ ^(main|master|v[0-9]+\.[0-9]+\.[0-9]+[A-Za-z0-9.-]*)$ ]] || { echo "::error::src_ref must be main, master, or a vX.Y.Z tag"; exit 1; }
+
+  pack:
+    needs: guard
+    permissions:
+      contents: write
+    uses: oxidean/docs-manifest/.github/workflows/release.yml@v0.1.6
+    with:
+      tag: ${{ inputs.tag }}
+      src-ref: ${{ inputs.src_ref }}
+      product: oxl
+    secrets:
+      site_dispatch_token: ${{ secrets.DOCS_SITE_DISPATCH_TOKEN }}

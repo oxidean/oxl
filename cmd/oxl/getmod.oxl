@@ -1283,6 +1283,11 @@ fn mk_ctx(root: str, mtext: str, sums: ref check.SumEnt) -> [own check.Ck, err] 
         }
         return nil, errors.new(msg)
     }
+    // floor gate mirrors mod_ctx_load: refuse to operate on a main
+    // manifest requiring a newer toolchain (dep manifests skip this)
+    if len(ck.mod_floor) > 0 && check.ver_tuple(ck.mod_floor) > check.ver_tuple(check.tool_ver()) {
+        return nil, errors.new("oxl.mod: requires oxl " + ck.mod_floor + ", toolchain is " + check.tool_ver())
+    }
     if check.parse_sums(ck, sums_text(sums)) == 0 {
         return nil, errors.new("malformed oxl.sum")
     }

@@ -83,7 +83,7 @@ this milestone dogfoods T's port.
   locally and via `extra/v*` tag through the cache — byte-parity
   diagnostics on both paths.
 - `oxl.work` malformed/missing-dir/conflicting-module diagnostics
-  land in `tests/diag/` corpus, both drivers byte-identical.
+  land in `tests/mod/` corpus, both drivers byte-identical.
 - `oxl publish` on a scratch index repo produces the tag + index
   entry; `oxl get` on a clean `OXLMODCACHE` resolves it; a tampered
   index entry (`h1` edited in the index repo) fails at `oxl get`'s

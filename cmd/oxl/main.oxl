@@ -438,16 +438,20 @@ fn emit_and_cc(csrc: str, out: str, entry: str) -> int {
     return 0
 }
 
-// child exit -> the driver's own exit (seed `st.code().unwrap_or(1)`):
-// a signaled child reports 1 — ExitStatus::code() is None there — and
-// exec.run's 128+sig convention marks exactly those deaths (real
+// child exit -> the driver's own exit (seed `st.code().unwrap_or(1)`).
+// POSIX signaled children come back 128+sig through exec.run — the
+// seed's ExitStatus::code() is None there, so they report 1 (real
 // exits >128 exist but can't be told apart through exec, and a
-// crashing program is the common case a run/test driver sees)
+// crashing program is the common case a run/test driver sees).
+// Windows GetExitCodeProcess returns the raw DWORD — including
+// NTSTATUS values like 0xC0000409 for fail-fast deaths — and the seed
+// exits with that code verbatim; the shell's own translation of an
+// abnormal-termination code must see it, so no clamping applies
 fn child_code(st: int, e: err) -> int {
     if e != nil {
         return 1
     }
-    if st > 128 {
+    if st > 128 && rt_is_windows() == 0 {
         return 1
     }
     return st

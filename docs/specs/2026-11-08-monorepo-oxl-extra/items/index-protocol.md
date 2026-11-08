@@ -10,15 +10,25 @@ index/github.com/oxidean/oxl/extra.json   # see path encoding below
 ```
 
 **Index alphabet.** A module path is index-eligible iff every
-segment matches `[a-zA-Z0-9._-]` and its *escaped* form (below) is
-≤ 200 bytes. Eligibility is checked before any key is derived —
-`oxl publish` rejects ineligible paths outright, and `oxl get`
-skips the index and falls back to direct git for them (a path
-containing e.g. `~` or a separator-adjacent byte must never be
-allowed to derive a key that selects another module's entry).
-The 200-byte bound keeps every filesystem component — escaped
-segment or `<leaf>.json` — under the 255-byte limit on all
-supported platforms, no matter how deep the path nests.
+segment:
+
+- fully matches `^[a-zA-Z0-9._-]+$` (one or more allowed chars —
+  a search match would admit `ac~me`; an empty segment fails),
+- passes the module-cache `check_component` rules (`oxl/src/
+  modcache.rs`: rejects `.`/`..` — so `.` can never normalize the
+  key onto a shorter path and `..` can never escape `index/` —
+  no trailing `.` or space, no Windows-reserved device stem such
+  as `con`, `aux`, `nul`, `com1-9`, `lpt1-9`), and
+- has an *escaped* form (below) of ≤ 200 bytes.
+
+The derived index path (`index/` + components + `.json`) must
+additionally be ≤ 240 bytes in full — a long multi-segment path
+must not produce a file Windows cannot check out (Git for
+Windows disables long paths by default). Eligibility is checked
+before any key is derived: `oxl publish` rejects ineligible
+paths outright, and `oxl get` skips the index and falls back to
+direct git for them — an ineligible path can never derive a key
+that selects another module's entry.
 
 **Key derivation.** Apply the module-cache case escaping
 (`oxl/src/modcache.rs` `escape_path`: every uppercase letter

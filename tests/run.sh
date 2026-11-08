@@ -1083,7 +1083,7 @@ for f in std/strings/strings.oxl std/io/io.oxl std/errors/errors.oxl \
          bootstrap/parser/parser.oxl bootstrap/check/check.oxl \
          bootstrap/codegen/codegen.oxl std/net/http/http.oxl \
          cmd/oxl/main.oxl cmd/oxl/fmt.oxl examples/hello.oxl tests/util_test.oxl; do
-    "$OXL" fmt "$f" > "$scratch/fmt.seed" 2>&1 || { echo "FAIL seed fmt $f"; cat "$scratch/fmt.seed"; exit 1; }
+    "$SEEDOXL" fmt "$f" > "$scratch/fmt.seed" 2>&1 || { echo "FAIL seed fmt $f"; cat "$scratch/fmt.seed"; exit 1; }
     "$SELFOXL" fmt "$f" > "$scratch/fmt.self" 2>&1 || { echo "FAIL self fmt $f"; cat "$scratch/fmt.self"; exit 1; }
     diff "$scratch/fmt.seed" "$scratch/fmt.self" >/dev/null || { echo "FAIL driver fmt parity $f"; diff "$scratch/fmt.seed" "$scratch/fmt.self" | head -20; exit 1; }
 done
@@ -1094,7 +1094,7 @@ done
 diff "$scratch/fmt1.oxl" "$scratch/fmt2.oxl" >/dev/null || { echo "FAIL fmt idempotency"; exit 1; }
 # `doc` output is byte-identical vs the seed on the std corpus
 for f in std/strings/strings.oxl std/io/io.oxl std/errors/errors.oxl std/bytes/bytes.oxl; do
-    "$OXL" doc "$f" > "$scratch/doc.seed" 2>&1 || { echo "FAIL seed doc $f"; exit 1; }
+    "$SEEDOXL" doc "$f" > "$scratch/doc.seed" 2>&1 || { echo "FAIL seed doc $f"; exit 1; }
     "$SELFOXL" doc "$f" > "$scratch/doc.self" 2>&1 || { echo "FAIL self doc $f"; exit 1; }
     diff "$scratch/doc.seed" "$scratch/doc.self" >/dev/null || { echo "FAIL driver doc parity $f"; diff "$scratch/doc.seed" "$scratch/doc.self" | head -20; exit 1; }
 done

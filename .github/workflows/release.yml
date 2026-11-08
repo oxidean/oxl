@@ -156,7 +156,12 @@ jobs:
             sleep 2
           done
           [ "$m" = "MERGEABLE" ] || { echo "::error::bump PR #$pr never became mergeable"; exit 1; }
-          gh pr merge "$pr" --squash --delete-branch
+          # The default squash body folds in "Co-authored-by: github-actions[bot]"
+          # (merger != author) and trips the bot-trailer ban in commit-lint —
+          # pin an explicit message instead.
+          gh pr merge "$pr" --squash --delete-branch \
+            --subject "chore(release): bump docs manifest to $ver" \
+            --body "Automated docs-manifest sync for $ver — the docs bundle packs from the tagged tree and gates on manifest.version == tag."
           mc=""
           for i in $(seq 1 15); do
             mc="$(gh pr view "$pr" --json mergeCommit,state --jq 'select(.state=="MERGED") | .mergeCommit.oid')"

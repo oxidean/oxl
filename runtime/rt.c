@@ -2359,6 +2359,26 @@ int64_t rt_isfile(OxlStr path) {
 #endif
 }
 
+/* regular-file probe — stat-style: follows symlinks, matching the
+ * seed's Path::is_file() (fs::metadata). Manifest and workspace
+ * discovery use this; the hashing walk keeps rt_isfile's lstat
+ * semantics so links are skipped like DirEntry::file_type() */
+int64_t rt_isfilex(OxlStr path) {
+    char *cp = rt_alloc(path.n + 1);
+    memcpy(cp, path.p, (size_t)path.n);
+    cp[path.n] = 0;
+#ifdef _WIN32
+    DWORD a = GetFileAttributesA(cp);
+    /* a link's directory bit mirrors its target type on Windows, so
+     * dropping the reparse-point exclusion follows like stat() does */
+    return (a != INVALID_FILE_ATTRIBUTES
+            && !(a & FILE_ATTRIBUTE_DIRECTORY)) ? 1 : 0;
+#else
+    struct stat st;
+    return (stat(cp, &st) == 0 && S_ISREG(st.st_mode)) ? 1 : 0;
+#endif
+}
+
 /* symlink probe — lstat-style: module-cache hashing must skip links
  * wholesale, matching DirEntry::file_type() which reports the link
  * itself as neither dir nor file */

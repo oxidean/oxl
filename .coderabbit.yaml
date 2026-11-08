@@ -2,13 +2,17 @@
 reviews:
   profile: chill
   path_filters:
-    # Materialized ox-agent scaffold (skills/, lifecycle/, pipelines/,
-    # schemas/, workflows/) is synced from the upstream Ox-Agent repo —
-    # in-place edits here are overwritten by the next `ox-agent assets
-    # sync`, so review findings on them belong upstream, not in this
-    # repo's review surface. Work items under work/ stay reviewable.
-    - "!.ox-agent/**"
-    - ".ox-agent/work/**"
+    # Only the materialized scaffold dirs are excluded — they are synced
+    # from the upstream Ox-Agent repo and in-place edits are overwritten
+    # by the next `ox-agent assets sync`, so findings on them belong
+    # upstream. Everything else (work items, context, state, runtime)
+    # stays in this repo's review surface.
+    - "!.ox-agent/skills/**"
+    - "!.ox-agent/schemas/**"
+    - "!.ox-agent/pipelines/**"
+    - "!.ox-agent/integrations/**"
+    - "!.ox-agent/lifecycle/**"
+    - "!.ox-agent/workflows/**"
   auto_approvals:
     enabled: true
   auto_review:

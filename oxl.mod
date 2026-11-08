@@ -1,2 +1,3 @@
-module file:///tmp/t4fix/dep
+module oxl
+
 oxl 0.3

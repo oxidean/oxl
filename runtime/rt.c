@@ -24,6 +24,9 @@
 #include <unistd.h>
 #endif
 #include <sys/stat.h>
+#ifdef _WIN32
+#include <aclapi.h>
+#endif
 
 #define ARENA_CAP (1 << 20)
 
@@ -2346,26 +2349,63 @@ int64_t rt_open_write(OxlStr path) {
     return fd < 0 ? -(int64_t)errno : fd;
 }
 
-/* open_write_mode: create|trunc with an explicit access mode — staged
- * replacements (fmt -w) are born under the source's mode instead of
- * umask defaults, so contents are never exposed looser than the file
- * they will replace. Owner-write is forced on so a read-only source
- * still accepts its staged content; the caller chmods the real mode
- * after the write completes. Windows pmode collapses to the read-only
- * attribute — create writable there and let the post-write chmod set
- * the read-only flag. */
+/* open_write_mode: exclusive create with an explicit access mode —
+ * staged replacements (fmt -w) are born under the source's mode
+ * instead of umask defaults, so contents are never exposed looser
+ * than the file they will replace. Owner-write is forced on so a
+ * read-only source still accepts its staged content; the caller
+ * chmods the real mode after the write completes. Windows pmode
+ * collapses to the read-only attribute — create writable there and
+ * let the post-write chmod set the read-only flag.
+ * O_EXCL/_O_EXCL make the create atomic: an occupied pathname fails
+ * -EEXIST instead of truncating through a symlink planted between a
+ * caller's existence check and the open. */
 int64_t rt_open_write_mode(OxlStr path, int64_t mode) {
     if (path.n > 0 && memchr(path.p, 0, (size_t)path.n)) return -EINVAL;
     const char *cp = rt_cstr(path);
 #ifdef _WIN32
     (void)mode;
-    int fd = _open(cp, _O_WRONLY | _O_CREAT | _O_TRUNC | _O_BINARY,
+    int fd = _open(cp, _O_WRONLY | _O_CREAT | _O_EXCL | _O_BINARY,
                    _S_IREAD | _S_IWRITE);
 #else
-    int fd = open(cp, O_WRONLY | O_CREAT | O_TRUNC,
+    int fd = open(cp, O_WRONLY | O_CREAT | O_EXCL | O_TRUNC,
                   (mode_t)((mode | 0200) & 0777));
 #endif
     return fd < 0 ? -(int64_t)errno : fd;
+}
+
+/* copy_acl: carry src's DACL onto dst — a staged replacement born
+ * with an inherited default DACL would loosen a private source's
+ * access on replace. POSIX mode bits already cover this (the caller
+ * chmods before rename); the call is a no-op there. A NULL source
+ * DACL is left alone rather than propagated — it means world access,
+ * and the inherited default errs stricter. */
+int64_t rt_copy_acl(OxlStr src, OxlStr dst) {
+#ifdef _WIN32
+    if (src.n > 0 && memchr(src.p, 0, (size_t)src.n)) return -EINVAL;
+    if (dst.n > 0 && memchr(dst.p, 0, (size_t)dst.n)) return -EINVAL;
+    const char *cs = rt_cstr(src);
+    const char *cd = rt_cstr(dst);
+    PACL dacl = NULL;
+    PSECURITY_DESCRIPTOR sd = NULL;
+    DWORD r = GetNamedSecurityInfoA(cs, SE_FILE_OBJECT,
+                                    DACL_SECURITY_INFORMATION,
+                                    NULL, NULL, &dacl, NULL, &sd);
+    if (r != ERROR_SUCCESS) return -((int64_t)r | RT_GLE_TAG);
+    int64_t rc = 0;
+    if (dacl) {
+        r = SetNamedSecurityInfoA(cd, SE_FILE_OBJECT,
+                                  DACL_SECURITY_INFORMATION,
+                                  NULL, NULL, dacl, NULL);
+        if (r != ERROR_SUCCESS) rc = -((int64_t)r | RT_GLE_TAG);
+    }
+    if (sd) LocalFree((HLOCAL)sd);
+    return rc;
+#else
+    (void)src;
+    (void)dst;
+    return 0;
+#endif
 }
 
 /* the read window is the slice's LEN — `b[:n]` sub-slices keep the

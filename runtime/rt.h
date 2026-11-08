@@ -361,7 +361,8 @@ int64_t rt_rmdir(OxlStr path);       /* empty-dir remove, 0 or -errno/GLE    */
 int64_t rt_rename(OxlStr a, OxlStr b); /* replace+cross-volume, 0 or -errno/GLE */
 int64_t rt_chmod(OxlStr path, int64_t mode); /* chmod(2) mode&0777; Windows honors owner-write only */
 int64_t rt_fmode(OxlStr path); /* stat(2) access mode&0777, or -errno/GLE */
-int64_t rt_open_write_mode(OxlStr path, int64_t mode); /* create|trunc w/ (mode|0200)&0777, fd or -errno */
+int64_t rt_open_write_mode(OxlStr path, int64_t mode); /* O_EXCL create w/ (mode|0200)&0777, fd or -errno */
+int64_t rt_copy_acl(OxlStr src, OxlStr dst);     /* copy src DACL to dst (Windows); no-op POSIX */
 /* argv/env are []str; argv[0]=program (PATH search), env="K=V" overrides
  * merged onto the inherited env (empty = inherit). Return: >=0 child exit
  * status (128+sig when signaled), <0 negative errno/GLE for spawn/pipe/

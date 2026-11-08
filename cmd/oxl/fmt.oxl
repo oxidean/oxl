@@ -37,6 +37,10 @@ extern fn rt_chmod(path: str, mode: int) -> int
 
 extern fn rt_open_write_mode(path: str, mode: int) -> int
 
+// copy the source's DACL onto the staged replacement (Windows; a
+// no-op under POSIX where the chmod above carries the permissions)
+extern fn rt_copy_acl(src: str, dst: str) -> int
+
 extern fn rt_fd_write(fd: int, b: []byte) -> int
 
 extern fn rt_fd_close(fd: int) -> int
@@ -3567,15 +3571,11 @@ fn cmd_fmt() {
                     }
                 } else if w == 1 {
                     if res.out != src {
-                        // unpredictable staging name — a shared
-                        // predictable path can be pre-created as a
-                        // symlink or clobbered by a concurrent fmt
+                        // unpredictable staging name + exclusive
+                        // create — the open itself is the existence
+                        // check, so a planted symlink or a concurrent
+                        // fmt loses the race instead of being followed
                         tmp := file + ".fmt-tmp-" + itoa(now_ms())
-                        tries := 0
-                        for os.exists(tmp) && tries < 8 {
-                            tries = tries + 1
-                            tmp = file + ".fmt-tmp-" + itoa(now_ms()) + "-" + itoa(tries)
-                        }
                         // stage under the source's mode from birth —
                         // a default-umask create would sit readable
                         // looser than a private source until chmod
@@ -3584,19 +3584,37 @@ fn cmd_fmt() {
                         if m >= 0 {
                             mode = m
                         }
-                        if stage_write(tmp, mode, res.out) != 0 {
+                        wr := stage_write(tmp, mode, res.out)
+                        // -EEXIST: the name was occupied — rotate a
+                        // few times before giving up
+                        tries := 0
+                        for wr == -17 && tries < 8 {
+                            tries = tries + 1
+                            tmp = file + ".fmt-tmp-" + itoa(now_ms()) + "-" + itoa(tries)
+                            wr = stage_write(tmp, mode, res.out)
+                        }
+                        if wr != 0 {
                             eprintln(file + ": write failed")
                             os.remove(tmp)
                             bad = 1
                         } else {
                             // drop the owner-write bit the stage
-                            // forced on for read-only sources
+                            // forced on for read-only sources, then
+                            // carry the source's ACL onto the stage —
+                            // a rename replaces the inode wholesale
                             rt_chmod(tmp, mode)
-                            re := os.rename(tmp, file)
-                            if re != nil {
-                                eprintln(file + ": " + errors.msg(re))
+                            ac := rt_copy_acl(file, tmp)
+                            if ac != 0 {
+                                eprintln(file + ": write failed")
                                 os.remove(tmp)
                                 bad = 1
+                            } else {
+                                re := os.rename(tmp, file)
+                                if re != nil {
+                                    eprintln(file + ": " + errors.msg(re))
+                                    os.remove(tmp)
+                                    bad = 1
+                                }
                             }
                         }
                     }

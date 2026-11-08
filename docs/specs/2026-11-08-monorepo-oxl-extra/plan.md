@@ -25,7 +25,9 @@ every stage lands with the suite green.
 - [ ] **E4 — git-backed index** — `index/<host>/<org>/<name>.json`
       `{version,commit,h1}` entries; `OXLMODINDEX` (path or git URL);
       `oxl publish` (validate + append + tag); `get` index-first →
-      git fallback; tamper caught by `oxl mod verify`.
+      git fallback; a tampered index entry is caught at fetch
+      (`oxl get` compares the entry `h1` to the fetched tree);
+      `oxl mod verify` re-hashes cache slots.
       Gate: scratch-index publish→get round-trip in the suite.
 - [ ] **E5 — extras release lane** — `extra/v*` tag series; bump
       rule extended per-module without retriggering the toolchain

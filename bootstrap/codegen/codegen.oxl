@@ -4375,13 +4375,22 @@ fn gfunc(g: mut G, i: int) {
                 // generic defs emit only as mono instantiations
                 return
             }
-            g.ck.cur_mod = g.its[i].mod
+            gset_ctx(g, i)
             qn := check.fn_qname(g.ck, g.its[i].mod, recv, name)
             gemit_named_fn(g, i, qn, qn)
         }
         _ => {
         }
     }
+}
+
+// checker name resolution keys per-file import tables on cur_file —
+// codegen must point both at the item being emitted (the seed rewrote
+// names at load; here they resolve at emit, so a selective binding
+// like `.{split}` needs its file's tables live)
+fn gset_ctx(g: mut G, i: int) {
+    g.ck.cur_mod = g.its[i].mod
+    g.ck.cur_file = g.its[i].file
 }
 
 // emit one fn under `qn` — `base` is the fnsv/susp-set key (same as qn
@@ -4442,7 +4451,7 @@ fn gfunc_inst(g: mut G, iq: str, im: str, ibind: own collections.Map) {
     if fi < 0 {
         return
     }
-    g.ck.cur_mod = g.its[fi].mod
+    gset_ctx(g, fi)
     // iq is already qualified — look it up directly; gfn's
     // resolve_named would re-prefix it (cur_mod "sort" + head "sort"
     // -> "sort.sort.sifto") and miss, leaving ty_scope unset so the
@@ -4519,7 +4528,7 @@ fn gemit_struct(g: mut G, i: int) {
     }
     match g.its[i].node {
         parser.Node.Struct{name, fields} => {
-            g.ck.cur_mod = g.its[i].mod
+            gset_ctx(g, i)
             qn := check.qname(g.its[i].mod, name)
             g.head = push(g.head, "struct o_s_" + cname(qn) + " {")
             fl := fields
@@ -4553,7 +4562,7 @@ fn gemit_retstruct(g: mut G, i: int) {
             if gretdk(g, ret) != 2 {
                 return
             }
-            g.ck.cur_mod = g.its[i].mod
+            gset_ctx(g, i)
             qn := check.fn_qname(g.ck, g.its[i].mod, recv, name)
             g.head = push(g.head, "struct o_ret_" + cname(qn) + " { " + gcty(g, gret1(g, ret)) + " val; int64_t err; };")
         }
@@ -4568,7 +4577,7 @@ fn gemit_static(g: mut G, i: int) {
     }
     match g.its[i].node {
         parser.Node.Let{name, ty, init} => {
-            g.ck.cur_mod = g.its[i].mod
+            gset_ctx(g, i)
             t := check.t_unk(g.ck)
             if ty != nil {
                 t = gty(g, ty)
@@ -4593,7 +4602,7 @@ fn gemit_proto(g: mut G, i: int) {
                 // generic fns only exist as instantiations (seed: no proto)
                 return
             }
-            g.ck.cur_mod = g.its[i].mod
+            gset_ctx(g, i)
             qn := check.fn_qname(g.ck, g.its[i].mod, recv, name)
             nm := name
             if !ex {
@@ -4970,7 +4979,7 @@ fn genall(g: mut G) -> str {
         if check.nk(g.its[i].node) == 10 {
             match g.its[i].node {
                 parser.Node.Let{name, ty, init} => {
-                    g.ck.cur_mod = g.its[i].mod
+                    gset_ctx(g, i)
                     t := check.t_unk(g.ck)
                     if ty != nil {
                         t = gty(g, ty)
@@ -5234,35 +5243,10 @@ fn genall(g: mut G) -> str {
 }
 
 // ---------- driver ----------
-// run is the cmd/codegen entry point — arg parsing stays here so the
-// thin main is a one-line call; the driver (cmd/oxl) uses genall directly.
-fn run() {
-    testm := 0
-    file := ""
-    ai := 1
-    for ai < argc() {
-        a := argv(ai)
-        if a == "--test" {
-            testm = 1
-        } else {
-            file = a
-        }
-        ai = ai + 1
-    }
-    if len(file) == 0 {
-        println("usage: codegen [--test] <file.oxl>")
-        exit(1)
-    }
-    r := check.check_file(file, 1 - testm)
-    if len(r.ck.diags) > 0 {
-        i := 0
-        for i < len(r.ck.diags) {
-            d := r.ck.diags[i]
-            println("error [" + d.kind + "] " + d.msg)
-            i = i + 1
-        }
-        exit(1)
-    }
+// emit is the library entry: consume a check_file result (diags are
+// the caller's to report — emit assumes a clean check) and return the
+// generated C text. testm mirrors codegen --test / `oxl test`.
+fn emit(r: own check.CkRes, testm: int) -> str {
     g := new(G)
     g.ck = r.ck
     g.its = r.items
@@ -5272,7 +5256,7 @@ fn run() {
         if check.nk(g.its[i].node) == 24 {
             match g.its[i].node {
                 parser.Node.Fn{name, recv} => {
-                    g.ck.cur_mod = g.its[i].mod
+                    gset_ctx(g, i)
                     collections.map_set(g.fidx, check.fn_qname(g.ck, g.its[i].mod, recv, name), i)
                 }
                 _ => {
@@ -5325,5 +5309,37 @@ fn run() {
     g.dchain = mkslice(int, 0)
     g.uhits = mkslice(int, 0)
     g.live = mkslice(int, 0)
-    print(genall(g))
+    return genall(g)
+}
+
+// run is the cmd/codegen entry point — arg parsing stays here so the
+// thin main is a one-line call.
+fn run() {
+    testm := 0
+    file := ""
+    ai := 1
+    for ai < argc() {
+        a := argv(ai)
+        if a == "--test" {
+            testm = 1
+        } else {
+            file = a
+        }
+        ai = ai + 1
+    }
+    if len(file) == 0 {
+        println("usage: codegen [--test] <file.oxl>")
+        exit(1)
+    }
+    r := check.check_file(file, 1 - testm)
+    if len(r.ck.diags) > 0 {
+        i := 0
+        for i < len(r.ck.diags) {
+            d := r.ck.diags[i]
+            println("error [" + d.kind + "] " + d.msg)
+            i = i + 1
+        }
+        exit(1)
+    }
+    print(emit(r, testm))
 }

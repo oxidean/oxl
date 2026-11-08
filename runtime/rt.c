@@ -2151,6 +2151,14 @@ OxlStr rt_ftoa(double v) {
     snprintf(p, 40, "%.15g", v);
     return rt_str(p);
 }
+/* %.*g at a caller-chosen precision — fmt's float printer walks
+   precisions to find the shortest repr that round-trips (Rust
+   Display semantics), which the fixed %.15g of rt_ftoa can't reach */
+OxlStr rt_ftoa_p(double v, int64_t prec) {
+    char *p = rt_alloc(48);
+    snprintf(p, 48, "%.*g", (int)prec, v);
+    return rt_str(p);
+}
 
 void *rt_mkbuf(int64_t size) { return rt_alloc_own(size); }
 OxlStr rt_bufstr(void *buf, int64_t n) {

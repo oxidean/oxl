@@ -312,6 +312,7 @@ int64_t rt_find(OxlStr s, OxlStr sub);
 int64_t rt_atoi(OxlStr s);
 double rt_atof(OxlStr s);
 OxlStr rt_ftoa(double v);
+OxlStr rt_ftoa_p(double v, int64_t prec);
 void *rt_mkbuf(int64_t size);
 RtSlice rt_bytes_str(OxlStr s);        /* arena copy -> []byte      */
 OxlStr  rt_str_bytes(RtSlice b);       /* zero-copy view -> str     */

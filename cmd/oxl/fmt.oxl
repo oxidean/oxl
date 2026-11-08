@@ -13,6 +13,8 @@ package main
 // them right and the emitter is a line-for-line port.
 import "std/errors"
 
+import "std/io"
+
 import "std/os"
 
 import "std/strings"
@@ -3444,6 +3446,25 @@ fn format_file(path: str, src: str) -> own FRes {
 }
 
 // io::Error display text for the two cases reachable from oxl
+// checked read — the readfile builtin collapses errors to "", which
+// would let fmt rewrite or doc print a truncated source; open+readall
+// keeps a mid-read failure distinct from an empty file
+fn read_src(file: str) -> [str, err] {
+    [f, oe] = os.open(file)
+    if oe != nil {
+        return "", oe
+    }
+    [src, re] = io.readall(f)
+    ce := f.close()
+    if re != nil {
+        return "", re
+    }
+    if ce != nil {
+        return "", ce
+    }
+    return src, nil
+}
+
 fn fmt_read_err(file: str) {
     if os.isdir(file) {
         eprintln(file + ": Is a directory (os error 21)")
@@ -3483,33 +3504,38 @@ fn cmd_fmt() {
             fmt_read_err(file)
             bad = 1
         } else {
-            src := readfile(file)
-            res := format_file(file, src)
-            if res.ok == 0 {
+            [src, serr] = read_src(file)
+            if serr != nil {
+                eprintln(errors.msg(serr))
                 bad = 1
-            } else if ck == 1 {
-                if res.out != src {
-                    eprintln(file + ": not formatted")
+            } else {
+                res := format_file(file, src)
+                if res.ok == 0 {
                     bad = 1
-                }
-            } else if w == 1 {
-                if res.out != src {
-                    tmp := file + ".fmt-tmp"
-                    if writefile(tmp, res.out) != 0 {
-                        eprintln(file + ": write failed")
-                        os.remove(tmp)
+                } else if ck == 1 {
+                    if res.out != src {
+                        eprintln(file + ": not formatted")
                         bad = 1
-                    } else {
-                        re := os.rename(tmp, file)
-                        if re != nil {
-                            eprintln(file + ": " + errors.msg(re))
+                    }
+                } else if w == 1 {
+                    if res.out != src {
+                        tmp := file + ".fmt-tmp"
+                        if writefile(tmp, res.out) != 0 {
+                            eprintln(file + ": write failed")
                             os.remove(tmp)
                             bad = 1
+                        } else {
+                            re := os.rename(tmp, file)
+                            if re != nil {
+                                eprintln(file + ": " + errors.msg(re))
+                                os.remove(tmp)
+                                bad = 1
+                            }
                         }
                     }
+                } else {
+                    print(res.out)
                 }
-            } else {
-                print(res.out)
             }
         }
         i = i + 1
@@ -3530,7 +3556,11 @@ fn cmd_doc() {
         fmt_read_err(file)
         exit(1)
     }
-    src := readfile(file)
+    [src, serr] = read_src(file)
+    if serr != nil {
+        eprintln(errors.msg(serr))
+        exit(1)
+    }
     doc := "# API\n"
     pending := mkslice(str, 0)
     pos := 0

@@ -3081,8 +3081,10 @@ static char *w2u(const wchar_t *w) {
 static int env_key_eq(const char *base, OxlStr ov) {
     const char *eq = strchr(base, '=');
     const char *oeq = memchr(ov.p, '=', (size_t)ov.n);
-    if (!eq || !oeq) return 0;
-    size_t k = (size_t)(eq - base), ok = (size_t)(oeq - ov.p);
+    if (!eq) return 0;
+    /* a bare-key override (no '=') still matches — it strips the
+     * inherited entry rather than replacing its value */
+    size_t k = (size_t)(eq - base), ok = oeq ? (size_t)(oeq - ov.p) : (size_t)ov.n;
     return k == ok && memcmp(base, ov.p, k) == 0;
 }
 
@@ -3119,7 +3121,8 @@ static char **env_base(void) {
 #endif
 }
 
-static char **env_merge(RtSlice env) {
+static char **env_merge(RtSlice env, int64_t *napp) {
+    *napp = 0;
     if (env.len <= 0) return NULL;
     char **base = env_base();
     if (!base) return NULL;   /* inherited env unreadable — callers must error, not spawn with overrides only */
@@ -3133,7 +3136,12 @@ static char **env_merge(RtSlice env) {
             if (env_key_eq(base[i], ((OxlStr *)env.ptr)[j])) { drop = 1; break; }
         if (!drop) r[w++] = base[i];
     }
-    for (int64_t j = 0; j < env.len; j++) r[w++] = os_cstr(((OxlStr *)env.ptr)[j]);
+    for (int64_t j = 0; j < env.len; j++) {
+        OxlStr ov = ((OxlStr *)env.ptr)[j];
+        if (!memchr(ov.p, '=', (size_t)ov.n)) continue;   /* strip key — never appended */
+        r[w++] = os_cstr(ov);
+        (*napp)++;
+    }
     r[w] = NULL;
 #ifdef _WIN32
     free(base);   /* the w2u'd strings live on in r — only the array goes */
@@ -3241,12 +3249,13 @@ int64_t rt_proc_run(RtSlice argv, RtSlice env) {
     if (argv.len < 1) return -EINVAL;
     char **av = argv_c(argv);
     if (!av) return -EINVAL;
-    char **ev = env_merge(env);
+    int64_t napp = 0;
+    char **ev = env_merge(env, &napp);
     if (env.len > 0 && !ev) { argv_free(av); return -EIO; }
     pid_t pid;
     int rc = posix_spawnp(&pid, av[0], NULL, NULL, av, ev ? ev : environ);
     argv_free(av);
-    env_merge_free(ev, env.len);
+    env_merge_free(ev, napp);
     if (rc != 0) return -(int64_t)rc;   /* spawn failures report errno directly */
     return child_status(pid);
 }
@@ -3255,18 +3264,19 @@ int64_t rt_proc_output(RtSlice argv, RtSlice env, RtSlice *out, RtSlice *errb) {
     if (argv.len < 1) return -EINVAL;
     char **av = argv_c(argv);
     if (!av) return -EINVAL;
-    char **ev = env_merge(env);
+    int64_t napp = 0;
+    char **ev = env_merge(env, &napp);
     if (env.len > 0 && !ev) { argv_free(av); return -EIO; }
     int op[2] = { -1, -1 }, ep[2] = { -1, -1 };
     if (pipe(op) < 0) {
         int e = errno;
-        argv_free(av); env_merge_free(ev, env.len);
+        argv_free(av); env_merge_free(ev, napp);
         return -(int64_t)e;
     }
     if (pipe(ep) < 0) {
         int e = errno;
         close(op[0]); close(op[1]);
-        argv_free(av); env_merge_free(ev, env.len);
+        argv_free(av); env_merge_free(ev, napp);
         return -(int64_t)e;
     }
     posix_spawn_file_actions_t fa;
@@ -3281,7 +3291,7 @@ int64_t rt_proc_output(RtSlice argv, RtSlice env, RtSlice *out, RtSlice *errb) {
     int rc = posix_spawnp(&pid, av[0], &fa, NULL, av, ev ? ev : environ);
     posix_spawn_file_actions_destroy(&fa);
     argv_free(av);
-    env_merge_free(ev, env.len);
+    env_merge_free(ev, napp);
     close(op[1]);
     close(ep[1]);
     if (rc != 0) {
@@ -3393,7 +3403,8 @@ static int wenv_cmp(const void *a, const void *b) {
 /* merged env as the sorted double-NUL wide block CreateProcessW
  * expects (paired with CREATE_UNICODE_ENVIRONMENT) */
 static wchar_t *env_block_w(RtSlice env) {
-    char **m = env_merge(env);
+    int64_t napp = 0;
+    char **m = env_merge(env, &napp);
     if (!m) return NULL;
     int64_t n = 0;
     for (char **p = m; *p; p++) n++;
@@ -3412,7 +3423,7 @@ static wchar_t *env_block_w(RtSlice env) {
     }
     *o = 0;
     free(ws);
-    env_merge_free(m, env.len);
+    env_merge_free(m, napp);
     return b;
 }
 

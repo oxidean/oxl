@@ -39,10 +39,26 @@ extern fn rt_chmod(path: str, mode: int) -> int
 // git's own mechanisms (ssh agent, credential helpers).
 struct Fetched { ver: str, tar: []byte, manifest: []byte }
 
+// repository-location vars are stripped, not overridden — an inherited
+// GIT_DIR et al would retarget our git invocations at a foreign repo and
+// cache sums for the wrong content. auth/config vars (GIT_SSH*,
+// GIT_ASKPASS, GIT_CONFIG_*) stay, so credential helpers still work.
 fn git_env() -> own []str {
-    e := mkslice(str, 2)
-    e[0] = "TZ=UTC"
-    e[1] = "GIT_TERMINAL_PROMPT=0"
+    e := mkslice(str, 14)
+    e[0] = "GIT_DIR"
+    e[1] = "GIT_WORK_TREE"
+    e[2] = "GIT_INDEX_FILE"
+    e[3] = "GIT_OBJECT_DIRECTORY"
+    e[4] = "GIT_ALTERNATE_OBJECT_DIRECTORIES"
+    e[5] = "GIT_COMMON_DIR"
+    e[6] = "GIT_NAMESPACE"
+    e[7] = "GIT_PREFIX"
+    e[8] = "GIT_CEILING_DIRECTORIES"
+    e[9] = "GIT_DISCOVERY_ACROSS_FILESYSTEM"
+    e[10] = "GIT_GRAFT_FILE"
+    e[11] = "GIT_SHALLOW_FILE"
+    e[12] = "TZ=UTC"
+    e[13] = "GIT_TERMINAL_PROMPT=0"
     return new(e)
 }
 
@@ -259,6 +275,40 @@ fn pseudo(tmp: str, sha: str) -> [str, err] {
     return "v" + itoa(maj) + "." + itoa(min) + "." + itoa(pat) + "-0." + ts + "-" + sh, nil
 }
 
+// pseudo_sha extracts the embedded commit hash from a pseudo-version
+// query ("v<semver>-0.<yyyymmddhhmmss>-<sha12>"), or "" when the query
+// isn't pseudo-shaped. the tail layout is fixed: -0. + 14 digits + - +
+// 12 lowercase hex = 30 bytes.
+fn pseudo_sha(query: str) -> str {
+    if len(query) < 32 || byteat(query, 0) != 118 {
+        return ""
+    }
+    tail := substr(query, len(query) - 30, len(query))
+    if byteat(tail, 0) != 45 || byteat(tail, 1) != 48 || byteat(tail, 2) != 46 {
+        return ""
+    }
+    i := 3
+    for i < 17 {
+        c := byteat(tail, i)
+        if c < 48 || c > 57 {
+            return ""
+        }
+        i = i + 1
+    }
+    if byteat(tail, 17) != 45 {
+        return ""
+    }
+    i = 18
+    for i < 30 {
+        c := byteat(tail, i)
+        if !(c >= 48 && c <= 57 || c >= 97 && c <= 102) {
+            return ""
+        }
+        i = i + 1
+    }
+    return substr(tail, 18, 30)
+}
+
 struct ShaVer { sha: str, ver: str }
 
 fn fetch_resolve(tmp: str, query: str) -> [own ShaVer, err] {
@@ -293,10 +343,19 @@ fn fetch_resolve(tmp: str, query: str) -> [own ShaVer, err] {
     }
     if byteat(query, 0) == 118 && check.sver_parse(query).ok == 1 {
         [sha, e] = rev_parse(tmp, "refs/tags/" + query)
-        if e != nil {
-            return nil, errors.new("unknown revision " + query)
+        if e == nil {
+            return new(ShaVer{sha: sha, ver: query}), nil
         }
-        return new(ShaVer{sha: sha, ver: query}), nil
+        // no such tag — a pinned pseudo-version still resolves by its
+        // embedded commit hash, so tidy can rebuild a missing cache slot
+        ph := pseudo_sha(query)
+        if len(ph) > 0 {
+            [psha, pe] = rev_parse(tmp, ph)
+            if pe == nil && strings.startswith(psha, ph) {
+                return new(ShaVer{sha: psha, ver: query}), nil
+            }
+        }
+        return nil, errors.new("unknown revision " + query)
     }
     // a branch name first, then a raw commit-ish
     [sha, e] = rev_parse(tmp, "refs/heads/" + query)

@@ -2155,8 +2155,9 @@ OxlStr rt_ftoa(double v) {
    precisions to find the shortest repr that round-trips (Rust
    Display semantics), which the fixed %.15g of rt_ftoa can't reach */
 OxlStr rt_ftoa_p(double v, int64_t prec) {
-    char *p = rt_alloc(48);
-    snprintf(p, 48, "%.*g", (int)prec, v);
+    int n = snprintf(NULL, 0, "%.*g", (int)prec, v);
+    char *p = rt_alloc(n + 1);
+    snprintf(p, n + 1, "%.*g", (int)prec, v);
     return rt_str(p);
 }
 

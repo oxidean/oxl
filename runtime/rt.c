@@ -2371,8 +2371,19 @@ int64_t rt_isfilex(OxlStr path) {
     DWORD a = GetFileAttributesA(cp);
     /* a link's directory bit mirrors its target type on Windows, so
      * dropping the reparse-point exclusion follows like stat() does */
-    return (a != INVALID_FILE_ATTRIBUTES
-            && !(a & FILE_ATTRIBUTE_DIRECTORY)) ? 1 : 0;
+    if (a == INVALID_FILE_ATTRIBUTES || (a & FILE_ATTRIBUTE_DIRECTORY))
+        return 0;
+    if (a & FILE_ATTRIBUTE_REPARSE_POINT) {
+        /* GetFileAttributesA reports the link itself even when its
+         * target dangles — stat() would fail ENOENT — so probe the
+         * resolved target (access 0 = metadata query, no open mode) */
+        HANDLE h = CreateFileA(cp, 0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+        if (h == INVALID_HANDLE_VALUE) return 0;
+        CloseHandle(h);
+    }
+    return 1;
 #else
     struct stat st;
     return (stat(cp, &st) == 0 && S_ISREG(st.st_mode)) ? 1 : 0;

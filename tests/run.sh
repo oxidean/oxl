@@ -592,6 +592,27 @@ if [ "$seed_rc" != 0 ] || [ "$self_rc" != 0 ] || [ "$self_out" != ok ]; then
     echo "-- self --"; printf '%s\n' "$self_out"
     exit 1
 fi
+# dangling oxl.work: stat-style probes see through the link to a missing
+# target, so the work file counts as absent and discovery continues —
+# identical on both checkers. Windows symlinks aren't reliably creatable
+# in CI, so the fixture is POSIX-gated like the get one above.
+case "$(uname -s)" in
+MINGW*|MSYS*|CYGWIN*) ;;
+*)
+mkdir -p "$scratch/workdangle/app"
+printf 'module local/dangle\noxl 0.3\n' > "$scratch/workdangle/oxl.mod"
+printf 'package main\nfn main() {}\n' > "$scratch/workdangle/app/main.oxl"
+ln -s "$scratch/workdangle/no-such-target" "$scratch/workdangle/oxl.work"
+seed_out=$("$SEEDOXL" build "$scratch/workdangle/app" -o "$scratch/danglebin" 2>&1 | sed 's/^[^:]*:[0-9][0-9]*:[0-9][0-9]*: //') && seed_rc=0 || seed_rc=1
+self_out=$("$scratch/selfcheck$EXE" "$scratch/workdangle/app" 2>&1) && self_rc=0 || self_rc=1
+if [ "$seed_rc" != 0 ] || [ "$self_rc" != 0 ] || [ "$self_out" != ok ]; then
+    echo "FAIL work-dangle: dangling oxl.work not treated as absent"
+    echo "-- seed --"; printf '%s\n' "$seed_out"
+    echo "-- self --"; printf '%s\n' "$self_out"
+    exit 1
+fi
+;;
+esac
 unset OXLMODCACHE
 
 echo "== v1 build list (oxl list -m all) =="

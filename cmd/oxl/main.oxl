@@ -28,6 +28,11 @@ extern fn rt_errstr(code: int) -> str
 
 extern fn rt_is_windows() -> int
 
+// the running binary's canonical path — PATH lookup hands us a bare
+// argv(0), so exe-anchored probes (runtime/, std/) must anchor here
+// to find a shipped toolchain from another project
+extern fn rt_exepath() -> str
+
 extern fn rt_open_write(path: str) -> int
 
 extern fn rt_fd_write(fd: int, b: []byte) -> int
@@ -215,7 +220,10 @@ fn runtime_at(base: str) -> str {
 }
 
 fn runtime_dir(entry: str) -> str {
-    d := runtime_at(check.canon_or(check.dir_of(argv(0))))
+    d := runtime_at(check.canon_or(check.dir_of(rt_exepath())))
+    if len(d) == 0 {
+        d = runtime_at(check.canon_or(check.dir_of(argv(0))))
+    }
     if len(d) == 0 {
         d = runtime_at(check.canon_or(entry))
     }

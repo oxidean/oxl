@@ -36,6 +36,10 @@ extern fn rt_fexists(path: str) -> int
 // the internal rule compare real ancestors, not lexical ones
 extern fn rt_fullpath(path: str) -> str
 
+// the running binary's canonical path — PATH lookup hands us a bare
+// argv(0), so exe-anchored probes must anchor here first
+extern fn rt_exepath() -> str
+
 extern fn rt_is_windows() -> int
 
 // ---------- interned types ----------
@@ -6577,7 +6581,10 @@ fn resolve_imp(ck: mut Ck, imp: str) -> RRes {
         // exe ancestors first (shipped-tree std beside the binary),
         // then the entry's ancestors — a self-hosted checker compiled
         // into a scratch dir still finds the SOURCE tree's std
-        r.dir = std_at(canon_or(dir_of(argv(0))), rest)
+        r.dir = std_at(canon_or(dir_of(rt_exepath())), rest)
+        if len(r.dir) == 0 {
+            r.dir = std_at(canon_or(dir_of(argv(0))), rest)
+        }
         if len(r.dir) == 0 {
             r.dir = std_at(ck.entry_dir, rest)
         }

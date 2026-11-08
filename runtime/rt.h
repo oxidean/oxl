@@ -349,6 +349,7 @@ int64_t rt_htonl(int64_t v);
 OxlStr rt_getenv(OxlStr name);
 int64_t rt_fexists(OxlStr path);
 OxlStr rt_fullpath(OxlStr path);
+OxlStr rt_exepath(void); /* canonical path of the running binary ("" on failure) */
 int64_t rt_open_read(OxlStr path);     /* fd or -1                  */
 int64_t rt_open_write(OxlStr path);    /* create|trunc, fd or -1    */
 int64_t rt_fd_read(int64_t fd, RtSlice b);   /* n or -errno        */

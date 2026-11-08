@@ -786,14 +786,14 @@ fn ssrev(l: own SSL) -> own SSL {
     return out
 }
 
-fn icons(v: own FItem, n: own FIL) -> own FIL {
+fn ficons(v: own FItem, n: own FIL) -> own FIL {
     c := new(FIL)
     c.v = v
     c.next = n
     return c
 }
 
-fn irev(l: own FIL) -> own FIL {
+fn firev(l: own FIL) -> own FIL {
     let out: own FIL = nil
     for l != nil {
         n := l.next
@@ -2224,7 +2224,7 @@ fn fparse(p: mut FPar) -> own FRoot {
         before := p.i
         it := fp_item(p)
         if it != nil {
-            items = icons(it, items)
+            items = ficons(it, items)
         } else {
             fskip_item(p)
             if p.i == before {
@@ -2232,7 +2232,7 @@ fn fparse(p: mut FPar) -> own FRoot {
             }
         }
     }
-    r.items = irev(items)
+    r.items = firev(items)
     return r
 }
 

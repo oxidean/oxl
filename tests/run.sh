@@ -613,6 +613,27 @@ if [ "$seed_rc" != 0 ] || [ "$self_rc" != 0 ] || [ "$self_out" != ok ]; then
 fi
 ;;
 esac
+# invalid UTF-8 inside a comment: the seed's read_to_string rejects the
+# file outright; the self-hosted driver must degrade to the documented
+# missing-directive diagnostic — validating before comment stripping,
+# not during line parsing. Diagnostics differ by contract, so only the
+# self side's text is asserted.
+mkdir -p "$scratch/workbadutf8/app"
+printf 'module local/badutf8\noxl 0.3\n' > "$scratch/workbadutf8/oxl.mod"
+printf 'package main\nfn main() {}\n' > "$scratch/workbadutf8/app/main.oxl"
+printf 'oxlwork 0.3\n// \xff\xfe\nuse ./app\n' > "$scratch/workbadutf8/oxl.work"
+seed_out=$("$SEEDOXL" build "$scratch/workbadutf8/app" -o "$scratch/utf8bin" 2>&1 | sed 's/^[^:]*:[0-9][0-9]*:[0-9][0-9]*: //') && seed_rc=0 || seed_rc=1
+self_out=$("$scratch/selfcheck$EXE" "$scratch/workbadutf8/app" 2>&1) && self_rc=0 || self_rc=1
+if [ "$seed_rc" = 0 ] || [ "$self_rc" = 0 ]; then
+    echo "FAIL work-badutf8: invalid UTF-8 accepted"
+    echo "-- seed --"; printf '%s\n' "$seed_out"
+    echo "-- self --"; printf '%s\n' "$self_out"
+    exit 1
+fi
+case "$self_out" in
+*"oxl.work: missing oxlwork directive"*) ;;
+*) echo "FAIL work-badutf8 self diag: $self_out"; exit 1 ;;
+esac
 unset OXLMODCACHE
 
 echo "== v1 build list (oxl list -m all) =="

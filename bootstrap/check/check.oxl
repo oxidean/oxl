@@ -18,6 +18,8 @@ import "std/collections"
 
 import "std/strings"
 
+import "std/unicode/utf8"
+
 // package loading needs portable dir probes (seed resolve_pkg mirrors)
 extern fn rt_lsdir(path: str) -> []str
 
@@ -6346,7 +6348,16 @@ fn parse_work_to(text: str) -> own WorkRes {
 // dedup, and no two trees may declare one module path (a `use` landing
 // on the main module's own dir is the same tree, not a conflict)
 fn load_work(ck: mut Ck, wr: str) -> int {
-    wout := parse_work_to(readfile(wr + "/oxl.work"))
+    wtext := readfile(wr + "/oxl.work")
+    // the seed's read_to_string rejects invalid UTF-8 outright; the
+    // documented degradation here is the missing-directive diagnostic.
+    // Validate before parse_work_to — strip_comment would otherwise
+    // drop bad bytes inside comments and accept the file.
+    if !utf8.valid(wtext) {
+        diag(ck, "check", "oxl.work: missing oxlwork directive")
+        return 0
+    }
+    wout := parse_work_to(wtext)
     if len(wout.errt) > 0 {
         diag(ck, "check", wout.errt)
         return 0

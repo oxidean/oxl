@@ -676,7 +676,7 @@ fn gfn_item(g: mut G, qn: str) -> int {
 fn xfnval_ty(g: mut G, f: ref parser.Node) -> int {
     if check.nk(f) == 2 {
         match f {
-            parser.Node.Name(n) => {
+            parser.Node.Name{n} => {
                 t := gx_lookup(g, n)
                 if t >= 0 && tyk(g, t) == check.k_fn() {
                     return t
@@ -722,9 +722,9 @@ fn xpatbinds(g: mut G, pat: ref parser.Node, st: int) -> own GBnd {
                 bl := binds
                 for bl != nil && wl != nil {
                     match bl.v {
-                        parser.Node.Name(bn) => {
-                            if bn != "_" {
-                                out = gbnd(bn, "", wl.v.t, out)
+                        parser.Node.Name{n} => {
+                            if n != "_" {
+                                out = gbnd(n, "", wl.v.t, out)
                             }
                         }
                         _ => {
@@ -738,11 +738,11 @@ fn xpatbinds(g: mut G, pat: ref parser.Node, st: int) -> own GBnd {
             bl := binds
             for bl != nil {
                 match bl.v {
-                    parser.Node.Name(bn) => {
-                        if bn != "_" {
-                            ft := check.ffind(fields, bn)
+                    parser.Node.Name{n} => {
+                        if n != "_" {
+                            ft := check.ffind(fields, n)
                             if ft >= 0 {
-                                out = gbnd(bn, "", ft, out)
+                                out = gbnd(n, "", ft, out)
                             }
                         }
                     }
@@ -925,7 +925,7 @@ fn xty(g: mut G, e: ref parser.Node) -> int {
         parser.Node.JInt(_) => check.t_int(g.ck)
         parser.Node.JFloat(_) => check.tk(g.ck, check.k_float())
         parser.Node.JStr(_) => check.t_str(g.ck)
-        parser.Node.Name(n) => xty_name(g, n)
+        parser.Node.Name{n} => xty_name(g, n)
         parser.Node.Call{f, args} => xty_call(g, f, args)
         parser.Node.Field{obj, name} => xty_field(g, obj, name)
         parser.Node.Lit{obj} => xty_lit(g, obj)
@@ -936,7 +936,7 @@ fn xty(g: mut G, e: ref parser.Node) -> int {
         parser.Node.Closure{params, body} => xty_closure(g, params, body)
         parser.Node.Bin{op, l, r} => xty_bin(g, op, l, r)
         parser.Node.Un{op, e} => xty_un(g, op, e)
-        parser.Node.Ty(_) => check.t_void(g.ck)
+        parser.Node.Ty{f0} => check.t_void(g.ck)
         _ => check.t_unk(g.ck)
     }
     return t
@@ -1035,8 +1035,8 @@ fn xty_call(g: mut G, f: ref parser.Node, args: ref parser.NList) -> int {
             a := args.v
             if check.nk(a) == 2 {
                 match a {
-                    parser.Node.Name(an) => {
-                        et = check.ty_parse(g.ck, an)
+                    parser.Node.Name{n} => {
+                        et = check.ty_parse(g.ck, n)
                     }
                     _ => {
                     }
@@ -1078,8 +1078,8 @@ fn xty_call(g: mut G, f: ref parser.Node, args: ref parser.NList) -> int {
             a := args.v
             if check.nk(a) == 2 {
                 match a {
-                    parser.Node.Name(sn) => {
-                        q := check.resolve_named(g.ck, sn)
+                    parser.Node.Name{n} => {
+                        q := check.resolve_named(g.ck, n)
                         if collections.map_has(g.ck.structs, q) {
                             st := check.tn(g.ck, check.k_struct(), q)
                             return check.ti(g.ck, check.k_own(), st)
@@ -1181,7 +1181,7 @@ fn xty_match(g: mut G, scrut: ref parser.Node, arms: ref parser.NList) -> int {
                     check.env_push(g.benv)
                     pb := xpatbinds(g, pat, st)
                     for pb != nil {
-                        check.env_set(g.benv, pb.n, pb.t)
+                        check.env_bind(g.benv, pb.n, pb.t)
                         pb = pb.next
                     }
                     t := xty(g, body)
@@ -1727,7 +1727,7 @@ fn gref(g: mut G, n: str) -> str {
 fn gfslot(g: mut G, name: str, ct: str) -> str {
     i := len(g.fdecls)
     g.fdecls = push(g.fdecls, ct + " v" + itoa(i) + ";")
-    check.env_set(g.fsl, name, i)
+    check.env_bind(g.fsl, name, i)
     return "v" + itoa(i)
 }
 
@@ -1839,10 +1839,10 @@ fn garm(g: mut G, pat: ref parser.Node, acc: str, st: int) -> GArm {
                 bl := binds
                 for bl != nil && wl != nil {
                     match bl.v {
-                        parser.Node.Name(bn) => {
-                            if bn != "_" {
+                        parser.Node.Name{n} => {
+                            if n != "_" {
                                 ce := acc + ".u.v" + itoa(ev.i) + ".f_" + wl.v.n
-                                out = gbnd(bn, ce, wl.v.t, out)
+                                out = gbnd(n, ce, wl.v.t, out)
                             }
                         }
                         _ => {
@@ -1855,10 +1855,10 @@ fn garm(g: mut G, pat: ref parser.Node, acc: str, st: int) -> GArm {
                 bl := binds
                 for bl != nil {
                     match bl.v {
-                        parser.Node.Name(bn) => {
-                            if bn != "_" {
-                                ce := acc + ".u.v" + itoa(ev.i) + ".f_" + bn
-                                out = gbnd(bn, ce, check.ffind(fields, bn), out)
+                        parser.Node.Name{n} => {
+                            if n != "_" {
+                                ce := acc + ".u.v" + itoa(ev.i) + ".f_" + n
+                                out = gbnd(n, ce, check.ffind(fields, n), out)
                             }
                         }
                         _ => {
@@ -1914,7 +1914,7 @@ fn gmatch(g: mut G, scrut: ref parser.Node, arms: ref parser.NList) -> str {
                 pb := ga.binds
                 for pb != nil {
                     o = o + gcty(g, pb.t) + " " + pb.n + " = " + pb.ce + "; "
-                    check.env_set(g.env, pb.n, pb.t)
+                    check.env_bind(g.env, pb.n, pb.t)
                     pb = pb.next
                 }
                 if body != nil && check.nk(body) == 23 {
@@ -2291,7 +2291,7 @@ fn gx(g: mut G, e: ref parser.Node) -> str {
         parser.Node.JInt(v) => itoa(v) + "LL"
         parser.Node.JFloat(s) => s
         parser.Node.JStr(s) => "rt_str_lit(\"" + s + "\")"
-        parser.Node.Name(n) => gxname(g, n)
+        parser.Node.Name{n} => gxname(g, n)
         parser.Node.Call{f, args} => gcall(g, f, args)
         parser.Node.Field{obj, name} => gxfield(g, obj, name)
         parser.Node.Lit{obj, fields} => gxlit(g, obj, fields)
@@ -2475,8 +2475,8 @@ fn gcall(g: mut G, f: ref parser.Node, args: ref parser.NList) -> str {
     if qn == "new" && args != nil {
         sn := ""
         match args.v {
-            parser.Node.Name(an) => {
-                sn = an
+            parser.Node.Name{n} => {
+                sn = n
             }
             _ => {
             }
@@ -2501,8 +2501,8 @@ fn gcall(g: mut G, f: ref parser.Node, args: ref parser.NList) -> str {
         et := check.t_unk(g.ck)
         if check.nk(args.v) == 2 {
             match args.v {
-                parser.Node.Name(an) => {
-                    et = check.ty_parse(g.ck, an)
+                parser.Node.Name{n} => {
+                    et = check.ty_parse(g.ck, n)
                 }
                 _ => {
                 }
@@ -3010,7 +3010,7 @@ fn gscan_e(g: mut G, s: mut GS, e: ref parser.Node) {
         return
     }
     match e {
-        parser.Node.Name(n) => {
+        parser.Node.Name{n} => {
             gsc_add(s, n)
         }
         parser.Node.Call{f, args} => {
@@ -3273,14 +3273,14 @@ fn gclosure(g: mut G, params: ref parser.NList, body: ref parser.Node) -> str {
     cp = caps
     for cp != nil {
         wln(g, "    " + gcty(g, cp.t) + " " + cname(cp.n) + " = _e->" + cname(cp.n) + ";")
-        check.env_set(g.env, cp.n, cp.t)
+        check.env_bind(g.env, cp.n, cp.t)
         cp = cp.next
     }
     pl = params
     for pl != nil {
         match pl.v {
             parser.Node.Param{name, ty} => {
-                check.env_set(g.env, name, gty(g, ty))
+                check.env_bind(g.env, name, gty(g, ty))
             }
             _ => {
             }
@@ -3357,11 +3357,11 @@ fn glet2(g: mut G, names: str, call: ref parser.Node) {
     wln(g, "    struct " + tag + " _r" + itoa(n) + " = " + c + ";")
     if len(na) > 0 && na != "_" {
         wln(g, "    " + gcty(g, vt) + " " + na + " = _r" + itoa(n) + ".val;")
-        check.env_set(g.env, na, vt)
+        check.env_bind(g.env, na, vt)
     }
     if len(nb) > 0 && nb != "_" {
         wln(g, "    int64_t " + nb + " = _r" + itoa(n) + ".err;")
-        check.env_set(g.env, nb, check.t_err(g.ck))
+        check.env_bind(g.env, nb, check.t_err(g.ck))
     }
 }
 
@@ -3381,14 +3381,14 @@ fn gs(g: mut G, s: ref parser.Node) {
             v := gx(g, init)
             v = gconv_v(g, init, v, t)
             wln(g, "    " + gcty(g, t) + " " + name + " = " + v + ";")
-            check.env_set(g.env, name, t)
+            check.env_bind(g.env, name, t)
         }
         parser.Node.Bind{name, init} => {
             t := xty(g, init)
             v := gx(g, init)
             v = gconv_v(g, init, v, t)
             wln(g, "    " + gcty(g, t) + " " + name + " = " + v + ";")
-            check.env_set(g.env, name, t)
+            check.env_bind(g.env, name, t)
         }
         parser.Node.Let2{names, call} => {
             glet2(g, names, call)
@@ -3683,7 +3683,7 @@ fn gfmatch(g: mut G, scrut: ref parser.Node, arms: ref parser.NList) {
                 pb := ga.binds
                 for pb != nil {
                     fd := gfslot(g, pb.n, gcty(g, pb.t))
-                    check.env_set(g.env, pb.n, pb.t)
+                    check.env_bind(g.env, pb.n, pb.t)
                     wln(g, "      fr->" + fd + " = " + pb.ce + ";")
                     pb = pb.next
                 }
@@ -3835,7 +3835,7 @@ fn gfselect(g: mut G, arms: ref parser.NList) {
                 wln(g, "    " + alabs[aidx] + ": ;")
                 if kind == "recv" && len(bind) > 0 {
                     fd := gfslot(g, bind, "int64_t")
-                    check.env_set(g.env, bind, check.t_int(g.ck))
+                    check.env_bind(g.env, bind, check.t_int(g.ck))
                     wln(g, "    fr->" + fd + " = rt_task_data(task);")
                 }
                 check.env_push(g.env)
@@ -3870,7 +3870,7 @@ fn gfstmt(g: mut G, s: ref parser.Node) {
             }
             ct := gcty(g, t)
             fd := gfslot(g, name, ct)
-            check.env_set(g.env, name, t)
+            check.env_bind(g.env, name, t)
             if len(g_call_susp(g, init)) > 0 {
                 gfsusp_go(g, init, 1, fd, "")
             } else {
@@ -3882,7 +3882,7 @@ fn gfstmt(g: mut G, s: ref parser.Node) {
         parser.Node.Bind{name, init} => {
             t := xty(g, init)
             fd := gfslot(g, name, gcty(g, t))
-            check.env_set(g.env, name, t)
+            check.env_bind(g.env, name, t)
             if len(g_call_susp(g, init)) > 0 {
                 gfsusp_go(g, init, 1, fd, "")
             } else {
@@ -3921,11 +3921,11 @@ fn gfstmt(g: mut G, s: ref parser.Node) {
             }
             if len(na) > 0 && na != "_" {
                 fa = gfslot(g, na, gcty(g, vt))
-                check.env_set(g.env, na, vt)
+                check.env_bind(g.env, na, vt)
             }
             if len(nb) > 0 && nb != "_" {
                 fb = gfslot(g, nb, "int64_t")
-                check.env_set(g.env, nb, check.t_err(g.ck))
+                check.env_bind(g.env, nb, check.t_err(g.ck))
             }
             if len(sn) > 0 {
                 match call {
@@ -4305,8 +4305,8 @@ fn gframe(g: mut G, qn: str, recv: ref parser.Node, params: ref parser.NList, re
             parser.Node.Param{name, ty} => {
                 t := gty(g, ty)
                 pfields = pfields + " " + gcty(g, t) + " p_" + name + ";"
-                check.env_set(g.env, name, t)
-                check.env_set(g.fsl, name, -2)
+                check.env_bind(g.env, name, t)
+                check.env_bind(g.fsl, name, -2)
             }
             _ => {
             }
@@ -4318,8 +4318,8 @@ fn gframe(g: mut G, qn: str, recv: ref parser.Node, params: ref parser.NList, re
             parser.Node.Param{name, ty} => {
                 t := gty(g, ty)
                 pfields = pfields + " " + gcty(g, t) + " p_" + name + ";"
-                check.env_set(g.env, name, t)
-                check.env_set(g.fsl, name, -2)
+                check.env_bind(g.env, name, t)
+                check.env_bind(g.fsl, name, -2)
             }
             _ => {
             }
@@ -4414,7 +4414,7 @@ fn gemit_named_fn(g: mut G, i: int, qn: str, base: str) {
             if recv != nil {
                 match recv {
                     parser.Node.Param{name, ty} => {
-                        check.env_set(g.env, name, gty(g, ty))
+                        check.env_bind(g.env, name, gty(g, ty))
                     }
                     _ => {
                     }
@@ -4424,7 +4424,7 @@ fn gemit_named_fn(g: mut G, i: int, qn: str, base: str) {
             for pl != nil {
                 match pl.v {
                     parser.Node.Param{name, ty} => {
-                        check.env_set(g.env, name, gty(g, ty))
+                        check.env_bind(g.env, name, gty(g, ty))
                     }
                     _ => {
                     }

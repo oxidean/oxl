@@ -11,6 +11,8 @@ package main
 // token's lo). The formatter's comment re-attachment, blank-line
 // preservation, and brace matching all measure off those spans — get
 // them right and the emitter is a line-for-line port.
+import "std/errors"
+
 import "std/os"
 
 import "std/strings"
@@ -1194,7 +1196,8 @@ fn fp_item(p: mut FPar) -> own FItem {
                     fbump(p)
                 }
             } else {
-                fbump(p)
+                ferr(p, t.lo, "parse", "unexpected " + fshow(p) + " in interface")
+                return nil
             }
             feat_p(p, ",")
             feat_p(p, ";")
@@ -3491,7 +3494,19 @@ fn cmd_fmt() {
                 }
             } else if w == 1 {
                 if res.out != src {
-                    writefile(file, res.out)
+                    tmp := file + ".fmt-tmp"
+                    if writefile(tmp, res.out) != 0 {
+                        eprintln(file + ": write failed")
+                        os.remove(tmp)
+                        bad = 1
+                    } else {
+                        re := os.rename(tmp, file)
+                        if re != nil {
+                            eprintln(file + ": " + errors.msg(re))
+                            os.remove(tmp)
+                            bad = 1
+                        }
+                    }
                 }
             } else {
                 print(res.out)

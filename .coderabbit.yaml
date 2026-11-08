@@ -3,6 +3,11 @@ reviews:
   profile: chill
   auto_approvals:
     enabled: true
+  auto_review:
+    ignore_title_keywords:
+      # Bot-opened manifest-sync PRs from release.yml must merge unattended —
+      # required_review_thread_resolution would deadlock them on a stray comment.
+      - "bump docs manifest to"
   pre_merge_checks:
     docstrings:
       # This is a bootstrap-stage compiler repo; we do not gate merges on

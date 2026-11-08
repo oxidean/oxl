@@ -1051,6 +1051,11 @@ echo "== toolchain driver fmt + doc (t3) =="
 if ! "$SELFOXL" fmt --check $(find std bootstrap tests examples cmd -name '*.oxl' | sort); then
     echo "FAIL self driver fmt --check: corpus not canonical"; exit 1
 fi
+# a valid but unformatted file must fail --check with exit 1
+printf 'package main\n\nfn add(a:int,b:int) -> int {\n  return a+b\n}\n' > "$scratch/unfmt.oxl"
+if "$SELFOXL" fmt --check "$scratch/unfmt.oxl" >/dev/null 2>&1; then
+    echo "FAIL fmt --check: accepted unformatted input"; exit 1
+fi
 # fmt output parity: the port must reproduce the seed's output
 # byte-for-byte on a corpus slice — round-trip, not a reformat
 for f in std/strings/strings.oxl std/io/io.oxl std/errors/errors.oxl \
@@ -1236,6 +1241,18 @@ send({"jsonrpc":"2.0","id":2,"method":"textDocument/hover","params":pos})
 h = recv(); assert "fn lexlib.lex(src: str)" in json.dumps(h), h
 send({"jsonrpc":"2.0","id":3,"method":"textDocument/definition","params":pos})
 d = recv(); assert d["result"]["uri"].endswith("lexlib/lexlib.oxl"), d
+# UTF-16 columns: a non-ASCII literal ahead of the use on its line makes
+# the char/UTF-16/byte columns all differ — hover must still land on lex
+src2 = src.replace("ast := parser.parse(", 'e := "\U0001f389"; ast := parser.parse(', 1)
+assert src2 != src
+send({"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":uri,"version":2},"contentChanges":[{"text":src2}]}}); recv()
+lines2 = src2.split("\n")
+i2 = next(i for i,l in enumerate(lines2) if "lexlib.lex(src)" in l)
+cidx = lines2[i2].index("lexlib.lex") + 7
+# the client speaks UTF-16 units — the emoji ahead on this line is two
+pos2 = {"textDocument":{"uri":uri},"position":{"line":i2,"character":len(lines2[i2][:cidx].encode("utf-16-le"))//2}}
+send({"jsonrpc":"2.0","id":4,"method":"textDocument/hover","params":pos2})
+h2 = recv(); assert "fn lexlib.lex(src: str)" in json.dumps(h2), h2
 send({"jsonrpc":"2.0","method":"exit","params":{}})
 PYEOF
 

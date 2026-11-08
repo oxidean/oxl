@@ -368,13 +368,21 @@ fn sl_has(ll: ref SList, ss: str) -> bool {
 
 struct Edge { a: str, b: str, next: own Edge }
 
-struct DBox { kind: str, msg: str }
+struct DBox { kind: str, msg: str, file: str, off: int }
+
+// an open editor buffer standing in for its on-disk path — the LSP
+// analyzes unsaved text (Rust `over` in load_pkg)
+struct OverEnt { path: str, text: str, next: own OverEnt }
 
 struct ClChk { callees: own SList, seeded: int, next: own ClChk }
 
 struct It { node: own parser.Node, mod: str, file: str }
 
-struct Scope { m: own collections.Map, moved: own SList }
+struct Scope {
+    m: own collections.Map,
+    moved: own SList,
+    ds: own collections.Map,
+}
 
 struct Env { scopes: []Scope }
 
@@ -425,27 +433,151 @@ struct Ck {
     clcks: own ClChk, // deferred closure susp checks
     loop_depth: int,
     nerr: int,
+    usev: []UseRec, // index.uses — use-site records (E1 port)
+    decls: own collections.Map, // decl key -> idx into declsv
+    declsv: []DeclEnt,
+    over: own OverEnt, // unsaved-buffer overrides (LSP only; nil in CLI use)
+    dpos: int, // pending diag offset — set at expr/stmt entry, read by diag()
 }
+
+// E1/LSP index: a use-site record mapping (file, [lo,hi)) to the decl it
+// resolves to (sig text for hover, def span for goto)
+struct UseRec {
+    file: str,
+    lo: int,
+    hi: int,
+    sig: str,
+    def_file: str,
+    def_lo: int,
+    def_hi: int,
+}
+
+struct DeclEnt { sig: str, file: str, lo: int, hi: int }
 
 fn env_new() -> own Env {
     e := Env{scopes: mkslice(Scope, 0)}
-    e.scopes = push(e.scopes, Scope{m: collections.map_new(), moved: nil})
+    e.scopes = push(e.scopes, Scope{m: collections.map_new(), moved: nil, ds: collections.map_new()})
     return new(e)
 }
 
 fn env_push(e: mut Env) {
-    e.scopes = push(e.scopes, Scope{m: collections.map_new(), moved: nil})
+    e.scopes = push(e.scopes, Scope{m: collections.map_new(), moved: nil, ds: collections.map_new()})
 }
 
 fn env_pop(e: mut Env) {
     e.scopes = e.scopes[0:len(e.scopes) - 1]
 }
 
-fn env_set(e: mut Env, n: str, t: int) {
+fn env_set(e: mut Env, n: str, t: int, lo: int, hi: int) {
     i := len(e.scopes) - 1
     collections.map_set(e.scopes[i].m, n, t)
     // a (re)binding starts un-moved — clears any stale mark on shadow
     e.scopes[i].moved = sl_del(e.scopes[i].moved, n)
+    // binding-site span for hover/goto on locals (E1 port)
+    collections.map_set(e.scopes[i].ds, n, lo * 4294967296 + hi)
+}
+
+struct Span { lo: int, hi: int }
+
+// no-span variant for scope maps that aren't index sources (codegen's
+// emission scopes)
+fn env_bind(e: mut Env, n: str, t: int) {
+    env_set(e, n, t, 0, 0)
+}
+
+// span of the visible binding for `n` (innermost scope first), nil on miss
+fn decl_span(e: ref Env, n: str) -> own Span {
+    i := len(e.scopes) - 1
+    for i >= 0 {
+        if collections.map_has(e.scopes[i].ds, n) {
+            [v, err] = collections.map_get(e.scopes[i].ds, n)
+            if err == nil {
+                return new(Span{lo: v / 4294967296, hi: v % 4294967296})
+            }
+        }
+        i = i - 1
+    }
+    return nil
+}
+
+// ---------- LSP index (E1 port) ----------
+// record a decl — keyed for use-site lookups, plus a self-use so the
+// decl name itself hovers/jumps (smallest-span wins at query time)
+fn rec_decl(ck: mut Ck, key: str, lo: int, hi: int, sig: str) {
+    if collections.map_has(ck.decls, key) {
+        [di, err] = collections.map_get(ck.decls, key)
+        if err == nil {
+            ck.declsv[di] = DeclEnt{sig: sig, file: ck.cur_file, lo: lo, hi: hi}
+        }
+    } else {
+        collections.map_set(ck.decls, key, len(ck.declsv))
+        ck.declsv = push(ck.declsv, DeclEnt{sig: sig, file: ck.cur_file, lo: lo, hi: hi})
+    }
+    ck.usev = push(ck.usev, UseRec{file: ck.cur_file, lo: lo, hi: hi, sig: sig, def_file: ck.cur_file, def_lo: lo, def_hi: hi})
+}
+
+// record a use-site -> its decl (no-op for builtins/locals — those
+// aren't `decls` keys)
+fn rec_use(ck: mut Ck, lo: int, hi: int, key: str) {
+    if collections.map_has(ck.decls, key) {
+        [di, err] = collections.map_get(ck.decls, key)
+        if err == nil {
+            d := ck.declsv[di]
+            ck.usev = push(ck.usev, UseRec{file: ck.cur_file, lo: lo, hi: hi, sig: d.sig, def_file: d.file, def_lo: d.lo, def_hi: d.hi})
+        }
+    }
+}
+
+// record a local-binding use — sig is `name: ty`, def is the visible
+// binding's span
+fn rec_local(ck: mut Ck, lo: int, hi: int, n: str, t: int, env: ref Env) {
+    dl := lo
+    dh := hi
+    ds := decl_span(env, n)
+    if ds != nil {
+        dl = ds.lo
+        dh = ds.hi
+    }
+    ck.usev = push(ck.usev, UseRec{file: ck.cur_file, lo: lo, hi: hi, sig: n + ": " + ty_name(ck, t), def_file: ck.cur_file, def_lo: dl, def_hi: dh})
+}
+
+// the `.name` region of a callee/field expr (dotted uses point at the
+// member, not the receiver): `x.m` -> m's span, `f` -> f's span
+fn member_span(f: ref parser.Node) -> own Span {
+    match f {
+        parser.Node.Field{name, hi} => {
+            return new(Span{lo: hi - len(name), hi: hi})
+        }
+        parser.Node.Name{n, lo, hi} => {
+            d := last_dot(n)
+            if d >= 0 {
+                ml := lo + d + 1
+                return new(Span{lo: ml, hi: ml + (len(n) - d - 1)})
+            }
+            return new(Span{lo: lo, hi: hi})
+        }
+        _ => {
+            return new(Span{lo: parser.nlo(f), hi: parser.nhi(f)})
+        }
+    }
+}
+
+// a `Node.Ty` f0 that is a bare (possibly dotted) type name — no space
+// (own/ref/mut/fn), no brackets, no parens
+fn bare_ty_name(s: str) -> bool {
+    if len(s) == 0 {
+        return false
+    }
+    i := 0
+    for i < len(s) {
+        ch := byteat(s, i)
+        ok := ch == 95 || ch == 46 || ch >= 97 && ch <= 122 || ch >= 65 && ch <= 90 || i > 0 && ch >= 48 && ch <= 57
+        if !ok {
+            return false
+        }
+        i = i + 1
+    }
+    return true
 }
 
 // ---------- move tracking (D2) ----------
@@ -581,7 +713,7 @@ fn node_ft(b: ref parser.Node) -> bool {
 // `e` consumes an `own` binding — mark it moved
 fn move_own(ck: mut Ck, e: ref parser.Node, env: mut Env) {
     match e {
-        parser.Node.Name(n) => {
+        parser.Node.Name{n} => {
             t := env_get(ck, env, n)
             if t >= 0 && ck.tyv[t].k == k_own() {
                 mark_moved(env, n)
@@ -1344,7 +1476,7 @@ fn env_get(ck: ref Ck, e: ref Env, n: str) -> int {
 }
 
 fn diag(ck: mut Ck, kind: str, msg: str) {
-    ck.diags = push(ck.diags, DBox{kind: kind, msg: msg})
+    ck.diags = push(ck.diags, DBox{kind: kind, msg: msg, file: ck.cur_file, off: ck.dpos})
     ck.nerr = ck.nerr + 1
 }
 
@@ -1584,8 +1716,8 @@ fn nk(n: ref parser.Node) -> int {
         parser.Node.JInt(_) => 0
         parser.Node.JFloat(_) => 42
         parser.Node.JStr(_) => 1
-        parser.Node.Name(_) => 2
-        parser.Node.Ty(_) => 3
+        parser.Node.Name{n} => 2
+        parser.Node.Ty{f0} => 3
         parser.Node.NamedField{name} => 4
         parser.Node.Param{name} => 5
         parser.Node.FieldDef{name} => 6
@@ -1643,7 +1775,7 @@ fn ty_str(n: ref parser.Node) -> str {
         return ""
     }
     s := match n {
-        parser.Node.Ty(v) => v
+        parser.Node.Ty{f0} => f0
         _ => ""
     }
     return s
@@ -1660,7 +1792,7 @@ fn path_join(obj: ref parser.Node, name: str) -> str {
 
 fn callee_name(f: ref parser.Node) -> str {
     n := match f {
-        parser.Node.Name(v) => v
+        parser.Node.Name{n} => n
         parser.Node.Field{obj, name} => path_join(obj, name)
         _ => ""
     }
@@ -1974,27 +2106,31 @@ fn reg_tynames(ck: mut Ck, its: []It) {
     // pass 0: type names first so self-refs and forward use resolve
     i := 0
     for i < len(its) {
+        ck.cur_file = its[i].file
         match its[i].node {
-            parser.Node.Struct{name, fields} => {
+            parser.Node.Struct{name, fields, lo, hi} => {
                 sn := qname(its[i].mod, name)
                 if !collections.map_has(ck.structs, sn) {
                     collections.map_set(ck.structs, sn, len(ck.structsv))
                     ck.structsv = push(ck.structsv, SEnt{n: sn, fields: nil})
                 }
+                rec_decl(ck, sn, lo, hi, "struct " + sn)
             }
-            parser.Node.Enum{name, vars} => {
+            parser.Node.Enum{name, vars, lo, hi} => {
                 en := qname(its[i].mod, name)
                 if !collections.map_has(ck.enums, en) {
                     collections.map_set(ck.enums, en, len(ck.enumsv))
                     ck.enumsv = push(ck.enumsv, EEnt{n: en, vars: nil})
                 }
+                rec_decl(ck, en, lo, hi, "enum " + en)
             }
-            parser.Node.Interface{name} => {
+            parser.Node.Interface{name, lo, hi} => {
                 iname := qname(its[i].mod, name)
                 if !collections.map_has(ck.ifaces, iname) {
                     collections.map_set(ck.ifaces, iname, len(ck.ifacesv))
                     ck.ifacesv = push(ck.ifacesv, IEnt{n: iname, ops: nil, methods: nil})
                 }
+                rec_decl(ck, iname, lo, hi, "interface " + iname)
             }
             _ => {
             }
@@ -2010,7 +2146,7 @@ fn reg_variant(ck: mut Ck, en: str, ei: int, vars: ref parser.NList) {
     vl := vars
     for vl != nil {
         match vl.v {
-            parser.Node.Variant{name, args} => {
+            parser.Node.Variant{name, args, lo, hi} => {
                 if sl_has(seen, name) {
                     diag(ck, "check", "duplicate variant `" + name + "`")
                 } else {
@@ -2039,6 +2175,25 @@ fn reg_variant(ck: mut Ck, en: str, ei: int, vars: ref parser.NList) {
                     collections.map_set(ck.structs, sn, len(ck.structsv))
                     ck.structsv = push(ck.structsv, SEnt{n: sn, fields: fclone(fields)})
                     out = vcons(name, fields, out)
+                    // decl sig: unit `E.V`, positional `E.V(t, ..)`, named `E.V { .. }`
+                    vsig := sn
+                    if args != nil {
+                        if nk(args.v) == 5 {
+                            vsig = sn + " { .. }"
+                        } else {
+                            ts := ""
+                            al2 := args
+                            for al2 != nil {
+                                if len(ts) > 0 {
+                                    ts = ts + ", "
+                                }
+                                ts = ts + ty_str(al2.v)
+                                al2 = al2.next
+                            }
+                            vsig = sn + "(" + ts + ")"
+                        }
+                    }
+                    rec_decl(ck, sn, lo, hi, vsig)
                 }
             }
             _ => {
@@ -2055,13 +2210,14 @@ fn reg_struct(ck: mut Ck, sn: str, si: int, fields: ref parser.NList) {
     fl := fields
     for fl != nil {
         match fl.v {
-            parser.Node.FieldDef{name, ty} => {
+            parser.Node.FieldDef{name, ty, lo, hi} => {
                 t := ty_parse(ck, ty_str(ty))
                 tk2 := ck.tyv[t].k
                 if tk2 == k_ref() || tk2 == k_mut() {
                     diag(ck, "own", "borrowed refs may not be stored in heap objects (v0)")
                 }
                 out = fcons(name, t, out)
+                rec_decl(ck, sn + "." + name, lo, hi, name + ": " + ty_str(ty))
             }
             _ => {
             }
@@ -2069,6 +2225,83 @@ fn reg_struct(ck: mut Ck, sn: str, si: int, fields: ref parser.NList) {
         fl = fl.next
     }
     ck.structsv[si].fields = frev(out)
+}
+
+// `-> t` / `-> [t, err]` ret text for hover sigs (mirrors the seed's
+// RetTy arms in fn_sig_text)
+fn ret_text(ret: ref parser.Node) -> str {
+    if ret == nil {
+        return ""
+    }
+    if nk(ret) == 3 {
+        return " -> " + ty_str(ret)
+    }
+    if nk(ret) == 23 {
+        match ret {
+            parser.Node.List{items} => {
+                if items != nil {
+                    return " -> [" + ty_str(items.v) + ", err]"
+                }
+            }
+            _ => {
+            }
+        }
+    }
+    return ""
+}
+
+// `fn name(params) -> ret` signature text (hover display)
+fn fn_sig_text(ck: mut Ck, qn: str, recv: ref parser.Node, typarams: ref parser.NList, params: ref parser.NList, ret: ref parser.Node) -> str {
+    s := "fn "
+    if recv != nil {
+        match recv {
+            parser.Node.Param{name, ty} => {
+                s = s + "(" + name + " " + ty_str(ty) + ") "
+            }
+            _ => {
+            }
+        }
+    }
+    s = s + qn
+    if typarams != nil {
+        tp := ""
+        l := typarams
+        for l != nil {
+            match l.v {
+                parser.Node.TyParam{name, constraint} => {
+                    if len(tp) > 0 {
+                        tp = tp + ", "
+                    }
+                    if len(constraint) > 0 {
+                        tp = tp + name + " " + constraint
+                    } else {
+                        tp = tp + name
+                    }
+                }
+                _ => {
+                }
+            }
+            l = l.next
+        }
+        s = s + "[" + tp + "]"
+    }
+    ps := ""
+    l2 := params
+    for l2 != nil {
+        match l2.v {
+            parser.Node.Param{name, ty} => {
+                if len(ps) > 0 {
+                    ps = ps + ", "
+                }
+                ps = ps + name + ": " + ty_str(ty)
+            }
+            _ => {
+            }
+        }
+        l2 = l2.next
+    }
+    s = s + "(" + ps + ")"
+    return s + ret_text(ret)
 }
 
 // shared ret resolution for fns + iface method sigs: `-> t` is One,
@@ -2120,8 +2353,8 @@ fn reg_iface(ck: mut Ck, ii: int, ops: ref parser.NList, methods: ref parser.NLi
     l := ops
     for l != nil {
         match l.v {
-            parser.Node.Name(op) => {
-                ol = scons(op, ol)
+            parser.Node.Name{n} => {
+                ol = scons(n, ol)
             }
             _ => {
             }
@@ -2133,13 +2366,18 @@ fn reg_iface(ck: mut Ck, ii: int, ops: ref parser.NList, methods: ref parser.NLi
     l = methods
     for l != nil {
         match l.v {
-            parser.Node.Method{name, params, ret} => {
+            parser.Node.Method{name, params, ret, lo, hi} => {
                 let ps: own IList = nil
+                pst := ""
                 pl := params
                 for pl != nil {
                     match pl.v {
-                        parser.Node.Param{ty} => {
+                        parser.Node.Param{name, ty} => {
                             ps = icons(ty_parse(ck, ty_str(ty)), ps)
+                            if len(pst) > 0 {
+                                pst = pst + ", "
+                            }
+                            pst = pst + name + ": " + ty_str(ty)
                         }
                         _ => {
                         }
@@ -2152,6 +2390,7 @@ fn reg_iface(ck: mut Ck, ii: int, ops: ref parser.NList, methods: ref parser.NLi
                 mc.v = m
                 mc.next = ml
                 ml = mc
+                rec_decl(ck, ck.ifacesv[ii].n + "." + name, lo, hi, "fn " + ck.ifacesv[ii].n + "." + name + "(" + pst + ")" + ret_text(ret))
             }
             _ => {
             }
@@ -2201,7 +2440,7 @@ fn reg_fields(ck: mut Ck, its: []It) {
     }
 }
 
-fn reg_fn(ck: mut Ck, mod: str, ex: bool, name: str, recv: ref parser.Node, typarams: ref parser.NList, params: ref parser.NList, ret: ref parser.Node) {
+fn reg_fn(ck: mut Ck, mod: str, ex: bool, name: str, recv: ref parser.Node, typarams: ref parser.NList, params: ref parser.NList, ret: ref parser.Node, lo: int, hi: int) {
     // pass 2 fn: params + ret resolve into a signature; generic params
     // scope ty names, a receiver prefixes the sig and keys `T.m`
     let tp: own TPList = nil
@@ -2293,9 +2532,12 @@ fn reg_fn(ck: mut Ck, mod: str, ex: bool, name: str, recv: ref parser.Node, typa
             ck.fnsv[idx].is_extern = 1
         }
     }
+    if !ex {
+        rec_decl(ck, qn, lo, hi, fn_sig_text(ck, qn, recv, typarams, params, ret))
+    }
 }
 
-fn reg_global(ck: mut Ck, name: str, ty: ref parser.Node, init: ref parser.Node) {
+fn reg_global(ck: mut Ck, name: str, ty: ref parser.Node, init: ref parser.Node, lo: int, hi: int) {
     // top-level `let` = a global; its init is checked against no env
     e := env_new()
     it := expr(ck, init, e)
@@ -2308,7 +2550,9 @@ fn reg_global(ck: mut Ck, name: str, ty: ref parser.Node, init: ref parser.Node)
     // package-qualified key — two packages can share a global name
     // (crypto/{md5,sha256} both keep P2/KT); the seed qualifies the decl
     // itself in qualify_item
-    collections.map_set(ck.globals, qname(ck.cur_mod, name), t)
+    gq := qname(ck.cur_mod, name)
+    collections.map_set(ck.globals, gq, t)
+    rec_decl(ck, gq, lo, hi, name + ": " + ty_name(ck, t))
 }
 
 fn reg_sigs(ck: mut Ck, its: []It) {
@@ -2317,11 +2561,11 @@ fn reg_sigs(ck: mut Ck, its: []It) {
         ck.cur_mod = its[i].mod
         ck.cur_file = its[i].file
         match its[i].node {
-            parser.Node.Fn{ex, name, recv, typarams, params, ret, body} => {
-                reg_fn(ck, its[i].mod, ex, name, recv, typarams, params, ret)
+            parser.Node.Fn{ex, name, recv, typarams, params, ret, body, lo, hi} => {
+                reg_fn(ck, its[i].mod, ex, name, recv, typarams, params, ret, lo, hi)
             }
-            parser.Node.Let{name, ty, init} => {
-                reg_global(ck, name, ty, init)
+            parser.Node.Let{name, ty, init, lo, hi} => {
+                reg_global(ck, name, ty, init, lo, hi)
             }
             _ => {
             }
@@ -2352,13 +2596,17 @@ fn expr(ck: mut Ck, e: ref parser.Node, env: mut Env) -> int {
     if e == nil {
         return t_unk(ck)
     }
+    elo := parser.nlo(e)
+    if elo >= 0 {
+        ck.dpos = elo
+    }
     t := match e {
         parser.Node.JInt(_) => t_int(ck)
         parser.Node.JFloat(_) => tk(ck, k_float())
         parser.Node.JStr(_) => t_str(ck)
-        parser.Node.Name(n) => ident(ck, n, env)
+        parser.Node.Name{n, lo, hi} => ident(ck, n, lo, hi, env)
         parser.Node.Call{f, args} => call(ck, f, args, env)
-        parser.Node.Field{obj, name} => field_expr(ck, obj, name, env)
+        parser.Node.Field{obj, name, hi} => field_expr(ck, obj, name, hi, env)
         parser.Node.Un{op, e} => un_expr(ck, op, e, env)
         parser.Node.Bin{op, l, r} => bin_expr(ck, op, l, r, env)
         parser.Node.Lit{obj, fields} => lit_expr(ck, obj, fields, env)
@@ -2367,7 +2615,7 @@ fn expr(ck: mut Ck, e: ref parser.Node, env: mut Env) -> int {
         parser.Node.Closure{params, body} => closure_expr(ck, params, body, env)
         parser.Node.Index{obj, idx} => index_expr(ck, obj, idx, env)
         parser.Node.Slice{obj, lo, hi} => slice_expr(ck, obj, lo, hi, env)
-        parser.Node.Ty(_) => tylit_bad(ck)
+        parser.Node.Ty{f0} => tylit_bad(ck)
         _ => t_unk(ck)
     }
     return t
@@ -2378,7 +2626,7 @@ fn tylit_bad(ck: mut Ck) -> int {
     return t_unk(ck)
 }
 
-fn ident(ck: mut Ck, n: str, env: mut Env) -> int {
+fn ident(ck: mut Ck, n: str, lo: int, hi: int, env: mut Env) -> int {
     // `nil`/`true`/`false` parse as Name in the bootstrap AST
     if n == "nil" {
         return t_err(ck)
@@ -2388,6 +2636,11 @@ fn ident(ck: mut Ck, n: str, env: mut Env) -> int {
     }
     t := env_get(ck, env, n)
     if t >= 0 {
+        if scope_of(env, n) >= 0 {
+            rec_local(ck, lo, hi, n, t, env)
+        } else {
+            rec_use(ck, lo, hi, resolve_named(ck, n))
+        }
         if is_moved(env, n) {
             diag(ck, "own", "use of moved value `" + n + "`")
         }
@@ -2395,6 +2648,7 @@ fn ident(ck: mut Ck, n: str, env: mut Env) -> int {
     }
     qn := resolve_named(ck, n)
     if collections.map_has(ck.fns, qn) {
+        rec_use(ck, lo, hi, qn)
         [fi, err] = collections.map_get(ck.fns, qn)
         if err == nil {
             sig := ck.fnsv[fi]
@@ -2423,7 +2677,7 @@ fn ident(ck: mut Ck, n: str, env: mut Env) -> int {
     return t_unk(ck)
 }
 
-fn field_expr(ck: mut Ck, obj: ref parser.Node, name: str, env: mut Env) -> int {
+fn field_expr(ck: mut Ck, obj: ref parser.Node, name: str, fhi: int, env: mut Env) -> int {
     // unit enum variant `E.V` — obj flattens to a path, not a value
     base := callee_name(obj)
     if len(base) > 0 {
@@ -2459,7 +2713,7 @@ fn field_expr(ck: mut Ck, obj: ref parser.Node, name: str, env: mut Env) -> int 
         hd = substr(base, 0, hi)
     }
     if len(base) > 0 && len(alias_stem(ck, hd)) > 0 {
-        return ident(ck, base + "." + name, env)
+        return ident(ck, base + "." + name, fhi - len(name), fhi, env)
     }
     t := expr(ck, obj, env)
     sn := ""
@@ -2491,6 +2745,8 @@ fn field_expr(ck: mut Ck, obj: ref parser.Node, name: str, env: mut Env) -> int 
         diag(ck, "type", "`" + sn + "` has no field `" + name + "`")
         return t_unk(ck)
     }
+    mlo := fhi - len(name)
+    rec_use(ck, mlo, mlo + len(name), sn + "." + name)
     return ft
 }
 
@@ -2540,6 +2796,7 @@ fn lit_fields(ck: mut Ck, path: str, want: ref FList, fields: ref parser.NList, 
 fn lit_expr(ck: mut Ck, obj: ref parser.Node, fields: ref parser.NList, env: mut Env) -> int {
     name := callee_name(obj)
     path := resolve_named(ck, name)
+    rec_use(ck, parser.nlo(obj), parser.nhi(obj), path)
     // named enum payload `E.V{f: x, ..}`
     ei := enum_variant(ck, path)
     if ei >= 0 {
@@ -2580,6 +2837,15 @@ fn lit_expr(ck: mut Ck, obj: ref parser.Node, fields: ref parser.NList, env: mut
 
 fn as_expr(ck: mut Ck, inner: ref parser.Node, ty: ref parser.Node, env: mut Env) -> int {
     ot := expr(ck, inner, env)
+    match ty {
+        parser.Node.Ty{f0, lo, hi} => {
+            if bare_ty_name(f0) {
+                rec_use(ck, lo, hi, resolve_named(ck, f0))
+            }
+        }
+        _ => {
+        }
+    }
     wt := ty_parse(ck, ty_str(ty))
     ok := ck.tyv[ot].k
     oname := ""
@@ -2777,11 +3043,11 @@ fn pat_lit(ck: mut Ck, v: ref parser.Node, st: int, env: mut Env, sk: int, saw: 
     lt := expr(ck, v, env)
     if sk == k_bool() && ck.tyv[lt].k == k_bool() {
         match v {
-            parser.Node.Name(nm) => {
-                if nm == "true" {
+            parser.Node.Name{n} => {
+                if n == "true" {
                     saw[0] = 1
                 }
-                if nm == "false" {
+                if n == "false" {
                     saw[1] = 1
                 }
             }
@@ -2795,7 +3061,9 @@ fn pat_lit(ck: mut Ck, v: ref parser.Node, st: int, env: mut Env, sk: int, saw: 
     }
 }
 
-fn pat_variant(ck: mut Ck, path: str, binds: ref parser.NList, en: str, covered: mut SListBox, env: mut Env) {
+// alo/ahi are the arm's span — payload binds take the arm's span as
+// their declaration, matching the seed's env.set(arm.span) behaviour
+fn pat_variant(ck: mut Ck, path: str, binds: ref parser.NList, en: str, covered: mut SListBox, alo: int, ahi: int, env: mut Env) {
     qpath := resolve_named(ck, path)
     vei := enum_variant(ck, qpath)
     if vei < 0 {
@@ -2837,9 +3105,9 @@ fn pat_variant(ck: mut Ck, path: str, binds: ref parser.NList, en: str, covered:
         bl := binds
         for bl != nil && wl != nil {
             match bl.v {
-                parser.Node.Name(bn) => {
-                    if bn != "_" {
-                        env_set(env, bn, wl.v.t)
+                parser.Node.Name{n} => {
+                    if n != "_" {
+                        env_set(env, n, wl.v.t, alo, ahi)
                     }
                 }
                 _ => {
@@ -2853,13 +3121,13 @@ fn pat_variant(ck: mut Ck, path: str, binds: ref parser.NList, en: str, covered:
     bl := binds
     for bl != nil {
         match bl.v {
-            parser.Node.Name(bn) => {
-                if bn != "_" {
-                    ft := ffind(vl.v.fields, bn)
+            parser.Node.Name{n} => {
+                if n != "_" {
+                    ft := ffind(vl.v.fields, n)
                     if ft < 0 {
-                        diag(ck, "check", "`" + qpath + "` has no field `" + bn + "`")
+                        diag(ck, "check", "`" + qpath + "` has no field `" + n + "`")
                     } else {
-                        env_set(env, bn, ft)
+                        env_set(env, n, ft, alo, ahi)
                     }
                 }
             }
@@ -2906,7 +3174,7 @@ fn match_expr(ck: mut Ck, scrut: ref parser.Node, arms: ref parser.NList, env: m
     for a != nil {
         moved_restore(env, ll_clone(pre))
         match a.v {
-            parser.Node.MArm{pat, body} => {
+            parser.Node.MArm{pat, body, lo, hi} => {
                 env_push(env)
                 pk := nk(pat)
                 if pk == 35 {
@@ -2917,7 +3185,7 @@ fn match_expr(ck: mut Ck, scrut: ref parser.Node, arms: ref parser.NList, env: m
                     wild = true
                     match pat {
                         parser.Node.PatBind{name} => {
-                            env_set(env, name, st)
+                            env_set(env, name, st, lo, hi)
                         }
                         _ => {
                         }
@@ -2937,7 +3205,7 @@ fn match_expr(ck: mut Ck, scrut: ref parser.Node, arms: ref parser.NList, env: m
                 if pk == 34 {
                     match pat {
                         parser.Node.Pat{path, binds} => {
-                            pat_variant(ck, path, binds, en, cov, env)
+                            pat_variant(ck, path, binds, en, cov, lo, hi, env)
                         }
                         _ => {
                         }
@@ -3037,6 +3305,8 @@ fn call(ck: mut Ck, f: ref parser.Node, args: ref parser.NList, env: mut Env) ->
         // enum variant ctor `E.V(...)`
         ei := enum_variant(ck, name)
         if ei >= 0 {
+            ms := member_span(f)
+            rec_use(ck, ms.lo, ms.hi, resolve_named(ck, name))
             ld := last_dot(name)
             vn := substr(name, ld + 1, len(name))
             en := ck.enumsv[ei].n
@@ -3077,6 +3347,8 @@ fn call(ck: mut Ck, f: ref parser.Node, args: ref parser.NList, env: mut Env) ->
         // local fn value shadows a same-named fn or builtin
         lt := env_get(ck, env, name)
         if lt >= 0 && ck.tyv[lt].k == k_fn() {
+            ms := member_span(f)
+            rec_local(ck, ms.lo, ms.hi, name, lt, env)
             return call_fnvalue(ck, ck.tyv[lt].args, ck.tyv[lt].r, args, env)
         }
         qn := resolve_named(ck, name)
@@ -3107,6 +3379,8 @@ fn call(ck: mut Ck, f: ref parser.Node, args: ref parser.NList, env: mut Env) ->
                         }
                         mt := method_target(ck, ot, name)
                         if mt.k == 2 {
+                            ms := member_span(f)
+                            rec_use(ck, ms.lo, ms.hi, mt.q)
                             return call_iface(ck, mt.ps, mt.rk, mt.r1, args, env)
                         }
                         if mt.k == 1 {
@@ -3193,8 +3467,9 @@ fn call(ck: mut Ck, f: ref parser.Node, args: ref parser.NList, env: mut Env) ->
                 a := args.v
                 if nk(a) == 2 {
                     match a {
-                        parser.Node.Name(an) => {
-                            sn := resolve_named(ck, an)
+                        parser.Node.Name{n, lo, hi} => {
+                            sn := resolve_named(ck, n)
+                            rec_use(ck, lo, hi, sn)
                             if collections.map_has(ck.structs, sn) {
                                 return ti(ck, k_own(), tn(ck, k_struct(), sn))
                             }
@@ -3248,13 +3523,23 @@ fn call(ck: mut Ck, f: ref parser.Node, args: ref parser.NList, env: mut Env) ->
                 a := args.v
                 if nk(a) == 2 {
                     match a {
-                        parser.Node.Name(an) => {
-                            et = ty_parse(ck, an)
+                        parser.Node.Name{n, lo, hi} => {
+                            rec_use(ck, lo, hi, resolve_named(ck, n))
+                            et = ty_parse(ck, n)
                         }
                         _ => {
                         }
                     }
                 } else if nk(a) == 3 {
+                    match a {
+                        parser.Node.Ty{f0, lo, hi} => {
+                            if bare_ty_name(f0) {
+                                rec_use(ck, lo, hi, resolve_named(ck, f0))
+                            }
+                        }
+                        _ => {
+                        }
+                    }
                     et = ty_parse(ck, ty_str(a))
                 } else {
                     diag(ck, "check", "`mkslice` takes a type name — mkslice(int, 8)")
@@ -3445,6 +3730,8 @@ fn call(ck: mut Ck, f: ref parser.Node, args: ref parser.NList, env: mut Env) ->
         if err != nil {
             return t_unk(ck)
         }
+        ms := member_span(f)
+        rec_use(ck, ms.lo, ms.hi, qn)
         sig := ck.fnsv[fi]
         if sig.is_extern == 1 {
             al := args
@@ -3594,8 +3881,14 @@ fn block_node(ck: mut Ck, body: ref parser.Node, env: mut Env) {
 }
 
 fn stmt(ck: mut Ck, s: ref parser.Node, env: mut Env) {
+    if s != nil {
+        slo := parser.nlo(s)
+        if slo >= 0 {
+            ck.dpos = slo
+        }
+    }
     match s {
-        parser.Node.Let{name, ty, init} => {
+        parser.Node.Let{name, ty, init, lo, hi} => {
             it := expr(ck, init, env)
             t := it
             if ty != nil {
@@ -3603,9 +3896,9 @@ fn stmt(ck: mut Ck, s: ref parser.Node, env: mut Env) {
                 assignable(ck, want, it)
                 t = want
             }
-            env_set(env, name, t)
+            env_set(env, name, t, lo, hi)
         }
-        parser.Node.Let2{names, call} => {
+        parser.Node.Let2{names, call, lo, hi} => {
             ck.in_let2 = 1
             expr(ck, call, env)
             ck.in_let2 = 0
@@ -3623,12 +3916,12 @@ fn stmt(ck: mut Ck, s: ref parser.Node, env: mut Env) {
                 bn = substr(names, i + 1, len(names))
             }
             if an != "_" {
-                env_set(env, an, val_ty)
+                env_set(env, an, val_ty, lo, hi)
             }
             if bn == "_" {
                 diag(ck, "check", "cannot discard `err` — handle it or pass it up")
             } else if len(bn) > 0 {
-                env_set(env, bn, t_err(ck))
+                env_set(env, bn, t_err(ck), lo, hi)
             }
         }
         parser.Node.Assign{target, val} => {
@@ -3637,7 +3930,7 @@ fn stmt(ck: mut Ck, s: ref parser.Node, env: mut Env) {
             idn := ""
             tt := t_unk(ck)
             match target {
-                parser.Node.Name(n) => {
+                parser.Node.Name{n} => {
                     idn = n
                     tt = env_get(ck, env, n)
                     if tt < 0 {
@@ -3778,9 +4071,9 @@ fn stmt(ck: mut Ck, s: ref parser.Node, env: mut Env) {
         parser.Node.Go{e} => {
             spawn_stmt(ck, e, env)
         }
-        parser.Node.Bind{name, init} => {
+        parser.Node.Bind{name, init, lo, hi} => {
             t := expr(ck, init, env)
-            env_set(env, name, t)
+            env_set(env, name, t, lo, hi)
         }
         parser.Node.Unsafe{body} => {
             block_node(ck, body, env)
@@ -4015,8 +4308,8 @@ fn closure_expr(ck: mut Ck, params: ref parser.NList, body: ref parser.Node, env
     wl := ps
     for pl != nil && wl != nil {
         match pl.v {
-            parser.Node.Param{name, ty} => {
-                env_set(env, name, wl.v)
+            parser.Node.Param{name, ty, lo, hi} => {
+                env_set(env, name, wl.v, lo, hi)
             }
             _ => {
             }
@@ -4261,7 +4554,8 @@ fn sel_stmt(ck: mut Ck, arms: ref parser.NList, env: mut Env) {
                     } else {
                         assignable(ck, tk(ck, k_chan()), expr(ck, ch, env))
                         if len(bind) > 0 {
-                            env_set(env, bind, t_int(ck))
+                            blo := parser.nhi(ch) + 1
+                            env_set(env, bind, t_int(ck), blo, blo + len(bind))
                         }
                     }
                 }
@@ -4821,8 +5115,8 @@ fn check_fn(ck: mut Ck, mod: str, name: str, recv: ref parser.Node, params: ref 
             wl := ck.fnsv[fi].params
             if recv != nil && wl != nil {
                 match recv {
-                    parser.Node.Param{name} => {
-                        env_set(env, name, wl.v)
+                    parser.Node.Param{name, lo, hi} => {
+                        env_set(env, name, wl.v, lo, hi)
                     }
                     _ => {
                     }
@@ -4832,8 +5126,8 @@ fn check_fn(ck: mut Ck, mod: str, name: str, recv: ref parser.Node, params: ref 
             pl := params
             for pl != nil && wl != nil {
                 match pl.v {
-                    parser.Node.Param{name, ty} => {
-                        env_set(env, name, wl.v)
+                    parser.Node.Param{name, ty, lo, hi} => {
+                        env_set(env, name, wl.v, lo, hi)
                     }
                     _ => {
                     }
@@ -6403,13 +6697,17 @@ struct PFile { path: str, clause: str, ast: own parser.Node }
 
 // read + parse a file, report failures; "" clause when unparseable
 fn parse_pfile(ck: mut Ck, path: str) -> PFile {
-    src := readfile(path)
+    src := over_src(ck, path)
     if len(src) == 0 {
         diag(ck, "check", "cannot read `" + path + "`")
         ck.load_fail = 1
         return PFile{path: path, clause: "", ast: nil}
     }
-    ast := parser.parse(lexlib.lex(src))
+    hush := 0
+    if ck.over != nil {
+        hush = 1 // LSP: lex errors print to stdout — keep the wire clean
+    }
+    ast := parser.parse2(lexlib.lex(src), hush)
     if ast == nil {
         diag(ck, "lex", "lexical error — see lex output above")
         ck.load_fail = 1
@@ -6494,7 +6792,7 @@ fn pfile_items(ck: mut Ck, ld: mut Loader, fpath: str, ast: own parser.Node, ite
                                     nl := names
                                     for nl != nil {
                                         match nl.v {
-                                            parser.Node.Name(n) => {
+                                            parser.Node.Name{n} => {
                                                 if modent_has(al, n) == 1 || modent_has(nm, n) == 1 {
                                                     diag(ck, "check", "`" + n + "` redeclared as imported name")
                                                     ck.load_fail = 1
@@ -6659,6 +6957,10 @@ fn ck_new() -> own Ck {
     ck.clcks = nil
     ck.loop_depth = 0
     ck.nerr = 0
+    ck.usev = mkslice(UseRec, 0)
+    ck.decls = collections.map_new()
+    ck.declsv = mkslice(DeclEnt, 0)
+    ck.dpos = -1
     ck.loading = nil
     ck.load_fail = 0
     ck.mod_on = 0
@@ -6737,7 +7039,40 @@ fn check_run_tail(ck: own Ck, ld: own Loader, root_pkg: str, need_main: int) -> 
 // `need_main` mirrors compile_mode: building requires `package main`
 // (test mode's generated driver exempts it).
 fn check_file(path: str, need_main: int) -> own CkRes {
+    return check_file_over(path, need_main, nil)
+}
+
+// readfile with unsaved-buffer substitution — the LSP seeds ck.over so a
+// didChange analyzes the wire text, not the stale disk copy
+fn over_src(ck: ref Ck, path: str) -> str {
+    o := ck.over
+    want := canon_or(path)
+    for o != nil {
+        if o.path == path || canon_or(o.path) == want {
+            return o.text
+        }
+        o = o.next
+    }
+    return readfile(path)
+}
+
+// LSP entry: analyze the package containing `path` (dir mode like the
+// seed's analyze), honoring open-buffer overrides; need_main is always 0
+// — editors check libraries too
+fn lsp_analyze(path: str, over: own OverEnt) -> own CkRes {
+    d := path
+    if rt_isdir(d) == 0 {
+        d = dir_of(d)
+    }
+    if len(d) == 0 {
+        d = "."
+    }
+    return check_file_over(d, 0, over)
+}
+
+fn check_file_over(path: str, need_main: int, over: own OverEnt) -> own CkRes {
     ck := ck_new()
+    ck.over = over
     ld := new(Loader)
     ld.items = mkslice(It, 0)
     // module ctx from the entry — dir args directly, file args' parent

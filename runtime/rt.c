@@ -2350,15 +2350,15 @@ int64_t rt_open_write(OxlStr path) {
     return fd < 0 ? -(int64_t)errno : fd;
 }
 
-/* open_write_mode: exclusive create with an explicit access mode —
- * staged replacements (fmt -w) are born under the source's mode
- * instead of umask defaults, so contents are never exposed looser
- * than the file they will replace. Owner-write is forced on so a
- * read-only source still accepts its staged content; the caller
- * chmods the real mode after the write completes. Windows pmode
- * collapses to the read-only attribute — create writable there and
- * let the post-write chmod set the read-only flag.
- * `src` names the file being replaced: on Windows an EFS-encrypted
+/* open_write_mode: exclusive create under a caller-chosen access
+ * mode — POSIX creates with (mode|0200)&0777, umask-masked by
+ * open(2) per the usual create contract. Owner-write is forced on
+ * so a read-only source's stage still accepts its staged content;
+ * the caller lands the real mode after the write completes.
+ * Windows has no DACL translation for a POSIX mode, so the stage is
+ * always born under an owner-only DACL regardless of mode — the
+ * read-only attribute rides in via rt_clone_attrs. `src` names the
+ * file being replaced: on Windows an EFS-encrypted
  * source puts FILE_ATTRIBUTE_ENCRYPTED on the create so the stage
  * is born encrypted — a default create would leave content written
  * plaintext, and the rename would carry the loss onto the source.
@@ -2384,7 +2384,7 @@ int64_t rt_open_write_mode(OxlStr path, int64_t mode, OxlStr src) {
     if (sattr & FILE_ATTRIBUTE_ENCRYPTED) cflags = FILE_ATTRIBUTE_ENCRYPTED;
     /* Born restrictive: an owner-only DACL on the staging file
      * closes the window where inherited parent ACEs could expose
-     * staged contents before the caller's rt_copy_acl carries the
+     * staged contents before the caller's rt_clone_attrs carries the
      * source DACL across. CREATE_NEW keeps the exclusive-create
      * contract; share mode 0 holds the stage closed to other opens
      * for the write's duration. "OW" is the owner-rights SID — the
@@ -2415,44 +2415,47 @@ int64_t rt_open_write_mode(OxlStr path, int64_t mode, OxlStr src) {
     if (fd < 0) { CloseHandle(h); return -(int64_t)EIO; }
     return fd;
 #else
-    /* Born restricted: the stage carries the creator's owner and
-     * group until rt_copy_acl applies the source's — 0600 keeps
-     * staged contents private for that window regardless of how
-     * permissive the source's mode is. Owner-write is implicit. */
+    /* Caller-chosen create mode, umask-masked by open(2) itself.
+     * fmt -w passes 0600: the stage carries the creator's owner and
+     * group until rt_clone_attrs applies the source's, and 0600
+     * keeps staged contents private for that window regardless of
+     * how permissive the source's mode is. Owner-write is forced
+     * so a read-only source's stage still accepts its content. */
     (void)src;
-    (void)mode;
-    int fd = open(cp, O_WRONLY | O_CREAT | O_EXCL | O_TRUNC, 0600);
+    int fd = open(cp, O_WRONLY | O_CREAT | O_EXCL | O_TRUNC,
+                  (int)(mode | 0200) & 0777);
     return fd < 0 ? -(int64_t)errno : fd;
 #endif
 }
 
-/* copy_acl: carry src's security onto dst — a staged replacement
- * born under the creator's identity would otherwise rewrite who the
- * file belongs to: OWNER RIGHTS ACEs would bind to the formatter's
- * SID, a null source DACL (world access) would collapse into the
- * stage's owner-only DACL, and on POSIX a 0660 source in a shared
- * directory would grant the creator's group while stripping the
- * real owner. Windows applies owner and DACL in one call — a NULL
- * source DACL is propagated as a NULL DACL, and SE_DACL_PROTECTED
- * travels with it so dst doesn't keep inheriting parent ACEs.
- * POSIX carries owner and group via chown(2); the caller chmods
- * the source mode after, per the preserve-before-mode contract.
- * A caller without privilege to restore a foreign owner/group
- * fails here, so the replacement is rejected rather than silently
- * re-owning the file. */
-int64_t rt_copy_acl(OxlStr src, OxlStr dst) {
-    if (src.n > 0 && memchr(src.p, 0, (size_t)src.n)) return -EINVAL;
-    if (dst.n > 0 && memchr(dst.p, 0, (size_t)dst.n)) return -EINVAL;
-    const char *cs = rt_cstr(src);
-    const char *cd = rt_cstr(dst);
+/* clone_attrs: carry the *open* source's security onto the *open*
+ * stage — a staged replace (fmt -w) must clone attrs from the same
+ * file it read, not whatever the source path resolves to later:
+ * fstat/fchown/fchmod close the check-to-use race where a swapped
+ * source in a shared directory would lend the stage a
+ * replacement's owner/group. POSIX fchown lands owner+group first,
+ * then fchmod the source mode — the window between them grants
+ * nothing beyond the source owner's access, and a caller without
+ * privilege to restore a foreign owner/group fails here rather
+ * than silently re-owning the file. Windows works the descriptors'
+ * handles: GetSecurityInfo/SetSecurityInfo carry owner and DACL in
+ * one call — a NULL source DACL (world access) is propagated as a
+ * NULL DACL, and SE_DACL_PROTECTED travels with it so dst doesn't
+ * keep inheriting parent ACEs — and the read-only attribute rides
+ * over via FILE_BASIC_INFO with times pinned to -1 (unchanged). */
+int64_t rt_clone_attrs(int64_t sfd, int64_t dfd) {
 #ifdef _WIN32
+    HANDLE sh = (HANDLE)_get_osfhandle((int)sfd);
+    HANDLE dh = (HANDLE)_get_osfhandle((int)dfd);
+    if (sh == INVALID_HANDLE_VALUE || dh == INVALID_HANDLE_VALUE)
+        return -(int64_t)EBADF;
     PSID owner = NULL;
     PACL dacl = NULL;
     PSECURITY_DESCRIPTOR sd = NULL;
-    DWORD r = GetNamedSecurityInfoA(cs, SE_FILE_OBJECT,
-                                    OWNER_SECURITY_INFORMATION |
-                                    DACL_SECURITY_INFORMATION,
-                                    &owner, NULL, &dacl, NULL, &sd);
+    DWORD r = GetSecurityInfo(sh, SE_FILE_OBJECT,
+                              OWNER_SECURITY_INFORMATION |
+                              DACL_SECURITY_INFORMATION,
+                              &owner, NULL, &dacl, NULL, &sd);
     if (r != ERROR_SUCCESS) return -((int64_t)r | RT_GLE_TAG);
     int64_t rc = 0;
     SECURITY_DESCRIPTOR_CONTROL ctl = 0;
@@ -2463,21 +2466,37 @@ int64_t rt_copy_acl(OxlStr src, OxlStr dst) {
         DWORD prot = (ctl & SE_DACL_PROTECTED)
                          ? PROTECTED_DACL_SECURITY_INFORMATION
                          : UNPROTECTED_DACL_SECURITY_INFORMATION;
-        /* MinGW spells the name param LPSTR; the API does not
-         * write it — the cast also keeps the build warning-free
-         * so compile output stays byte-stable across runs. */
-        r = SetNamedSecurityInfoA((char *)cd, SE_FILE_OBJECT,
-                                  OWNER_SECURITY_INFORMATION |
-                                  DACL_SECURITY_INFORMATION | prot,
-                                  owner, NULL, dacl, NULL);
+        r = SetSecurityInfo(dh, SE_FILE_OBJECT,
+                            OWNER_SECURITY_INFORMATION |
+                            DACL_SECURITY_INFORMATION | prot,
+                            owner, NULL, dacl, NULL);
         if (r != ERROR_SUCCESS) rc = -((int64_t)r | RT_GLE_TAG);
     }
     if (sd) LocalFree((HLOCAL)sd);
-    return rc;
+    if (rc != 0) return rc;
+    FILE_BASIC_INFO sbi;
+    if (!GetFileInformationByHandle(sh, FileBasicInfo, &sbi,
+                                    sizeof(sbi)))
+        return RT_GLE();
+    FILE_BASIC_INFO dbi;
+    /* -1 in a FILE_BASIC_INFO time member leaves the value
+     * unchanged — only FileAttributes is carried */
+    dbi.CreationTime.QuadPart = dbi.LastAccessTime.QuadPart =
+        dbi.LastWriteTime.QuadPart = dbi.ChangeTime.QuadPart = -1;
+    dbi.FileAttributes = sbi.FileAttributes;
+    if (!SetFileInformationByHandle(dh, FileBasicInfo, &dbi,
+                                    sizeof(dbi)))
+        return RT_GLE();
+    return 0;
 #else
+    (void)sfd;
+    (void)dfd;
     struct stat ss;
-    if (stat(cs, &ss) != 0) return -(int64_t)errno;
-    if (chown(cd, ss.st_uid, ss.st_gid) != 0) return -(int64_t)errno;
+    if (fstat((int)sfd, &ss) != 0) return -(int64_t)errno;
+    if (fchown((int)dfd, ss.st_uid, ss.st_gid) != 0)
+        return -(int64_t)errno;
+    if (fchmod((int)dfd, ss.st_mode & 0777) != 0)
+        return -(int64_t)errno;
     return 0;
 #endif
 }
@@ -3377,24 +3396,6 @@ int64_t rt_chmod(OxlStr path, int64_t mode) {
         ? RT_GLE() : 0;
 #else
     return chmod(cp, (mode_t)(mode & 0777)) < 0 ? -(int64_t)errno : 0;
-#endif
-}
-
-/* fmode: access-mode bits of path — callers staging a temp+rename
- * carry the source's mode over the replace (a fresh inode would
- * otherwise take umask defaults). Windows has only the read-only
- * attribute, mirroring rt_chmod's two-state mapping. */
-int64_t rt_fmode(OxlStr path) {
-    if (path.n > 0 && memchr(path.p, 0, (size_t)path.n)) return -EINVAL;
-    const char *cp = rt_cstr(path);
-#ifdef _WIN32
-    DWORD a = GetFileAttributesA(cp);
-    if (a == INVALID_FILE_ATTRIBUTES) return RT_GLE();
-    return (a & FILE_ATTRIBUTE_READONLY) ? 0444 : 0666;
-#else
-    struct stat st;
-    if (stat(cp, &st) != 0) return -(int64_t)errno;
-    return (int64_t)(st.st_mode & 0777);
 #endif
 }
 

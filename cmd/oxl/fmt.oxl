@@ -27,23 +27,23 @@ extern fn rt_ftoa_p(v: float, prec: int) -> str
 // mkbuf frees itself into the copied string via bufstr
 extern fn rt_free(p: own void)
 
-// access-mode bits of a path (fmt -w carries the source's mode onto
-// the staging file); open_write_mode creates the staging file under
-// that mode at birth — no window where staged content sits readable
-// looser than the source it will replace
-extern fn rt_fmode(path: str) -> int
-
-extern fn rt_chmod(path: str, mode: int) -> int
-
-// open_write_mode takes the source path too: on Windows a source
-// carrying EFS (FILE_ATTRIBUTE_ENCRYPTED) makes the create encrypt
-// the stage at birth — content never lands plaintext, and the
-// attribute survives the rename that replaces the source
+// open_write_mode creates under (mode|0200)&0777, umask-masked —
+// fmt -w passes 0600 so the stage is born restricted and never
+// sits readable looser than the source it will replace. It takes
+// the source path too: on Windows a source carrying EFS
+// (FILE_ATTRIBUTE_ENCRYPTED) makes the create encrypt the stage at
+// birth — content never lands plaintext, and the attribute
+// survives the rename that replaces the source
 extern fn rt_open_write_mode(path: str, mode: int, src: str) -> int
 
-// copy the source's DACL onto the staged replacement (Windows; a
-// no-op under POSIX where the chmod above carries the permissions)
-extern fn rt_copy_acl(src: str, dst: str) -> int
+// clone_attrs carries the *open* source's security onto the *open*
+// stage — owner+group+mode via fstat/fchown/fchmod on POSIX,
+// owner+DACL+FileAttributes via Get/SetSecurityInfo +
+// FILE_BASIC_INFO on Windows. Descriptor-bound, so the attrs clone
+// from the file that was read — path-based stat/chown would race a
+// source swap in a shared directory and lend the stage a
+// replacement's owner/group
+extern fn rt_clone_attrs(sfd: int, dfd: int) -> int
 
 extern fn rt_fd_write(fd: int, b: []byte) -> int
 
@@ -3487,11 +3487,12 @@ fn read_src(file: str) -> [str, err] {
     return src, nil
 }
 
-// stage_write creates path with access mode and writes s — the
-// mode lands at create time (open_write_mode forces owner-write on
-// so a read-only source still accepts its content); callers chmod
-// the final mode after the write completes
-fn stage_write(path: str, mode: int, src: str, s: str) -> int {
+// stage_write_hold creates path under mode and writes s, returning
+// the *open* fd on success — the caller clones the source's attrs
+// onto the descriptor (rt_clone_attrs) before closing it, so the
+// attrs land on the inode that was written. On write error the fd
+// is closed and -errno/-EIO(-5) returned.
+fn stage_write_hold(path: str, mode: int, src: str, s: str) -> int {
     fd := rt_open_write_mode(path, mode, src)
     if fd < 0 {
         return fd
@@ -3511,14 +3512,14 @@ fn stage_write(path: str, mode: int, src: str, s: str) -> int {
         }
         off = off + w
     }
-    c := rt_fd_close(fd)
     if rc != 0 {
+        c := rt_fd_close(fd)
+        if c < 0 {
+            return c
+        }
         return rc
     }
-    if c < 0 {
-        return c
-    }
-    return 0
+    return fd
 }
 
 fn fmt_read_err(file: str) {
@@ -3559,6 +3560,85 @@ fn cmd_fmt() {
         if !os.exists(file) || os.isdir(file) {
             fmt_read_err(file)
             bad = 1
+        } else if w == 1 && ck == 0 {
+            // -w holds the source's descriptor open across the
+            // read and the staged replace: clone_attrs fstats THAT
+            // descriptor for the stage's owner + mode, so a swapped
+            // source path can't lend the stage a different file's
+            // attrs — reading then re-statting by name would leave a
+            // check-to-use window (check/print paths don't stage and
+            // can let read_src close immediately)
+            [sf, oe] = os.open(file)
+            if oe != nil {
+                eprintln(errors.msg(oe))
+                bad = 1
+            } else {
+                [src, re] = io.readall(sf)
+                if re != nil {
+                    eprintln(errors.msg(re))
+                    ce := sf.close()
+                    if ce != nil {
+                        eprintln(errors.msg(ce))
+                    }
+                    bad = 1
+                } else {
+                    res := format_file(file, src)
+                    if res.ok == 0 {
+                        bad = 1
+                    } else if res.out != src {
+                        // unpredictable staging name + exclusive
+                        // create — the open itself is the
+                        // existence check, so a planted symlink or
+                        // a concurrent fmt loses the race instead
+                        // of being followed
+                        tmp := file + ".fmt-tmp-" + itoa(now_ms())
+                        // born restricted under 0600 — clone_attrs
+                        // lands the source's mode after the write,
+                        // so the stage never sits readable looser
+                        // than the file it replaces
+                        sfd := stage_write_hold(tmp, 384, file, res.out)
+                        // -EEXIST: the name was occupied — rotate
+                        // a few times before giving up
+                        tries := 0
+                        for sfd == -17 && tries < 8 {
+                            tries = tries + 1
+                            tmp = file + ".fmt-tmp-" + itoa(now_ms()) + "-" + itoa(tries)
+                            sfd = stage_write_hold(tmp, 384, file, res.out)
+                        }
+                        if sfd < 0 {
+                            eprintln(file + ": write failed")
+                            os.remove(tmp)
+                            bad = 1
+                        } else {
+                            // clone from the descriptor the
+                            // source was read on: owner+group
+                            // land before mode, so the window
+                            // between them grants nothing beyond
+                            // the source owner's access — then
+                            // the rename replaces the inode
+                            // wholesale
+                            ac := rt_clone_attrs(sf.fd, sfd)
+                            c2 := rt_fd_close(sfd)
+                            if ac != 0 || c2 < 0 {
+                                eprintln(file + ": write failed")
+                                os.remove(tmp)
+                                bad = 1
+                            } else {
+                                re2 := os.rename(tmp, file)
+                                if re2 != nil {
+                                    eprintln(file + ": " + errors.msg(re2))
+                                    os.remove(tmp)
+                                    bad = 1
+                                }
+                            }
+                        }
+                    }
+                    ce := sf.close()
+                    if ce != nil {
+                        eprintln(errors.msg(ce))
+                    }
+                }
+            }
         } else {
             [src, serr] = read_src(file)
             if serr != nil {
@@ -3572,56 +3652,6 @@ fn cmd_fmt() {
                     if res.out != src {
                         eprintln(file + ": not formatted")
                         bad = 1
-                    }
-                } else if w == 1 {
-                    if res.out != src {
-                        // unpredictable staging name + exclusive
-                        // create — the open itself is the existence
-                        // check, so a planted symlink or a concurrent
-                        // fmt loses the race instead of being followed
-                        tmp := file + ".fmt-tmp-" + itoa(now_ms())
-                        // stage under the source's mode from birth —
-                        // a default-umask create would sit readable
-                        // looser than a private source until chmod
-                        m := rt_fmode(file)
-                        mode := 384
-                        if m >= 0 {
-                            mode = m
-                        }
-                        wr := stage_write(tmp, mode, file, res.out)
-                        // -EEXIST: the name was occupied — rotate a
-                        // few times before giving up
-                        tries := 0
-                        for wr == -17 && tries < 8 {
-                            tries = tries + 1
-                            tmp = file + ".fmt-tmp-" + itoa(now_ms()) + "-" + itoa(tries)
-                            wr = stage_write(tmp, mode, file, res.out)
-                        }
-                        if wr != 0 {
-                            eprintln(file + ": write failed")
-                            os.remove(tmp)
-                            bad = 1
-                        } else {
-                            // carry the source's owner + access
-                            // onto the stage first — a rename
-                            // replaces the inode wholesale — then
-                            // apply its mode, so permissions never
-                            // bind to the creator's identity
-                            ac := rt_copy_acl(file, tmp)
-                            rt_chmod(tmp, mode)
-                            if ac != 0 {
-                                eprintln(file + ": write failed")
-                                os.remove(tmp)
-                                bad = 1
-                            } else {
-                                re := os.rename(tmp, file)
-                                if re != nil {
-                                    eprintln(file + ": " + errors.msg(re))
-                                    os.remove(tmp)
-                                    bad = 1
-                                }
-                            }
-                        }
                     }
                 } else {
                     print(res.out)

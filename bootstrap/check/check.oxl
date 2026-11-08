@@ -6784,6 +6784,12 @@ fn check_files(paths: []str, need_main: int) -> own CkRes {
     ck := ck_new()
     ld := new(Loader)
     ld.items = mkslice(It, 0)
+    if len(paths) == 0 {
+        r := new(CkRes)
+        r.ck = ck
+        r.items = ld.items
+        return r
+    }
     // module ctx anchors at the first file's parent, like check_file
     start := dir_of(paths[0])
     ck.entry_dir = start

@@ -18,5 +18,7 @@ Rules:
   semantics) — the `require` line still documents the minimum
   version for published consumers.
 - Diagnostics (`mod_work_*`): malformed directive, `use` dir without
-  `oxl.mod`, two `use`d modules claiming overlapping paths.
+  `oxl.mod`, and two `use`d modules declaring the *same* module path.
+  Nested module paths (`example.org/a` and `example.org/a/b`) are
+  valid — longest-path-wins already disambiguates them.
 - File mode (no `oxl.mod` found): `oxl.work` is ignored entirely.

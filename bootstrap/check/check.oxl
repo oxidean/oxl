@@ -3471,7 +3471,10 @@ fn call(ck: mut Ck, f: ref parser.Node, args: ref parser.NList, env: mut Env) ->
                 an := callee_name(a)
                 if len(an) > 0 {
                     sn := resolve_named(ck, an)
-                    if collections.map_has(ck.structs, sn) {
+                    // `E.V` registers a struct for `as` payloads — but in
+                    // `new(...)` a dotted arg naming a variant is a value
+                    // expression, not a type name (the seed takes expr here)
+                    if collections.map_has(ck.structs, sn) && enum_variant(ck, sn) < 0 {
                         rec_use(ck, parser.nlo(a), parser.nhi(a), sn)
                         return ti(ck, k_own(), tn(ck, k_struct(), sn))
                     }

@@ -1,0 +1,15 @@
+schema_version: 1
+request_id: IN-0001
+work_item_id: WI-0004
+run_id: run_1794155462068_f76af0
+kind: decision
+question: 'Milestone-shaping decision needed before specify: (1) G paradigm — full retained-widget-layer spec per map, or narrow to managed bindings; (2) whether R gets spec''d now in parallel or stays map-level until G ships; (3) P-track disposition.'
+options:
+    - 'Adopt recommendations: spec G as the retained-widget-layer milestone now; R stays map-level (spec at its start); P stays opportunistic'
+    - 'Spec G and R both now: produce both milestone specs in this plan round (R''s index-protocol fork left as an explicit open decision)'
+    - 'Narrow G to thin bindings: ship managed GTK bindings only; defer the portable layer and re-open the paradigm question at milestone start'
+status: cancelled
+created_by: ox-agent
+answered_by: jesse
+created_at: "2026-11-08T16:33:11Z"
+answered_at: "2026-11-08T16:37:35Z"

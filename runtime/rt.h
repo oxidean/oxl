@@ -327,6 +327,7 @@ int64_t rt_file_readable(const char *path);            /* open+close probe */
 RtSlice rt_lsdir(OxlStr path);
 int64_t rt_isdir(OxlStr path);
 int64_t rt_isfile(OxlStr path);
+int64_t rt_isfilex(OxlStr path);
 int64_t rt_islnk(OxlStr path);
 int64_t rt_strlen(const char *s);                         /* strlen, name-safe */
 #ifdef OXL_NET

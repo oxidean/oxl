@@ -1,6 +1,36 @@
 # CodeRabbit configuration — see https://docs.coderabbit.ai/reference/configuration
 reviews:
   profile: chill
+  path_filters:
+    # Only the materialized scaffold dirs are excluded — they are synced
+    # from the upstream Ox-Agent repo and in-place edits are overwritten
+    # by the next `ox-agent assets sync`, so findings on them belong
+    # upstream. Everything else (work items, context, state, runtime)
+    # stays in this repo's review surface.
+    # Managed skill dirs are enumerated (not skills/**) so a contributor-
+    # added extension skill under .ox-agent/skills/ stays in the review
+    # surface. Extend this list when `ox-agent assets sync` adds managed skills.
+    - "!.ox-agent/skills/adr/**"
+    - "!.ox-agent/skills/brainstorm/**"
+    - "!.ox-agent/skills/clean-user-facing-text/**"
+    - "!.ox-agent/skills/code-review/**"
+    - "!.ox-agent/skills/discover-context/**"
+    - "!.ox-agent/skills/discussion/**"
+    - "!.ox-agent/skills/implementation/**"
+    - "!.ox-agent/skills/multi-stage-plan/**"
+    - "!.ox-agent/skills/progress/**"
+    - "!.ox-agent/skills/remove-ai-marks/**"
+    - "!.ox-agent/skills/retrospective/**"
+    - "!.ox-agent/skills/shipping/**"
+    - "!.ox-agent/skills/specify/**"
+    - "!.ox-agent/skills/tdd/**"
+    - "!.ox-agent/skills/verify/**"
+    - "!.ox-agent/skills/README.md"
+    - "!.ox-agent/schemas/**"
+    - "!.ox-agent/pipelines/**"
+    - "!.ox-agent/integrations/**"
+    - "!.ox-agent/lifecycle/**"
+    - "!.ox-agent/workflows/**"
   auto_approvals:
     enabled: true
   auto_review:

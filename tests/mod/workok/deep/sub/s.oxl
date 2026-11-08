@@ -1,0 +1,5 @@
+package sub
+
+fn mark() -> int {
+    return 2
+}

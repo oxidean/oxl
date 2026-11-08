@@ -18,12 +18,16 @@ import "std/collections"
 
 import "std/strings"
 
+import "std/unicode/utf8"
+
 // package loading needs portable dir probes (seed resolve_pkg mirrors)
 extern fn rt_lsdir(path: str) -> []str
 
 extern fn rt_isdir(path: str) -> int
 
 extern fn rt_isfile(path: str) -> int
+
+extern fn rt_isfilex(path: str) -> int
 
 extern fn rt_islnk(path: str) -> int
 
@@ -423,6 +427,8 @@ struct Ck {
     mod_sel: own ModEnt, // MVS build list: module path -> selected version
     modcache: str, // module cache root
     mod_sums: own SumEnt, // oxl.sum lines — cache lookups verify against them
+    work_root: str, // dir holding oxl.work when a workspace extends discovery
+    mod_uses: own ModEnt, // `use`d module path -> canonical local dir
     entry_dir: str, // root package dir — anchors the source-tree std walk
     root_pkg: str, // root package clause — the seed fires builtin-redefine only on main's bare decls
     fnvals: own SList, // named fns used as values
@@ -5754,16 +5760,43 @@ fn find_root(d: str) -> str {
         d = c
     }
     for len(d) > 0 {
-        if rt_isfile(d + "/oxl.mod") == 1 {
+        // "." is never a canonical ancestor — dir_of degrades a drive
+        // root ("C:") to "." and a probe would resolve against the cwd
+        if d == "." {
+            break
+        }
+        if rt_isfilex(d + "/oxl.mod") == 1 {
             return d
         }
-        if d == "." || d == "/" {
+        if d == "/" {
             break
         }
         d = dir_of(d)
     }
-    if rt_isfile("/oxl.mod") == 1 {
-        return "/"
+    return ""
+}
+
+// nearest ancestor dir holding oxl.work — same walk as find_root;
+// only consulted in module mode (a lone work file is file-mode-ignored)
+fn find_work(d: str) -> str {
+    c := canon_or(d)
+    if len(c) == 0 {
+        c = canon_or(".")
+    }
+    if len(c) > 0 {
+        d = c
+    }
+    for len(d) > 0 {
+        if d == "." {
+            break
+        }
+        if rt_isfilex(d + "/oxl.work") == 1 {
+            return d
+        }
+        if d == "/" {
+            break
+        }
+        d = dir_of(d)
     }
     return ""
 }
@@ -5784,10 +5817,23 @@ fn modcache_dir() -> str {
     return ".oxl/mod"
 }
 
-// manifest diagnostic — `oxl.mod:<line>: <msg>` (the file is always AT
-// the module root, so the bare name locates it)
-fn merr(ck: mut Ck, lineno: int, msg: str) {
-    diag(ck, "check", "oxl.mod:" + itoa(lineno) + ": " + msg)
+// manifest diagnostic text — `oxl.mod:<line>: <msg>` (the file is
+// always AT the module root, so the bare name locates it); callers
+// either diag() it (main manifest) or wrap it (use'd manifests)
+fn mstr(lineno: int, msg: str) -> str {
+    return "oxl.mod:" + itoa(lineno) + ": " + msg
+}
+
+// manifest parse output — ok/first-err-text + path/floor/requires/
+// replaces, folded into ck's mod_ fields by the parse_manifest wrapper
+// (mirrors the seed's Result<tuple>; `err` can't carry our text shape)
+struct ManRes {
+    ok: int,
+    errt: str,
+    path: str,
+    floor: str,
+    reqs: own ModEnt,
+    reps: own ModEnt,
 }
 
 // replace RHS is a local dir — absolute when `/` or `X:`-rooted,
@@ -5803,37 +5849,40 @@ fn is_abs(p: str) -> bool {
 }
 
 // one require/replace entry (inline or inside a ( ) block); `rest` is
-// the text after the keyword
-fn manifest_entry(ck: mut Ck, kw: str, rest: str, lineno: int) -> int {
+// the text after the keyword. Replace dirs anchor at `root` — the
+// manifest's own dir, which for `use`d manifests is the use dir.
+// First failure's text lands in `out.errt` (ok flips 0); success just
+// links the entry.
+fn manifest_entry_to(out: mut ManRes, root: str, kw: str, rest: str, lineno: int) {
     toks := split_ws(rest)
     n := sl_len(toks)
     if kw == "require" {
         if n != 2 {
-            merr(ck, lineno, "expected `path version`")
-            return 0
+            out.errt = mstr(lineno, "expected `path version`")
+            return
         }
         p := sl_at(toks, 0)
         v := sl_at(toks, 1)
         sv := sver_parse(v)
         if sv.ok == 0 {
-            merr(ck, lineno, "bad version \"" + v + "\"")
-            return 0
+            out.errt = mstr(lineno, "bad version \"" + v + "\"")
+            return
         }
         ve := require_ok_s(p, v, sv.maj)
         if len(ve) > 0 {
-            merr(ck, lineno, ve)
-            return 0
+            out.errt = mstr(lineno, ve)
+            return
         }
-        l := ck.mod_reqs
+        l := out.reqs
         for l != nil {
             if l.alias == p {
-                merr(ck, lineno, "duplicate require \"" + p + "\"")
-                return 0
+                out.errt = mstr(lineno, "duplicate require \"" + p + "\"")
+                return
             }
             l = l.next
         }
-        ck.mod_reqs = new(ModEnt{alias: p, stem: v, ver: "", next: ck.mod_reqs})
-        return 1
+        out.reqs = new(ModEnt{alias: p, stem: v, ver: "", next: out.reqs})
+        return
     }
     // replace <path> [ver] => <dir>
     arrow := -1
@@ -5846,32 +5895,34 @@ fn manifest_entry(ck: mut Ck, kw: str, rest: str, lineno: int) -> int {
         i = i + 1
     }
     if arrow < 0 {
-        merr(ck, lineno, "expected `=>`")
-        return 0
+        out.errt = mstr(lineno, "expected `=>`")
+        return
     }
     if arrow == 0 || arrow > 2 || arrow + 1 != n - 1 {
-        merr(ck, lineno, "expected `path [version] => dir`")
-        return 0
+        out.errt = mstr(lineno, "expected `path [version] => dir`")
+        return
     }
     lver := ""
     if arrow == 2 {
         if sver_parse(sl_at(toks, 1)).ok == 0 {
-            merr(ck, lineno, "bad version \"" + sl_at(toks, 1) + "\"")
-            return 0
+            out.errt = mstr(lineno, "bad version \"" + sl_at(toks, 1) + "\"")
+            return
         }
         lver = sl_at(toks, 1)
     }
     dir := sl_at(toks, arrow + 1)
     if is_abs(dir) == false {
-        dir = ck.mod_root + "/" + dir
+        dir = root + "/" + dir
     }
-    ck.mod_reps = new(ModEnt{alias: sl_at(toks, 0), stem: dir, ver: lver, next: ck.mod_reps})
-    return 1
+    out.reps = new(ModEnt{alias: sl_at(toks, 0), stem: dir, ver: lver, next: out.reps})
 }
 
-// parse oxl.mod into ck's module fields — mirrors parse_manifest:
-// `//` comments, ( ) blocks, identical diagnostics incl. the oxl floor
-fn parse_manifest(ck: mut Ck, text: str) -> int {
+// parse oxl.mod text -> ManRes{ok, errt, ...} — mirrors
+// parse_manifest's Result: `//` comments, ( ) blocks, identical
+// diagnostics. The toolchain-floor check is the CALLER's job (the
+// seed checks it in mod_ctx only — dep/use'd manifests skip it).
+fn parse_manifest_to(root: str, text: str) -> own ManRes {
+    out := new(ManRes)
     lines := strings.split(text, "\n")
     lineno := 0
     block := ""
@@ -5887,8 +5938,11 @@ fn parse_manifest(ck: mut Ck, text: str) -> int {
         if len(block) > 0 {
             if t == ")" {
                 block = ""
-            } else if manifest_entry(ck, block, t, lineno) == 0 {
-                return 0
+            } else {
+                manifest_entry_to(out, root, block, t, lineno)
+                if len(out.errt) > 0 {
+                    return out
+                }
             }
             continue
         }
@@ -5896,49 +5950,64 @@ fn parse_manifest(ck: mut Ck, text: str) -> int {
         kw := sl_at(toks, 0)
         n := sl_len(toks)
         if kw == "module" {
-            if len(ck.mod_path) > 0 {
-                merr(ck, lineno, "duplicate directive \"module\"")
-                return 0
+            if len(out.path) > 0 {
+                out.errt = mstr(lineno, "duplicate directive \"module\"")
+                return out
             }
             if n != 2 {
-                merr(ck, lineno, "expected module path")
-                return 0
+                out.errt = mstr(lineno, "expected module path")
+                return out
             }
-            ck.mod_path = sl_at(toks, 1)
+            out.path = sl_at(toks, 1)
         } else if kw == "oxl" {
-            if len(ck.mod_floor) > 0 {
-                merr(ck, lineno, "duplicate directive \"oxl\"")
-                return 0
+            if len(out.floor) > 0 {
+                out.errt = mstr(lineno, "duplicate directive \"oxl\"")
+                return out
             }
             if n != 2 || ver_tuple(sl_at(toks, 1)) < 0 {
-                merr(ck, lineno, "expected version")
-                return 0
+                out.errt = mstr(lineno, "expected version")
+                return out
             }
-            ck.mod_floor = sl_at(toks, 1)
+            out.floor = sl_at(toks, 1)
         } else if kw == "require" || kw == "replace" {
             if n == 2 && sl_at(toks, 1) == "(" {
                 block = kw
                 block_line = lineno
-            } else if manifest_entry(ck, kw, substr(t, len(kw), len(t)), lineno) == 0 {
-                return 0
+            } else {
+                manifest_entry_to(out, root, kw, substr(t, len(kw), len(t)), lineno)
+                if len(out.errt) > 0 {
+                    return out
+                }
             }
         } else {
-            merr(ck, lineno, "unknown directive \"" + kw + "\"")
-            return 0
+            out.errt = mstr(lineno, "unknown directive \"" + kw + "\"")
+            return out
         }
     }
     if len(block) > 0 {
-        merr(ck, block_line, "unterminated " + block + " block")
+        out.errt = mstr(block_line, "unterminated " + block + " block")
+        return out
+    }
+    if len(out.path) == 0 {
+        out.errt = "oxl.mod: missing module directive"
+        return out
+    }
+    out.ok = 1
+    return out
+}
+
+// parse the main module's manifest into ck's mod_ fields — the
+// wrapper getmod/check both call; floor-check lives in mod_ctx_load
+fn parse_manifest(ck: mut Ck, text: str) -> int {
+    out := parse_manifest_to(ck.mod_root, text)
+    if len(out.errt) > 0 {
+        diag(ck, "check", out.errt)
         return 0
     }
-    if len(ck.mod_path) == 0 {
-        diag(ck, "check", "oxl.mod: missing module directive")
-        return 0
-    }
-    if len(ck.mod_floor) > 0 && ver_tuple(ck.mod_floor) > ver_tuple(tool_ver()) {
-        diag(ck, "check", "oxl.mod: requires oxl " + ck.mod_floor + ", toolchain is " + tool_ver())
-        return 0
-    }
+    ck.mod_path = out.path
+    ck.mod_floor = out.floor
+    ck.mod_reqs = out.reqs
+    ck.mod_reps = out.reps
     return 1
 }
 
@@ -6103,6 +6172,17 @@ fn mod_build_list(ck: mut Ck) {
         queue = push(queue, l.alias + "|" + l.stem)
         l = l.next
     }
+    // `use`d modules contribute their own requirements to selection —
+    // go.work semantics: the workspace build list covers every tree
+    u := ck.mod_uses
+    for u != nil {
+        reqs := dep_manifest_reqs(readfile(u.stem + "/oxl.mod"))
+        for reqs != nil {
+            queue = push(queue, reqs.alias + "|" + reqs.stem)
+            reqs = reqs.next
+        }
+        u = u.next
+    }
     qi := 0
     for qi < len(queue) {
         ent := queue[qi]
@@ -6136,7 +6216,7 @@ fn mod_build_list(ck: mut Ck) {
             continue
         }
         mf := dr.dir + "/oxl.mod"
-        if rt_isfile(mf) == 0 {
+        if rt_isfilex(mf) == 0 {
             continue
         }
         reqs := dep_manifest_reqs(readfile(mf))
@@ -6174,6 +6254,170 @@ fn selected_ver(ck: ref Ck, mp: str) -> str {
     return ""
 }
 
+// one `use` line's argument + its line number (work-file diagnostics
+// name the written arg — hermetic, never a canonical path)
+struct UseEnt { arg: str, line: int, next: own UseEnt }
+
+// work-file parse output — ok/first-err-text + `oxlwork` floor + the
+// `use` dir list (mirrors the seed's Result<tuple>)
+struct WorkRes { ok: int, errt: str, floor: str, dirs: own UseEnt }
+
+// parse oxl.work text -> WorkRes — mirrors parse_work: manifest
+// grammar, `oxlwork` is the one required directive, `use` takes one
+// dir inline or per ( ) block line
+fn parse_work_to(text: str) -> own WorkRes {
+    out := new(WorkRes)
+    lines := strings.split(text, "\n")
+    lineno := 0
+    block := 0
+    block_line := 0
+    for lines != nil {
+        lineno = lineno + 1
+        t := strip_comment(lines.v)
+        lines = lines.next
+        t = strings.trim(t)
+        if len(t) == 0 {
+            continue
+        }
+        if block == 1 {
+            if t == ")" {
+                block = 0
+            } else {
+                toks := split_ws(t)
+                if sl_len(toks) != 1 {
+                    out.errt = "oxl.work:" + itoa(lineno) + ": expected `dir`"
+                    return out
+                }
+                out.dirs = new(UseEnt{arg: sl_at(toks, 0), line: lineno, next: out.dirs})
+            }
+            continue
+        }
+        toks := split_ws(t)
+        kw := sl_at(toks, 0)
+        n := sl_len(toks)
+        if kw == "oxlwork" {
+            if len(out.floor) > 0 {
+                out.errt = "oxl.work:" + itoa(lineno) + ": duplicate directive \"oxlwork\""
+                return out
+            }
+            if n != 2 || ver_tuple(sl_at(toks, 1)) < 0 {
+                out.errt = "oxl.work:" + itoa(lineno) + ": expected version"
+                return out
+            }
+            out.floor = sl_at(toks, 1)
+        } else if kw == "use" {
+            if n == 2 && sl_at(toks, 1) == "(" {
+                block = 1
+                block_line = lineno
+            } else {
+                if n != 2 {
+                    out.errt = "oxl.work:" + itoa(lineno) + ": expected `dir`"
+                    return out
+                }
+                out.dirs = new(UseEnt{arg: sl_at(toks, 1), line: lineno, next: out.dirs})
+            }
+        } else {
+            out.errt = "oxl.work:" + itoa(lineno) + ": unknown directive \"" + kw + "\""
+            return out
+        }
+    }
+    if block == 1 {
+        out.errt = "oxl.work:" + itoa(block_line) + ": unterminated use block"
+        return out
+    }
+    if len(out.floor) == 0 {
+        out.errt = "oxl.work: missing oxlwork directive"
+        return out
+    }
+    // entries prepended during the scan — restore file order, the
+    // seed's Vec keeps it and diagnostics name line numbers
+    let rev: own UseEnt = nil
+    for out.dirs != nil {
+        nx := out.dirs.next
+        out.dirs.next = rev
+        rev = out.dirs
+        out.dirs = nx
+    }
+    out.dirs = rev
+    out.ok = 1
+    return out
+}
+
+// oxl.work load — mirrors mod_ctx's work block: parse, floor-check,
+// then per `use` the dir must hold a parseable oxl.mod; canonical-dir
+// dedup, and no two trees may declare one module path (a `use` landing
+// on the main module's own dir is the same tree, not a conflict)
+fn load_work(ck: mut Ck, wr: str) -> int {
+    wtext := readfile(wr + "/oxl.work")
+    // the seed's read_to_string rejects invalid UTF-8 outright; the
+    // documented degradation here is the missing-directive diagnostic.
+    // Validate before parse_work_to — strip_comment would otherwise
+    // drop bad bytes inside comments and accept the file.
+    if !utf8.valid(wtext) {
+        diag(ck, "check", "oxl.work: missing oxlwork directive")
+        return 0
+    }
+    wout := parse_work_to(wtext)
+    if len(wout.errt) > 0 {
+        diag(ck, "check", wout.errt)
+        return 0
+    }
+    if ver_tuple(wout.floor) > ver_tuple(tool_ver()) {
+        diag(ck, "check", "oxl.work: requires oxlwork " + wout.floor + ", toolchain is " + tool_ver())
+        return 0
+    }
+    root_canon := canon_or(ck.mod_root)
+    wdirs := wout.dirs
+    for wdirs != nil {
+        lineno := wdirs.line
+        arg := wdirs.arg
+        wdirs = wdirs.next
+        dir := arg
+        if is_abs(dir) == false {
+            dir = wr + "/" + dir
+        }
+        canon := canon_or(dir)
+        // canonical-dir dedup runs against the use list itself — `use`
+        // on the main module's own root never lands there, so listing
+        // it twice stays harmless (mirrors the seed order)
+        ud := ck.mod_uses
+        for ud != nil {
+            if ud.stem == canon {
+                diag(ck, "check", "oxl.work:" + itoa(lineno) + ": duplicate use \"" + arg + "\"")
+                return 0
+            }
+            ud = ud.next
+        }
+        mf := dir + "/oxl.mod"
+        if rt_isfilex(mf) == 0 {
+            diag(ck, "check", "oxl.work:" + itoa(lineno) + ": use dir \"" + arg + "\" has no oxl.mod")
+            return 0
+        }
+        mout := parse_manifest_to(dir, readfile(mf))
+        if len(mout.errt) > 0 {
+            diag(ck, "check", "oxl.work:" + itoa(lineno) + ": use dir \"" + arg + "\": " + mout.errt)
+            return 0
+        }
+        if canon == root_canon {
+            continue
+        }
+        ud = ck.mod_uses
+        dup := 0
+        for ud != nil {
+            if ud.alias == mout.path {
+                dup = 1
+            }
+            ud = ud.next
+        }
+        if mout.path == ck.mod_path || dup == 1 {
+            diag(ck, "check", "oxl.work:" + itoa(lineno) + ": duplicate use module \"" + mout.path + "\"")
+            return 0
+        }
+        ck.mod_uses = new(ModEnt{alias: mout.path, stem: canon, ver: "", next: ck.mod_uses})
+    }
+    return 1
+}
+
 fn mod_ctx_load(ck: mut Ck, start: str) -> int {
     root := find_root(start)
     if len(root) == 0 {
@@ -6181,12 +6425,25 @@ fn mod_ctx_load(ck: mut Ck, start: str) -> int {
     }
     ck.mod_root = root
     ck.modcache = modcache_dir()
-    text := readfile(root + "/oxl.mod")
-    if parse_manifest(ck, text) == 0 {
+    if parse_manifest(ck, readfile(root + "/oxl.mod")) == 0 {
         return 0
     }
-    if rt_isfile(root + "/oxl.sum") == 1 {
+    // floor gate mirrors the seed: parse validates the version shape,
+    // the toolchain check lives in ctx-load (dep/use'd manifests skip it)
+    if len(ck.mod_floor) > 0 && ver_tuple(ck.mod_floor) > ver_tuple(tool_ver()) {
+        diag(ck, "check", "oxl.mod: requires oxl " + ck.mod_floor + ", toolchain is " + tool_ver())
+        return 0
+    }
+    if rt_isfilex(root + "/oxl.sum") == 1 {
         if parse_sums(ck, readfile(root + "/oxl.sum")) == 0 {
+            return 0
+        }
+    }
+    // a found oxl.work extends — does not replace — module discovery
+    wr := find_work(start)
+    if len(wr) > 0 {
+        ck.work_root = wr
+        if load_work(ck, wr) == 0 {
             return 0
         }
     }
@@ -6196,10 +6453,17 @@ fn mod_ctx_load(ck: mut Ck, start: str) -> int {
 }
 
 // `<base>`-anchored ancestor walk for `std/<rest>` — the exe and the
-// entry dir each get one pass inside resolve_imp
-fn std_at(base: str, rest: str) -> str {
+// entry dir each get one pass inside resolve_imp. `rel` marks a
+// relative base: its "." tail mirrors the seed's "" parent (probed
+// cwd-relative). Canonical bases never legitimately reach "." —
+// dir_of degrades a drive root ("C:") to "." there, and probing it
+// would resolve against an unrelated cwd.
+fn std_at(base: str, rest: str, rel: int) -> str {
     d := base
     for len(d) > 0 {
+        if d == "." && rel == 0 {
+            break
+        }
         p := d + "/std/" + rest
         if rt_isdir(p) == 1 {
             return p
@@ -6564,7 +6828,7 @@ fn verify_slot(ck: ref Ck, dir: str, path: str, ver: str) -> str {
         return "verifying " + path + "@" + ver + ": checksum mismatch"
     }
     mp := dir + "/oxl.mod"
-    if rt_isfile(mp) == 0 {
+    if rt_isfilex(mp) == 0 {
         return mp + ": No such file or directory (os error 2)"
     }
     if mod_h1(path, ver, readfile(mp)) != m {
@@ -6574,8 +6838,85 @@ fn verify_slot(ck: ref Ck, dir: str, path: str, ver: str) -> str {
 }
 
 // ---------- import resolution ----------------------------------------
+// module mode runs ONE longest-path-prefix competition over every
+// known tree — main module, `use`d workspace trees, then requires —
+// ties keep the earlier candidate, so a `use`d tree shadows a require
+// on the same path (the require still documents the published floor).
+// `std/` is the final anchor (mirrors the seed order: use trees →
+// replaces/cache → std anchor).
 fn resolve_imp(ck: mut Ck, imp: str) -> RRes {
     r := RRes{dir: "", missing: "", tampered: ""}
+    if ck.mod_on == 1 {
+        best_len := 0
+        kind := 0 // 1 main module, 2 use tree, 3 require
+        best_mp := ""
+        best_dir := ""
+        if imp == ck.mod_path || strings.startswith(imp, ck.mod_path + "/") {
+            best_len = len(ck.mod_path)
+            kind = 1
+            best_mp = ck.mod_path
+        }
+        l := ck.mod_uses
+        for l != nil {
+            if (imp == l.alias || strings.startswith(imp, l.alias + "/")) && len(l.alias) > best_len {
+                best_len = len(l.alias)
+                kind = 2
+                best_mp = l.alias
+                best_dir = l.stem
+            }
+            l = l.next
+        }
+        l = ck.mod_reqs
+        for l != nil {
+            if (imp == l.alias || strings.startswith(imp, l.alias + "/")) && len(l.alias) > best_len {
+                best_len = len(l.alias)
+                kind = 3
+                best_mp = l.alias
+            }
+            l = l.next
+        }
+        if kind == 1 || kind == 2 {
+            rest := ""
+            if len(imp) > len(best_mp) {
+                rest = substr(imp, len(best_mp) + 1, len(imp))
+            }
+            p := ck.mod_root
+            if kind == 2 {
+                p = best_dir
+            }
+            if len(rest) > 0 {
+                p = p + "/" + rest
+            }
+            if rt_isdir(p) == 1 {
+                r.dir = p
+            }
+            return r
+        }
+        if kind == 3 {
+            rest := ""
+            if len(imp) > len(best_mp) {
+                rest = substr(imp, len(best_mp) + 1, len(imp))
+            }
+            best_ver := selected_ver(ck, best_mp)
+            dr := module_dir(ck, best_mp, best_ver)
+            if len(dr.err) > 0 {
+                r.tampered = dr.err
+                return r
+            }
+            if len(dr.dir) == 0 {
+                r.missing = best_mp + "@" + best_ver
+                return r
+            }
+            p := dr.dir
+            if len(rest) > 0 {
+                p = p + "/" + rest
+            }
+            if rt_isdir(p) == 1 {
+                r.dir = p
+            }
+            return r
+        }
+    }
     if strings.startswith(imp, "std/") {
         rest := substr(imp, 4, len(imp))
         // exe ancestors first (shipped-tree std beside the binary),
@@ -6585,70 +6926,18 @@ fn resolve_imp(ck: mut Ck, imp: str) -> RRes {
         // canon_or would silently anchor the search at the cwd.
         exe := rt_exepath()
         if len(exe) > 0 {
-            r.dir = std_at(canon_or(dir_of(exe)), rest)
+            r.dir = std_at(canon_or(dir_of(exe)), rest, 0)
         }
         // a bare argv(0) (PATH invocation) has no dir component —
         // dir_of yields "." which canon_or turns into the cwd, so the
         // probe is skipped unless argv(0) actually carries a path
         av := argv(0)
         if len(r.dir) == 0 && strings.contains(av, "/") {
-            r.dir = std_at(canon_or(dir_of(av)), rest)
+            r.dir = std_at(canon_or(dir_of(av)), rest, 0)
         }
         if len(r.dir) == 0 {
-            r.dir = std_at(ck.entry_dir, rest)
+            r.dir = std_at(ck.entry_dir, rest, 1)
         }
-        return r
-    }
-    if ck.mod_on == 0 {
-        return r
-    }
-    if imp == ck.mod_path || strings.startswith(imp, ck.mod_path + "/") {
-        rest := ""
-        if len(imp) > len(ck.mod_path) {
-            rest = substr(imp, len(ck.mod_path) + 1, len(imp))
-        }
-        p := ck.mod_root
-        if len(rest) > 0 {
-            p = p + "/" + rest
-        }
-        if rt_isdir(p) == 1 {
-            r.dir = p
-        }
-        return r
-    }
-    // requires — longest path prefix wins; the build list's
-    // selection decides which version dir resolves
-    best_alias := ""
-    l := ck.mod_reqs
-    for l != nil {
-        if (imp == l.alias || strings.startswith(imp, l.alias + "/")) && len(l.alias) > len(best_alias) {
-            best_alias = l.alias
-        }
-        l = l.next
-    }
-    if len(best_alias) > 0 {
-        rest := ""
-        if len(imp) > len(best_alias) {
-            rest = substr(imp, len(best_alias) + 1, len(imp))
-        }
-        best_ver := selected_ver(ck, best_alias)
-        dr := module_dir(ck, best_alias, best_ver)
-        if len(dr.err) > 0 {
-            r.tampered = dr.err
-            return r
-        }
-        if len(dr.dir) == 0 {
-            r.missing = best_alias + "@" + best_ver
-            return r
-        }
-        p := dr.dir
-        if len(rest) > 0 {
-            p = p + "/" + rest
-        }
-        if rt_isdir(p) == 1 {
-            r.dir = p
-        }
-        return r
     }
     return r
 }

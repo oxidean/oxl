@@ -1,0 +1,7 @@
+oxlwork 0.3
+use ./
+use ./lib
+use (
+    ./nested
+    ./deep
+)

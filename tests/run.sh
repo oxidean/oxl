@@ -577,6 +577,63 @@ if [ "$seed_rc" = 0 ] || [ "$self_rc" = 0 ] || [ "$seed_out" != "$self_out" ]; t
     echo "-- self --"; printf '%s\n' "$self_out"
     exit 1
 fi
+# file mode: a lone oxl.work with no oxl.mod is ignored entirely —
+# the `use` dir doesn't even exist, so honoring it would diagnose
+# (no std import: the scratch-built selfcheck lives outside the tree
+# and its exe-anchored std walk can't reach it)
+mkdir -p "$scratch/workfm"
+printf 'oxlwork 0.3\nuse ./nonexistent\n' > "$scratch/workfm/oxl.work"
+printf 'package main\n\nfn main() {}\n' > "$scratch/workfm/main.oxl"
+seed_out=$("$SEEDOXL" build "$scratch/workfm/main.oxl" -o "$scratch/workfmbin" 2>&1 | sed 's/^[^:]*:[0-9][0-9]*:[0-9][0-9]*: //') && seed_rc=0 || seed_rc=1
+self_out=$("$scratch/selfcheck$EXE" "$scratch/workfm/main.oxl" 2>&1) && self_rc=0 || self_rc=1
+if [ "$seed_rc" != 0 ] || [ "$self_rc" != 0 ] || [ "$self_out" != ok ]; then
+    echo "FAIL work-filemode: work file not ignored"
+    echo "-- seed --"; printf '%s\n' "$seed_out"
+    echo "-- self --"; printf '%s\n' "$self_out"
+    exit 1
+fi
+# dangling oxl.work: stat-style probes see through the link to a missing
+# target, so the work file counts as absent and discovery continues —
+# identical on both checkers. Windows symlinks aren't reliably creatable
+# in CI, so the fixture is POSIX-gated like the get one above.
+case "$(uname -s)" in
+MINGW*|MSYS*|CYGWIN*) ;;
+*)
+mkdir -p "$scratch/workdangle/app"
+printf 'module local/dangle\noxl 0.3\n' > "$scratch/workdangle/oxl.mod"
+printf 'package main\nfn main() {}\n' > "$scratch/workdangle/app/main.oxl"
+ln -s "$scratch/workdangle/no-such-target" "$scratch/workdangle/oxl.work"
+seed_out=$("$SEEDOXL" build "$scratch/workdangle/app" -o "$scratch/danglebin" 2>&1 | sed 's/^[^:]*:[0-9][0-9]*:[0-9][0-9]*: //') && seed_rc=0 || seed_rc=1
+self_out=$("$scratch/selfcheck$EXE" "$scratch/workdangle/app" 2>&1) && self_rc=0 || self_rc=1
+if [ "$seed_rc" != 0 ] || [ "$self_rc" != 0 ] || [ "$self_out" != ok ]; then
+    echo "FAIL work-dangle: dangling oxl.work not treated as absent"
+    echo "-- seed --"; printf '%s\n' "$seed_out"
+    echo "-- self --"; printf '%s\n' "$self_out"
+    exit 1
+fi
+;;
+esac
+# invalid UTF-8 inside a comment: the seed's read_to_string rejects the
+# file outright; the self-hosted driver must degrade to the documented
+# missing-directive diagnostic — validating before comment stripping,
+# not during line parsing. Diagnostics differ by contract, so only the
+# self side's text is asserted.
+mkdir -p "$scratch/workbadutf8/app"
+printf 'module local/badutf8\noxl 0.3\n' > "$scratch/workbadutf8/oxl.mod"
+printf 'package main\nfn main() {}\n' > "$scratch/workbadutf8/app/main.oxl"
+printf 'oxlwork 0.3\n// \xff\xfe\nuse ./app\n' > "$scratch/workbadutf8/oxl.work"
+seed_out=$("$SEEDOXL" build "$scratch/workbadutf8/app" -o "$scratch/utf8bin" 2>&1 | sed 's/^[^:]*:[0-9][0-9]*:[0-9][0-9]*: //') && seed_rc=0 || seed_rc=1
+self_out=$("$scratch/selfcheck$EXE" "$scratch/workbadutf8/app" 2>&1) && self_rc=0 || self_rc=1
+if [ "$seed_rc" = 0 ] || [ "$self_rc" = 0 ]; then
+    echo "FAIL work-badutf8: invalid UTF-8 accepted"
+    echo "-- seed --"; printf '%s\n' "$seed_out"
+    echo "-- self --"; printf '%s\n' "$self_out"
+    exit 1
+fi
+case "$self_out" in
+*"oxl.work: missing oxlwork directive"*) ;;
+*) echo "FAIL work-badutf8 self diag: $self_out"; exit 1 ;;
+esac
 unset OXLMODCACHE
 
 echo "== v1 build list (oxl list -m all) =="

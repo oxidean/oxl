@@ -463,7 +463,7 @@ assert len(d["items"])>20 and not any("skip" in i for i in d["items"]), d' || { 
 
 echo "== bootstrap checker =="
 # the self-hosted typechecker must check itself and representative sources
-for f in bootstrap/check examples/features.oxl tests/match.oxl std/collections; do
+for f in bootstrap/check bootstrap/codegen examples/features.oxl tests/match.oxl std/collections; do
     out=$("$OXL" run bootstrap/cmd/check -- "$f")
     [ "$out" = "ok" ] || { echo "FAIL checker $f: $out"; exit 1; }
 done

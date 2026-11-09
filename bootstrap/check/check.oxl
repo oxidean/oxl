@@ -7316,11 +7316,40 @@ fn check_run_tail(ck: own Ck, ld: own Loader, root_pkg: str, need_main: int) -> 
     check_items(ck, ld.items)
     susp_seeds(ck, ld.items)
     susp_fixpoint(ck)
-    // D3: methods may not suspend — vtable/indirect calls carry no task
+    // D3: a suspendable method is unsafe only when vtable-reachable —
+    // its receiver satisfies an interface declaring that method name,
+    // and indirect calls carry no task frame. Direct calls suspend
+    // like plain fns, so other methods may suspend freely. The report
+    // names the first matching interface in byte order (parity with
+    // the seed checker's deterministic pick).
     ml := ck.methods
     for ml != nil {
         if sl_has(ck.susp, ml.v) {
-            diag(ck, "check", "suspendable method `" + ml.v + "` — methods may not suspend (v0.2)")
+            ld := last_dot(ml.v)
+            if ld >= 0 {
+                recv := substr(ml.v, 0, ld)
+                mname := substr(ml.v, ld + 1, len(ml.v))
+                hit := ""
+                ii := 0
+                for ii < len(ck.ifacesv) {
+                    iname := ck.ifacesv[ii].n
+                    mm := ck.ifacesv[ii].methods
+                    has := 0
+                    for mm != nil {
+                        if mm.v.n == mname {
+                            has = 1
+                        }
+                        mm = mm.next
+                    }
+                    if has == 1 && impl_satisfies(ck, recv, iname) && (len(hit) == 0 || iname < hit) {
+                        hit = iname
+                    }
+                    ii = ii + 1
+                }
+                if len(hit) > 0 {
+                    diag(ck, "check", "suspendable method `" + ml.v + "` — `" + recv + "` satisfies interface `" + hit + "`; vtable calls carry no task frame")
+                }
+            }
         }
         ml = ml.next
     }

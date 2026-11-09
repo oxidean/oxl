@@ -1,0 +1,19 @@
+package main
+
+struct Client { tmo: int }
+
+// susp method with no interface claiming `request` — never
+// vtable-reachable, so suspension is legal (D3 narrowed)
+fn (c Client) request() -> int {
+    select {
+        timeout(1) => {
+            return 7
+        }
+    }
+    return 0
+}
+
+fn main() {
+    c := Client{tmo: 5}
+    println(itoa(c.request()))
+}

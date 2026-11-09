@@ -1,0 +1,14 @@
+package main
+
+interface Worker { run() }
+
+struct Job {}
+
+fn (j Job) run() {
+    sleep(1)
+}
+
+fn main() {
+    j := Job{}
+    j.run()
+}

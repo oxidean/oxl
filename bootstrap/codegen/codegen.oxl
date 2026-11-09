@@ -1884,6 +1884,87 @@ fn g_call_susp(g: mut G, e: ref parser.Node) -> str {
     return ""
 }
 
+// expr-level susp scan over the codegen env (seed expr_has_susp) —
+// check.expr_has_susp can't see method callees (`x.m()` resolves
+// through gcall_plan + xty, not resolve_named), so `&&`/`||` guards
+// and nested scans use this g-level mirror
+fn gexpr_has_susp(g: mut G, e: ref parser.Node) -> bool {
+    if e == nil {
+        return false
+    }
+    match e {
+        parser.Node.Call{f, args} => {
+            if len(g_call_susp(g, e)) > 0 {
+                return true
+            }
+            if gexpr_has_susp(g, f) {
+                return true
+            }
+            l := args
+            for l != nil {
+                if gexpr_has_susp(g, l.v) {
+                    return true
+                }
+                l = l.next
+            }
+        }
+        parser.Node.Bin{l, r} => {
+            if gexpr_has_susp(g, l) || gexpr_has_susp(g, r) {
+                return true
+            }
+        }
+        parser.Node.Un{e} => {
+            if gexpr_has_susp(g, e) {
+                return true
+            }
+        }
+        parser.Node.Field{obj} => {
+            if gexpr_has_susp(g, obj) {
+                return true
+            }
+        }
+        parser.Node.As{e} => {
+            if gexpr_has_susp(g, e) {
+                return true
+            }
+        }
+        parser.Node.Lit{fields} => {
+            fl := fields
+            for fl != nil {
+                match fl.v {
+                    parser.Node.NamedField{val} => {
+                        if gexpr_has_susp(g, val) {
+                            return true
+                        }
+                    }
+                    _ => {
+                    }
+                }
+                fl = fl.next
+            }
+        }
+        parser.Node.Index{obj, idx} => {
+            if gexpr_has_susp(g, obj) || gexpr_has_susp(g, idx) {
+                return true
+            }
+        }
+        parser.Node.Slice{obj, lo, hi} => {
+            if gexpr_has_susp(g, obj) {
+                return true
+            }
+            if lo != nil && gexpr_has_susp(g, lo) {
+                return true
+            }
+            if hi != nil && gexpr_has_susp(g, hi) {
+                return true
+            }
+        }
+        _ => {
+        }
+    }
+    return false
+}
+
 // pattern -> (cond, binds) over scrutinee accessor `acc` (seed arm_cond)
 fn garm(g: mut G, pat: ref parser.Node, acc: str, st: int) -> GArm {
     r := GArm{has: -1, cond: "", binds: nil}
@@ -2384,7 +2465,7 @@ fn gx(g: mut G, e: ref parser.Node) -> str {
         hit := false
         match e {
             parser.Node.Bin{op, l, r} => {
-                if (op == "&&" || op == "||") && check.expr_has_susp(g.ck, r) {
+                if (op == "&&" || op == "||") && gexpr_has_susp(g, r) {
                     early = gxguard(g, op, l, r)
                     hit = true
                 }

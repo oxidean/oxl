@@ -93,6 +93,10 @@ fn test_filepath() {
     }
     // abs resolves against the cwd — result must be absolute on both OSes
     testing.expect(filepath.isabs(filepath.abs(".")), "abs(.) is absolute")
+    // canonical form never carries a trailing separator — "./" input
+    // would leave one under a naive _fullpath port (Windows diverged)
+    a := filepath.abs("./")
+    testing.expect(!strings.endswith(a, "/") && !strings.endswith(a, "\\"), "abs(./) no trailing sep")
 }
 
 fn test_cmp() {

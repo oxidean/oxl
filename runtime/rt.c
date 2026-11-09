@@ -2243,6 +2243,12 @@ OxlStr rt_fullpath(OxlStr path) {
 #endif
     out[n] = 0;
     free(r);
+    /* realpath(3) and Rust canonicalize never emit a trailing
+     * separator, but Windows _fullpath keeps one on "dir/."-style
+     * input — strip it unless the result is a root ("/", "X:/") so
+     * canonical-path comparisons hold across platforms */
+    if (n > 1 && out[n - 1] == '/' && !(n == 3 && out[1] == ':'))
+        out[--n] = 0;
     return (OxlStr){ out, (int64_t)n };
 }
 

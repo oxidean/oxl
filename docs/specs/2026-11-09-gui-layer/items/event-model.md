@@ -87,14 +87,19 @@ blocking that task, and scope cancellation does not interrupt an
 inline foreign call. `gui.run` therefore wires the watcher
 internally — a supervisor task that observes the enclosing scope's
 cancellation and calls `b.stop()` — so plain `scope { gui.run(...) }`
-tears down correctly. Dispatcher lifecycle: `eb` carries a `closed`
-flag next to `dropped` — after `pump` returns (stop honored or the
-toolkit loop ended) `gui.run` sets `closed` and posts a final
-`try_send` ping; the dispatcher drains the remaining buf, emits any
-pending marker, and exits when it sees `closed` with an empty buf,
-and `run` joins it before returning — a normal pump exit can never
-leave the dispatcher parked on `ping` and hang the scope join. On
-the cancellation path the scope's own teardown kills it; `pump`
-returning leaves any buffered events for the dispatcher to drain or
-drop — no event is delivered after the scope that owns the tree has
+tears down correctly. Dispatcher lifecycle: it runs in an INNER
+scope owned by `gui.run`, and `eb` carries a `closed` flag next to
+`dropped`. After `pump` returns (stop honored or the toolkit loop
+ended) `run` sets `closed` and posts a final `try_send` ping — then
+cancels the inner scope and joins it before returning. Scope
+cancellation force-wakes whatever the dispatcher is parked on: a
+`ping` receive AND a blocked `events` send alike (a send blocked on
+a full app channel cannot observe a ping, so the cancel is the
+guaranteed wakeup — documented runtime semantics). While the app is
+still draining, the dispatcher forwards the buffered tail (and any
+pending marker) and exits on `closed`+empty; while it is not, the
+cancel unwinds it and remaining events are dropped — a normal pump
+exit can never hang `run`'s join either way. On the outer
+cancellation path the enclosing scope's own teardown kills it;
+no event is delivered after the scope that owns the tree has
 closed (widget handles it names would already be destroyed).

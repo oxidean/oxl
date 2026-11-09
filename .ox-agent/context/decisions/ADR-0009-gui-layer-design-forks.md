@@ -17,13 +17,21 @@ attach/detach/destroy/pump/stop/wake). Spec-level forks resolved:
    a `go`/`spawn`ed `gui.run` is a contract violation `gui.run`
    itself rejects unconditionally; backends additionally check
    affinity via the dev gate. The check rides a G1 `is_root` flag
-   marking tasks `rt_run_root` drives — which intentionally also
-   passes spawn-fallback and test-harness tasks (both pinned to
-   their driving thread; tests need `pump` driven). A `pin`
+   marking only the task `rt_run_root` was ENTERED for — the
+   process or test-binary root task, which is always the entry
+   thread. A spawned frame that fell back to running inline through
+   `rt_run_root` (thread creation failed, no pool workers) is NOT
+   marked: it can sit on a non-entry thread, and GTK on the wrong
+   thread is the exact hazard the check exists for — a fallback
+   task gets `err_not_root`, not a pass. Test binaries still pass
+   legitimately since their main IS their root task, so the mock
+   suite keeps its `pump`-driving path without admitting
+   fallbacks. A `pin`
    primitive stays parked and is revisited at G6 with two
    backends' evidence. Reversible either way.
-2. **Single buffered `chan own Event`, app-side dispatch** — events are
-   ordinary channel values `select`ed next to app channels; overflow
+2. **Single buffered `chan own Event`, app-side dispatch** — events
+   are ordinary channel values `select`ed next to app channels;
+   overflow
    policy is drop-oldest + an `overflow` marker event (input events
    never vanish silently).
 3. **Typed public setters over a narrow `Prop{id,val}` protocol** —

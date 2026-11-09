@@ -63,12 +63,17 @@ Two channels' worth of machinery, split at the backend boundary:
   `recv` and `select` arm bindings come back typed `own Event`.
 - **Backend-facing:** `pump` does NOT send on that chan directly.
   `gui.run` also allocates an `EventBuf` — a core-owned bounded deque
-  guarded by a `sync` mutex, carrying a `dropped` count and a cap-1
-  `ping` chan — and hands it to `pump`. A dispatcher task spawned by
-  `gui.run` into the same inner scope drains the buf onto `events`
-  with ordinary blocking sends (it is a pool task; blocking is its
-  job). `pump` itself is never spawned — it IS `gui.run`'s calling
-  task, per the thread rule.
+  guarded by a `sync` mutex, carrying
+  `dropped`/`dropped_pending` counts and a cap-1 `ping` chan — and
+  hands it to `pump`. A dispatcher task spawned by
+  `gui.run` drains the buf onto `events` with ordinary blocking
+  sends (it is a pool task; blocking is its job). It lives in its
+  OWN dedicated scope nested inside `run`'s inner scope — NOT in
+  the scope the app workers join: the
+  drain-grace timeout cancels the dispatcher scope alone, so a slow
+  app can never have its workers force-killed by event-channel
+  backpressure (see *Teardown*). `pump` itself is never
+  spawned — it IS `gui.run`'s calling task, per the thread rule.
 
 `eb.post(e)` is the only entry point the backend uses and it can
 NEVER block: lock, evict if needed, append, unlock, `try_send(ping)`
@@ -79,7 +84,8 @@ plan); cap-1 means a failed send implies a pending signal the
 dispatcher will already consume, so no wake is ever lost.
 Eviction fires when a post would push the drop-eligible count past
 `cap`: scan head→tail for the first
-*drop-eligible* event and evict it, incrementing `dropped`, then
+*drop-eligible* event and evict it, incrementing `dropped` and
+`dropped_pending`, then
 append the incoming event — the incoming event always lands in the
 same post, so capacity-one bufs make progress and there is no
 evict/reinsert cycle. `cap` bounds the DROP-ELIGIBLE backlog only:
@@ -101,7 +107,13 @@ time whether the first request is still buffered, in flight to the
 dispatcher, or already delivered and awaiting the app's decision.
 The flag clears only on `destroy`/`gui.remove` (decision landed,
 request settled) or `gui.dismiss_close(w)`, and the clearing
-happens in the mutator wrapper at `CmdBuf.post` time — the flag is
+happens in the mutator wrapper only AFTER `CmdBuf.post` reports
+the settle Cmd enqueued — a poster parked on a full buf and then
+cancelled leaves the flag SET, which is the correct state: the
+close decision never landed, the window is still live with a
+pending request, and a later OS close absorbs into that pending
+slot instead of stacking a second protected entry behind it. The
+flag is
 guarded by the **EventBuf** mutex everywhere (set + dedup-checked by
 `eb.post`, cleared by the wrapper under that same lock before it
 takes `CmdBuf`'s, so the two mutexes never nest) — not deferred
@@ -121,20 +133,28 @@ its target's liveness (see `items/backend-protocol.md`), it
 becomes drop-eligible so settled requests can never pile protected
 backlog behind a dead handle.
 
-Overflow reporting: `dropped` is a counter flag, NOT a queue entry.
+Overflow reporting uses TWO counters, not one: `dropped` is the
+cumulative total `gui.events_dropped()` reads (never cleared), and
+`dropped_pending` accumulates the drops not yet covered by a
+marker. Neither is a queue entry.
 When the dispatcher is about to emit a marker it first does
-`n := eb.take_dropped()` — read-and-clear under the buf mutex —
+`n := eb.take_dropped()` — read-and-clear of `dropped_pending`
+under the buf mutex (`dropped` itself is untouched, so the query
+never reads zero after a marker flush) —
 then sends `Event{kind: overflow, target: 0, data: Index(n)}`
 ahead of the next real event. If that marker send is cancelled
 (grace expiry or scope cancel), `n` is credited back into
-`dropped` before unwind — a cancelled marker loses no increments
-either. Drops landing during the blocked marker send are counted
-into the NEXT marker, so accounting never loses increments.
+`dropped_pending` before unwind — a cancelled marker loses
+no increments either. Drops landing during the blocked marker send
+are counted into `dropped_pending` for the NEXT marker, so
+accounting never loses increments.
 The marker costs no buf slot, can never starve delivery at any
 capacity, and a dropped `clicked` is always visible, never silent.
 
 `gui.events_dropped() -> int` is the pull-based loss report: it
-reads the cumulative `dropped` count and stays valid after `run`
+reads the cumulative `dropped` total — unaffected by
+`take_dropped()`, which only clears the pending delta — and stays
+valid after `run`
 has returned or `events` observed `closed` — `run` stashes the
 final count into package state before returning, and the
 drain-grace/cancel path counts every still-unsent entry into
@@ -143,7 +163,12 @@ holding a mailbox or chan slot.
 
 `text_changed` MAY coalesce to latest-value inside `post` — a
 core-side policy applied under the buf mutex (payload stays
-current); all other coalescing is backend-internal, merged before
+current) — but ONLY against the buf's tail entry and only when it
+is another `text_changed` for the same target: a keystroke event
+queued behind a `clicked` or any other entry appends in order
+instead of merging across it, so an intervening action is never
+handled with a text value that arrived after it. All other
+coalescing is backend-internal, merged before
 `post` is ever called. FIFO ordering otherwise.
 
 ## Dispatch
@@ -173,10 +198,12 @@ only cancellation could wake would keep the enclosing scope's
 `pending` nonzero and deadlock `join_scope` on a plain
 `scope { gui.run(...) }`.
 
-Dispatcher lifecycle: it runs in an INNER
-scope owned by `gui.run`, and `eb` carries a `closed` flag next to
-`dropped`. After `pump` returns (stop honored or the toolkit loop
-ended) `run` sets `closed` and posts a final `try_send` ping — then
+Dispatcher lifecycle: it runs in its OWN inner
+scope nested in `run`'s — a sibling of the app workers' scope, so
+cancelling it can never sweep application work — and `eb` carries
+a `closed` flag next to `dropped`/`dropped_pending`. After `pump`
+returns (stop honored or the toolkit loop ended) `run` sets
+`closed` and posts a final `try_send` ping — then
 enters a **bounded drain-grace window** instead of cancelling
 immediately. During the window the dispatcher keeps forwarding the
 buffered tail (including a pending overflow marker) with ordinary
@@ -188,15 +215,19 @@ default ~250 ms):
   delivered; `done` fires; no cancel is ever issued. A
   `close_requested` posted by `pump` as its last act is always
   preserved this way.
-- App not draining → the window expires, `run` cancels the inner
-  scope (via the scoped-cancel surface in *Language additions*)
-  and joins it. Scope cancellation force-wakes whatever the
+- App not draining → the window expires, `run` cancels the
+  DISPATCHER scope only (via the scoped-cancel surface in
+  *Language additions*) and joins it — application workers are
+  untouched; they observe `events` closing below and wind down on
+  the ordinary path, so a worker suspended in a save is never
+  force-cancelled mid-commit by event backpressure. Scope
+  cancellation force-wakes whatever the
   dispatcher is parked on: a `ping` receive AND a blocked `events`
   send alike (a send blocked on a full app channel cannot observe a
   ping, so the cancel is the guaranteed wakeup — documented runtime
   semantics). Remaining events drop, but never silently: they are
-  counted into `dropped`, and if a final marker still fits the
-  dispatcher emits it before unwinding.
+  counted into `dropped`/`dropped_pending`, and if a final marker
+  still fits the dispatcher emits it before unwinding.
 
 Either way a normal pump exit cannot hang `run`'s join, and no
 buffered event is lost while the app is still receiving. On the
@@ -206,7 +237,7 @@ scope that owns the tree has closed (widget handles it names would
 already be destroyed).
 
 Once the dispatcher has unwound — `done` observed or the
-cancelled inner scope joined — `run` `close`s `events` before
+cancelled dispatcher scope joined — `run` `close`s `events` before
 returning. Closure is the consumer-facing termination signal:
 close wakes every parked `recv`, the buffered tail still drains
 first (documented runtime semantics), and a `recv` that observes

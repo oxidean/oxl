@@ -31,7 +31,10 @@ struct CmdBuf   { /* mutex-guarded BOUNDED list of Cmd: cap,
 // never dropped: a lost `destroy` leaks a widget, a lost reply
 // carrier wedges its caller). Ordering stays FIFO either way.
 // Cap is fixed at `gui.run` time (default 512;
-// `gui.set_cmd_buffer(n)` before `run`). Blocking here cannot
+// `gui.set_cmd_buffer(n)` before `run` — `n` must be >= 1: a
+// non-positive cap is a caller-contract violation and panics,
+// since a zero-cap buf could never accept the first create Cmd
+// and would wedge every producer permanently). Blocking here cannot
 // deadlock: the only drainer is `pump` on the root task, which
 // never posts to `cmds`, so a full buf always drains. A poster
 // cancelled before its enqueue lands keeps its `own Cmd` — the
@@ -46,7 +49,7 @@ struct CmdBuf   { /* mutex-guarded BOUNDED list of Cmd: cap,
 
 ```oxl
 iface Backend {
-    new(kind: WidgetKind, props: []Prop) -> int
+    new(kind: WidgetKind, props: []Prop) -> (int, err)
     set_prop(h: int, p: Prop)
     attach(parent: int, child: int)
     detach(parent: int, child: int)
@@ -79,7 +82,11 @@ carries a task frame and suspending is legal.
 ## Method contracts
 
 - `new` — create a native object of `kind`, applying `props` in
-  order; returns its handle. Not yet attached anywhere.
+  order; returns `(handle, e)` — a live handle on success, the
+  creation failure in `e` otherwise (`handle` is meaningless when
+  `e != nil` and `pump` never attaches a failed creation — the
+  error reaches the caller through `CmdResult.e`, never as a dead
+  handle). Not yet attached anywhere.
   Creation happens during `gui.run` setup on the root task.
 - `set_prop` — mutate one property post-creation. `Prop{id, val}`
   where `id` is a protocol-assigned property id and `val` a
@@ -96,7 +103,11 @@ carries a task frame and suspending is legal.
   (mock records; gtk reports it via the dev gate). `destroy` itself
   is idempotent on a dead handle — repeated teardown is a no-op,
   not a trap.
-  **Handles are never reissued within a `gui.run` session**: a
+  **Handles are never reissued within a `gui.run` session** and
+  **0 is reserved**: it is the protocol's absent-parent/no-handle
+  sentinel (a `new_kind` `target` of 0 means detached), so a
+  backend must never issue 0 as a live handle — allocation starts
+  at 1. A
   backend allocates handles monotonically (or otherwise guarantees
   freshness), so a destroyed handle stays retired for the life of
   the run — a stale queued event or a `close_pending` flag can
@@ -160,7 +171,10 @@ struct CmdResult { e: err, handle: int, val: PropVal }
 // attach-parent's liveness FIRST — a dead `target` resolves
 // `err_gone` through the reply without creating anything (a
 // create-then-fail-attach would orphan the fresh handle) — then
-// passes `props` straight to `Backend.new(kind, props)` and applies
+// passes `props` straight to `Backend.new(kind, props)` — a
+// creation error returns in the tuple's `e` and resolves through
+// `CmdResult.e` with NOTHING attached (`new` owns its failure —
+// there is no handle to destroy) — and applies
 // `attach(target, child)` when `target` is nonzero — so `new`'s
 // "not yet attached anywhere" contract holds and a create-and-attach
 // stays one `Cmd`. `read` selects its property by `prop.id`.
@@ -194,7 +208,18 @@ The chan itself is allocated bound to the **mailbox-owning scope**
 caller task's innermost scope: a caller cancelled mid-`recv`
 unwinds its inner scopes while its `Cmd` may still be queued, and
 a scope-bound chan freed then would leave `pump`'s `try_send`
-landing in reclaimed memory. Binding `reply` to the mailbox scope
+landing in reclaimed memory. The caller's unwind path instead
+`close`s its `reply` chan — a send on a closed chan fails, so
+`pump`'s `try_send` observing `false` is exactly the
+caller-is-gone signal, and `pump` reconciles by shape: for `read`
+it drops the `CmdResult` payload (ordinary `own` reclaim); for
+`new_kind` it issues `Backend.destroy` on the just-created handle
+first — a creation whose reply cannot be delivered transfers its
+ownership to nobody, so the handle is destroyed on the spot rather
+than left attached and ownerless until shutdown. The
+create-then-destroy is ordered inside the same `pump` iteration,
+so an abandoned creation never becomes visible work the tree lost
+track of. Binding `reply` to the mailbox scope
 (the scope-targeted `mkchan` in *Language additions*) keeps it
 alive until the mailboxes die — by which point the queue is drained
 and every pending reply answered (the residual-Cmd sweep below) —
@@ -210,6 +235,20 @@ the caller as an error, never as a dead handle. The layer
 allocates `reply` as a **cap-1 channel per Cmd**, so `pump`'s
 `try_send` always lands — the chan is empty when `pump` touches
 it even if the caller has not reached its receive yet.
+Chans are drawn from a small **reply-chan pool bound to the same
+mailbox scope** so a long session does not accumulate a chan
+object per `read`: the wrapper `close`s the chan and returns it to
+the pool once its `recv` resolves (delivery already happened —
+reuse cannot alias a live wait); a cancelled caller's `close` can
+NOT recycle immediately, since its `Cmd` may still be queued, so
+that chan returns only when the Cmd resolves — `pump`'s `try_send`
+sees the closed chan, drops/destroys per the rule above, and
+returns it, and the residual-Cmd sweep at shutdown is the last
+return path. Reuse is therefore settle-before-recycle in both
+directions: no chan re-enters the pool while a queued `Cmd` still
+names it (a recycled chan would deliver a stale reply to the wrong
+caller), and every outstanding chan reaches its terminal state
+before the mailbox scope tears down.
 
 `button.set_label(s)` on any task = `cmds.post(Cmd{set_prop, h, ...})`
 + `b.wake()` when the post enqueued; `pump` applies it on the UI
@@ -221,7 +260,21 @@ contract stays silent) — so publication always completes before
 there is no full-channel-before-wake interleaving for the pump to
 miss, and a poster that never lands its enqueue (cancelled while
 parked, or `closed`) never wakes either, which is correct — there
-is nothing queued for `pump` to see. Reads
+is nothing queued for `pump` to see. `wake()` itself is LATCHED,
+not edge-triggered: it sets a `wake_pending` flag under the `cmds`
+mutex before issuing the toolkit nudge, and `pump` makes its wait
+decision under that same mutex — drain, then lock and re-check
+`cmds`: nonempty drains again, empty-with-latch-set clears the
+latch and loops back to drain, and only empty-with-latch-clear may
+suspend into the toolkit's event wait. A post landing in the gap
+between `pump`'s drain and its wait decision therefore leaves the
+latch set and cannot be lost — the "wait" either rechecks the
+queue immediately or the pending nudge interrupts it; no command
+can sit queued behind a `wake` that arrived too early. The latch
+is what makes `wake` safe on backends whose toolkit nudge is a
+one-shot edge (a `g_idle_add` already consumed, a pipe byte
+already drained): the level lives in `wake_pending`, not in the
+delivery mechanism. Reads
 (`entry.text()`) post a `read` Cmd carrying its reply chan and
 block-receive — the reply crosses the boundary as an owned `str`,
 satisfying the copy rule, and the app-side wait is an ordinary chan

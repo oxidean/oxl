@@ -16,20 +16,31 @@ you want verdicted, and again after the last fix commit.
       kind wrappers, `gui.Widget` iface, `gui.append`/`gui.remove`,
       `gui.run`, the `CmdBuf`/`EventBuf` mailbox direction (mutators
       post + `wake`, `pump` drains on the root task) — `CmdBuf` and
-      `post`/`wake` land here since mutators need them from day one;
+      `post`/`wake` land here since mutators need them from day one
+      — plus the drain dispatcher → app `chan own Event` (basic
+      delivery only: the G1 mock test asserts dispatch end-to-end,
+      so the delivery path cannot wait for G2's real backend; the
+      full overflow policy still lands in G3). The internal
+      `stop`-watcher lands here too — `gui.run` + cancellable
+      scopes without it leave `pump` parked forever on the cancel
+      path (the watcher `select`s scope-cancel vs `retire`, its
+      `defer` calls `b.stop()`);
       `try_send` builtin added to the runtime here (the `ping`
       mechanism depends on it — `select` has receive arms only),
       covering `chan own T` payloads too: `pump`'s reply publication
       must be non-suspending (iface methods can't suspend across a
       vtable), so `try_send` on `chan own CmdResult` is the legal
       reply path — `true` moves the payload, `false` retains it.
-      Also here: the runtime marks tasks `rt_run_root` drives
-      (`is_root` — `external` can't discriminate them from
-      `rt_spawnb_task` tasks) so `gui.run`'s `err_not_root()` check
-      has something to test. `is_root` intentionally also passes
-      spawn-fallback and test-harness tasks: both are
-      `rt_run_root`-driven and pinned to their driving thread, and
-      the mock suite needs `pump` driven from a test.
+      Also here: the runtime marks the task `rt_run_root` is
+      ENTERED for (`is_root` — `external` can't discriminate the
+      root task from `rt_spawnb_task` tasks) so `gui.run`'s
+      `err_not_root()` check has something to test. The mark lands
+      on the true root task only: a spawned frame that fell back
+      to inline `rt_run_root` execution (thread creation failed,
+      no pool workers) is NOT marked — it can sit on a non-entry
+      thread where GTK must never run. Test binaries still pass
+      legitimately (their main IS their root task), so the mock
+      suite keeps its `pump`-driving path.
       `mock/`: pure-oxl backend recording protocol calls
       with a scriptable `pump`. `tests/gui_test.oxl` drives the
       whole surface headless.
@@ -50,13 +61,16 @@ you want verdicted, and again after the last fix commit.
       cancelled caller must not free a chan under a queued `Cmd`;
       see `items/backend-protocol.md`).
       Gate: `oxl test` green on both checkers; zero gtk4 dependency;
-      typed-chan parity between Rust and self-hosted checkers.
+      typed-chan parity between Rust and self-hosted checkers;
+      mock-driven dispatch asserted end-to-end and a cancellation
+      test (`scope { gui.run(...) }` + cancel while `pump` waits →
+      watcher fires `stop`, `run` returns, join completes).
 - [not started] **G2 — GTK4 backend** — `extra/gui/gtk` +
-      generalized `gtk_shim.c` from the pilot pattern; basic event
-      dispatch lands here (`EventBuf` + drain dispatcher → app chan)
-      since the selftest needs signals reaching the app — the app
-      chan is `chan own Event` from the start (typed channels land
-      in G1 above); events marshalled into `Event`; thread-affinity
+      generalized `gtk_shim.c` from the pilot pattern; the GTK
+      backend wires real toolkit signals into the G1 delivery path
+      (`eb.post` → dispatcher → app chan — the chan is `chan own
+      Event` from the start, typed channels landed in G1 above);
+      events marshalled into `Event`; thread-affinity
       debug assert;
       `examples/gui-todo` re-expressed through `extra/gui`.
       Gate: gtk4-gated build + `--selftest` parity (add/remove,
@@ -67,7 +81,7 @@ you want verdicted, and again after the last fix commit.
       the full overflow policy: `eb.post` evicts drop-oldest among
       drop-eligible + counts drops + applies per-target
       `close_requested` dedup; dispatcher synthesizes the
-      `overflow` marker; internal `stop`-watcher for scope teardown;
+      `overflow` marker;
       `gui.events_dropped()` loss reporting; demo mixing UI events
       with a timer chan on one `select`.
       Gate: select-composability + overflow policy (incl. cap-1 and

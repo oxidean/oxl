@@ -18,8 +18,13 @@ Depends on: E2 (`extra/` layout) — landed.
   `chan own T` + `drop_elem` destructor plumbing; `try_send` on
   bare `chan` AND `chan own T` (the reply path needs it — `pump`
   is an iface method and can't suspend); an `is_root` runtime
-  marker (`rt_run_root` sets it; `external` is shared with
-  `rt_spawnb_task`) backing `gui.err_not_root()`.
+  marker (`rt_run_root` marks the task it was ENTERED for — the
+  true root; spawn-fallback frames are unmarked; `external` is
+  shared with `rt_spawnb_task`) backing `gui.err_not_root()`;
+  a scoped-cancel surface (heap/named scope + `rt_scope_cancel`
+  export — the drain-grace abort needs it); and scope-targeted
+  `mkchan` (reply chans bind to the mailbox-owning scope, not the
+  caller's innermost).
 - `extra/gui/gui.oxl`: `Backend` iface, `WidgetKind`/`EventKind`
   enums, `Prop`/`PropVal`, `Event`, own-typed tree (`Window`/`Button`/
   `Entry`/`Label`/`Box`/`List`/`Scrolled` typed wrappers over int
@@ -28,7 +33,11 @@ Depends on: E2 (`extra/` layout) — landed.
   the real worker into `run`'s inner scope — plus
   the `CmdBuf`/`EventBuf` mailbox direction (mutators post +
   `wake`, `pump` drains on the root task), which mutators need
-  from day one.
+  from day one — plus the drain dispatcher → app `chan own Event`
+  (basic delivery; the G1 mock test asserts dispatch, the full
+  overflow policy stays G3) and the internal `stop`-watcher
+  (scope-cancel → `b.stop()`; `gui.run` + cancellable scopes is
+  a G1 path, so its teardown machinery can't wait for G3).
 - `extra/gui/mock/mock.oxl`: pure-oxl `Backend` recording every
   protocol call in order; scriptable `pump` (test feeds an event
   script, asserts dispatch).
@@ -47,8 +56,9 @@ Depends on: G1.
 - `extra/gui/gtk/gtk.oxl` + `gtk_shim.c` (generalize the pilot's
   `gui_shim.c`: same opaque-int handles, {env,fp} trampolines, but
   events marshalled into `Event` structs for `pump`).
-- Basic event dispatch lands here: `EventBuf` + drain dispatcher
-  → app `chan own Event` (cap 256 default, `gui.set_event_buffer(n)`).
+- The GTK backend wires real toolkit signals into the G1 delivery
+  path (`eb.post` → dispatcher → app `chan own Event`, cap 256
+  default, `gui.set_event_buffer(n)`).
 - Thread-affinity convention enforced: backend records the `gtk_init`
   thread id; `pump`/`new`/`set_prop` assert on it (debug check).
 - Re-express the pilot: `examples/gui-todo` rewritten on `extra/gui`

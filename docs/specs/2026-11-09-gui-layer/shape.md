@@ -82,7 +82,9 @@ root task, which is how an event handler on an app task can
 update a widget without breaking the thread rule (see
 `items/backend-protocol.md`). Mailboxes rather than chans because
 the boundary needs semantics a chan cannot express (never-blocking
-posts, mid-queue eviction); the typed `chan own Event` is a
+EVENT posts — `CmdBuf` admission is the opposite direction, a
+bounded queue whose full-buf park IS the mutator backpressure —
+plus mid-queue eviction); the typed `chan own Event` is a
 language addition the event model depends on (see
 `items/event-model.md`).
 

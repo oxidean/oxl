@@ -31,9 +31,11 @@ against the handles its typed wrappers hold.
   can `go` workers that `select` on it.
 - Backend `pump` marshals toolkit signals into `Event`s and
   **try-sends**: on a full queue it scans from the head for the
-  first *drop-eligible* event and evicts it, then marks the next
-  post `kind = overflow` — a dropped `clicked` is a lost user
-  action, so saturation is always visible, never silent.
+  first *drop-eligible* event and evicts it, then posts an
+  `Event{kind: overflow}` marker as its own queue entry — the
+  marker never rewrites another event's `kind` — before the
+  incoming event retries its send. A dropped `clicked` is a lost
+  user action, so saturation is always visible, never silent.
   `close_requested` is never drop-eligible and never coalesces (a
   lost close is a wedged app); if the queue holds ONLY protected
   events — the degenerate case, an app that has stopped draining —

@@ -75,20 +75,26 @@ struct Cmd {
     widget: WidgetKind,      // new_kind only
     prop: Prop,              // set_prop only
     arg: int,                // attach/detach: the child handle
-    reply: chan PropVal      // read only: the response channel
+    reply: chan CmdResult    // new_kind + read: the response channel
 }
+
+struct CmdResult { e: err, handle: int, val: PropVal }
 ```
 
-`reply` uses `PropVal` as the value union — reads return the same
-payload shape properties carry.
+`reply` carries `CmdResult`: reads fill `val` (the same payload
+shape properties carry), `new_kind` fills `handle`, and both report
+failure in `e` (`e == nil` on success) — creation failure reaches
+the caller as an error, never as a dead handle.
 
 `button.set_label(s)` on any task = enqueue `Cmd{set_prop, h, ...}`
 + `b.wake()`; `pump` applies it on the UI thread. Reads
 (`entry.text()`) enqueue a `read` Cmd carrying a reply chan and
 block-receive — the reply crosses the boundary as an owned `str`,
-satisfying the copy rule. `gui.run` allocates the `cmds` chan next
-to `events` and hands both to `pump`; widget handles are issued by
-`new_kind` Cmds so handlers can create widgets too.
+satisfying the copy rule. `new_kind` uses the same shape: the
+caller block-receives `CmdResult{handle: h}` (or `e`) — handlers
+can create widgets too, and `attach` can name the returned handle.
+`gui.run` allocates the `cmds` chan next to `events` and hands
+both to `pump`.
 
 ## Prop protocol
 

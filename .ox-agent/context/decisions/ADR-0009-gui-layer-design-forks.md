@@ -58,7 +58,10 @@ attach/detach/destroy/pump/stop). Spec-level forks resolved:
 ## Consequences
 
 - `gui.run` + `backend.stop()` is the documented enter/exit pair for
-  the pinned task; scopes cancel UI by calling `stop` in `defer`.
+  the pinned task; scope cancellation reaches `pump` through
+  `gui.run`'s internal watcher task — a `defer` on the pump-blocked
+  task cannot run while it blocks (see
+  `docs/specs/2026-11-09-gui-layer/items/event-model.md`).
 - Headless CI never blocks on a display: mock drives the protocol,
   gtk selftests are pkg-config-gated as today.
 - Parked with triggers: `pin` primitive (G6 revisit), dialogs/a11y/

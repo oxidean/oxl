@@ -103,9 +103,16 @@ Three backends matter:
   (`gui.set_drain_grace(d)`) preserves the buffered tail on pump
   exit; post-exit reply-carrying commands (`read`, `new_kind`)
   resolve with `gui.err_stopped()` — while fire-and-forget
-  commands (`set_prop`, `attach`, `detach`, `destroy`) are
-  accepted-and-dropped, so callers must not rely on an error to
-  detect a dropped mutation.
+  commands (`set_prop`, `attach`, `detach`, `destroy`,
+  `dismiss_close`) are accepted-and-dropped, so callers must not
+  rely on an error to detect a dropped mutation. Loss reporting is
+  pull-based so it survives shutdown without needing a chan slot:
+  `gui.events_dropped()` reads the EventBuf `dropped` counter even
+  after `run` has returned or `events` observed closed — when the
+  drain grace expires or the dispatcher is cancelled, every
+  still-unsent entry is counted into `dropped` before unwind, so a
+  tail that overflowed the app channel can never vanish silently
+  even when no marker event would fit.
 - **Copy at the boundary.** Text getters return owned `str`; no
   borrowed `cstr` aliases cross the public API.
 - **The protocol is the milestone,** not widget count — pilot parity

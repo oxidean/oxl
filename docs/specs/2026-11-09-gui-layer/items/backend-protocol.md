@@ -65,6 +65,12 @@ entirely above the iface, in the `.oxl` tree.
   dead: `set_prop`/`attach` on a dead handle is a protocol error
   (mock records; gtk debug-asserts). `destroy` itself is idempotent
   on a dead handle — repeated teardown is a no-op, not a trap.
+  **Handles are never reissued within a `gui.run` session**: a
+  backend allocates handles monotonically (or otherwise guarantees
+  freshness), so a destroyed handle stays retired for the life of
+  the run — a stale queued event or a `close_pending` flag can
+  never bind to, or coalesce into, a DIFFERENT widget's lifetime
+  that happened to recycle the number.
 - `pump` — runs the toolkit loop **on the calling task** (the root
   task — see the thread rule below). Two duties per iteration:
   decode toolkit signals into `Event` structs posted via
@@ -95,7 +101,8 @@ event handler running on an app task can never call the backend
 directly. So **widget mutators enqueue, they do not call**:
 
 ```oxl
-enum CmdKind { new_kind, set_prop, attach, detach, destroy, read }
+enum CmdKind { new_kind, set_prop, attach, detach, destroy, read,
+             dismiss_close }
 struct Cmd {
     kind: CmdKind,
     target: int,             // handle (or parent for attach/detach)
@@ -106,6 +113,13 @@ struct Cmd {
 }
 
 struct CmdResult { e: err, handle: int, val: PropVal }
+
+`dismiss_close` is the fire-and-forget veto-keep verb: it clears the
+target's `close_pending` flag (see `items/event-model.md`), meaning
+"the app considered the pending `close_requested` and keeps the
+window". On a dead handle it is a no-op like `destroy`. It carries
+no reply — the dispatcher that posted the close does not need to
+learn the decision, only the flag's release matters.
 
 `CmdBuf.post` retains an OWNED copy of every `str` inside the `Cmd`
 (prop text, widget strings) at post time: the caller's scope may
@@ -195,28 +209,41 @@ takes the widget, and reads against it resolve `err_stopped()`,
 which is the documented "inspect after teardown" answer.
 
 **Pending close requests are bounded per window.** `EventBuf.post`
-applies one coalescing rule to `close_requested` (see
+enforces per-handle close dedup via `close_pending` (see
 `items/event-model.md`): a request for a handle that already has a
-request pending absorbs into it — a window can occupy at most one
-close slot, so an app that stops draining can never accrue more
-protected backlog than it has live windows, and the veto decision
-is still never lost. The backend posts every close it vetoes; the
+decision pending — in the buf, in flight, or delivered — absorbs
+into it, so a window can occupy at most one close slot, an app
+that stops draining can never accrue more protected backlog than
+it has live windows, and the veto decision is still never lost. The backend posts every close it vetoes; the
 dedup lives in `post`, not in the backend.
 
 **Removal resolves pending close requests.** `destroy` (directly or
 via `gui.remove`) settles every pending `close_requested` for that
-handle: the widget is gone, so the veto the request awaited is
-moot. A `close_requested` already queued when its target dies is
-still delivered in order — but handlers MUST treat it as a no-op
-(window already removed: nothing left to keep alive), and `read`
-or mutation commands against the dead handle resolve
-`gui.err_stopped()` per the dead-handle rule above — the same
-"inspect after teardown" answer the sweep path produces. A
+handle — and clears `close_pending`: the widget is gone, so the
+veto the request awaited is moot. Settlement also ends the
+request's drop-protection: a `close_requested` still queued for a
+dead handle becomes DROP-ELIGIBLE in `EventBuf` (delivered in
+order if it survives — handlers MUST treat it as a no-op, window
+already removed) — so an app that stops draining can never pile
+protected backlog behind dead handles: protected entries stay
+bounded at the live-window count no matter how many windows cycle
+through create/close/destroy.
+
+Commands against a dead handle split by shape, mirroring the
+post-stop rule: reply-carrying calls (`read`, `new_kind` naming it
+as parent) resolve `gui.err_stopped()` through their reply chan —
+the same "inspect after teardown" answer the sweep path produces;
+fire-and-forget `Cmd`s (`set_prop`, `attach`, `detach`, `destroy`,
+`dismiss_close`) are accepted-and-dropped — there is no reply chan
+to carry an error, and the caller-facing outcome matches the
+post-stop contract exactly (the mock still records the dead-target
+call as a protocol violation for diagnostics, and gtk
+debug-asserts; the app simply cannot observe it either way). A
 `close_requested` emitted for a handle the backend already knows
-is dead is a protocol error (mock records; gtk debug-asserts);
-the live-then-removed interleave is the only legitimate
-dead-target delivery, and the contract makes it harmless by
-construction.
+is dead is likewise a backend-side protocol error (mock records;
+gtk debug-asserts); the live-then-removed interleave is the only
+legitimate dead-target delivery, and the contract makes it
+harmless by construction.
 
 ## Prop protocol
 

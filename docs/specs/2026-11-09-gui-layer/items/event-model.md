@@ -29,7 +29,12 @@ Two channels' worth of machinery, split at the backend boundary:
 
 - **App-facing:** `gui.run(b, app)` allocates `chan own Event` (cap
   256 default; `gui.set_event_buffer(n)` before `run` for control)
-  and invokes `app(events)` — typically inside the app's `scope`, so
+  then spawns the `pump`
+  task BEFORE invoking `app(events)` — the ordering is required, not
+  incidental: the pump must already be servicing `CmdBuf` (in
+  particular `new_kind` replies) while the callback runs, since the
+  app fn creates widgets synchronously inside it. `app(events)` runs
+  typically inside the app's `scope`, so
   the app fn can `go` workers that `select` on it. This chan is the
   ONLY event channel user code sees. `chan own Event` is a **typed
   channel** — a language addition this spec requires (see *Language
@@ -52,20 +57,36 @@ dispatcher will already consume, so no wake is ever lost. Eviction on a full buf
 *drop-eligible* event and evict it, incrementing `dropped`, then
 append the incoming event — the incoming event always lands in the
 same post, so capacity-one bufs make progress and there is no
-evict/reinsert cycle. `close_requested` is never drop-eligible and
-never cross-target coalesces (a lost close is a wedged app). One
-bounded exception: posting a `close_requested` for a handle that
-ALREADY has a `close_requested` pending in the buf absorbs into it
-— one pending close decision per window is the semantic bound
-(the first veto already holds the window alive; a second pending
-request decides nothing new). Per-target dedup keeps a single
-window's close backlog at one slot while preserving the veto, and
-bounds the protected backlog at the live-window count. If the buf holds
-only protected events — the degenerate case, an app that has
-stopped draining — protected posts still append past `cap`: the
-bound applies to the droppable backlog; correctness is preferred
-over the bound for events that must not be lost, and saturation is
-already being signaled via `dropped`.
+evict/reinsert cycle. `cap` bounds the DROP-ELIGIBLE backlog only:
+when the scan finds no drop-eligible entry — the degenerate case,
+a buf holding only protected events — nothing is evicted and the
+incoming post (protected or not) still appends. Buf SIZE may
+therefore exceed `cap` exactly by the protected surplus, and a
+drop-eligible post landing behind an all-protected buf still
+counts toward its own bound (at most `cap` drop-eligible entries
+coexist). Saturation stays visible via `dropped`; correctness is
+preferred over the bound only for events that must not be lost.
+
+`close_requested` is never drop-eligible *while its target lives*
+and never cross-target coalesces (a lost close is a wedged app).
+Pending closes are deduplicated by a per-handle `close_pending`
+flag in core's widget table — set under the buf mutex by `post`,
+checked by the same `post`, so a second OS close absorbs at post
+time whether the first request is still buffered, in flight to the
+dispatcher, or already delivered and awaiting the app's decision.
+The flag clears only on `destroy`/`gui.remove` (decision landed,
+request settled) or `gui.dismiss_close(w)` — an explicit
+fire-and-forget `Cmd` meaning "keep this window": it resolves the
+pending decision and re-arms the next user close. Without the flag
+a second close arriving after the dispatcher forwards the first
+would re-post and hand a keep-the-window app a stale second prompt;
+with it, pending decisions are tracked from post until explicit
+resolution, and the protected backlog is bounded at the
+live-window count. A request whose target is destroyed while still
+queued is settled the same way — and losing its protection with
+its target's liveness (see `items/backend-protocol.md`), it
+becomes drop-eligible so settled requests can never pile protected
+backlog behind a dead handle.
 
 Overflow reporting: `dropped` is a counter flag, NOT a queue entry.
 When the dispatcher is about to emit a marker it first does
@@ -145,7 +166,9 @@ The app-facing chan needs payload typing the language does not yet
 have: `chan` today is an untyped word channel (`send` requires a
 word-sized value and moves `own`s through it, but `recv`/`select`
 bindings return `int` — nothing rebinds a word back to `own T`).
-G3 therefore lands two language features alongside the model:
+G1 therefore lands two language features ahead of the model
+(typed channels in G1 so G2's app chan is `chan own Event` from
+its first selftest):
 
 - **Typed channels `chan own T`** — `chan` gains an optional
   payload parameter in type position. `send` type-checks the
@@ -157,6 +180,17 @@ G3 therefore lands two language features alongside the model:
 - **`try_send(chan, v) -> bool`** — nonblocking send; `false`
   means full. `select` has receive arms only, so the EventBuf
   `ping` nudge and cap-1 reply channels need this primitive.
+  **Payload is restricted to word-sized values in v1** (`int`,
+  `err`, `str`/slice words by reference — the `ping` and reply-chan
+  uses): the checker rejects `try_send` on an `own` argument, and
+  owned payloads use blocking `send`, whose cancelled-send
+  ownership contract below already covers every outcome. That
+  keeps the `false` branch unambiguous — the caller retains
+  ownership — instead of leaving implementations free to leak or
+  double-free on a result the caller cannot distinguish. If a
+  later spec widens `try_send` to `own` payloads the contract is
+  already pinned: `false` leaves ownership with the caller (retry
+  or drop is its choice), `true` moves it.
 
 **Cancelled-send ownership contract.** Channel teardown and
 cancellation must account for owned payloads exactly once:
@@ -170,6 +204,13 @@ cancellation must account for owned payloads exactly once:
   closed (documented runtime semantics); `EventBuf` teardown drops
   undelivered entries — each buffered `own Event` freed once by
   its owner.
+- A `chan own T` reclaims its buffered tail at destruction: when
+  the channel object itself is freed (its owning scope ends), every
+  `own T` still queued in it is destroyed exactly once by the
+  runtime. Receivers that keep draining take ownership at `recv`
+  as usual — this rule covers only what no receiver can ever drain,
+  so an app that stops reading `events` cannot leak the sent-but-
+  unread tail or its payloads.
 - Teardown never frees a delivered event: once `recv` returns the
   `own Event`, ownership is the receiver's.
 

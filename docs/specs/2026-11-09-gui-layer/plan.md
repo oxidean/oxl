@@ -19,12 +19,22 @@ Spec: `shape.md`. Design contracts: `items/backend-protocol.md`,
       `mock/`: pure-oxl backend recording protocol calls
       with a scriptable `pump`. `tests/gui_test.oxl` drives the
       whole surface headless.
-      Gate: `oxl test` green on both checkers; zero gtk4 dependency.
+      Language additions land here so G2's app chan is typed from
+      its first selftest (parser + both checkers, runtime
+      representation unchanged): `chan own T` — `send` type-checks
+      the payload, `recv`/`select` bindings yield `own T`, bare
+      `chan` unchanged — plus the cancelled-send ownership contract
+      and `chan own T` teardown reclaiming buffered payloads, per
+      `items/event-model.md`.
+      Gate: `oxl test` green on both checkers; zero gtk4 dependency;
+      typed-chan parity between Rust and self-hosted checkers.
 - [not started] **G2 — GTK4 backend** — `extra/gui/gtk` +
       generalized `gtk_shim.c` from the pilot pattern; basic event
       dispatch lands here (`EventBuf` + drain dispatcher → app chan)
-      since the selftest needs signals reaching the app; events
-      marshalled into `Event`; thread-affinity debug assert;
+      since the selftest needs signals reaching the app — the app
+      chan is `chan own Event` from the start (typed channels land
+      in G1 above); events marshalled into `Event`; thread-affinity
+      debug assert;
       `examples/gui-todo` re-expressed through `extra/gui`.
       Gate: gtk4-gated build + `--selftest` parity (add/remove,
       churn RSS); copy-at-boundary verified; headless CI
@@ -36,14 +46,9 @@ Spec: `shape.md`. Design contracts: `items/backend-protocol.md`,
       `close_requested` dedup; dispatcher synthesizes the
       `overflow` marker; internal `stop`-watcher for scope teardown;
       demo mixing UI events with a timer chan on one `select`.
-      Language additions land here (parser + both checkers, runtime
-      representation unchanged): typed `chan own T` channels —
-      `send` checks payload, `recv`/`select` bindings yield `own T`,
-      bare `chan` unchanged — and the cancelled-send ownership
-      contract from `items/event-model.md`.
       Gate: select-composability + overflow policy (incl. cap-1 and
-      all-protected cases) proven in selftests; typed-chan parity
-      between Rust and self-hosted checkers.
+      all-protected cases) proven in selftests; `close_pending`
+      dedup exercised from post through delivery and dismissal.
 - [not started] **G4 — widget tranche** — pilot parity: window,
       vbox/hbox, label, button, entry, list, scrolled + whatever the
       reference app needs; per-kind Prop coverage table in

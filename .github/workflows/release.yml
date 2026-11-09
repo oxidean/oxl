@@ -301,7 +301,7 @@ jobs:
           gh api "repos/$GITHUB_REPOSITORY/git/refs" \
             -f ref="refs/tags/$TAG" -f sha="$tag_obj"
       - name: github release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.version.outputs.tag }}
           files: dist/oxl-toolchain-linux-x86_64.tar.gz
@@ -359,7 +359,7 @@ jobs:
           gh api "repos/$GITHUB_REPOSITORY/git/refs" \
             -f ref="refs/tags/$TAG" -f sha="$tag_obj"
       - name: github release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.version.outputs.etag }}
           name: oxl extras ${{ needs.version.outputs.etag }}

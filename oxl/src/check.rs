@@ -14,7 +14,10 @@ pub enum Ty {
     CStr,
     Void,
     Err,
-    Chan,
+    /// `chan` bare (None) | `chan own T` typed payload (Some(own T))
+    Chan(Option<Box<Ty>>),
+    /// named scope handle (mkscope) — opaque word, copyable
+    Scope,
     Own(Box<Ty>),
     Ref(Box<Ty>),
     Mut(Box<Ty>),
@@ -42,7 +45,9 @@ impl Ty {
             Ty::CStr => "cstr".into(),
             Ty::Void => "void".into(),
             Ty::Err => "err".into(),
-            Ty::Chan => "chan".into(),
+            Ty::Chan(None) => "chan".into(),
+            Ty::Chan(Some(p)) => format!("chan {}", p.name()),
+            Ty::Scope => "scope".into(),
             Ty::Own(t) => format!("own {}", t.name()),
             Ty::Ref(t) => format!("ref {}", t.name()),
             Ty::Mut(t) => format!("mut {}", t.name()),
@@ -60,7 +65,7 @@ impl Ty {
         }
     }
     fn is_word(&self) -> bool {
-        matches!(self, Ty::Int | Ty::Bool | Ty::Chan | Ty::Own(_) | Ty::Shared)
+        matches!(self, Ty::Int | Ty::Bool | Ty::Chan(_) | Ty::Own(_) | Ty::Shared | Ty::Scope)
     }
 }
 
@@ -263,7 +268,8 @@ pub struct Checker<'a> {
 }
 
 const BUILTINS: &[&str] = &[
-    "print", "println", "mkchan", "send", "recv", "close", "sleep", "msleep", "new",
+    "print", "println", "mkchan", "smkchan", "send", "try_send", "recv", "close", "sleep", "msleep", "new",
+    "mkscope", "sjoin", "scancel", "is_root", "curscope",
     "mkslice", "push",
     "assert", "itoa", "argc", "argv", "len", "byteat", "substr", "find", "atoi",
     "mkbuf", "bufstr", "poke8", "poke16", "poke32", "htons", "htonl",
@@ -635,7 +641,10 @@ impl<'a> Checker<'a> {
             TyKind::Own(t) => Ty::Own(Box::new(self.resolve(t))),
             TyKind::Ref(t) => Ty::Ref(Box::new(self.resolve(t))),
             TyKind::Mut(t) => Ty::Mut(Box::new(self.resolve(t))),
-            TyKind::Chan => Ty::Chan,
+            TyKind::Chan(p) => {
+                Ty::Chan(p.as_ref().map(|t| Box::new(self.resolve(t))))
+            }
+            TyKind::Scope => Ty::Scope,
             TyKind::Slice(t) => Ty::Slice(Box::new(self.resolve(t))),
             TyKind::Fn { params, ret } => Ty::Fn(
                 params.iter().map(|p| self.resolve(p)).collect(),
@@ -876,18 +885,22 @@ impl<'a> Checker<'a> {
                 }
             }
             Stmt::Scope { body, .. } => self.block(body, env),
-            Stmt::Spawn { call, .. } => {
+            Stmt::Spawn { call, scope, span, .. } => {
                 match &call.kind {
                     ExprKind::Call { f, .. } => {
                         // mark suspend-relevant edge
                         if let ExprKind::Ident(n) = &f.kind {
                             self.calls.entry(self.cur_fn.clone()).or_default().insert(n.clone());
                         }
+                        if let Some(se) = scope {
+                            let st = self.expr(se, env);
+                            self.assignable(&Ty::Scope, &st, se.span);
+                        }
                         self.in_spawn = true;
                         self.expr(call, env);
                         self.in_spawn = false;
                     }
-                    _ => self.diags.push(Diag::err(call.span, "check", "`spawn` requires a call")),
+                    _ => self.diags.push(Diag::err(*span, "check", "`spawn` requires a call")),
                 }
             }
             Stmt::Unsafe { body, .. } => self.block(body, env),
@@ -906,9 +919,16 @@ impl<'a> Checker<'a> {
                     match &arm.kind {
                         SelKind::Recv { chan, bind, span } => {
                             let ct = self.expr(chan, env);
-                            self.assignable(&Ty::Chan, &ct, chan.span);
+                            if !matches!(ct, Ty::Chan(_)) {
+                                self.diags.push(Diag::err(chan.span, "type",
+                                    format!("expected `chan`, found `{}`", ct.name())));
+                            }
                             if let Some(n) = bind {
-                                env.set(n.clone(), Ty::Int, *span); // word payload (v0)
+                                let bt = match &ct {
+                                    Ty::Chan(Some(p)) => (**p).clone(),
+                                    _ => Ty::Int, // bare chan: word payload
+                                };
+                                env.set(n.clone(), bt, *span);
                             }
                         }
                         SelKind::Timeout { ms, .. } => {
@@ -1052,7 +1072,7 @@ impl<'a> Checker<'a> {
     /// cover it; ops keep their fixed vocabulary.
     fn satisfies(&self, t: &Ty, c: &str) -> bool {
         let op_ok = |op: &str, t: &Ty| match op {
-            "eq" => matches!(t, Ty::Int | Ty::Bool | Ty::Str | Ty::Chan | Ty::Var(_)
+            "eq" => matches!(t, Ty::Int | Ty::Bool | Ty::Str | Ty::Chan(_) | Ty::Scope | Ty::Var(_)
                 | Ty::Float | Ty::Byte | Ty::Err),
             "ordered" => matches!(t, Ty::Int | Ty::Float | Ty::Byte | Ty::Str | Ty::Var(_)),
             "add" => matches!(t, Ty::Int | Ty::Str | Ty::Float | Ty::Byte | Ty::Var(_)),
@@ -1234,6 +1254,33 @@ impl<'a> Checker<'a> {
     }
 
 
+    /// type-argument to mkchan/smkchan: `Event` (name → own Event) or a
+    /// TyLit `own Event`. Returns the payload Ty (already `own`-wrapped).
+    fn chan_payload_arg(&mut self, a: &Expr) -> Option<Ty> {
+        match &a.kind {
+            ExprKind::Ident(tn) if self.structs.contains_key(tn) || self.enums.contains_key(tn) => {
+                Some(Ty::Own(Box::new(self.resolve(&TyRef {
+                    kind: TyKind::Named(tn.clone()),
+                    span: a.span,
+                }))))
+            }
+            ExprKind::TyLit(tr) => {
+                if let TyKind::Named(n) = &tr.kind {
+                    self.rec_use(tr.span, n);
+                }
+                let t = self.resolve(tr);
+                if matches!(t, Ty::Own(_)) {
+                    Some(t)
+                } else {
+                    self.diags.push(Diag::err(a.span, "check",
+                        "chan payload must be an owned type — `own T`"));
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
     fn assignable(&mut self, want: &Ty, got: &Ty, sp: Span) {
         if *want == Ty::Unknown || *got == Ty::Unknown {
             return;
@@ -1249,7 +1296,7 @@ impl<'a> Checker<'a> {
             || (*want == Ty::Int && *got == Ty::Byte)
             // nil (Ty::Err) is the null pointer for owned/borrowed refs
             // and the empty slice
-            || (*got == Ty::Err && matches!(want, Ty::Own(_) | Ty::Ref(_) | Ty::Mut(_) | Ty::Chan | Ty::Slice(_) | Ty::Shared))
+            || (*got == Ty::Err && matches!(want, Ty::Own(_) | Ty::Ref(_) | Ty::Mut(_) | Ty::Chan(_) | Ty::Slice(_) | Ty::Shared | Ty::Scope))
             || matches!((want, got), (Ty::Ref(w), Ty::Own(g) | Ty::Mut(g) | Ty::Ref(g)) | (Ty::Mut(w), Ty::Own(g) | Ty::Mut(g)) if **w == **g)
             // own []T reads as a []T borrow — the view is scope-bounded
             // like every slice; the owner's heap backing outlives it
@@ -2011,32 +2058,103 @@ impl<'a> Checker<'a> {
                     }
                     return Ty::Void;
                 }
-                "mkchan" => {
-                    if args.len() > 1 {
-                        self.diags.push(Diag::err(sp, "check", "`mkchan` takes at most one capacity arg"));
-                    }
-                    if let Some(a) = args.first() {
+                "mkchan" | "smkchan" => {
+                    // mkchan(cap?) — bare word chan
+                    // mkchan(T, cap?) | mkchan(own T, cap?) — typed payload chan
+                    // smkchan(T, cap?, scope) — typed chan owned by a named scope
+                    let scoped = name == "smkchan";
+                    let (tn, rest) = match args.first() {
+                        Some(a) => {
+                            if let Some(p) = self.chan_payload_arg(a) {
+                                (Some(p), &args[1..])
+                            } else if scoped {
+                                self.diags.push(Diag::err(a.span, "check",
+                                    "`smkchan` takes a payload type — smkchan(Event, cap, sc)"));
+                                (None, &args[..])
+                            } else {
+                                (None, &args[..])
+                            }
+                        }
+                        None => (None, &args[..]),
+                    };
+                    let (cap_a, sc_a) = if scoped {
+                        if rest.len() < 2 {
+                            self.diags.push(Diag::err(sp, "check",
+                                "`smkchan` takes (T, cap, scope)"));
+                        }
+                        (rest.first(), rest.get(1))
+                    } else {
+                        (rest.first(), None)
+                    };
+                    if let Some(a) = cap_a {
                         let t = self.expr(a, env);
                         self.assignable(&Ty::Int, &t, a.span);
                     }
-                    return Ty::Chan;
+                    if let Some(a) = sc_a {
+                        let t = self.expr(a, env);
+                        self.assignable(&Ty::Scope, &t, a.span);
+                    }
+                    if rest.len() > if scoped { 2 } else { 1 } {
+                        self.diags.push(Diag::err(sp, "check",
+                            if scoped { "`smkchan` takes (T, cap, scope)" }
+                            else { "`mkchan` takes (T?, cap?)" }));
+                    }
+                    return Ty::Chan(tn.map(Box::new));
                 }
-                "send" => {
+                "send" | "try_send" => {
                     if args.len() != 2 {
-                        self.diags.push(Diag::err(sp, "check", "`send` takes (chan, value)"));
+                        self.diags.push(Diag::err(sp, "check",
+                            &format!("`{name}` takes (chan, value)")));
                     } else {
                         let ct = self.expr(&args[0], env);
-                        self.assignable(&Ty::Chan, &ct, args[0].span);
-                        let vt = self.expr(&args[1], env);
-                        if !vt.is_word() {
-                            self.diags.push(Diag::err(args[1].span, "own",
-                                format!("channels carry word-sized owned values (v0), not `{}`", vt.name())));
+                        if !matches!(ct, Ty::Chan(_)) {
+                            self.diags.push(Diag::err(args[0].span, "type",
+                                format!("expected `chan`, found `{}`", ct.name())));
                         }
+                        let vt = self.expr(&args[1], env);
+                        match &ct {
+                            Ty::Chan(Some(p)) => {
+                                // typed chan: payload must match `own T` exactly
+                                self.assignable(p, &vt, args[1].span);
+                            }
+                            _ if !vt.is_word() => {
+                                self.diags.push(Diag::err(args[1].span, "own",
+                                    format!("channels carry word-sized owned values (v0), not `{}`", vt.name())));
+                            }
+                            _ => {}
+                        }
+                        // try_send is a conditional handoff at runtime, but
+                        // statically it always moves — a `false` result leaves
+                        // the payload dropped-by-disuse, not recoverable (v0:
+                        // construct a fresh value per attempt)
                         self.move_own(&args[1], env);
+                    }
+                    return if name == "try_send" { Ty::Bool } else { Ty::Void };
+                }
+                "recv" => {
+                    let ct = args.first().map(|a| self.expr(a, env)).unwrap_or(Ty::Unknown);
+                    return match ct {
+                        Ty::Chan(Some(p)) => (*p).clone(),
+                        _ => Ty::Int,
+                    };
+                }
+                "mkscope" => return Ty::Scope,
+                "curscope" => return Ty::Scope,
+                "is_root" => return Ty::Bool,
+                "scancel" => {
+                    if let Some(a) = args.first() {
+                        let t = self.expr(a, env);
+                        self.assignable(&Ty::Scope, &t, a.span);
                     }
                     return Ty::Void;
                 }
-                "recv" => return Ty::Int,
+                "sjoin" => {
+                    if let Some(a) = args.first() {
+                        let t = self.expr(a, env);
+                        self.assignable(&Ty::Scope, &t, a.span);
+                    }
+                    return Ty::Int; // the joined scope's trap code (0 = clean)
+                }
                 "close" => {
                     // chan close OR libc close(fd) — dispatch on arg type
                     for a in args {
@@ -2287,7 +2405,7 @@ impl<'a> Checker<'a> {
             if sig.is_extern {
                 for a in args {
                     let t = self.expr(a, env);
-                    if !matches!(t, Ty::Int | Ty::Float | Ty::Byte | Ty::Err | Ty::Bool | Ty::CStr | Ty::Str | Ty::Slice(_) | Ty::Own(_) | Ty::Ref(_) | Ty::Mut(_) | Ty::Chan | Ty::Shared | Ty::Fn(..) | Ty::Unknown) {
+                    if !matches!(t, Ty::Int | Ty::Float | Ty::Byte | Ty::Err | Ty::Bool | Ty::CStr | Ty::Str | Ty::Slice(_) | Ty::Own(_) | Ty::Ref(_) | Ty::Mut(_) | Ty::Chan(_) | Ty::Shared | Ty::Scope | Ty::Fn(..) | Ty::Unknown) {
                         self.diags.push(Diag::err(a.span, "ffi",
                             format!("`{}` cannot cross the FFI boundary", t.name())));
                     }
@@ -2420,7 +2538,7 @@ impl<'a> Checker<'a> {
                 ExprKind::Call { f, args } => {
                     let builtin_susp = matches!(
                         &f.kind,
-                        ExprKind::Ident(n) if n == "recv" || n == "send" || n == "sleep" || n == "msleep"
+                        ExprKind::Ident(n) if n == "recv" || n == "send" || n == "sleep" || n == "msleep" || n == "sjoin"
                     );
                     // the callee itself can't suspend: fn values may not
                     // be susp (B4), iface impls are methods (D3), and a
@@ -2488,7 +2606,7 @@ impl<'a> Checker<'a> {
                 ExprKind::Call { f, args } => {
                     let susp_callee = matches!(&f.kind,
                         ExprKind::Ident(n)
-                            if susp.contains(n) || n == "recv" || n == "send" || n == "sleep" || n == "msleep");
+                            if susp.contains(n) || n == "recv" || n == "send" || n == "sleep" || n == "msleep" || n == "sjoin");
                     susp_callee
                         || expr_has_susp(f, susp)
                         || args.iter().any(|a| expr_has_susp(a, susp))
@@ -2560,7 +2678,7 @@ impl<'a> Checker<'a> {
                                     ExprKind::Call { f, .. }
                                         if matches!(&f.kind, ExprKind::Ident(n)
                                             if susp.contains(n)
-                                                || n == "recv" || n == "send" || n == "sleep" || n == "msleep"));
+                                                || n == "recv" || n == "send" || n == "sleep" || n == "msleep" || n == "sjoin"));
                                 if !(stmt_pos && top_call) {
                                     diags.push(Diag::err(a.span, "check",
                                         "suspending call inside a match arm must be the whole arm body \
@@ -2633,7 +2751,19 @@ impl<'a> Checker<'a> {
                     Stmt::Let { init, .. } | Stmt::Assign { val: init, .. } => {
                         scan_match(init, susp, diags, false)
                     }
-                    Stmt::Let2 { call, .. } | Stmt::Spawn { call, .. } => {
+                    Stmt::Let2 { call, .. } => scan_match(call, susp, diags, false),
+                    Stmt::Spawn { call, scope, span, .. } => {
+                        if let Some(se) = scope {
+                            scan_match(se, susp, diags, false);
+                            // goin binds the task's scope at frame creation —
+                            // only the susp-callee path has a frame to bind
+                            let ok = matches!(&call.kind, ExprKind::Call { f, .. }
+                                if matches!(&f.kind, ExprKind::Ident(n) if susp.contains(n.as_str())));
+                            if !ok {
+                                diags.push(Diag::err(*span, "check",
+                                    "`goin` requires a susp fn call — the scope binds at frame-task creation"));
+                            }
+                        }
                         scan_match(call, susp, diags, false)
                     }
                     Stmt::Return { vals, .. } => {
@@ -2824,7 +2954,7 @@ fn scan_expr(e: &Expr, s: &mut BodyScan) {
             if let ExprKind::Ident(n) = &f.kind {
                 s.callees.insert(n.clone());
                 // usleep is deliberately absent — it blocks its thread, it never parks
-                if matches!(n.as_str(), "recv" | "send" | "sleep" | "msleep") {
+                if matches!(n.as_str(), "recv" | "send" | "sleep" | "msleep" | "sjoin") {
                     s.seeded = true;
                 }
             } else {

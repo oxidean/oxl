@@ -1,0 +1,98 @@
+package main
+
+// G1: typed payload channels + named scopes
+// `chan own T` moves owned payloads; `try_send` never parks; `mkscope`
+// hands a named child scope to `goin`/`sjoin`/`scancel`; `is_root` marks
+// the rt_run_root-entered task; `smkchan` binds a chan's drain to a scope.
+
+import "std/time"
+
+struct Ev { kind: int, x: int }
+
+fn producer(c: chan own Ev) {
+    e := new(Ev)
+    e.kind = 7
+    e.x = 42
+    send(c, e)
+    e2 := new(Ev)
+    e2.kind = 8
+    e2.x = 1
+    if !try_send(c, e2) {
+        println("try_send on open chan failed — BUG")
+    }
+}
+
+fn worker() {
+    time.sleep_ms(1)
+}
+
+fn parker() {
+    c := mkchan()
+    recv(c)
+    println("parker survived cancel — BUG")
+}
+
+fn main() {
+    if !is_root() {
+        println("is_root false on root task — BUG")
+    }
+    me := curscope()
+    if me == nil {
+        println("curscope nil on root task — BUG")
+    }
+
+    // typed chan: own payloads move through send/recv
+    c := mkchan(Ev, 4)
+    scope { go producer(c) }
+    e := recv(c)
+    assert(e.kind == 7 && e.x == 42)
+    e2 := recv(c)
+    assert(e2.kind == 8 && e2.x == 1)
+
+    // try_send: false on full, false on closed — never parks
+    c2 := mkchan(Ev, 1)
+    send(c2, new(Ev))
+    assert(!try_send(c2, new(Ev)))
+    close(c2)
+    assert(!try_send(c2, new(Ev)))
+
+    // named scope: clean join delivers 0
+    sc := mkscope()
+    goin(sc, worker())
+    rc := sjoin(sc)
+    assert(rc == 0)
+
+    // cancel a parked task in a named scope, then join it
+    sc2 := mkscope()
+    goin(sc2, parker())
+    time.sleep_ms(10)
+    scancel(sc2)
+    rc2 := sjoin(sc2)
+    assert(rc2 == 0)
+
+    // select arm binds the typed payload
+    c3 := mkchan(Ev, 2)
+    e3 := new(Ev)
+    e3.kind = 99
+    send(c3, e3)
+    got := 0
+    select {
+        v := recv(c3) => { got = v.kind }
+        timeout(50) => { println("select timed out — BUG") }
+    }
+    assert(got == 99)
+
+    // smkchan: scope teardown drains buffered payloads (10k rounds —
+    // a leak or double-free in rt_chan_teardown shows up here)
+    i := 0
+    for i < 10000 {
+        scope {
+            cc := smkchan(Ev, 8, curscope())
+            send(cc, new(Ev))
+            send(cc, new(Ev))
+        }
+        i = i + 1
+    }
+
+    println("chan_own done")
+}

@@ -1508,6 +1508,10 @@ out=$("$OXL" run tests/select_fair.oxl)
 grep -qE "^select fair ok a=[0-9]+$" <<<"$(tail -1 <<<"$out")" || { echo "FAIL select_fair: $out"; exit 1; }
 out=$("$OXL" run tests/select.oxl)
 [ "$(tail -1 <<<"$out")" = "select done" ] || { echo "FAIL select: $out"; exit 1; }
+
+echo "== g1 typed chans + named scopes =="
+out=$("$OXL" run tests/chan_own.oxl)
+[ "$(tail -1 <<<"$out")" = "chan_own done" ] || { echo "FAIL chan_own: $out"; exit 1; }
 # parked select must unwedge on sibling trap — exits nonzero, not a hang.
 # 124 = with_timeout expiry = the hang this test exists to catch. Build
 # first so a compile error fails the check instead of passing as a

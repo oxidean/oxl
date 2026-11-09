@@ -57,6 +57,7 @@ enum Node {
     Spawn { e: own Node }, // {"spawn": <e>}
     SpawnBlocking { e: own Node }, // {"spawnBlocking": <e>}
     Go { e: own Node }, // {"go": <e>}
+    GoIn { sc: own Node, e: own Node }, // {"goin": <sc>, "call": <e>}
     Let2 { names: str, call: own Node, lo: int, hi: int }, // {"let2": s} (+"call")
     Bind { name: str, init: own Node, lo: int, hi: int }, // {"bind": s, "init": <init>}
     ExprStmt { e: own Node }, // {"expr": <e>}
@@ -217,6 +218,10 @@ fn to_json(n: own Node) -> own json.Json {
         }
         Node.Go{e} => {
             json.jadd(o, "go", to_json(e))
+        }
+        Node.GoIn{sc, e} => {
+            json.jadd(o, "goin", to_json(sc))
+            json.jadd(o, "call", to_json(e))
         }
         Node.Let2{names, call} => {
             json.jadd(o, "let2", json.jstr(names))
@@ -951,6 +956,15 @@ fn p_stmt(c: mut PCur) -> own Node {
     if eat(c, "go") {
         return b(Node.Go{e: p_expr(c)})
     }
+    if at(c, "goin") {
+        next(c)
+        eat(c, "(")
+        sc := p_expr(c)
+        eat(c, ",")
+        e := p_expr(c)
+        eat(c, ")")
+        return b(Node.GoIn{sc: sc, e: e})
+    }
     if at(c, "defer") {
         next(c)
         return b(Node.Defer{call: p_expr(c)})
@@ -1077,6 +1091,15 @@ fn p_ty(c: mut PCur) -> own Node {
             s = s + " -> " + rt.f0
         }
         return b(Node.Ty{f0: s, lo: m, hi: c.phi})
+    }
+    // `chan` bare | `chan own T` typed payload — canonical "chan own Ev"
+    if txt == "chan" {
+        next(c)
+        if at(c, "own") {
+            inner := p_ty(c) as Node.Ty
+            return b(Node.Ty{f0: "chan " + inner.f0, lo: m, hi: c.phi})
+        }
+        return b(Node.Ty{f0: "chan", lo: m, hi: c.phi})
     }
     // own/ref/mut [own/ref/mut] dotted.name
     if txt == "own" || txt == "ref" || txt == "mut" {

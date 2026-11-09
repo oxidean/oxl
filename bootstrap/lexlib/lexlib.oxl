@@ -55,7 +55,7 @@ fn is_space(c: int) -> bool {
 }
 
 fn is_kw(w: str) -> bool {
-    return w == "fn" || w == "struct" || w == "extern" || w == "return" || w == "if" || w == "else" || w == "for" || w == "let" || w == "scope" || w == "spawn" || w == "go" || w == "own" || w == "ref" || w == "mut" || w == "unsafe" || w == "nil" || w == "true" || w == "false" || w == "import" || w == "package" || w == "chan" || w == "break" || w == "continue" || w == "interface" || w == "spawnBlocking"
+    return w == "fn" || w == "struct" || w == "extern" || w == "return" || w == "if" || w == "else" || w == "for" || w == "let" || w == "scope" || w == "spawn" || w == "go" || w == "own" || w == "ref" || w == "mut" || w == "unsafe" || w == "nil" || w == "true" || w == "false" || w == "import" || w == "package" || w == "chan" || w == "break" || w == "continue" || w == "interface" || w == "spawnBlocking" || w == "goin"
 }
 
 fn push(tail: own Tok, kind: int, text: str, ln: int, off: int, eoff: int) -> own Tok {

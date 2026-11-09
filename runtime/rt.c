@@ -216,6 +216,10 @@ struct RtTask {
     struct RtTask *next;  /* pool queue / chan wait queue link */
     int is_frame;
     int external;         /* driven by rt_run_root / blocking thread */
+    int is_root;          /* the task rt_run_root was ENTERED for on a
+                           * task-free thread (oxl_main, test harness) —
+                           * NOT spawn_fallback's nested re-entry, which
+                           * can sit on a non-entry thread */
     RtWake *wk;           /* external wakeup, driver-stack-owned */
     int64_t chan_res;     /* channel delivery slot */
     /* parked-on-a-waitqueue bookkeeping: scope cancel enumerates the
@@ -317,6 +321,9 @@ static struct {
 } pool = { OXL_MUTEX_INIT, OXL_CV_INIT, 0, 0, 0, 0 };
 
 static void scope_heap_free(RtScope *s);
+static void scope_chans_teardown(RtScope *s); /* defined with the chan internals */
+static void scope_pending_up(RtScope *s);
+static int join_scope(RtScope *s);
 
 /* teardown for a scope no joiner will consume: the arena bump buffer
  * and the scope-tracked heap blocks. Sync objects die too — pending==0
@@ -362,6 +369,7 @@ static void scope_teardown(RtScope *s) {
     oxl_mu_unlock(&s->mu);
     scope_unlink(s);
     scope_detach_children(s);
+    scope_chans_teardown(s);
     oxl_mu_destroy(&s->mu);
     oxl_cv_destroy(&s->cv);
     scope_heap_free(s);
@@ -433,6 +441,49 @@ int64_t rt_scope_join_free(void *sv) {
     return rt_scope_try((RtScope *)sv);
 }
 
+/* named child scope handle (`mkscope()`): linked under the CALLER's
+ * current scope like rt_scope_enter, but tls_scope is restored so the
+ * caller keeps its own scope — the handle exists to be spawned into
+ * (rt_task_new_in) and cancelled (rt_scope_cancel), joined last via
+ * rt_scope_join_named. The caller's scope takes a pending hold so its
+ * own join can never outlive the handle (the hold drops at join_named —
+ * a named scope left unjoined hangs the parent's join, loudly). */
+void *rt_scope_named(void) {
+    RtScope *s = rt_alloc(sizeof *s);
+    RtScope *cur = tls_scope;
+    if (cur) scope_pending_up(cur);
+    rt_scope_enter(s);
+    tls_scope = cur;
+    return s;
+}
+
+/* join a named scope — rt_scope_try semantics (returns the trap code,
+ * no propagate), then releases the hold mkscope took on the parent.
+ * Unlike join_scope this does NOT consume the caller's tls_scope: the
+ * named scope isn't the frame the joiner is leaving. */
+int64_t rt_scope_join_named(void *sv) {
+    RtScope *s = sv;
+    RtScope *p = s->parent;   /* unlink inside join_scope clears it */
+    RtScope *save = tls_scope;
+    int64_t e = join_scope(s);
+    tls_scope = save;
+    if (p) scope_done(p);
+    return e;
+}
+
+/* named-scope finish: rt_scope_finish minus the wait, minus the
+ * tls_scope restore (the joiner isn't leaving its own scope), plus the
+ * parent's pending hold drop from mkscope. */
+int64_t rt_scope_finish_named(void *sv) {
+    RtScope *s = sv;
+    RtScope *p = s->parent;
+    RtScope *save = tls_scope;
+    int64_t e = rt_scope_finish(s);
+    tls_scope = save;
+    if (p) scope_done(p);
+    return e;
+}
+
 /* serializes trap-time descendant passes: trappers share the wnext
  * scratch links, so two racing traps must not clobber each other */
 static oxl_mutex_t cancel_tree_mu = OXL_MUTEX_INIT;
@@ -469,6 +520,22 @@ static void scope_cancel_tree(RtScope *s) {
          * them — an orphan-only drop would hang the scope's owner. */
         scope_done(c);
     }
+}
+
+/* scoped cancel on a named scope (`scancel(sc)`): mark + wake its own
+ * parked tasks + cancel the whole descendant subtree — the same three
+ * steps rt_trap applies to each ancestor scope. Dead scopes are left
+ * alone: their mutex may already be destroyed. */
+void rt_scope_cancel(void *sv) {
+    RtScope *s = sv;
+    oxl_mu_lock(&s->mu);
+    if (s->dead) { oxl_mu_unlock(&s->mu); return; }
+    s->cancel = 1;
+    oxl_mu_unlock(&s->mu);
+    scope_cancel_wake(s);
+    oxl_mu_lock(&cancel_tree_mu);
+    scope_cancel_tree(s);
+    oxl_mu_unlock(&cancel_tree_mu);
 }
 
 /* defer stack — per task so entries survive suspends (a parked frame
@@ -830,6 +897,18 @@ RtFrame *rt_task_new(RtPoll poll, int64_t bytes) {
     return fr;
 }
 
+/* scope-targeted spawn (`goin(sc, f(args))`): the task binds to the
+ * named scope's pending count instead of the caller's innermost one —
+ * rt_spawn_task then joins it under `sc`, and rt_scope_cancel reaches
+ * it there. */
+RtFrame *rt_task_new_in(void *sv, RtPoll poll, int64_t bytes) {
+    RtScope *save = tls_scope;
+    tls_scope = sv;
+    RtFrame *fr = rt_task_new(poll, bytes);
+    tls_scope = save;
+    return fr;
+}
+
 static RtTask *task_of(RtFrame *fr) { return ((RtTask *)fr) - 1; }
 
 void rt_spawn_task(RtFrame *fr) {
@@ -859,6 +938,12 @@ int rt_run_root(RtFrame *fr) {
     t->external = 1;
     t->wk = &wk;
     RtTask *prev = tls_task;
+    /* the root task is the one driven on a thread with no enclosing
+     * task — oxl_main's entry and the test-harness task. A nested
+     * rt_run_root (spawn_fallback driving a frame task on the SPAWNING
+     * thread, possibly a pool worker) leaves the mark off: gui.run's
+     * toolkit thread rule must reject that task. */
+    t->is_root = prev == NULL;
     RtScope *prev_scope = tls_scope; /* a trapping frame task unwinds past
         every scope_leave — the caller's scope must come back or later
         rt_scope_enter/rt_alloc on this thread walk freed scope memory */
@@ -901,6 +986,16 @@ int rt_run_root(RtFrame *fr) {
 /* cooperative cancel check -- tasks observe at suspend points */
 int rt_cancelled(void) { return tls_scope && tls_scope->cancel; }
 
+/* the gui.run gate: set only on the task rt_run_root was ENTERED for
+ * with no enclosing task (oxl_main, the test-harness task) — the one
+ * permanently pinned to its entry thread. */
+int rt_is_root(void) { return tls_task && tls_task->is_root; }
+
+/* the caller's innermost live scope as an opaque handle (`curscope()`) —
+ * gui.run captures the enclosing scope this way before opening its own
+ * inner scopes, then binds mailboxes/chans to it. */
+void *rt_scope_current(void) { return tls_scope; }
+
 int64_t rt_task_data(RtTask *t) { return t->chan_res; }
 
 static void scope_heap_free(RtScope *s) {
@@ -922,6 +1017,7 @@ static int join_scope(RtScope *s) {
     RtScope *up = s->parent; /* captured pre-detach for tls_scope restore */
     scope_unlink(s);
     scope_detach_children(s);
+    scope_chans_teardown(s);
     oxl_mu_destroy(&s->mu);
     oxl_cv_destroy(&s->cv);
     scope_heap_free(s);
@@ -952,6 +1048,7 @@ int rt_scope_finish(RtScope *s) {
     RtScope *up = s->parent;
     scope_unlink(s);
     scope_detach_children(s);
+    scope_chans_teardown(s);
     oxl_mu_destroy(&s->mu);
     oxl_cv_destroy(&s->cv);
     scope_heap_free(s);
@@ -1288,6 +1385,12 @@ struct RtChan {
     RtTask *recvq;      /* parked frame receivers (task->next chain) */
     SendReq *sendq;     /* parked frame sends */
     SelW *selq;         /* parked select waiters */
+    /* `chan own T`: codegen's per-element drop thunk (reclaims one
+     * buffered payload exactly once) and the owning scope whose
+     * teardown drains + closes the chan — NULL for bare `mkchan` */
+    void (*drop_elem)(int64_t);
+    RtScope *owner;
+    struct RtChan *snext; /* owning scope's chan-list link */
 };
 
 static SendReq *chan_pop_send(RtChan *ch); /* defined below */
@@ -1372,6 +1475,56 @@ RtChan *rt_mkchan(int64_t cap) {
     c->cap = cap < 0 ? 0 : cap;
     if (c->cap > 0) c->buf = xcalloc((size_t)c->cap, sizeof(int64_t));
     return c;
+}
+
+/* `chan own T` / scope-targeted mkchan: registers the chan on the
+ * owning scope's `chans` list so scope teardown closes it and reclaims
+ * every still-queued payload via drop_elem. A scope that already
+ * committed teardown can't accept a new member — the chan is born
+ * closed (posts/sends complete silently, recv yields the zero word). */
+RtChan *rt_mkchan_scoped(void *sv, int64_t cap, void (*drop)(int64_t)) {
+    RtChan *c = rt_mkchan(cap);
+    c->drop_elem = drop;
+    RtScope *s = sv;
+    if (!s) return c;
+    c->owner = s;
+    oxl_mu_lock(&s->mu);
+    if (s->dead) {
+        oxl_mu_unlock(&s->mu);
+        c->owner = NULL;
+        c->closed = 1;
+        return c;
+    }
+    c->snext = s->chans;
+    s->chans = c;
+    oxl_mu_unlock(&s->mu);
+    return c;
+}
+
+/* nonblocking send: 1 = the value moved in, 0 = full or closed.
+ * Mirrors rt_send's delivery order minus every wait — recv waiter,
+ * select waiter, then ring space; nothing is ever deposited or parked. */
+int rt_try_send(RtChan *ch, int64_t v) {
+    oxl_mu_lock(&ch->mu);
+    if (ch->closed) { oxl_mu_unlock(&ch->mu); return 0; }
+    RtTask *r = chan_pop_recv(ch);
+    if (r) {
+        r->chan_res = v;
+        oxl_mu_unlock(&ch->mu);
+        rt_task_wake(r);
+        task_unref(r);
+        return 1;
+    }
+    if (sel_fire(ch, v)) return 1; /* sel_fire releases ch->mu */
+    if (ch->count < ch->cap) {
+        ch->buf[(ch->head + ch->count) % ch->cap] = v;
+        ch->count++;
+        oxl_cv_broadcast(&ch->cv_recv);
+        oxl_mu_unlock(&ch->mu);
+        return 1;
+    }
+    oxl_mu_unlock(&ch->mu);
+    return 0;
 }
 
 void rt_send(RtChan *ch, int64_t v) {
@@ -1618,6 +1771,89 @@ void rt_close(RtChan *ch) {
         task_unref(s->t);
         sel_unref(s);
         sw = n;
+    }
+}
+
+/* scope-teardown chan close: everything rt_close does for waiters, plus
+ * drop_elem on every still-queued payload — ring entries, a deposited
+ * slot value, and parked senders' never-consumed values (their tasks
+ * are already dead, so the send-revert contract has nobody to revert
+ * to). The struct, ring, and sync objects stay allocated: a foreign
+ * task can still call into the chan and must find memory intact —
+ * today's never-freed model keeps that safe. */
+void rt_chan_teardown(RtChan *ch) {
+    RtTask *r;
+    SendReq *sq;
+    SelW *sw;
+    oxl_mu_lock(&ch->mu);
+    ch->closed = 1;
+    if (ch->drop_elem) {
+        while (ch->count > 0) {
+            ch->drop_elem(ch->buf[ch->head]);
+            ch->head = (ch->head + 1) % ch->cap;
+            ch->count--;
+        }
+        if (ch->has) ch->drop_elem(ch->val);
+        for (SendReq *q = ch->sendq; q; q = q->next) ch->drop_elem(q->v);
+    }
+    oxl_cv_broadcast(&ch->cv_send);
+    oxl_cv_broadcast(&ch->cv_recv);
+    r = ch->recvq;  ch->recvq = NULL;
+    sq = ch->sendq; ch->sendq = NULL;
+    sw = ch->selq;  ch->selq = NULL;
+    for (SelW *w = sw; w; w = w->next)
+        __sync_add_and_fetch(&w->sel->refs, 1);
+    ch->has = 0;
+    ch->val = 0;
+    oxl_mu_unlock(&ch->mu);
+    while (r) {
+        RtTask *n = r->next;
+        if (park_claim(r)) {
+            park_del(r);
+            r->chan_res = 0;
+            rt_task_wake(r);
+        }
+        task_unref(r);
+        r = n;
+    }
+    while (sq) {
+        SendReq *n = sq->next;
+        if (park_claim(sq->t)) {
+            park_del(sq->t);
+            rt_task_wake(sq->t);
+        }
+        task_unref(sq->t);
+        free(sq);
+        sq = n;
+    }
+    while (sw) {
+        SelW *n = sw->next;
+        struct RtSel *s = sw->sel;
+        if (park_claim(s->t)) {
+            s->winner = sw->slot;
+            s->t->chan_res = 0;
+            s->t->sel_arm = sw->slot;
+            rt_task_wake(s->t);
+        }
+        task_unref(s->t);
+        sel_unref(s);
+        sw = n;
+    }
+}
+
+/* teardown hook on RtScope.chans — membership is stable once `dead`
+ * commits (rt_mkchan_scoped refuses dead scopes), so the list can be
+ * walked without s->mu. */
+static void scope_chans_teardown(RtScope *s) {
+    oxl_mu_lock(&s->mu);
+    RtChan *l = s->chans;
+    s->chans = NULL;
+    oxl_mu_unlock(&s->mu);
+    while (l) {
+        RtChan *n = l->snext;
+        l->snext = NULL;
+        rt_chan_teardown(l);
+        l = n;
     }
 }
 

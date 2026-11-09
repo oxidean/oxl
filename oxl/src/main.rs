@@ -929,7 +929,12 @@ fn qualify_ty(
         ast::TyKind::Own(i) | ast::TyKind::Ref(i) | ast::TyKind::Mut(i) => {
             qualify_ty(i, renames, aliases, used)
         }
-        ast::TyKind::Chan => {}
+        ast::TyKind::Chan(p) => {
+            if let Some(t) = p.as_mut() {
+                qualify_ty(t.as_mut(), renames, aliases, used);
+            }
+        }
+        ast::TyKind::Scope => {}
         ast::TyKind::Slice(i) => qualify_ty(i, renames, aliases, used),
         ast::TyKind::Fn { params, ret } => {
             for p in params {

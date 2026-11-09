@@ -164,6 +164,12 @@ struct RtScope {
     struct RtScope *sib;    /* next sibling in parent->children */
     struct RtScope *wnext;  /* scratch wake-list link, owned by rt_trap */
     volatile int dead;
+    /* scope-owned channels: `chan own T` registers here via
+     * rt_mkchan_scoped; teardown marks each closed, wakes its waiters,
+     * and drops every buffered payload through the chan's drop_elem.
+     * The chan struct itself is NOT freed (foreign waiters may still
+     * resume on it — matching today's never-freed chan objects) */
+    struct RtChan *chans;
     /* arena: bump allocator freed on leave */
     char *arena_buf;
     int64_t arena_off, arena_cap;
@@ -186,11 +192,19 @@ int64_t rt_scope_join_free(void *s);          /* try-join + free: swallow trap c
 void rt_spawn(void *(*fn)(void *), void *arg);   /* fn task (non-susp fns) */
 void rt_spawnb(void *(*fn)(void *), void *arg);  /* blocking pool (FFI) */
 RtFrame *rt_task_new(RtPoll poll, int64_t bytes); /* one alloc: task+frame */
+RtFrame *rt_task_new_in(void *scope, RtPoll poll, int64_t bytes); /* named-scope bind */
 void rt_spawn_task(RtFrame *fr);                  /* enqueue frame task in scope */
 void rt_spawnb_task(RtFrame *fr);                 /* frame task, blocking pool */
 int rt_run_root(RtFrame *fr);                     /* drive a task to completion */
 void rt_task_wake(RtTask *t);                    /* re-enqueue a suspended task */
 int rt_cancelled(void);
+int rt_is_root(void);              /* the rt_run_root-entered task mark */
+void *rt_scope_current(void);      /* caller's innermost scope (`curscope()`) */
+void *rt_scope_named(void);        /* mkscope(): named child scope handle */
+int64_t rt_scope_join_named(void *s); /* blocking join (non-frame ctx) */
+int64_t rt_scope_finish_named(void *s); /* join teardown after READY */
+/* sjoin emits rt_scope_join_poll + rt_scope_finish_named at the resume label */
+void rt_scope_cancel(void *s);     /* scancel(): cancel a named scope subtree */
 int64_t rt_task_data(RtTask *t);                 /* delivered channel value */
 void rt_trap(int64_t code);
 
@@ -238,6 +252,12 @@ void rt_free(void *obj);
  * task was parked on the chan's wait queue and will be re-enqueued). */
 typedef struct RtChan RtChan;
 RtChan *rt_mkchan(int64_t cap);
+/* `chan own T` + scope-targeted chans: drop_elem reclaims one buffered
+ * payload (codegen's per-T thunk); owner scope teardown closes + drains
+ * via rt_chan_teardown */
+RtChan *rt_mkchan_scoped(void *owner_scope, int64_t cap, void (*drop_elem)(int64_t));
+int rt_try_send(RtChan *ch, int64_t v);  /* nonblocking: 1 moved, 0 full/closed */
+void rt_chan_teardown(RtChan *ch);       /* close + wake + drop queued payloads */
 void rt_send(RtChan *ch, int64_t v);
 int64_t rt_recv(RtChan *ch);
 int rt_send_poll(RtChan *ch, int64_t v, RtTask *t);

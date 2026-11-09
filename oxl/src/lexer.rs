@@ -5,6 +5,7 @@ pub enum Kw {
     Fn, Struct, Extern, Return, If, Else, For, Let, Scope, Spawn, Go,
     Own, Ref, Mut, Unsafe, Nil, True, False, Import, Chan,
     Break, Continue, Interface, SpawnB, Defer, Select, Enum, Match, Package,
+    GoIn,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -193,6 +194,7 @@ pub fn lex(src: &str, diags: &mut Diags) -> Vec<Token> {
                     "let" => Some(Kw::Let),
                     "scope" => Some(Kw::Scope),
                     "spawn" => Some(Kw::Spawn),
+                    "goin" => Some(Kw::GoIn),
                     "go" => Some(Kw::Go),
                     "own" => Some(Kw::Own),
                     "ref" => Some(Kw::Ref),

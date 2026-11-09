@@ -181,6 +181,8 @@ struct G {
     retk: int, // current fn ret kind (2 = [T, err])
     cret: int, // current fn declared ret1 tyid (-1 none; conv target)
     subst: own collections.Map, // tyvar -> tyid for the inst being emitted (nil = off)
+    drop_tys: []str, // struct/enum names needing an o_drop_<n> chan-payload destructor
+    drop_word: int, // payload kinds that only need rt_free on the word
     insts: own GInst, // pending instantiation queue (LIFO)
     inst_done: own collections.Map, // mangled inst name -> 1
     vtabs: own GVU, // materialized (iface, impl) pairs, newest first
@@ -532,6 +534,9 @@ fn gcty(g: mut G, t: int) -> str {
     }
     if k == check.k_shared() {
         return "RtShared*"
+    }
+    if k == check.k_scope() {
+        return "RtScope*"
     }
     if k == check.k_slice() {
         return "RtSlice"
@@ -1026,7 +1031,13 @@ fn xty_call(g: mut G, f: ref parser.Node, args: ref parser.NList) -> int {
         }
         return check.t_void(g.ck)
     }
-    if name == "mkchan" {
+    if name == "mkchan" || name == "smkchan" {
+        if args != nil {
+            pt := check.chan_payload_arg(g.ck, args.v)
+            if pt >= 0 {
+                return check.ti(g.ck, check.k_chan(), pt)
+            }
+        }
         return check.tk(g.ck, check.k_chan())
     }
     if name == "mkslice" {
@@ -1051,7 +1062,28 @@ fn xty_call(g: mut G, f: ref parser.Node, args: ref parser.NList) -> int {
     if name == "push" && args != nil {
         return xty(g, args.v)
     }
-    if name == "recv" || name == "argc" || name == "len" || name == "byteat" || name == "find" || name == "atoi" || name == "ftoi" || name == "htons" || name == "htonl" || name == "sqlite_exec" || name == "writefile" || name == "sget" || name == "scas" || name == "sadd" || name == "now" || name == "now_ms" {
+    if name == "recv" {
+        if args != nil {
+            ct := xty(g, args.v)
+            if ct >= 0 && tyk(g, ct) == check.k_chan() && tyi(g, ct) >= 0 {
+                return tyi(g, ct)
+            }
+        }
+        return check.t_int(g.ck)
+    }
+    if name == "try_send" || name == "is_root" {
+        return check.t_bool(g.ck)
+    }
+    if name == "mkscope" || name == "curscope" {
+        return check.tk(g.ck, check.k_scope())
+    }
+    if name == "sjoin" {
+        return check.t_int(g.ck)
+    }
+    if name == "scancel" {
+        return check.t_void(g.ck)
+    }
+    if name == "argc" || name == "len" || name == "byteat" || name == "find" || name == "atoi" || name == "ftoi" || name == "htons" || name == "htonl" || name == "sqlite_exec" || name == "writefile" || name == "sget" || name == "scas" || name == "sadd" || name == "now" || name == "now_ms" {
         return check.t_int(g.ck)
     }
     if name == "itof" || name == "atof" {
@@ -2145,7 +2177,7 @@ fn gmatch(g: mut G, scrut: ref parser.Node, arms: ref parser.NList) -> str {
 }
 
 // builtins that expand to an rt_* call (seed builtin_emit)
-fn gbuiltin(name: str, argvs: ref GAv) -> str {
+fn gbuiltin(g: mut G, name: str, args: ref parser.NList, argvs: ref GAv) -> str {
     a0 := ""
     if argvs != nil {
         a0 = argvs.v
@@ -2154,16 +2186,68 @@ fn gbuiltin(name: str, argvs: ref GAv) -> str {
     if name == "assert" {
         return "((" + a0 + ") ? (void)0 : (rt_trap(3)))"
     }
-    if name == "mkchan" {
-        if argvs == nil {
-            return "rt_mkchan(0LL)"
+    if name == "mkchan" || name == "smkchan" {
+        // a leading type arg (Event / own Event) is detected on the AST —
+        // argvs positions follow the same index, so value refs start at 1
+        payload := -1
+        if args != nil {
+            payload = check.chan_payload_arg(g.ck, args.v)
         }
-        return "rt_mkchan(" + a0 + ")"
+        drop := "0 /*no drop*/"
+        if payload >= 0 {
+            drop = drop_sym(g, payload)
+        }
+        scoped := name == "smkchan"
+        cap := "0LL"
+        sc := "0LL"
+        if scoped {
+            if argvs != nil && argvs.next != nil {
+                cap = argvs.next.v
+            }
+            if argvs != nil && argvs.next != nil && argvs.next.next != nil {
+                sc = argvs.next.next.v
+            }
+        } else {
+            ci := 0
+            if payload >= 0 {
+                ci = 1
+            }
+            cv := gav_at(argvs, ci)
+            if len(cv) > 0 {
+                cap = cv
+            }
+        }
+        return "rt_mkchan_scoped((void*)" + sc + ", " + cap + ", " + drop + ")"
     }
     if name == "send" {
-        return "rt_send(" + j + ")"
+        return "rt_send(" + a0 + ", (int64_t)(" + gav_at(argvs, 1) + "))"
+    }
+    if name == "try_send" {
+        return "rt_try_send(" + a0 + ", (int64_t)(" + gav_at(argvs, 1) + "))"
+    }
+    if name == "is_root" {
+        return "rt_is_root()"
+    }
+    if name == "mkscope" {
+        return "rt_scope_named()"
+    }
+    if name == "curscope" {
+        return "rt_scope_current()"
+    }
+    if name == "scancel" {
+        return "rt_scope_cancel((void*)" + a0 + ")"
+    }
+    if name == "sjoin" {
+        return "rt_scope_join_named((void*)" + a0 + ")"
     }
     if name == "recv" {
+        // typed payload chan: recv's word result casts back to own T
+        if args != nil {
+            ct := xty(g, args.v)
+            if ct >= 0 && tyk(g, ct) == check.k_chan() && tyi(g, ct) >= 0 {
+                return "((" + gcty(g, tyi(g, ct)) + ")rt_recv(" + a0 + "))"
+            }
+        }
         return "rt_recv(" + a0 + ")"
     }
     if name == "sleep" {
@@ -2736,7 +2820,7 @@ fn gcall(g: mut G, f: ref parser.Node, args: ref parser.NList) -> str {
         }
         return "rt_len(" + a0 + ")"
     }
-    b := gbuiltin(qn, argvs)
+    b := gbuiltin(g, qn, args, argvs)
     if len(b) > 0 {
         return b
     }
@@ -2933,7 +3017,162 @@ fn gav_decl(g: mut G, args: ref parser.NList, fi: int, bind: ref collections.Map
     return head
 }
 
-fn gspawn(g: mut G, e: ref parser.Node, blocking: bool) {
+// destructor thunk symbol for a `chan own T` payload; registers the
+// underlying type (and every own field reachable from it) so
+// gemit_drops writes each o_drop_<n> once. Non-struct payloads get the
+// shared rt_free shim.
+fn drop_sym(g: mut G, payload: int) -> str {
+    inner := tyi(g, payload)
+    if inner < 0 {
+        return "0 /*no drop*/"
+    }
+    ik := tyk(g, inner)
+    let stack: own check.IList = nil
+    stack = check.icons(inner, stack)
+    for stack != nil {
+        t := stack.v
+        stack = stack.next
+        tk := tyk(g, t)
+        if tk == check.k_struct() || tk == check.k_enum() {
+            n := g.ck.tyv[t].name
+            if !sl_has_str(g.drop_tys, n) {
+                g.drop_tys = push(g.drop_tys, n)
+            }
+        } else {
+            g.drop_word = 1
+        }
+        // enqueue own fields/variant payloads of the type just seen
+        if tk == check.k_struct() {
+            [si, err] = collections.map_get(g.ck.structs, g.ck.tyv[t].name)
+            if err == 0 {
+                fl := g.ck.structsv[si].fields
+                for fl != nil {
+                    ft := fl.v.t
+                    if tyk(g, ft) == check.k_own() {
+                        stack = check.icons(tyi(g, ft), stack)
+                    } else if tyk(g, ft) == check.k_str() {
+                        g.drop_word = 1
+                    }
+                    fl = fl.next
+                }
+            }
+        }
+        if tk == check.k_enum() {
+            [ei, err2] = collections.map_get(g.ck.enums, g.ck.tyv[t].name)
+            if err2 == 0 {
+                vl := g.ck.enumsv[ei].vars
+                for vl != nil {
+                    fl := vl.v.fields
+                    for fl != nil {
+                        ft := fl.v.t
+                        if tyk(g, ft) == check.k_own() {
+                            stack = check.icons(tyi(g, ft), stack)
+                        } else if tyk(g, ft) == check.k_str() {
+                            g.drop_word = 1
+                        }
+                        fl = fl.next
+                    }
+                    vl = vl.next
+                }
+            }
+        }
+    }
+    if ik == check.k_struct() || ik == check.k_enum() {
+        return "o_drop_" + cname(g.ck.tyv[inner].name)
+    }
+    g.drop_word = 1
+    return "o_drop_word"
+}
+
+fn sl_has_str(l: []str, n: str) -> bool {
+    i := 0
+    for i < len(l) {
+        if l[i] == n {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// one C stmt dropping an own field/payload word; borrowed fields are
+// untouched (they share the owner's lifetime, not the object's)
+fn drop_field(g: mut G, acc: str, ft: int) -> str {
+    if tyk(g, ft) != check.k_own() {
+        return ""
+    }
+    it := tyi(g, ft)
+    ik := tyk(g, it)
+    if ik == check.k_struct() || ik == check.k_enum() {
+        return "    o_drop_" + cname(g.ck.tyv[it].name) + "((int64_t)" + acc + ");\n"
+    }
+    if ik == check.k_slice() {
+        return "    if (" + acc + ") { rt_free(((RtSlice*)" + acc + ")->ptr); rt_free(" + acc + "); }\n"
+    }
+    return "    rt_free((void*)" + acc + ");\n"
+}
+
+// write each registered o_drop_<n> into the root unit's trampoline
+// section — emitted once, `static`, scanned by the mark like any other
+// referenced symbol
+fn gemit_drops(g: mut G, ru: int) {
+    if len(g.drop_tys) == 0 && g.drop_word == 0 {
+        return
+    }
+    src := ""
+    if g.drop_word == 1 {
+        src = src + "static void o_drop_word(int64_t _v) { rt_free((void*)_v); }\n"
+    }
+    i := 0
+    for i < len(g.drop_tys) {
+        src = src + "static void o_drop_" + cname(g.drop_tys[i]) + "(int64_t _v);\n"
+        i = i + 1
+    }
+    i = 0
+    for i < len(g.drop_tys) {
+        n := g.drop_tys[i]
+        cn := cname(n)
+        if collections.map_has(g.ck.structs, n) {
+            body := "static void o_drop_" + cn + "(int64_t _v) { struct o_s_" + cn + " *p = (struct o_s_" + cn + " *)_v; if (!p) return;\n"
+            [si, err] = collections.map_get(g.ck.structs, n)
+            if err == 0 {
+                fl := g.ck.structsv[si].fields
+                for fl != nil {
+                    body = body + drop_field(g, "p->f_" + fl.v.n, fl.v.t)
+                    fl = fl.next
+                }
+            }
+            body = body + "    rt_free(p);\n}\n"
+            src = src + body
+        } else if collections.map_has(g.ck.enums, n) {
+            body := "static void o_drop_" + cn + "(int64_t _v) { struct o_en_" + cn + " *p = (struct o_en_" + cn + " *)_v; if (!p) return; switch (p->tag) {\n"
+            [ei, err2] = collections.map_get(g.ck.enums, n)
+            if err2 == 0 {
+                vi := 0
+                vl := g.ck.enumsv[ei].vars
+                for vl != nil {
+                    fl := vl.v.fields
+                    casebody := ""
+                    for fl != nil {
+                        casebody = casebody + drop_field(g, "p->u.v" + itoa(vi) + ".f_" + fl.v.n, fl.v.t)
+                        fl = fl.next
+                    }
+                    if len(casebody) > 0 {
+                        body = body + "    case " + itoa(vi) + ":\n" + casebody + "        break;\n"
+                    }
+                    vi = vi + 1
+                    vl = vl.next
+                }
+            }
+            body = body + "    }\n    rt_free(p);\n}\n"
+            src = src + body
+        }
+        i = i + 1
+    }
+    g.units[ru].tp = push(g.units[ru].tp, src)
+}
+
+fn gspawn(g: mut G, sc: ref parser.Node, e: ref parser.Node, blocking: bool) {
     if e == nil || check.nk(e) != 8 {
         return
     }
@@ -3020,7 +3259,12 @@ fn gspawn(g: mut G, e: ref parser.Node, blocking: bool) {
                 if bind != nil {
                     ginst_queue(g, base, g.ck.fnsv[fi2].typarams, bind)
                 }
-                wln(g, "    { struct o_frm_" + cn + " *_t = (struct o_frm_" + cn + " *)rt_task_new(o_poll_" + cn + ", (int64_t)sizeof(struct o_frm_" + cn + "));")
+                tnew := "rt_task_new(o_poll_" + cn + ", (int64_t)sizeof(struct o_frm_" + cn + "))"
+                if sc != nil {
+                    sv := gx(g, sc)
+                    tnew = "rt_task_new_in((void*)" + sv + ", o_poll_" + cn + ", (int64_t)sizeof(struct o_frm_" + cn + "))"
+                }
+                wln(g, "    { struct o_frm_" + cn + " *_t = (struct o_frm_" + cn + " *)" + tnew + ";")
                 gspawn_args(g, base, "_t", argvs)
                 sp := "rt_spawn_task"
                 if blocking {
@@ -3101,7 +3345,7 @@ fn gspawn(g: mut G, e: ref parser.Node, blocking: bool) {
                     body = "close(a->a0);"
                 }
             } else {
-                bb := gbuiltin(name, afs)
+                bb := gbuiltin(g, name, args, afs)
                 if len(bb) > 0 {
                     body = bb + ";"
                 } else {
@@ -3338,6 +3582,10 @@ fn gscan_s(g: mut G, s: mut GS, st: ref parser.Node) {
             gscan_e(g, s, e)
         }
         parser.Node.Go{e} => {
+            gscan_e(g, s, e)
+        }
+        parser.Node.GoIn{sc, e} => {
+            gscan_e(g, s, sc)
             gscan_e(g, s, e)
         }
         parser.Node.Defer{call} => {
@@ -3666,13 +3914,16 @@ fn gs(g: mut G, s: ref parser.Node) {
             wln(g, "      rt_scope_leave(&_sc" + itoa(id) + "); }")
         }
         parser.Node.Spawn{e} => {
-            gspawn(g, e, false)
+            gspawn(g, nil, e, false)
         }
         parser.Node.Go{e} => {
-            gspawn(g, e, false)
+            gspawn(g, nil, e, false)
+        }
+        parser.Node.GoIn{sc, e} => {
+            gspawn(g, sc, e, false)
         }
         parser.Node.SpawnBlocking{e} => {
-            gspawn(g, e, true)
+            gspawn(g, nil, e, true)
         }
         parser.Node.Select{arms} => {
             wln(g, "    fprintf(stderr, \"select in non-suspendable fn\\n\"); abort();")
@@ -3784,7 +4035,7 @@ fn gfsusp_leaf(g: mut G, name: str, args: ref parser.NList, dk: int, da: str, db
         poll = "rt_recv_poll(" + gav_at(argvs, 0) + ", task)"
     }
     if name == "send" {
-        poll = "rt_send_poll(" + gav_at(argvs, 0) + ", " + gav_at(argvs, 1) + ", task)"
+        poll = "rt_send_poll(" + gav_at(argvs, 0) + ", (int64_t)(" + gav_at(argvs, 1) + "), task)"
     }
     if name == "sleep" {
         poll = "rt_sleep_poll(" + gav_at(argvs, 0) + ", task)"
@@ -3792,14 +4043,34 @@ fn gfsusp_leaf(g: mut G, name: str, args: ref parser.NList, dk: int, da: str, db
     if name == "msleep" {
         poll = "rt_msleep_poll(" + gav_at(argvs, 0) + ", task)"
     }
+    if name == "sjoin" {
+        poll = "rt_scope_join_poll((RtScope*)" + gav_at(argvs, 0) + ", task)"
+    }
     wln(g, "    if (" + poll + " == RT_PENDING) { fr->cur_scope = tls_scope; tls_scope = saved; return RT_PENDING; }")
     wln(g, "    s" + itoa(k) + ": ;")
     wln(g, "    if (rt_cancelled()) { fr->cur_scope = tls_scope; tls_scope = saved; return RT_CANCEL; }")
+    res := "rt_task_data(task)"
+    if name == "recv" && args != nil {
+        ct := xty(g, args.v)
+        if ct >= 0 && tyk(g, ct) == check.k_chan() && tyi(g, ct) >= 0 {
+            res = "((" + gcty(g, tyi(g, ct)) + ")rt_task_data(task))"
+        }
+    }
+    if name == "sjoin" {
+        // join completed (that's what woke us) — teardown runs on the
+        // joiner's thread and delivers the scope's trap code
+        res = "rt_scope_finish_named((void*)" + gav_at(argvs, 0) + ")"
+    }
     if dk == 1 {
-        wln(g, "    fr->" + da + " = rt_task_data(task);")
+        wln(g, "    fr->" + da + " = " + res + ";")
     }
     if dk == 2 {
-        wln(g, "    " + da + " = rt_task_data(task);")
+        wln(g, "    " + da + " = " + res + ";")
+    }
+    if dk != 1 && dk != 2 && name == "sjoin" {
+        // the finish is the join's second half — it must run even when
+        // the err result is discarded or the parent hold leaks
+        wln(g, "    " + res + ";")
     }
 }
 
@@ -4021,12 +4292,17 @@ fn gfselect(g: mut G, arms: ref parser.NList) {
     a = arms
     for a != nil {
         match a.v {
-            parser.Node.SArm{kind, bind, body} => {
+            parser.Node.SArm{kind, ch, bind, body} => {
                 wln(g, "    " + alabs[aidx] + ": ;")
                 if kind == "recv" && len(bind) > 0 {
-                    fd := gfslot(g, bind, "int64_t")
-                    check.env_bind(g.env, bind, check.t_int(g.ck))
-                    wln(g, "    fr->" + fd + " = rt_task_data(task);")
+                    bt := check.t_int(g.ck)
+                    ct := xty(g, ch)
+                    if ct >= 0 && tyk(g, ct) == check.k_chan() && tyi(g, ct) >= 0 {
+                        bt = tyi(g, ct)
+                    }
+                    fd := gfslot(g, bind, gcty(g, bt))
+                    check.env_bind(g.env, bind, bt)
+                    wln(g, "    fr->" + fd + " = (" + gcty(g, bt) + ")rt_task_data(task);")
                 }
                 check.env_push(g.env)
                 check.env_push(g.fsl)
@@ -4290,13 +4566,16 @@ fn gfstmt(g: mut G, s: ref parser.Node) {
             gfscope_close(g, i)
         }
         parser.Node.Spawn{e} => {
-            gspawn(g, e, false)
+            gspawn(g, nil, e, false)
         }
         parser.Node.Go{e} => {
-            gspawn(g, e, false)
+            gspawn(g, nil, e, false)
+        }
+        parser.Node.GoIn{sc, e} => {
+            gspawn(g, sc, e, false)
         }
         parser.Node.SpawnBlocking{e} => {
-            gspawn(g, e, true)
+            gspawn(g, nil, e, true)
         }
         parser.Node.Select{arms} => {
             gfselect(g, arms)
@@ -5284,6 +5563,7 @@ fn genall(g: mut G) -> str {
     if g.testm == 0 && g.maink == 2 {
         g.units[ru].ob = push(g.units[ru].ob, "void oxl_main(void) {\n@@GLOBALS@@    o_f_main(); }\n")
     }
+    gemit_drops(g, ru)
     // mark: from the root seeds over use edges until fixpoint
     g.live = mkslice(int, len(g.units))
     work := mkslice(int, 0)

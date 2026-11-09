@@ -91,15 +91,29 @@ tears down correctly. Dispatcher lifecycle: it runs in an INNER
 scope owned by `gui.run`, and `eb` carries a `closed` flag next to
 `dropped`. After `pump` returns (stop honored or the toolkit loop
 ended) `run` sets `closed` and posts a final `try_send` ping — then
-cancels the inner scope and joins it before returning. Scope
-cancellation force-wakes whatever the dispatcher is parked on: a
-`ping` receive AND a blocked `events` send alike (a send blocked on
-a full app channel cannot observe a ping, so the cancel is the
-guaranteed wakeup — documented runtime semantics). While the app is
-still draining, the dispatcher forwards the buffered tail (and any
-pending marker) and exits on `closed`+empty; while it is not, the
-cancel unwinds it and remaining events are dropped — a normal pump
-exit can never hang `run`'s join either way. On the outer
-cancellation path the enclosing scope's own teardown kills it;
-no event is delivered after the scope that owns the tree has
-closed (widget handles it names would already be destroyed).
+enters a **bounded drain-grace window** instead of cancelling
+immediately. During the window the dispatcher keeps forwarding the
+buffered tail (including a pending overflow marker) with ordinary
+blocking sends and signals a `done` chan on `closed`+empty. `run`
+`select`s on `done` vs a timeout arm (`gui.set_drain_grace(d)`;
+default ~250 ms):
+
+- App draining normally → every queued event (and the marker) is
+  delivered; `done` fires; no cancel is ever issued. A
+  `close_requested` posted by `pump` as its last act is always
+  preserved this way.
+- App not draining → the window expires, `run` cancels the inner
+  scope and joins it. Scope cancellation force-wakes whatever the
+  dispatcher is parked on: a `ping` receive AND a blocked `events`
+  send alike (a send blocked on a full app channel cannot observe a
+  ping, so the cancel is the guaranteed wakeup — documented runtime
+  semantics). Remaining events drop, but never silently: they are
+  counted into `dropped`, and if a final marker still fits the
+  dispatcher emits it before unwinding.
+
+Either way a normal pump exit cannot hang `run`'s join, and no
+buffered event is lost while the app is still receiving. On the
+outer cancellation path the enclosing scope's own teardown kills
+the dispatcher directly — no grace window, no delivery after the
+scope that owns the tree has closed (widget handles it names would
+already be destroyed).

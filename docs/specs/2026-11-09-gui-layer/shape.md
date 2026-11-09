@@ -92,7 +92,9 @@ Three backends matter:
   buffered `chan Event` (default 256, `gui.set_event_buffer(n)`);
   the app `select`s UI events next to its own channels. Overflow:
   drop-oldest + an `overflow` marker event — input events must not
-  silently vanish.
+  silently vanish. Shutdown: a bounded drain-grace window
+  (`gui.set_drain_grace(d)`) preserves the buffered tail on pump
+  exit; post-exit commands resolve with `gui.err_stopped()`.
 - **Copy at the boundary.** Text getters return owned `str`; no
   borrowed `cstr` aliases cross the public API.
 - **The protocol is the milestone,** not widget count — pilot parity

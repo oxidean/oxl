@@ -135,6 +135,32 @@ can create widgets too, and `attach` can name the returned handle.
 `gui.run` allocates both mailboxes next to `events` and hands them
 to `pump`.
 
+## Shutdown
+
+`CmdBuf` carries a `closed` flag next to the queue, mirroring
+`EventBuf`. After `pump` returns — stop honored or toolkit loop
+ended — `run` sets `closed` under the buf mutex and drains any
+residual `Cmd`s **itself**: every reply-carrying `Cmd` gets
+`CmdResult{e: gui.err_stopped()}` posted to its cap-1 chan, which
+cannot block by construction. A blocked `read`/`new_kind` caller
+therefore always resolves — the app-side receive unwinds with an
+error instead of hanging on a dead pump.
+
+Post-close, `CmdBuf.post` still cannot block, but mutators check
+`closed` under the same mutex before enqueueing:
+
+- reply-carrying calls (`read`, `new_kind`) short-circuit —
+  `gui.err_stopped()` is returned WITHOUT enqueueing, so a handler
+  that fires on a drained `close_requested` tail and calls
+  `entry.text()` or creates a widget gets an error, not a wait;
+- fire-and-forget `Cmd`s (`set_prop`, `attach`, `detach`,
+  `destroy`) are accepted-and-dropped — post-stop mutation is a
+  no-op under the same idempotence rule `destroy` already has.
+
+`gui.err_stopped()` is the sentinel err for "backend loop exited"
+(mirrors `io.eof()`-style sentinels; equality-comparable for
+`if e == gui.err_stopped()`).
+
 ## Prop protocol
 
 `Prop{id: int, val: PropVal}` with `PropVal` a payload enum

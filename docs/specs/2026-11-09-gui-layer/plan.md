@@ -12,12 +12,18 @@ Spec: `shape.md`. Design contracts: `items/backend-protocol.md`,
       `Prop`/`PropVal`, `Event`/`EventData`, own-typed tree, typed
       kind wrappers, `gui.Widget` iface, `gui.append`/`gui.remove`,
       `gui.run`, the `CmdBuf`/`EventBuf` mailbox direction (mutators
-      post + `wake`, `pump` drains on the root task). `mock/`: pure-oxl backend recording protocol calls
+      post + `wake`, `pump` drains on the root task) — `CmdBuf` and
+      `post`/`wake` land here since mutators need them from day one;
+      `try_send` builtin added to the runtime here (the `ping`
+      mechanism depends on it — `select` has receive arms only).
+      `mock/`: pure-oxl backend recording protocol calls
       with a scriptable `pump`. `tests/gui_test.oxl` drives the
       whole surface headless.
       Gate: `oxl test` green on both checkers; zero gtk4 dependency.
 - [not started] **G2 — GTK4 backend** — `extra/gui/gtk` +
-      generalized `gtk_shim.c` from the pilot pattern; events
+      generalized `gtk_shim.c` from the pilot pattern; basic event
+      dispatch lands here (`EventBuf` + drain dispatcher → app chan)
+      since the selftest needs signals reaching the app; events
       marshalled into `Event`; thread-affinity debug assert;
       `examples/gui-todo` re-expressed through `extra/gui`.
       Gate: gtk4-gated build + `--selftest` parity (add/remove,

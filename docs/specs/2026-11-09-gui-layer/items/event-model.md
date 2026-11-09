@@ -40,9 +40,12 @@ Two channels' worth of machinery, split at the backend boundary:
   sends (it is a pool task; blocking is its job).
 
 `eb.post(e)` is the only entry point the backend uses and it can
-NEVER block: lock, evict if needed, append, unlock, try-send `ping`
-(`select { ping <- 1 {} else {} }` — the ping is a nudge, not a
-queue). Eviction on a full buf: scan head→tail for the first
+NEVER block: lock, evict if needed, append, unlock, `try_send(ping)`
+— the ping is a nudge, not a queue. `try_send` is a new builtin
+(nonblocking send returning a flag — `select` has receive arms
+only, so this needs the G1 runtime addition listed in the stage
+plan); cap-1 means a failed send implies a pending signal the
+dispatcher will already consume, so no wake is ever lost. Eviction on a full buf: scan head→tail for the first
 *drop-eligible* event and evict it, incrementing `dropped`, then
 append the incoming event — the incoming event always lands in the
 same post, so capacity-one bufs make progress and there is no
@@ -55,12 +58,13 @@ over the bound for events that must not be lost, and saturation is
 already being signaled via `dropped`.
 
 Overflow reporting: `dropped` is a counter flag, NOT a queue entry.
-When the dispatcher sees `dropped > 0` it emits one synthesized
-`Event{kind: overflow, data: Index(n)}` — n the count lost since
-the last marker — ahead of the next real event, then clears the
-flag. The marker therefore costs no buf slot, can never starve
-delivery at any capacity, and a dropped `clicked` is always visible,
-never silent.
+When the dispatcher is about to emit a marker it first does
+`n := eb.take_dropped()` — read-and-clear under the buf mutex —
+then sends `Event{kind: overflow, data: Index(n)}` ahead of the
+next real event. Drops landing during the blocked marker send are
+counted into the NEXT marker, so accounting never loses increments.
+The marker costs no buf slot, can never starve delivery at any
+capacity, and a dropped `clicked` is always visible, never silent.
 
 Coalescing is backend-defined otherwise; `text_changed` MAY coalesce
 to latest-value inside `post` (payload stays current). FIFO ordering
@@ -83,8 +87,14 @@ blocking that task, and scope cancellation does not interrupt an
 inline foreign call. `gui.run` therefore wires the watcher
 internally — a supervisor task that observes the enclosing scope's
 cancellation and calls `b.stop()` — so plain `scope { gui.run(...) }`
-tears down correctly. The dispatcher lives inside the same scope and
-dies with it; `pump` returning leaves any buffered events for the
-dispatcher to drain or drop — no event is delivered after the scope
-that owns the tree has closed (widget handles it names would
-already be destroyed).
+tears down correctly. Dispatcher lifecycle: `eb` carries a `closed`
+flag next to `dropped` — after `pump` returns (stop honored or the
+toolkit loop ended) `gui.run` sets `closed` and posts a final
+`try_send` ping; the dispatcher drains the remaining buf, emits any
+pending marker, and exits when it sees `closed` with an empty buf,
+and `run` joins it before returning — a normal pump exit can never
+leave the dispatcher parked on `ping` and hang the scope join. On
+the cancellation path the scope's own teardown kills it; `pump`
+returning leaves any buffered events for the dispatcher to drain or
+drop — no event is delivered after the scope that owns the tree has
+closed (widget handles it names would already be destroyed).

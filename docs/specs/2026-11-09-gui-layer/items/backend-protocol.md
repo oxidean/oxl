@@ -104,6 +104,12 @@ struct Cmd {
 }
 
 struct CmdResult { e: err, handle: int, val: PropVal }
+
+`CmdBuf.post` retains an OWNED copy of every `str` inside the `Cmd`
+(prop text, widget strings) at post time: the caller's scope may
+close before `pump` drains the queue, and a queued `Cmd` must never
+alias storage that can die underneath it. Same rule as event
+payloads — the copy boundary is the mailbox, not the pump.
 ```
 
 `reply` carries `CmdResult`: reads fill `val` (the same payload

@@ -1,10 +1,30 @@
 # Backend protocol contract (G1 contract)
 
-The portability seam is one iface. Backends: `extra/gui/mock`
-(pure-oxl, test), `extra/gui/gtk` (GTK4 shim), later a DOM-protocol
-backend. Everything the tree needs from a toolkit fits in seven
-methods; the pilot measured the GTK side of this surface at ~15 C
-functions.
+The portability seam is one iface plus two core-owned mailboxes.
+Backends: `extra/gui/mock` (pure-oxl, test), `extra/gui/gtk` (GTK4
+shim), later a DOM-protocol backend. Everything the tree needs from
+a toolkit fits in seven methods; the pilot measured the GTK side of
+this surface at ~15 C functions.
+
+`EventBuf` and `CmdBuf` are `extra/gui`-core types — mutex-guarded
+lists, not `chan`s — because the boundary needs semantics a chan
+cannot express: event posts can never block `pump` (post is append
++ wake, not send), event eviction removes a mid-queue element, and
+command publication must precede `wake` without ever stalling on a
+full channel. The app-facing `chan Event` still exists — it is fed
+by a dispatcher task inside `gui.run`, not by `pump` (see
+`items/event-model.md`).
+
+```oxl
+// core-owned mailboxes — opaque to backends beyond post/drain
+struct EventBuf { /* mutex-guarded deque, cap, dropped: int,
+                     ping: chan int (cap-1 nudge) */ }
+struct CmdBuf   { /* mutex-guarded list of Cmd */ }
+// EventBuf.post(e) — never blocks (evict + append + ping)
+// EventBuf.drain() — dispatcher-side: buffered events + drop count
+// CmdBuf.post(c) — never blocks (append); caller then wake()s
+// CmdBuf.drain() — pump-side: queued Cmds, oldest-first
+```
 
 ## iface Backend
 
@@ -15,7 +35,7 @@ iface Backend {
     attach(parent: int, child: int)
     detach(parent: int, child: int)
     destroy(h: int)
-    pump(events: chan Event, cmds: chan Cmd)
+    pump(events: EventBuf, cmds: CmdBuf)
     stop()
     wake()                                          // nudge a blocked pump
 }
@@ -45,11 +65,16 @@ entirely above the iface, in the `.oxl` tree.
   dead: `set_prop`/`attach` on a dead handle is a protocol error
   (mock records; gtk debug-asserts). `destroy` itself is idempotent
   on a dead handle — repeated teardown is a no-op, not a trap.
-- `pump` — runs the toolkit loop **on the calling task** (the pinned
-  UI task). Two duties per iteration: decode toolkit signals into
-  `Event` structs posted on `events` (per `items/event-model.md`),
-  AND drain `cmds`, executing each `Cmd` on this task. Returns when
-  `stop` is honored or the toolkit loop ends.
+- `pump` — runs the toolkit loop **on the calling task** (the root
+  task — see the thread rule below). Two duties per iteration:
+  decode toolkit signals into `Event` structs posted via
+  `events.post(e)` — which never blocks, per
+  `items/event-model.md` — AND drain `cmds` (`cmds.drain()` returns
+  the queued `Cmd`s, oldest-first), executing each `Cmd` on this
+  task. Returns when `stop` is honored or the toolkit loop ends.
+  `pump` must never block on `events` or `cmds` themselves; its
+  only waits are the toolkit's own event wait and `reply` sends on
+  cap-1 channels (which cannot block by construction).
 - `stop` — idempotent, safe from any task: asks `pump` to unwind
   and return. Must be callable from a different task than the
   pump-blocked one — a `defer` inside the scope around `gui.run`
@@ -84,17 +109,25 @@ struct CmdResult { e: err, handle: int, val: PropVal }
 `reply` carries `CmdResult`: reads fill `val` (the same payload
 shape properties carry), `new_kind` fills `handle`, and both report
 failure in `e` (`e == nil` on success) — creation failure reaches
-the caller as an error, never as a dead handle.
+the caller as an error, never as a dead handle. The layer
+allocates `reply` as a **cap-1 channel per Cmd**, so `pump`'s reply
+send can never block even if the caller has not reached its
+receive yet.
 
-`button.set_label(s)` on any task = enqueue `Cmd{set_prop, h, ...}`
-+ `b.wake()`; `pump` applies it on the UI thread. Reads
-(`entry.text()`) enqueue a `read` Cmd carrying a reply chan and
+`button.set_label(s)` on any task = `cmds.post(Cmd{set_prop, h, ...})`
++ `b.wake()`; `pump` applies it on the UI thread. `CmdBuf.post`
+appends under a mutex — **it cannot block** — so publication always
+completes before `wake` is called, and `wake` is called
+unconditionally after every post: there is no
+full-channel-before-wake interleaving for the pump to miss. Reads
+(`entry.text()`) post a `read` Cmd carrying its reply chan and
 block-receive — the reply crosses the boundary as an owned `str`,
-satisfying the copy rule. `new_kind` uses the same shape: the
+satisfying the copy rule, and the app-side wait is an ordinary chan
+op (suspendable, cancellable). `new_kind` uses the same shape: the
 caller block-receives `CmdResult{handle: h}` (or `e`) — handlers
 can create widgets too, and `attach` can name the returned handle.
-`gui.run` allocates the `cmds` chan next to `events` and hands
-both to `pump`.
+`gui.run` allocates both mailboxes next to `events` and hands them
+to `pump`.
 
 ## Prop protocol
 
@@ -107,13 +140,20 @@ serializes to DOM attribute/property pairs without loss.
 
 ## Thread rule
 
-Backend calls happen on the task that ran `gui.run` — same rule GTK
-enforces natively, applied uniformly so every backend shares one
-contract. A backend SHOULD debug-assert thread affinity on `new`/
-`set_prop`/`pump`. App logic on other tasks reaches the UI thread
-through channels — events arrive on `events`, mutations return via
-`cmds` (the command direction above). Widget fns are safe from any
-task precisely because they only enqueue.
+`gui.run` MUST be called on the **root task** — the task executing
+`main`'s call chain. This is a mechanism, not a convention: the
+runtime drives the root task on the process's main OS thread via
+its own external park loop (`rt_run_root`); it is never submitted
+to the worker pool, so it cannot migrate across a channel
+suspension the way a spawned task can. Root-task-only IS the pin —
+and it matches GTK's own hard requirement (a main-thread main loop)
+exactly. Calling `gui.run` from a `go`/`spawn`ed task is a contract
+violation; a backend SHOULD debug-assert thread affinity on `new`/
+`set_prop`/`pump` to catch it. `stop`, `wake`, `CmdBuf.post`, and
+`EventBuf.post` are explicitly safe from ANY task — the watcher and
+dispatcher use them, and widget mutators do too: app logic on other
+tasks reaches the UI thread through the mailboxes alone. Widget fns
+are safe from any task precisely because they only append.
 
 ## String ownership
 

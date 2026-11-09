@@ -26,9 +26,12 @@ git-index publishing — that this layer is the first real consumer of.
 - **Events are channel values.** The backend posts `Event` structs to
   a buffered `chan Event` the app `select`s on next to its own
   channels. Callback-style `gui_connect` stays backend-internal.
-- **UI-thread convention:** the task that calls `gui.run` owns the
-  toolkit — documented as sharply as GTK's own rule; a `pin`
-  primitive is a *revisitable* non-goal for this milestone.
+- **UI-thread rule:** `gui.run` must be called on the **root task**
+  (the task executing `main`'s call chain). The runtime drives that
+  task on the process's main OS thread via its own park loop and
+  never pool-schedules it — root-task-only is a real pin mechanism,
+  not a documented convention, and it matches GTK's main-thread
+  requirement exactly.
 - **Narrow backend protocol.** Typed public setters
   (`button.set_label`) desugar to `set_prop(h, Prop{id, val})` on the
   backend; `Prop` serializes toward DOM attributes.
@@ -57,7 +60,7 @@ iface Backend {
     attach(parent: int, child: int)
     detach(parent: int, child: int)
     destroy(h: int)
-    pump(events: chan Event, cmds: chan Cmd)        // blocks; pinned task
+    pump(events: EventBuf, cmds: CmdBuf)            // blocks; root task only
     stop()                                          // asks pump to return
     wake()                                          // nudge a blocked pump
 }
@@ -66,6 +69,8 @@ enum CmdKind { new_kind, set_prop, attach, detach, destroy, read }
 struct Cmd       { kind: CmdKind, target: int, widget: WidgetKind,
                    prop: Prop, arg: int, reply: chan CmdResult }
 struct CmdResult { e: err, handle: int, val: PropVal }
+// reply is a cap-1 chan allocated per Cmd — pump's reply send
+// can never block waiting for the caller to receive
 
 struct Prop   { id: int, val: PropVal }             // tagged union
 struct Event  { kind: EventKind, target: int, data: EventData }
@@ -83,10 +88,15 @@ enum EventKind  { clicked, activated, text_changed, close_requested,
 // common `gui.Widget` iface for kind-polymorphic app code
 // tree: gui.append(parent, child) consumes child (own move into
 // the tree); gui.remove(parent, child) detaches + destroys
-// run: gui.run(b: Backend, app: fn(chan Event)) — the calling task
-// is pinned; run allocates `cmds` next to `events`, and an internal
-// watcher relays scope cancellation to b.stop() — a defer on the
-// blocked task can't run while pump blocks
+// EventBuf / CmdBuf: core-owned mutex-guarded mailboxes (NOT chans)
+// — pump posts via eb.post / drains via cb.drain(), both of which
+// never block; a dispatcher task inside run drains eb onto the
+// app-facing chan Event, synthesizing the overflow marker from a
+// dropped-count flag (never a queue entry)
+// run: gui.run(b: Backend, app: fn(chan Event)) — must be called on
+// the root task; run allocates the mailboxes + `events`, and an
+// internal watcher relays scope cancellation to b.stop() — a defer
+// on the blocked task can't run while pump blocks
 ```
 
 ## Acceptance criteria
@@ -103,7 +113,8 @@ enum EventKind  { clicked, activated, text_changed, close_requested,
   churn leak check) wherever gtk4 resolves.
 - **AC4 (G3):** events flow through `chan Event` + `select`; a demo
   mixes UI events with a `time`/`chan` producer on one select loop;
-  overflow policy verified (drop-oldest + `overflow` marker event).
+  overflow policy verified (drop-oldest among drop-eligible +
+  synthesized `overflow` marker event).
 - **AC5 (G4):** widget tranche = pilot parity: window, vbox/hbox,
   label, button, entry, list, scrolled — plus whatever the reference
   app needs; each kind's Prop coverage documented.
@@ -119,8 +130,9 @@ enum EventKind  { clicked, activated, text_changed, close_requested,
 
 ## Non-goals (explicit)
 
-- No `pin`/UI-thread language primitive (convention documented;
-  revisited at G6 — see brainstorm G-a).
+- No `pin`/UI-thread language primitive — the root-task rule IS the
+  mechanism (the root task cannot migrate); revisited at G6 only if
+  non-root GUI driving is ever wanted (see brainstorm G-a).
 - No dialogs/modals, menus, IME, a11y, HiDPI model beyond raw pixels,
   canvas/draw surface. Each is parked with a reopen trigger (a11y:
   DOM backend work).
@@ -136,8 +148,9 @@ enum EventKind  { clicked, activated, text_changed, close_requested,
 - Scope-arena capture dangle: borrowed data captured into a closure
   that escapes to the backend UAFs on scope close — documented rule +
   the chan-event model makes handler escapes unnecessary by design.
-- GTK thread-affinity vs `spawnBlocking`: `pump` must never be
-  pool-scheduled; convention docs + a debug assert in the backend.
+- GTK thread-affinity vs the worker pool: `pump` must only ever run
+  on the root task — structurally guaranteed by the `gui.run`
+  root-task rule + a debug assert in the backend.
 - Enum/union expressiveness: `PropVal` tagged union leans on v0.2
   enum/match — if payload variety outgrows it, the fallback is
   per-kind Prop/EventData structs (noted in plan).

@@ -11,8 +11,8 @@ Spec: `shape.md`. Design contracts: `items/backend-protocol.md`,
       `gui.oxl`: `Backend` iface, `WidgetKind`/`EventKind`,
       `Prop`/`PropVal`, `Event`/`EventData`, own-typed tree, typed
       kind wrappers, `gui.Widget` iface, `gui.append`/`gui.remove`,
-      `gui.run`, the `Cmd` channel direction (mutators enqueue,
-      `pump` executes on the pinned task). `mock/`: pure-oxl backend recording protocol calls
+      `gui.run`, the `CmdBuf`/`EventBuf` mailbox direction (mutators
+      post + `wake`, `pump` drains on the root task). `mock/`: pure-oxl backend recording protocol calls
       with a scriptable `pump`. `tests/gui_test.oxl` drives the
       whole surface headless.
       Gate: `oxl test` green on both checkers; zero gtk4 dependency.
@@ -24,13 +24,13 @@ Spec: `shape.md`. Design contracts: `items/backend-protocol.md`,
       churn RSS); copy-at-boundary verified; headless CI
       compile-only.
 - [not started] **G3 — chan event model** — `gui.run` allocates the
-      buffered `chan Event` and the `cmds` chan; backend `pump`
-      posts via try-send; drop-oldest among drop-eligible +
-      `overflow` marker on saturation (protected events degrade to
-      blocking send); internal `stop`-watcher for scope teardown;
+      buffered `chan Event`, the `EventBuf`/`CmdBuf` mailboxes, and
+      the drain dispatcher; `eb.post` evicts drop-oldest among
+      drop-eligible + counts drops; dispatcher synthesizes the
+      `overflow` marker; internal `stop`-watcher for scope teardown;
       demo mixing UI events with a timer chan on one `select`.
-      Gate: select-composability + overflow policy proven in
-      selftests.
+      Gate: select-composability + overflow policy (incl. cap-1 and
+      all-protected cases) proven in selftests.
 - [not started] **G4 — widget tranche** — pilot parity: window,
       vbox/hbox, label, button, entry, list, scrolled + whatever the
       reference app needs; per-kind Prop coverage table in
@@ -60,6 +60,7 @@ G5. Within a stage, mock tests and backend work split cleanly.
   concrete prop list is written; per-kind structs is the documented
   fallback.
 - `gui.run` inside a cancellable scope needs the `stop()` exit path
-  documented and tested.
+  documented and tested; root-task-only invocation needs the
+  debug-assert verified (call from a spawned task must fail loudly).
 - GTK availability: only gtk4-present environments run backend
   selftests; mock verification never blocks on a display.

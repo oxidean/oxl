@@ -173,7 +173,8 @@ jobs:
           git -c user.name="github-actions[bot]" \
               -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
               commit -am "chore(release): bump docs manifest to $ver"
-          git remote set-url origin "https://x-access-token:*** github.repository }}.git"
+          git remote set-url origin "https://github.com/${{ github.repository }}.git"
+          gh auth setup-git --hostname github.com
           git fetch origin main -q
           # A previous attempt may have merged the bump but died before
           # tagging — reuse the commit that set the version rather than

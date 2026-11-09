@@ -19,10 +19,23 @@ by a dispatcher task inside `gui.run`, not by `pump` (see
 // core-owned mailboxes — opaque to backends beyond post/drain
 struct EventBuf { /* mutex-guarded deque, cap, dropped: int,
                      ping: chan int (cap-1 nudge) */ }
-struct CmdBuf   { /* mutex-guarded list of Cmd */ }
+struct CmdBuf   { /* mutex-guarded BOUNDED list of Cmd: cap,
+                     closed flag, parked-poster wakeup */ }
 // EventBuf.post(e) — never blocks (evict + append + ping)
 // EventBuf.drain() — dispatcher-side: buffered events + drop count
-// CmdBuf.post(c) — never blocks (append); caller then wake()s
+// CmdBuf.post(c) — appends under the mutex; parks ONLY while the
+// buf is full (bounded admission = backpressure — commands are
+// never dropped: a lost `destroy` leaks a widget, a lost reply
+// carrier wedges its caller). Ordering stays FIFO either way.
+// Cap is fixed at `gui.run` time (default 512;
+// `gui.set_cmd_buffer(n)` before `run`). Blocking here cannot
+// deadlock: the only drainer is `pump` on the root task, which
+// never posts to `cmds`, so a full buf always drains. A poster
+// cancelled before its enqueue lands keeps its `own Cmd` — the
+// enqueue is atomic under the buf mutex, so a command is either
+// queued or never was; setting `closed` force-wakes parked
+// posters, which then fail fast per the post-stop rule below.
+// Caller then wake()s.
 // CmdBuf.drain() — pump-side: queued Cmds, oldest-first
 ```
 
@@ -50,11 +63,11 @@ entirely above the iface, in the `.oxl` tree.
 
 - `new` — create a native object of `kind`, applying `props` in
   order; returns its handle. Not yet attached anywhere.
-  Creation happens during `gui.run` setup on the pinned task.
+  Creation happens during `gui.run` setup on the root task.
 - `set_prop` — mutate one property post-creation. `Prop{id, val}`
   where `id` is a protocol-assigned property id and `val` a
-  `PropVal` payload. Unknown id = backend-defined trap (mock
-  records it; gtk asserts in debug).
+  `PropVal` payload. Unknown id = protocol violation (mock
+  records it; gtk reports it via the dev gate — see below).
 - `attach` / `detach` — parent-edge management ONLY. `detach` never
   destroys: the single destruction rule is "`destroy` releases, and
   only `destroy`". `gui.remove` = `detach` then `destroy`, always —
@@ -63,7 +76,7 @@ entirely above the iface, in the `.oxl` tree.
   the toolkit's container ops (gtk: `box_append`, `listbox_insert`, …).
 - `destroy` — final teardown. Backends define a destroyed handle as
   dead: `set_prop`/`attach` on a dead handle is a protocol error
-  (mock records; gtk debug-asserts). `destroy` itself is idempotent
+  (mock records; gtk reports it via the dev gate). `destroy` itself is idempotent
   on a dead handle — repeated teardown is a no-op, not a trap.
   **Handles are never reissued within a `gui.run` session**: a
   backend allocates handles monotonically (or otherwise guarantees
@@ -96,7 +109,7 @@ entirely above the iface, in the `.oxl` tree.
 ## The command direction
 
 Events flow out on `events`; mutations flow back in on `cmds`. The
-thread rule — only the pinned task may touch the toolkit — means an
+thread rule — only the root task may touch the toolkit — means an
 event handler running on an app task can never call the backend
 directly. So **widget mutators enqueue, they do not call**:
 
@@ -109,7 +122,7 @@ struct Cmd {
     widget: WidgetKind,      // new_kind only
     prop: Prop,              // set_prop only
     arg: int,                // attach/detach: the child handle
-    reply: chan CmdResult    // new_kind + read: the response channel
+    reply: chan own CmdResult // new_kind + read: cap-1 response chan
 }
 
 struct CmdResult { e: err, handle: int, val: PropVal }
@@ -128,20 +141,33 @@ alias storage that can die underneath it. Same rule as event
 payloads — the copy boundary is the mailbox, not the pump.
 ```
 
-`reply` carries `CmdResult`: reads fill `val` (the same payload
-shape properties carry), `new_kind` fills `handle`, and both report
+`reply` is a **`chan own CmdResult`** — the same typed-channel
+feature the app-facing `events` chan uses, so the struct payload
+crosses with its ownership spelled out: `pump` allocates an owned
+`CmdResult`, `send` moves it in, and the caller's `recv` takes
+ownership (an ordinary drop after it reads `handle`/`val`/`e`). If
+the caller's scope is already gone, the reply chan's teardown
+reclaims the undelivered result under the `chan own T` reclaim
+rule — no leak in either direction. Cancellation: the caller's
+block-receive is an ordinary suspendable chan op, so a cancelled
+waiter simply never receives; the queued `CmdResult` is reclaimed
+by that same rule. reads fill `val` (the same payload shape
+properties carry), `new_kind` fills `handle`, and both report
 failure in `e` (`e == nil` on success) — creation failure reaches
 the caller as an error, never as a dead handle. The layer
-allocates `reply` as a **cap-1 channel per Cmd**, so `pump`'s reply
-send can never block even if the caller has not reached its
+allocates `reply` as a **cap-1 channel per Cmd**, so `pump`'s
+reply send can never block even if the caller has not reached its
 receive yet.
 
 `button.set_label(s)` on any task = `cmds.post(Cmd{set_prop, h, ...})`
 + `b.wake()`; `pump` applies it on the UI thread. `CmdBuf.post`
-appends under a mutex — **it cannot block** — so publication always
-completes before `wake` is called, and `wake` is called
-unconditionally after every post: there is no
-full-channel-before-wake interleaving for the pump to miss. Reads
+appends under a mutex and parks only while the buf is full (see
+above) — so publication always completes before `wake` is called,
+and `wake` is called unconditionally after every post: there is no
+full-channel-before-wake interleaving for the pump to miss, and a
+poster that never lands its enqueue (cancelled while parked, or
+`closed`) never wakes either, which is correct — there is nothing
+queued for `pump` to see. Reads
 (`entry.text()`) post a `read` Cmd carrying its reply chan and
 block-receive — the reply crosses the boundary as an owned `str`,
 satisfying the copy rule, and the app-side wait is an ordinary chan
@@ -162,7 +188,8 @@ cannot block by construction. A blocked `read`/`new_kind` caller
 therefore always resolves — the app-side receive unwinds with an
 error instead of hanging on a dead pump.
 
-Post-close, `CmdBuf.post` still cannot block, but mutators check
+Post-close, `CmdBuf.post` never parks: `closed` is set under the
+buf mutex and force-wakes every parked poster, and mutators check
 `closed` under the same mutex before enqueueing:
 
 - reply-carrying calls (`read`, `new_kind`) short-circuit —
@@ -237,11 +264,11 @@ fire-and-forget `Cmd`s (`set_prop`, `attach`, `detach`, `destroy`,
 `dismiss_close`) are accepted-and-dropped — there is no reply chan
 to carry an error, and the caller-facing outcome matches the
 post-stop contract exactly (the mock still records the dead-target
-call as a protocol violation for diagnostics, and gtk
-debug-asserts; the app simply cannot observe it either way). A
+call as a protocol violation for diagnostics, and gtk reports it
+via the dev gate; the app simply cannot observe it either way). A
 `close_requested` emitted for a handle the backend already knows
 is dead is likewise a backend-side protocol error (mock records;
-gtk debug-asserts); the live-then-removed interleave is the only
+gtk reports it via the dev gate); the live-then-removed interleave is the only
 legitimate dead-target delivery, and the contract makes it
 harmless by construction.
 
@@ -264,8 +291,20 @@ to the worker pool, so it cannot migrate across a channel
 suspension the way a spawned task can. Root-task-only IS the pin —
 and it matches GTK's own hard requirement (a main-thread main loop)
 exactly. Calling `gui.run` from a `go`/`spawn`ed task is a contract
-violation; a backend SHOULD debug-assert thread affinity on `new`/
-`set_prop`/`pump` to catch it. `stop`, `wake`, `CmdBuf.post`, and
+violation; a backend SHOULD check thread affinity on `new`/
+`set_prop`/`pump` and report it via the dev gate to catch it.
+
+Protocol violations are development aids, never runtime traps:
+`gui.debug_protocol(true)` (off by default) turns every recorded
+violation into a hard assert during backend development; with the
+gate off — the only mode apps and CI ship — a queued dead-target or
+unknown-id command is dropped after being counted on the backend's
+violation counter (mock exposes it for test asserts; gtk logs to
+stderr), so a late setter against a destroyed widget can never
+terminate the process. This narrows nothing about the contract
+itself — the commands are still errors — it only pins the
+*response*: count and drop, nonfatally, unless the dev gate asked
+for the trap. `stop`, `wake`, `CmdBuf.post`, and
 `EventBuf.post` are explicitly safe from ANY task — the watcher and
 dispatcher use them, and widget mutators do too: app logic on other
 tasks reaches the UI thread through the mailboxes alone. Widget fns

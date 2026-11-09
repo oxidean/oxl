@@ -51,16 +51,23 @@ Depends on: G1.
 
 Depends on: G2 (a real backend to post events).
 
-- `gui.run(b, app)`: allocates `chan Event` (cap 256 default,
-  `gui.set_event_buffer(n)`), hands it to `b.pump` and to `app`.
-- Backend `pump`: toolkit callbacks marshal → `Event`, `send` on the
-  chan (non-blocking try-send; on full: drop oldest, mark next
-  `Event.kind = overflow`).
+- `gui.run(b, app)`: allocates `chan own Event` (cap 256 default,
+  `gui.set_event_buffer(n)`), the `EventBuf`/`CmdBuf` mailboxes, and
+  the drain dispatcher; spawns `app`; runs `b.pump` inline on the
+  root task.
+- Backend `pump`: toolkit callbacks marshal → `Event`, `eb.post(e)`
+  on the `EventBuf` (never blocks — lock, evict the first
+  drop-eligible entry on full, append, `try_send` ping). A
+  dispatcher task drains the buf onto `events` with blocking sends
+  and synthesizes `Event{kind: overflow, Index(n)}` from the
+  `dropped` count; `close_requested` is never drop-eligible while
+  its target lives (per-handle `close_pending` dedup).
 - Demo: `examples/gui-clock` or extend reference — `select` arm over
   `events` + a `time.tick`-style producer chan on one loop.
 - Gate: selftest proves select-composability (UI click and timer
-  interleave on one loop); overflow test: saturated queue emits the
-  marker.
+  interleave on one loop); overflow tests: saturated buf emits the
+  marker; cap-1 and all-protected bufs still make progress;
+  `close_pending` exercised post → delivery → `dismiss_close`.
 
 ## G4 — widget tranche (AC5)
 
@@ -118,7 +125,11 @@ gtk-backend work split cleanly across files.
 - GTK availability: only gtk4-present environments run the backend
   selftest; everything else is mock-verified — the milestone never
   blocks on a display.
-- The `pump` blocking contract interacts with `select`: app code
-  must NOT call `gui.run` inside a scope that expects to cancel the
-  pump — document the exit path (backend-provided `stop`/quit
-  event).
+- `gui.run` inside a cancellable scope is a SUPPORTED path, not a
+  hazard: `run` wires an internal watcher that relays the enclosing
+  scope's cancellation to `b.stop()`, so `scope { gui.run(...) }`
+  tears down cleanly — verified by a mock-driven cancellation test.
+  What teardown cannot ride is `defer` on the `gui.run` task itself
+  (it can't fire while `pump` blocks that task) — the watcher exists
+  precisely for that; `stop`/a quit `Cmd` remains the in-band exit
+  path.

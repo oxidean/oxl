@@ -26,7 +26,7 @@ reference app needs.
   scope-arena data.
 - Design forks owner-decided (WI-0004 brainstorm, 2026-11-08):
   retained widget tree over backend iface; own-tree scope-bound
-  ownership; `chan Event` + `select` events; retained-widget backend
+  ownership; `chan own Event` + `select` events; retained-widget backend
   protocol; `extra/` packaging.
 - Spec-level forks resolved in WI-0005 brainstorm: UI-thread
   convention over primitive; single buffered event chan with
@@ -44,7 +44,7 @@ iface Backend {
     attach(parent: int, child: int)
     detach(parent: int, child: int)
     destroy(h: int)
-    pump(events: EventBuf, cmds: CmdBuf)            // blocks; pinned task
+    pump(events: EventBuf, cmds: CmdBuf)            // blocks; runs inline on the root task
     stop()                                          // asks pump to return
     wake()                                          // nudge a blocked pump
 }
@@ -70,7 +70,7 @@ Two mailboxes cross the iface: `events` (an `EventBuf`) carries
 `Event`s out to a dispatcher, which forwards them onto the
 app-facing `chan own Event`; `cmds` (a `CmdBuf`) carries `Cmd`s
 back in — widget mutators enqueue and `pump` executes them on the
-pinned task, which is how an event handler on an app task can
+root task, which is how an event handler on an app task can
 update a widget without breaking the thread rule (see
 `items/backend-protocol.md`). Mailboxes rather than chans because
 the boundary needs semantics a chan cannot express (never-blocking

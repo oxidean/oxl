@@ -24,7 +24,7 @@ git-index publishing — that this layer is the first real consumer of.
   cancel give free teardown. `gui.Widget` is the iface for
   user-visible widget *kinds*; the tree itself is own-typed.
 - **Events are channel values.** The backend posts `Event` structs to
-  a buffered `chan Event` the app `select`s on next to its own
+  a buffered `chan own Event` the app `select`s on next to its own
   channels. Callback-style `gui_connect` stays backend-internal.
 - **UI-thread rule:** `gui.run` must be called on the **root task**
   (the task executing `main`'s call chain). The runtime drives that
@@ -65,9 +65,10 @@ iface Backend {
     wake()                                          // nudge a blocked pump
 }
 
-enum CmdKind { new_kind, set_prop, attach, detach, destroy, read }
+enum CmdKind { new_kind, set_prop, attach, detach, destroy, read,
+               dismiss_close }
 struct Cmd       { kind: CmdKind, target: int, widget: WidgetKind,
-                   prop: Prop, arg: int, reply: chan CmdResult }
+                   prop: Prop, arg: int, reply: chan own CmdResult }
 struct CmdResult { e: err, handle: int, val: PropVal }
 // reply is a cap-1 chan allocated per Cmd — pump's reply send
 // can never block waiting for the caller to receive
@@ -91,12 +92,13 @@ enum EventKind  { clicked, activated, text_changed, close_requested,
 // EventBuf / CmdBuf: core-owned mutex-guarded mailboxes (NOT chans)
 // — pump posts via eb.post / drains via cb.drain(), both of which
 // never block; a dispatcher task inside run drains eb onto the
-// app-facing chan Event, synthesizing the overflow marker from a
+// app-facing chan own Event, synthesizing the overflow marker from a
 // dropped-count flag (never a queue entry)
-// run: gui.run(b: Backend, app: fn(chan Event)) — must be called on
-// the root task; run allocates the mailboxes + `events`, and an
-// internal watcher relays scope cancellation to b.stop() — a defer
-// on the blocked task can't run while pump blocks
+// run: gui.run(b: Backend, app: fn(chan own Event)) — must be called
+// on the root task; run allocates the mailboxes + `events`, spawns
+// `app` and the dispatcher, then calls `pump` INLINE on that same
+// root task; an internal watcher relays scope cancellation to
+// b.stop() — a defer on the blocked task can't run while pump blocks
 ```
 
 ## Acceptance criteria
@@ -111,7 +113,7 @@ enum EventKind  { clicked, activated, text_changed, close_requested,
   `gui_shim.c`; the todo pilot **re-expressed through `extra/gui`**
   builds and passes the same selftest assertions (real GTK signals,
   churn leak check) wherever gtk4 resolves.
-- **AC4 (G3):** events flow through `chan Event` + `select`; a demo
+- **AC4 (G3):** events flow through `chan own Event` + `select`; a demo
   mixes UI events with a `time`/`chan` producer on one select loop;
   overflow policy verified (drop-oldest among drop-eligible +
   synthesized `overflow` marker event).

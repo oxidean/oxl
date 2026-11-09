@@ -28,15 +28,21 @@ against the handles its typed wrappers hold.
 Two channels' worth of machinery, split at the backend boundary:
 
 - **App-facing:** `gui.run(b, app)` allocates `chan own Event` (cap
-  256 default; `gui.set_event_buffer(n)` before `run` for control)
-  then spawns the `pump`
-  task BEFORE invoking `app(events)` — the ordering is required, not
-  incidental: the pump must already be servicing `CmdBuf` (in
-  particular `new_kind` replies) while the callback runs, since the
-  app fn creates widgets synchronously inside it. `app(events)` runs
-  typically inside the app's `scope`, so
-  the app fn can `go` workers that `select` on it. This chan is the
-  ONLY event channel user code sees. `chan own Event` is a **typed
+  256 default; `gui.set_event_buffer(n)` before `run` for control),
+  spawns `app` as a task inside `run`'s inner scope, then calls
+  `b.pump(events_buf, cmds_buf)` **inline on the root task** — the
+  same task `gui.run` was called on. This is required, not
+  incidental: the root task is the only one the runtime pins to the
+  main OS thread (a spawned `pump` could pool-schedule onto a worker
+  and break the toolkit's thread rule), and running `pump` inline is
+  also what keeps the app's synchronous widget creation working —
+  `app` posts `new_kind` and blocks on its reply while the root task
+  is already inside `pump`'s `CmdBuf` drain, so the request is
+  serviced and the reply lands. `app(events)` returning does NOT end
+  the session — the GUI lives until `pump` exits; `app` is only the
+  startup callback that builds the tree and `go`s the workers that
+  `select` on it. This chan is the ONLY event channel user code
+  sees. `chan own Event` is a **typed
   channel** — a language addition this spec requires (see *Language
   additions* below): `send` moves the `own Event` pointer word,
   `recv` and `select` arm bindings come back typed `own Event`.
@@ -44,8 +50,10 @@ Two channels' worth of machinery, split at the backend boundary:
   `gui.run` also allocates an `EventBuf` — a core-owned bounded deque
   guarded by a `sync` mutex, carrying a `dropped` count and a cap-1
   `ping` chan — and hands it to `pump`. A dispatcher task spawned by
-  `gui.run` drains the buf onto `events` with ordinary blocking
-  sends (it is a pool task; blocking is its job).
+  `gui.run` into the same inner scope drains the buf onto `events`
+  with ordinary blocking sends (it is a pool task; blocking is its
+  job). `pump` itself is never spawned — it IS `gui.run`'s calling
+  task, per the thread rule.
 
 `eb.post(e)` is the only entry point the backend uses and it can
 NEVER block: lock, evict if needed, append, unlock, `try_send(ping)`
@@ -175,8 +183,17 @@ its first selftest):
   payload against `T` and still moves `own` semantics; `recv` and
   `select` arm bindings yield `own T`. Bare `chan` keeps its
   current word/`int` semantics so existing code is untouched.
-  Runtime representation is unchanged (words end to end) — this is
-  a parser + both-checkers feature, not a runtime one.
+  Word-sized representation is unchanged end to end — but owned
+  payload cleanup is NOT free, so this is a parser + both-checkers
+  + small-runtime feature: `chan own T` creation registers an
+  element destructor on the channel object (codegen emits a
+  `drop T` thunk per instantiated `T`; `rt` stores a `drop_elem`
+  fn pointer on the channel — bare `chan` stores none), and the
+  channel-teardown, `close`-drain, and cancelled-`recv` paths
+  invoke it exactly once per unreceived payload per the
+  cancelled-send contract below. Without that metadata the
+  unread-tail reclaim rule could not free payload contents, so
+  G1's scope is the type surface AND the destructor plumbing.
 - **`try_send(chan, v) -> bool`** — nonblocking send; `false`
   means full. `select` has receive arms only, so the EventBuf
   `ping` nudge and cap-1 reply channels need this primitive.

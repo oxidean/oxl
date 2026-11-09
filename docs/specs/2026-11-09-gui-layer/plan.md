@@ -4,6 +4,9 @@ Spec: `shape.md`. Design contracts: `items/backend-protocol.md`,
 `items/event-model.md`. Working artifacts: WI-0005 under
 `.ox-agent/work/`. Every stage is a PR through the review loop
 (approval + green CI); every stage lands with the suite green.
+Automatic reviews are disabled repo-wide — request a pass manually
+with `@coderabbitai review` on each stage PR after pushing the head
+you want verdicted, and again after the last fix commit.
 
 - [in progress] **G0 — spec** — this directory, WI-0005 artifacts,
       ADR for the six spec-level forks. *(this PR)*
@@ -20,11 +23,13 @@ Spec: `shape.md`. Design contracts: `items/backend-protocol.md`,
       with a scriptable `pump`. `tests/gui_test.oxl` drives the
       whole surface headless.
       Language additions land here so G2's app chan is typed from
-      its first selftest (parser + both checkers, runtime
-      representation unchanged): `chan own T` — `send` type-checks
-      the payload, `recv`/`select` bindings yield `own T`, bare
-      `chan` unchanged — plus the cancelled-send ownership contract
-      and `chan own T` teardown reclaiming buffered payloads, per
+      its first selftest (parser + both checkers + a small runtime
+      element-drop hook — word representation unchanged): `chan own
+      T` — `send` type-checks the payload, `recv`/`select` bindings
+      yield `own T`, bare `chan` unchanged — plus a `drop_elem`
+      destructor registered on owned channels so the cancelled-send
+      ownership contract and `chan own T` teardown reclaim of
+      buffered payloads have the metadata they need, per
       `items/event-model.md`.
       Gate: `oxl test` green on both checkers; zero gtk4 dependency;
       typed-chan parity between Rust and self-hosted checkers.

@@ -8,11 +8,16 @@ Milestone G builds the charter's path (b): a portable widget layer in
 `.oxl` under `extra/gui`, over a `gui.Backend` iface (new/set_prop/
 attach/detach/destroy/pump/stop). Spec-level forks resolved:
 
-1. **UI-thread convention, not a language primitive** — the task that
-   calls `gui.run` owns the toolkit; documented as sharply as GTK's
-   own rule. A `pin` primitive stays parked and is revisited at G6
-   with two backends' evidence. Reversible either way.
-2. **Single buffered `chan Event`, app-side dispatch** — events are
+1. **UI-thread convention, not a language primitive** — the **root
+   task** (the one executing `main`'s call chain) must call
+   `gui.run`; it alone owns the toolkit. This is a mechanism, not a
+   documented convention: the runtime pins the root task to the main
+   OS thread and never pool-schedules it, while spawned tasks CAN
+   migrate onto workers — so "the calling task" would be wrong, and
+   a `go`/`spawn`ed `gui.run` is a contract violation backends check
+   via the dev gate. A `pin` primitive stays parked and is revisited
+   at G6 with two backends' evidence. Reversible either way.
+2. **Single buffered `chan own Event`, app-side dispatch** — events are
    ordinary channel values `select`ed next to app channels; overflow
    policy is drop-oldest + an `overflow` marker event (input events
    never vanish silently).
@@ -31,7 +36,7 @@ attach/detach/destroy/pump/stop). Spec-level forks resolved:
    bug-breeding place).
 7. **Commands are channel values too** (added at review) — events
    flow out on `events`; mutations flow back on `cmds`, a second
-   chan the `pump` drains on the pinned task. Widget mutators only
+   chan the `pump` drains on the root task. Widget mutators only
    enqueue; reads are `Cmd`s carrying a reply chan. This resolves
    the review-caught gap where the thread rule left event handlers
    no legal way to mutate widgets. Related fixes: `detach` never
@@ -45,7 +50,7 @@ attach/detach/destroy/pump/stop). Spec-level forks resolved:
 
 - Paradigm-level forks were already owner-decided (WI-0004,
   2026-11-08): retained widget tree over backend iface; own-tree
-  scope-bound ownership with `gui.Widget` for kinds; `chan Event`
+  scope-bound ownership with `gui.Widget` for kinds; `chan own Event`
   events; retained-widget backend protocol; `extra/` packaging.
 - The pilot (`docs/gui-pilot.md`) measured the seam: ~15 C functions
   per macro-heavy toolkit, `{env,fp}` closures as the event
@@ -58,7 +63,7 @@ attach/detach/destroy/pump/stop). Spec-level forks resolved:
 ## Consequences
 
 - `gui.run` + `backend.stop()` is the documented enter/exit pair for
-  the pinned task; scope cancellation reaches `pump` through
+  the root task; scope cancellation reaches `pump` through
   `gui.run`'s internal watcher task — a `defer` on the pump-blocked
   task cannot run while it blocks (see
   `docs/specs/2026-11-09-gui-layer/items/event-model.md`).

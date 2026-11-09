@@ -49,6 +49,14 @@ and their observable behavior must match: same diagnostics byte-for-byte
 touch the checker, run the diag corpus; when you touch codegen, run the
 self-compile comparison. `tests/run.sh` covers both.
 
+## Pull requests
+
+Every PR runs the review loop: CodeRabbit approval, zero unresolved
+threads, and green CI is the merge bar. Automatic reviews are off
+repo-wide (`.coderabbit.yaml`), so request a pass manually — comment
+`@coderabbitai review` on the PR after pushing the head you want
+verdicted, and again after the last fix commit.
+
 ## Commits
 
 - Subjects are SemVer-prefixed: `type(scope): subject` — types

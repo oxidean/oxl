@@ -57,9 +57,15 @@ iface Backend {
     attach(parent: int, child: int)
     detach(parent: int, child: int)
     destroy(h: int)
-    pump(events: chan Event)                        // blocks; pinned task
+    pump(events: chan Event, cmds: chan Cmd)        // blocks; pinned task
     stop()                                          // asks pump to return
+    wake()                                          // nudge a blocked pump
 }
+
+enum CmdKind { new_kind, set_prop, attach, detach, destroy, read }
+struct Cmd       { kind: CmdKind, target: int, widget: WidgetKind,
+                   prop: Prop, arg: int, reply: chan CmdResult }
+struct CmdResult { e: err, handle: int, val: PropVal }
 
 struct Prop   { id: int, val: PropVal }             // tagged union
 struct Event  { kind: EventKind, target: int, data: EventData }
@@ -78,7 +84,9 @@ enum EventKind  { clicked, activated, text_changed, close_requested,
 // tree: gui.append(parent, child) consumes child (own move into
 // the tree); gui.remove(parent, child) detaches + destroys
 // run: gui.run(b: Backend, app: fn(chan Event)) — the calling task
-// is pinned; backend.stop() unwedges pump for scope teardown
+// is pinned; run allocates `cmds` next to `events`, and an internal
+// watcher relays scope cancellation to b.stop() — a defer on the
+// blocked task can't run while pump blocks
 ```
 
 ## Acceptance criteria

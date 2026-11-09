@@ -65,11 +65,14 @@ Depends on: G1.
 Depends on: G2 (a real backend to post events).
 
 - `gui.run(b, app)`: extends the event machinery from G1/G2
-  (mailboxes + dispatcher) with the full overflow policy; spawns
-  `app`; runs `b.pump` inline on the root task.
+  (mailboxes + dispatcher) with the full overflow policy; calls
+  `app` (a non-susp trampoline whose body `go`s the worker); runs
+  `b.pump` inline on the root task.
 - Backend `pump`: toolkit callbacks marshal → `Event`, `eb.post(e)`
-  on the `EventBuf` (never blocks — lock, evict the first
-  drop-eligible entry on full, append, `try_send` ping). A
+  on the `EventBuf` (never blocks — lock, evict drop-oldest among
+  drop-eligible when they push that count past `cap` — an
+  all-protected buf overflows instead of evicting — append,
+  `try_send` ping). A
   dispatcher task drains the buf onto `events` with blocking sends
   and synthesizes `Event{kind: overflow, Index(n)}` from the
   `dropped` count; `close_requested` is never drop-eligible while

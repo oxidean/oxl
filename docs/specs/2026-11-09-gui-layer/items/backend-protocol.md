@@ -65,8 +65,9 @@ Nothing `own`-typed crosses the boundary — the ownership story stays
 entirely above the iface, in the `.oxl` tree.
 
 **Suspendability bound.** Every `Backend` method must stay
-non-susp-capable: a method whose receiver satisfies an iface cannot
-suspend (vtable calls carry no task frame), so `pump`'s event posts
+non-susp-capable: a method *declared by* an iface its receiver
+satisfies cannot suspend (vtable calls carry no task frame), so
+`pump`'s event posts
 are nonblocking `eb.post`s, its replies are `try_send`s, and
 `stop`/`wake` are flag-and-nudge operations. The same bound applies
 to `gui.Widget` (`shape.md`): the iface may only declare non-susp
@@ -92,8 +93,9 @@ carries a task frame and suspending is legal.
   the toolkit's container ops (gtk: `box_append`, `listbox_insert`, …).
 - `destroy` — final teardown. Backends define a destroyed handle as
   dead: `set_prop`/`attach` on a dead handle is a protocol error
-  (mock records; gtk reports it via the dev gate). `destroy` itself is idempotent
-  on a dead handle — repeated teardown is a no-op, not a trap.
+  (mock records; gtk reports it via the dev gate). `destroy` itself
+  is idempotent on a dead handle — repeated teardown is a no-op,
+  not a trap.
   **Handles are never reissued within a `gui.run` session**: a
   backend allocates handles monotonically (or otherwise guarantees
   freshness), so a destroyed handle stays retired for the life of
@@ -154,18 +156,24 @@ struct Cmd {
 
 struct CmdResult { e: err, handle: int, val: PropVal }
 
-// `new_kind` is the single create verb: `pump` passes `props`
-// straight to `Backend.new(kind, props)`, then applies
+// `new_kind` is the single create verb: `pump` checks the
+// attach-parent's liveness FIRST — a dead `target` resolves
+// `err_gone` through the reply without creating anything (a
+// create-then-fail-attach would orphan the fresh handle) — then
+// passes `props` straight to `Backend.new(kind, props)` and applies
 // `attach(target, child)` when `target` is nonzero — so `new`'s
 // "not yet attached anywhere" contract holds and a create-and-attach
 // stays one `Cmd`. `read` selects its property by `prop.id`.
 //
-// `dismiss_close` is the fire-and-forget veto-keep verb: it clears the
-// target's `close_pending` flag (see `items/event-model.md`), meaning
-// "the app considered the pending `close_requested` and keeps the
-// window". On a dead handle it is a no-op like `destroy`. It carries
-// no reply — the dispatcher that posted the close does not need to
-// learn the decision, only the flag's release matters.
+// `dismiss_close` is the fire-and-forget veto-keep verb: the flag
+// flip itself happens in the wrapper at `CmdBuf.post` time (see
+// `items/event-model.md`); the Cmd exists as the *ordered settle
+// record* in the queue — a backend reading the stream sees the
+// dismissal where it landed relative to other Cmds, and the mock
+// can log it as a protocol event. On a dead handle it is a no-op
+// like `destroy`. It carries no reply — the dispatcher that posted
+// the close does not need to learn the decision, only the flag's
+// release matters.
 //
 // `CmdBuf.post` retains an OWNED copy of every `str` inside the `Cmd`
 // (prop text, `props` entries, widget strings) at post time: the
@@ -180,10 +188,19 @@ feature the app-facing `events` chan uses, so the struct payload
 crosses with its ownership spelled out: `pump` allocates an owned
 `CmdResult`, `try_send` moves it in (non-suspending, per the
 vtable rule above), and the caller's `recv` takes
-ownership (an ordinary drop after it reads `handle`/`val`/`e`). If
-the caller's scope is already gone, the reply chan's teardown
-reclaims the undelivered result under the `chan own T` reclaim
-rule — no leak in either direction. Cancellation: the caller's
+ownership (an ordinary drop after it reads `handle`/`val`/`e`).
+The chan itself is allocated bound to the **mailbox-owning scope**
+— the enclosing scope `gui.run` placed the mailboxes in — NOT the
+caller task's innermost scope: a caller cancelled mid-`recv`
+unwinds its inner scopes while its `Cmd` may still be queued, and
+a scope-bound chan freed then would leave `pump`'s `try_send`
+landing in reclaimed memory. Binding `reply` to the mailbox scope
+(the scope-targeted `mkchan` in *Language additions*) keeps it
+alive until the mailboxes die — by which point the queue is drained
+and every pending reply answered (the residual-Cmd sweep below) —
+and a caller that never receives still gets its result freed by the
+chan's teardown under the `chan own T` reclaim rule — no leak in
+either direction. Cancellation: the caller's
 block-receive is an ordinary suspendable chan op, so a cancelled
 waiter simply never receives; the queued `CmdResult` is reclaimed
 by that same rule. reads fill `val` (the same payload shape
@@ -195,22 +212,30 @@ allocates `reply` as a **cap-1 channel per Cmd**, so `pump`'s
 it even if the caller has not reached its receive yet.
 
 `button.set_label(s)` on any task = `cmds.post(Cmd{set_prop, h, ...})`
-+ `b.wake()`; `pump` applies it on the UI thread. `CmdBuf.post`
-appends under a mutex and parks only while the buf is full (see
-above) — so publication always completes before `wake` is called,
-and `wake` is called unconditionally after every post: there is no
-full-channel-before-wake interleaving for the pump to miss, and a
-poster that never lands its enqueue (cancelled while parked, or
-`closed`) never wakes either, which is correct — there is nothing
-queued for `pump` to see. Reads
++ `b.wake()` when the post enqueued; `pump` applies it on the UI
+thread. `CmdBuf.post` appends under a mutex and parks only while
+the buf is full (see above) and reports internally whether it
+enqueued (the caller never sees the flag — the accepted-and-dropped
+contract stays silent) — so publication always completes before
+`wake` is called, and `wake` fires after every *successful* post:
+there is no full-channel-before-wake interleaving for the pump to
+miss, and a poster that never lands its enqueue (cancelled while
+parked, or `closed`) never wakes either, which is correct — there
+is nothing queued for `pump` to see. Reads
 (`entry.text()`) post a `read` Cmd carrying its reply chan and
 block-receive — the reply crosses the boundary as an owned `str`,
 satisfying the copy rule, and the app-side wait is an ordinary chan
 op (suspendable, cancellable). `new_kind` uses the same shape: the
 caller block-receives `CmdResult{handle: h}` (or `e`) — handlers
 can create widgets too, and `attach` can name the returned handle.
-`gui.run` allocates both mailboxes next to `events` and hands them
-to `pump`.
+`gui.run` allocates both mailboxes — `CmdBuf`, `EventBuf`, their
+`closed` flags — plus `events`, bound to the **enclosing scope** it
+was called from, not its own inner scope: widget wrappers carry
+mailbox refs and are bound to that same scope, so a post-`run`
+mutator call always finds a live `closed` flag and hits the
+accepted-and-dropped rule instead of dangling — and the reply
+chans the post path allocates bind there too (see `reply` above).
+`run` hands the mailboxes to `pump` for the session.
 
 ## Shutdown
 
@@ -281,7 +306,8 @@ enforces per-handle close dedup via `close_pending` (see
 decision pending — in the buf, in flight, or delivered — absorbs
 into it, so a window can occupy at most one close slot, an app
 that stops draining can never accrue more protected backlog than
-it has live windows, and the veto decision is still never lost. The backend posts every close it vetoes; the
+it has live windows, and the veto decision is still never lost.
+The backend posts every close it vetoes; the
 dedup lives in `post`, not in the backend.
 
 **Removal resolves pending close requests.** `destroy` (directly or
@@ -308,7 +334,8 @@ call as a protocol violation for diagnostics, and gtk reports it
 via the dev gate; the app simply cannot observe it either way). A
 `close_requested` emitted for a handle the backend already knows
 is dead is likewise a backend-side protocol error (mock records;
-gtk reports it via the dev gate); the live-then-removed interleave is the only
+gtk reports it via the dev gate); the live-then-removed interleave
+is the only
 legitimate dead-target delivery, and the contract makes it
 harmless by construction.
 
@@ -334,7 +361,12 @@ exactly. Calling `gui.run` from a `go`/`spawn`ed task is a contract
 violation `gui.run` itself enforces: the runtime knows the root
 task's identity — a G1 runtime addition marks it (an `is_root`
 flag set by `rt_run_root`; the existing `external` field cannot
-discriminate — `rt_spawnb_task` sets it too) — so `run` checks its
+discriminate — `rt_spawnb_task` sets it too). `is_root` reads
+"driven inline by `rt_run_root`", which covers `main`'s task plus
+two intentional passes: spawn-fallback frame tasks and
+test-harness tasks are also `rt_run_root`-driven and pinned to
+their driving thread — and tests need it to drive `pump` — so
+`run` checks its
 caller up front and returns `gui.err_not_root()` on a spawned task:
 a named sentinel like `err_stopped()`, testable by the mock suite,
 fatal to that `run` call and nothing else — no dev gate,

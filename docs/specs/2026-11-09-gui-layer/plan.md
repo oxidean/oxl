@@ -23,10 +23,13 @@ you want verdicted, and again after the last fix commit.
       must be non-suspending (iface methods can't suspend across a
       vtable), so `try_send` on `chan own CmdResult` is the legal
       reply path — `true` moves the payload, `false` retains it.
-      Also here: the runtime marks the root task (`is_root` set by
-      `rt_run_root` — `external` can't discriminate it from
+      Also here: the runtime marks tasks `rt_run_root` drives
+      (`is_root` — `external` can't discriminate them from
       `rt_spawnb_task` tasks) so `gui.run`'s `err_not_root()` check
-      has something to test.
+      has something to test. `is_root` intentionally also passes
+      spawn-fallback and test-harness tasks: both are
+      `rt_run_root`-driven and pinned to their driving thread, and
+      the mock suite needs `pump` driven from a test.
       `mock/`: pure-oxl backend recording protocol calls
       with a scriptable `pump`. `tests/gui_test.oxl` drives the
       whole surface headless.
@@ -38,7 +41,14 @@ you want verdicted, and again after the last fix commit.
       destructor registered on owned channels so the cancelled-send
       ownership contract and `chan own T` teardown reclaim of
       buffered payloads have the metadata they need, per
-      `items/event-model.md`.
+      `items/event-model.md`. Two more runtime surfaces land here:
+      a scoped-cancel surface (heap/named scope value +
+      `rt_scope_cancel` export + a `cancel`/`std/task` entry —
+      G3's drain-grace abort has no other way to fire) and
+      scope-targeted `mkchan` (cap-1 reply chans bind to the
+      mailbox-owning scope, not the caller's innermost — a
+      cancelled caller must not free a chan under a queued `Cmd`;
+      see `items/backend-protocol.md`).
       Gate: `oxl test` green on both checkers; zero gtk4 dependency;
       typed-chan parity between Rust and self-hosted checkers.
 - [not started] **G2 — GTK4 backend** — `extra/gui/gtk` +

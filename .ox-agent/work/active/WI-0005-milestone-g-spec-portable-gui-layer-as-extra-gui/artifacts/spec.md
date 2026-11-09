@@ -104,14 +104,18 @@ enum EventKind  { clicked, activated, text_changed, close_requested,
 // never block; a dispatcher task inside run drains eb onto the
 // app-facing chan own Event, synthesizing the overflow marker from a
 // dropped-count flag (never a queue entry)
+// sentinels: gui.err_stopped() (backend loop exited / post-stop
+//   calls), gui.err_gone() (dead handle on the reply path),
+//   gui.err_not_root() (run called off the root task);
+//   gui.events_dropped() reads the cumulative overflow-drop count,
+//   still valid after `run` returns
 // run: gui.run(b: Backend, app: fn(chan own Event)) -> err — must be
 // called on the root task (else gui.err_not_root()); run allocates
 // the mailboxes + `events`, calls `app(events)` synchronously inside
 // its inner scope — `app` is a non-susp trampoline whose body `go`s
 // the real worker (susp fns can't be fn values; spawn needs a static
 // callee) — spawns the dispatcher, then calls `pump` INLINE on that
-// same
-// root task; an internal watcher relays scope cancellation to
+// same root task; an internal watcher relays scope cancellation to
 // b.stop() — a defer on the blocked task can't run while pump blocks
 ```
 

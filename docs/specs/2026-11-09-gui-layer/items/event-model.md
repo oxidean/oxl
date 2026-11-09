@@ -38,11 +38,12 @@ Two channels' worth of machinery, split at the backend boundary:
   task's innermost *active* scope at call time, not to the callee's
   lexical home. `app` MUST be non-susp: suspendable fns cannot be
   passed as fn values (the checker rejects `suspendable fn … can't
-  be a value`), `run` cannot `spawn` a value (spawn lowers to a
-  static callee's task frame), and a susp `app` iface or closure is
+  be a value` — a `(v0.2)` ban it marks explicitly), `run` cannot
+  `spawn` a susp worker *through* a value either (spawn of a fn
+  value exists for non-susp callees today, but a susp callee can
+  never BE a value to reach), and a susp `app` iface or closure is
   banned for the same reasons — so the trampoline is the only legal
-  shape today (a later spec could relax this with susp-fn-values or
-  spawn-by-value, both `(v0.2)` bans the checker marks explicitly).
+  shape today (a later spec could relax it with susp-fn-values).
   The `app_main` worker is what posts `new_kind` and blocks on its
   reply while the root task is already inside `pump`'s `CmdBuf`
   drain, so the request is serviced and the reply lands. This is
@@ -51,7 +52,9 @@ Two channels' worth of machinery, split at the backend boundary:
   pool-schedule onto a worker and break the toolkit's thread rule),
   and running `pump` inline is also what keeps the app's synchronous
   widget creation working. `app(events)` returning does NOT end
-  the session — the GUI lives until `pump` exits; `app` is only the
+  the session — `run` returns only after `pump` exits AND the inner
+  scope joins, so a worker that never observes `events`-close holds
+  `run` at the join; `app` is only the
   startup trampoline that builds the tree's first spawn; the workers
   it `go`s `select` on `events`. This chan is the ONLY event channel
   user code sees. `chan own Event` is a **typed
@@ -73,7 +76,9 @@ NEVER block: lock, evict if needed, append, unlock, `try_send(ping)`
 (nonblocking send returning a flag — `select` has receive arms
 only, so this needs the G1 runtime addition listed in the stage
 plan); cap-1 means a failed send implies a pending signal the
-dispatcher will already consume, so no wake is ever lost. Eviction fires when a post would push the drop-eligible count past `cap`: scan head→tail for the first
+dispatcher will already consume, so no wake is ever lost.
+Eviction fires when a post would push the drop-eligible count past
+`cap`: scan head→tail for the first
 *drop-eligible* event and evict it, incrementing `dropped`, then
 append the incoming event — the incoming event always lands in the
 same post, so capacity-one bufs make progress and there is no
@@ -99,9 +104,9 @@ request settled) or `gui.dismiss_close(w)`, and the clearing
 happens in the mutator wrapper at `CmdBuf.post` time — the flag is
 guarded by the **EventBuf** mutex everywhere (set + dedup-checked by
 `eb.post`, cleared by the wrapper under that same lock before it
-takes `CmdBuf`'s, so the two mutexes never nest) — not deferred to
-`pump` execution,
-so a settle-Cmd racing a second OS close serializes at post; the
+takes `CmdBuf`'s, so the two mutexes never nest) — not deferred
+to `pump` execution, so a settle-Cmd racing a second OS close
+serializes at post; the
 pump-side exit sweep clears any remainder wholesale at teardown.
 `gui.dismiss_close(w)` — an explicit
 fire-and-forget `Cmd` meaning "keep this window": it resolves the
@@ -159,9 +164,16 @@ scope around `gui.run` cannot run while `gui.run` itself is still
 blocking that task, and scope cancellation does not interrupt an
 inline foreign call. `gui.run` therefore wires the watcher
 internally — a supervisor task that parks for the enclosing scope's
-lifetime and whose `defer` calls `b.stop()` (a cancel-woken task
+lifetime, whose `defer` calls `b.stop()` (a cancel-woken task
 dies at its resume point, so `stop` must ride the unwind, not the
-wake) — so plain `scope { gui.run(...) }` tears down correctly. Dispatcher lifecycle: it runs in an INNER
+wake), and which also `select`s on a `retire` chan `run` closes
+before returning — the normal-path termination. Post-exit `stop`
+is idempotent, so the retire path is a no-op; without it a watcher
+only cancellation could wake would keep the enclosing scope's
+`pending` nonzero and deadlock `join_scope` on a plain
+`scope { gui.run(...) }`.
+
+Dispatcher lifecycle: it runs in an INNER
 scope owned by `gui.run`, and `eb` carries a `closed` flag next to
 `dropped`. After `pump` returns (stop honored or the toolkit loop
 ended) `run` sets `closed` and posts a final `try_send` ping — then
@@ -177,7 +189,8 @@ default ~250 ms):
   `close_requested` posted by `pump` as its last act is always
   preserved this way.
 - App not draining → the window expires, `run` cancels the inner
-  scope and joins it. Scope cancellation force-wakes whatever the
+  scope (via the scoped-cancel surface in *Language additions*)
+  and joins it. Scope cancellation force-wakes whatever the
   dispatcher is parked on: a `ping` receive AND a blocked `events`
   send alike (a send blocked on a full app channel cannot observe a
   ping, so the cancel is the guaranteed wakeup — documented runtime
@@ -246,6 +259,21 @@ its first selftest):
   cap-1 reply chan is allocated fresh per `Cmd` and receives
   exactly one send. A non-`own` `false` branch is unambiguous for
   the same reason — nothing was moved.
+- **Scoped cancellation surface** — the drain-grace abort needs a
+  first-class way to cancel a named scope: today only `rt_trap`
+  cancels and only its own task's chain (`scope_cancel_tree` is a
+  `static` runtime internal), so G1 adds a heap/named scope value
+  the runtime cancels through an exported `rt_scope_cancel`,
+  surfaced app-side as a `cancel` builtin or a `std/task` API —
+  and `gui.run` holds its dispatcher's inner scope as that handle.
+  Without it the abort path above has no mechanism to fire.
+- **Scope-targeted `mkchan`** — a `mkchan` form taking a scope
+  handle (or a `rt_scope_adopt`-style rebind) so a chan can be
+  bound to a scope other than the caller's innermost one. The
+  cap-1 `reply` chans need it: they bind to the mailbox-owning
+  scope, never the caller's — a cancelled caller would otherwise
+  free the chan under a queued `Cmd` (see `reply` lifetime in
+  `items/backend-protocol.md`).
 
 **Cancelled-send ownership contract.** Channel teardown and
 cancellation must account for owned payloads exactly once:

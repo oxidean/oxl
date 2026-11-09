@@ -66,7 +66,8 @@ concrete setters; a `gui.Widget` iface covers kind-polymorphic app
 code — but may only declare non-susp methods (`handle()`, `kind()`):
 suspendable methods can't cross a vtable, so CmdBuf-posting mutators
 and reply-blocking getters live on the concrete wrappers (see
-`items/backend-protocol.md`). `gui.append` consumes the child (`own` move into the tree);
+`items/backend-protocol.md`). `gui.append` consumes the child
+(`own` move into the tree);
 `gui.remove` detaches + destroys (`detach` never destroys —
 `destroy` is the single release op). `gui.run(b, app)` takes `app`
 as a non-suspending trampoline `fn(chan own Event)` — susp fns

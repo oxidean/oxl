@@ -16,8 +16,12 @@ attach/detach/destroy/pump/stop/wake). Spec-level forks resolved:
    migrate onto workers — so "the calling task" would be wrong, and
    a `go`/`spawn`ed `gui.run` is a contract violation `gui.run`
    itself rejects unconditionally; backends additionally check
-   affinity via the dev gate. A `pin` primitive stays parked and is revisited
-   at G6 with two backends' evidence. Reversible either way.
+   affinity via the dev gate. The check rides a G1 `is_root` flag
+   marking tasks `rt_run_root` drives — which intentionally also
+   passes spawn-fallback and test-harness tasks (both pinned to
+   their driving thread; tests need `pump` driven). A `pin`
+   primitive stays parked and is revisited at G6 with two
+   backends' evidence. Reversible either way.
 2. **Single buffered `chan own Event`, app-side dispatch** — events are
    ordinary channel values `select`ed next to app channels; overflow
    policy is drop-oldest + an `overflow` marker event (input events

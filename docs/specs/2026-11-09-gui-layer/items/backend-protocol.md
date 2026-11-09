@@ -11,7 +11,7 @@ lists, not `chan`s — because the boundary needs semantics a chan
 cannot express: event posts can never block `pump` (post is append
 + wake, not send), event eviction removes a mid-queue element, and
 command publication must precede `wake` without ever stalling on a
-full channel. The app-facing `chan Event` still exists — it is fed
+full channel. The app-facing `chan own Event` still exists — it is fed
 by a dispatcher task inside `gui.run`, not by `pump` (see
 `items/event-model.md`).
 
@@ -182,7 +182,7 @@ documented post-stop no-op instead of a leak.
 
 The sweep can never outrun a live close decision, because
 `close_requested` is **veto-backed**: a backend posting it must
-first veto the toolkit's native teardown (gtk: `delete-event`
+first veto the toolkit's native teardown (gtk: `close-request`
 returns TRUE; the window survives untouched). The toolkit loop's
 natural end — last toplevel gone — is therefore unreachable while
 a close decision is still pending: the app answers with
@@ -193,6 +193,30 @@ handle *unless* shutdown was app-initiated (`stop`): on that path
 the veto is moot — the app already chose teardown — the sweep
 takes the widget, and reads against it resolve `err_stopped()`,
 which is the documented "inspect after teardown" answer.
+
+**Pending close requests are bounded per window.** `EventBuf.post`
+applies one coalescing rule to `close_requested` (see
+`items/event-model.md`): a request for a handle that already has a
+request pending absorbs into it — a window can occupy at most one
+close slot, so an app that stops draining can never accrue more
+protected backlog than it has live windows, and the veto decision
+is still never lost. The backend posts every close it vetoes; the
+dedup lives in `post`, not in the backend.
+
+**Removal resolves pending close requests.** `destroy` (directly or
+via `gui.remove`) settles every pending `close_requested` for that
+handle: the widget is gone, so the veto the request awaited is
+moot. A `close_requested` already queued when its target dies is
+still delivered in order — but handlers MUST treat it as a no-op
+(window already removed: nothing left to keep alive), and `read`
+or mutation commands against the dead handle resolve
+`gui.err_stopped()` per the dead-handle rule above — the same
+"inspect after teardown" answer the sweep path produces. A
+`close_requested` emitted for a handle the backend already knows
+is dead is a protocol error (mock records; gtk debug-asserts);
+the live-then-removed interleave is the only legitimate
+dead-target delivery, and the contract makes it harmless by
+construction.
 
 ## Prop protocol
 

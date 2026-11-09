@@ -30,13 +30,20 @@ Spec: `shape.md`. Design contracts: `items/backend-protocol.md`,
       churn RSS); copy-at-boundary verified; headless CI
       compile-only.
 - [not started] **G3 — chan event model** — `gui.run` allocates the
-      buffered `chan Event`, the `EventBuf`/`CmdBuf` mailboxes, and
-      the drain dispatcher; `eb.post` evicts drop-oldest among
-      drop-eligible + counts drops; dispatcher synthesizes the
+      buffered `chan own Event`, the `EventBuf`/`CmdBuf` mailboxes,
+      and the drain dispatcher; `eb.post` evicts drop-oldest among
+      drop-eligible + counts drops + applies per-target
+      `close_requested` dedup; dispatcher synthesizes the
       `overflow` marker; internal `stop`-watcher for scope teardown;
       demo mixing UI events with a timer chan on one `select`.
+      Language additions land here (parser + both checkers, runtime
+      representation unchanged): typed `chan own T` channels —
+      `send` checks payload, `recv`/`select` bindings yield `own T`,
+      bare `chan` unchanged — and the cancelled-send ownership
+      contract from `items/event-model.md`.
       Gate: select-composability + overflow policy (incl. cap-1 and
-      all-protected cases) proven in selftests.
+      all-protected cases) proven in selftests; typed-chan parity
+      between Rust and self-hosted checkers.
 - [not started] **G4 — widget tranche** — pilot parity: window,
       vbox/hbox, label, button, entry, list, scrolled + whatever the
       reference app needs; per-kind Prop coverage table in

@@ -44,7 +44,7 @@ iface Backend {
     attach(parent: int, child: int)
     detach(parent: int, child: int)
     destroy(h: int)
-    pump(events: chan Event, cmds: chan Cmd)        // blocks; pinned task
+    pump(events: EventBuf, cmds: CmdBuf)            // blocks; pinned task
     stop()                                          // asks pump to return
     wake()                                          // nudge a blocked pump
 }
@@ -66,11 +66,17 @@ code. `gui.append` consumes the child (`own` move into the tree);
 `gui.remove` detaches + destroys (`detach` never destroys —
 `destroy` is the single release op).
 
-Two channels cross the iface: `events` carries `Event`s out to the
-app; `cmds` carries `Cmd`s back in — widget mutators enqueue and
-`pump` executes them on the pinned task, which is how an event
-handler on an app task can update a widget without breaking the
-thread rule (see `items/backend-protocol.md`).
+Two mailboxes cross the iface: `events` (an `EventBuf`) carries
+`Event`s out to a dispatcher, which forwards them onto the
+app-facing `chan own Event`; `cmds` (a `CmdBuf`) carries `Cmd`s
+back in — widget mutators enqueue and `pump` executes them on the
+pinned task, which is how an event handler on an app task can
+update a widget without breaking the thread rule (see
+`items/backend-protocol.md`). Mailboxes rather than chans because
+the boundary needs semantics a chan cannot express (never-blocking
+posts, mid-queue eviction); the typed `chan own Event` is a
+language addition the event model depends on (see
+`items/event-model.md`).
 
 Three backends matter:
 
@@ -88,8 +94,9 @@ Three backends matter:
   `gui.run` owns the toolkit — documented as sharply as GTK's own
   rule. A `pin` primitive stays parked; revisited at G6 with
   two-backend evidence (reversible either way).
-- **Events are channel values.** Backend posts `Event` structs to a
-  buffered `chan Event` (default 256, `gui.set_event_buffer(n)`);
+- **Events are channel values.** Backend posts `Event` structs into
+  a bounded `EventBuf`; a dispatcher forwards them onto a buffered
+  `chan own Event` (default 256, `gui.set_event_buffer(n)`);
   the app `select`s UI events next to its own channels. Overflow:
   drop-oldest + an `overflow` marker event — input events must not
   silently vanish. Shutdown: a bounded drain-grace window

@@ -27,13 +27,14 @@ against the handles its typed wrappers hold.
 
 Two channels' worth of machinery, split at the backend boundary:
 
-- **App-facing:** `gui.run(b, app)` allocates `chan Event` (cap 256
-  default; `gui.set_event_buffer(n)` before `run` for control) and
-  invokes `app(events)` — typically inside the app's `scope`, so the
-  app fn can `go` workers that `select` on it. This chan is the ONLY
-  event channel user code sees. Channels carry word-sized owned
-  values, so `Event` travels as `own Event` — the send moves the
-  pointer word; `recv` returns it typed back to `own Event`.
+- **App-facing:** `gui.run(b, app)` allocates `chan own Event` (cap
+  256 default; `gui.set_event_buffer(n)` before `run` for control)
+  and invokes `app(events)` — typically inside the app's `scope`, so
+  the app fn can `go` workers that `select` on it. This chan is the
+  ONLY event channel user code sees. `chan own Event` is a **typed
+  channel** — a language addition this spec requires (see *Language
+  additions* below): `send` moves the `own Event` pointer word,
+  `recv` and `select` arm bindings come back typed `own Event`.
 - **Backend-facing:** `pump` does NOT send on that chan directly.
   `gui.run` also allocates an `EventBuf` — a core-owned bounded deque
   guarded by a `sync` mutex, carrying a `dropped` count and a cap-1
@@ -52,7 +53,14 @@ dispatcher will already consume, so no wake is ever lost. Eviction on a full buf
 append the incoming event — the incoming event always lands in the
 same post, so capacity-one bufs make progress and there is no
 evict/reinsert cycle. `close_requested` is never drop-eligible and
-never coalesces (a lost close is a wedged app). If the buf holds
+never cross-target coalesces (a lost close is a wedged app). One
+bounded exception: posting a `close_requested` for a handle that
+ALREADY has a `close_requested` pending in the buf absorbs into it
+— one pending close decision per window is the semantic bound
+(the first veto already holds the window alive; a second pending
+request decides nothing new). Per-target dedup keeps a single
+window's close backlog at one slot while preserving the veto, and
+bounds the protected backlog at the live-window count. If the buf holds
 only protected events — the degenerate case, an app that has
 stopped draining — protected posts still append past `cap`: the
 bound applies to the droppable backlog; correctness is preferred
@@ -130,3 +138,42 @@ so `e == nil` is the termination test. A worker `select`ing on
 `events` therefore always resolves after `run` exits — with the
 drained tail, then with the closed signal — and cannot outlive
 `run` parked on a channel that will never produce again.
+
+## Language additions
+
+The app-facing chan needs payload typing the language does not yet
+have: `chan` today is an untyped word channel (`send` requires a
+word-sized value and moves `own`s through it, but `recv`/`select`
+bindings return `int` — nothing rebinds a word back to `own T`).
+G3 therefore lands two language features alongside the model:
+
+- **Typed channels `chan own T`** — `chan` gains an optional
+  payload parameter in type position. `send` type-checks the
+  payload against `T` and still moves `own` semantics; `recv` and
+  `select` arm bindings yield `own T`. Bare `chan` keeps its
+  current word/`int` semantics so existing code is untouched.
+  Runtime representation is unchanged (words end to end) — this is
+  a parser + both-checkers feature, not a runtime one.
+- **`try_send(chan, v) -> bool`** — nonblocking send; `false`
+  means full. `select` has receive arms only, so the EventBuf
+  `ping` nudge and cap-1 reply channels need this primitive.
+
+**Cancelled-send ownership contract.** Channel teardown and
+cancellation must account for owned payloads exactly once:
+
+- a `send` that is cancelled before its value lands reverts
+  ownership to the sender — the word is either delivered or
+  returned, never silently consumed. The dispatcher's unwind path
+  then destroys the `own Event` it still holds (struct + `own`
+  payloads) as an ordinary drop.
+- `close`d channel contents still drain before `recv` observes
+  closed (documented runtime semantics); `EventBuf` teardown drops
+  undelivered entries — each buffered `own Event` freed once by
+  its owner.
+- Teardown never frees a delivered event: once `recv` returns the
+  `own Event`, ownership is the receiver's.
+
+This is the contract that makes a cancelled dispatcher safe: the
+in-flight event is reclaimed by whoever holds it after the cancel
+lands — sender on a failed send, buf on teardown — and nothing
+already delivered is ever touched.

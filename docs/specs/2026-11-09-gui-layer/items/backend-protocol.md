@@ -3,7 +3,7 @@
 The portability seam is one iface plus two core-owned mailboxes.
 Backends: `extra/gui/mock` (pure-oxl, test), `extra/gui/gtk` (GTK4
 shim), later a DOM-protocol backend. Everything the tree needs from
-a toolkit fits in seven methods; the pilot measured the GTK side of
+a toolkit fits in eight methods; the pilot measured the GTK side of
 this surface at ~15 C functions.
 
 `EventBuf` and `CmdBuf` are `extra/gui`-core types — mutex-guarded
@@ -18,9 +18,12 @@ by a dispatcher task inside `gui.run`, not by `pump` (see
 ```oxl
 // core-owned mailboxes — opaque to backends beyond post/drain
 struct EventBuf { /* mutex-guarded deque, cap, dropped: int,
-                     ping: chan int (cap-1 nudge) */ }
+                     ping: chan (cap-1 nudge, bare word chan) */ }
 struct CmdBuf   { /* mutex-guarded BOUNDED list of Cmd: cap,
-                     closed flag, parked-poster wakeup */ }
+                     closed flag, parked-poster wakeup — the park
+                     waits on a suspendable wakeup (chan/task-park),
+                     not the std/sync spin Mutex: a parked poster
+                     must not burn a pool worker */ }
 // EventBuf.post(e) — never blocks (evict + append + ping)
 // EventBuf.drain() — dispatcher-side: buffered events + drop count
 // CmdBuf.post(c) — appends under the mutex; parks ONLY while the
@@ -48,6 +51,8 @@ iface Backend {
     attach(parent: int, child: int)
     detach(parent: int, child: int)
     destroy(h: int)
+    // EventBuf/CmdBuf are shared core-owned objects, passed by
+    // reference — sketches show them bare for brevity
     pump(events: EventBuf, cmds: CmdBuf)
     stop()
     wake()                                          // nudge a blocked pump
@@ -118,14 +123,24 @@ enum CmdKind { new_kind, set_prop, attach, detach, destroy, read,
              dismiss_close }
 struct Cmd {
     kind: CmdKind,
-    target: int,             // handle (or parent for attach/detach)
+    target: int,             // handle (or parent for attach/detach;
+                                 // new_kind: optional attach-parent, 0 =
+                                 // detached)
     widget: WidgetKind,      // new_kind only
-    prop: Prop,              // set_prop only
+    prop: Prop,              // set_prop: the write; read: prop.id
+                             // selects the property (val unused)
+    props: []Prop,           // new_kind only: creation props
     arg: int,                // attach/detach: the child handle
     reply: chan own CmdResult // new_kind + read: cap-1 response chan
 }
 
 struct CmdResult { e: err, handle: int, val: PropVal }
+
+`new_kind` is the single create verb: `pump` passes `props`
+straight to `Backend.new(kind, props)`, then applies
+`attach(target, child)` when `target` is nonzero — so `new`'s
+"not yet attached anywhere" contract holds and a create-and-attach
+stays one `Cmd`. `read` selects its property by `prop.id`.
 
 `dismiss_close` is the fire-and-forget veto-keep verb: it clears the
 target's `close_pending` flag (see `items/event-model.md`), meaning
@@ -135,7 +150,7 @@ no reply — the dispatcher that posted the close does not need to
 learn the decision, only the flag's release matters.
 
 `CmdBuf.post` retains an OWNED copy of every `str` inside the `Cmd`
-(prop text, widget strings) at post time: the caller's scope may
+(prop text, `props` entries, widget strings) at post time: the caller's scope may
 close before `pump` drains the queue, and a queued `Cmd` must never
 alias storage that can die underneath it. Same rule as event
 payloads — the copy boundary is the mailbox, not the pump.
@@ -197,12 +212,17 @@ buf mutex and force-wakes every parked poster, and mutators check
   that fires on a drained `close_requested` tail and calls
   `entry.text()` or creates a widget gets an error, not a wait;
 - fire-and-forget `Cmd`s (`set_prop`, `attach`, `detach`,
-  `destroy`) are accepted-and-dropped — post-stop mutation is a
-  no-op under the same idempotence rule `destroy` already has.
+  `destroy`, `dismiss_close`) are accepted-and-dropped — post-stop
+  mutation is a no-op under the same idempotence rule `destroy`
+  already has.
 
 `gui.err_stopped()` is the sentinel err for "backend loop exited"
 (mirrors `io.eof()`-style sentinels; equality-comparable for
-`if e == gui.err_stopped()`).
+`if e == gui.err_stopped()`). Its dead-handle sibling is
+`gui.err_gone()` — "the target no longer exists" — resolved on
+`read`/`new_kind` calls against destroyed handles while the loop
+still runs, so `e` distinguishes "backend stopped" from "widget
+gone".
 
 ### Live-handle sweep
 
@@ -258,8 +278,8 @@ through create/close/destroy.
 
 Commands against a dead handle split by shape, mirroring the
 post-stop rule: reply-carrying calls (`read`, `new_kind` naming it
-as parent) resolve `gui.err_stopped()` through their reply chan —
-the same "inspect after teardown" answer the sweep path produces;
+as parent) resolve `gui.err_gone()` through their reply chan —
+"widget gone" where the sweep path answers `err_stopped()`;
 fire-and-forget `Cmd`s (`set_prop`, `attach`, `detach`, `destroy`,
 `dismiss_close`) are accepted-and-dropped — there is no reply chan
 to carry an error, and the caller-facing outcome matches the
@@ -291,8 +311,12 @@ to the worker pool, so it cannot migrate across a channel
 suspension the way a spawned task can. Root-task-only IS the pin —
 and it matches GTK's own hard requirement (a main-thread main loop)
 exactly. Calling `gui.run` from a `go`/`spawn`ed task is a contract
-violation; a backend SHOULD check thread affinity on `new`/
-`set_prop`/`pump` and report it via the dev gate to catch it.
+violation `gui.run` itself enforces: the runtime knows the root
+task's identity (`rt_run_root` runs it), so `run` checks its
+caller up front and fails loudly on a spawned task — no dev gate,
+no counting, no silent UB. A backend SHOULD additionally check
+thread affinity on `new`/`set_prop`/`pump` and report it via the
+dev gate to catch direct-iface misuse.
 
 Protocol violations are development aids, never runtime traps:
 `gui.debug_protocol(true)` (off by default) turns every recorded

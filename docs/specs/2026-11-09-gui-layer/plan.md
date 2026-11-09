@@ -44,16 +44,19 @@ you want verdicted, and again after the last fix commit.
       Gate: gtk4-gated build + `--selftest` parity (add/remove,
       churn RSS); copy-at-boundary verified; headless CI
       compile-only.
-- [not started] **G3 — chan event model** — `gui.run` allocates the
-      buffered `chan own Event`, the `EventBuf`/`CmdBuf` mailboxes,
-      and the drain dispatcher; `eb.post` evicts drop-oldest among
+- [not started] **G3 — chan event model** — extends `gui.run`'s
+      event machinery (mailboxes + dispatcher land in G1/G2) with
+      the full overflow policy: `eb.post` evicts drop-oldest among
       drop-eligible + counts drops + applies per-target
       `close_requested` dedup; dispatcher synthesizes the
       `overflow` marker; internal `stop`-watcher for scope teardown;
-      demo mixing UI events with a timer chan on one `select`.
+      `gui.events_dropped()` loss reporting; demo mixing UI events
+      with a timer chan on one `select`.
       Gate: select-composability + overflow policy (incl. cap-1 and
       all-protected cases) proven in selftests; `close_pending`
-      dedup exercised from post through delivery and dismissal.
+      dedup exercised from post through delivery and dismissal;
+      `events_dropped()` reads the stashed count after `run`
+      returns.
 - [not started] **G4 — widget tranche** — pilot parity: window,
       vbox/hbox, label, button, entry, list, scrolled + whatever the
       reference app needs; per-kind Prop coverage table in
@@ -84,6 +87,7 @@ G5. Within a stage, mock tests and backend work split cleanly.
   fallback.
 - `gui.run` inside a cancellable scope needs the `stop()` exit path
   documented and tested; root-task-only invocation needs the
-  debug-assert verified (call from a spawned task must fail loudly).
+  unconditional check in `gui.run` verified (a call from a spawned
+  task must fail loudly).
 - GTK availability: only gtk4-present environments run backend
   selftests; mock verification never blocks on a display.

@@ -60,6 +60,7 @@ iface Backend {
     attach(parent: int, child: int)
     detach(parent: int, child: int)
     destroy(h: int)
+    // EventBuf/CmdBuf are shared core-owned objects, passed by ref
     pump(events: EventBuf, cmds: CmdBuf)            // blocks; root task only
     stop()                                          // asks pump to return
     wake()                                          // nudge a blocked pump
@@ -68,7 +69,11 @@ iface Backend {
 enum CmdKind { new_kind, set_prop, attach, detach, destroy, read,
                dismiss_close }
 struct Cmd       { kind: CmdKind, target: int, widget: WidgetKind,
-                   prop: Prop, arg: int, reply: chan own CmdResult }
+                   prop: Prop, props: []Prop, arg: int,
+                   reply: chan own CmdResult }
+// target: handle (parent for attach/detach; new_kind: optional
+//   attach-parent, 0 = detached); prop.id also selects for `read`;
+//   props feeds Backend.new(kind, props) on the new_kind path
 struct CmdResult { e: err, handle: int, val: PropVal }
 // reply is a cap-1 chan allocated per Cmd — pump's reply send
 // can never block waiting for the caller to receive

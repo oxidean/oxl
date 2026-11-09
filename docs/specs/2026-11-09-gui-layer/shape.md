@@ -44,6 +44,7 @@ iface Backend {
     attach(parent: int, child: int)
     detach(parent: int, child: int)
     destroy(h: int)
+    // EventBuf/CmdBuf are shared core-owned objects, passed by reference
     pump(events: EventBuf, cmds: CmdBuf)            // blocks; runs inline on the root task
     stop()                                          // asks pump to return
     wake()                                          // nudge a blocked pump

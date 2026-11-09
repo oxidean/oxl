@@ -17,7 +17,10 @@ Depends on: E2 (`extra/` layout) — landed.
 - `extra/gui/gui.oxl`: `Backend` iface, `WidgetKind`/`EventKind`
   enums, `Prop`/`PropVal`, `Event`, own-typed tree (`Window`/`Button`/
   `Entry`/`Label`/`Box`/`List`/`Scrolled` typed wrappers over int
-  handles), `gui.append`/`gui.remove`, `gui.run(b, app)`.
+  handles), `gui.append`/`gui.remove`, `gui.run(b, app)` — plus
+  the `CmdBuf`/`EventBuf` mailbox direction (mutators post +
+  `wake`, `pump` drains on the root task), which mutators need
+  from day one.
 - `extra/gui/mock/mock.oxl`: pure-oxl `Backend` recording every
   protocol call in order; scriptable `pump` (test feeds an event
   script, asserts dispatch).
@@ -36,6 +39,8 @@ Depends on: G1.
 - `extra/gui/gtk/gtk.oxl` + `gtk_shim.c` (generalize the pilot's
   `gui_shim.c`: same opaque-int handles, {env,fp} trampolines, but
   events marshalled into `Event` structs for `pump`).
+- Basic event dispatch lands here: `EventBuf` + drain dispatcher
+  → app `chan own Event` (cap 256 default, `gui.set_event_buffer(n)`).
 - Thread-affinity convention enforced: backend records the `gtk_init`
   thread id; `pump`/`new`/`set_prop` assert on it (debug check).
 - Re-express the pilot: `examples/gui-todo` rewritten on `extra/gui`
@@ -51,10 +56,9 @@ Depends on: G1.
 
 Depends on: G2 (a real backend to post events).
 
-- `gui.run(b, app)`: allocates `chan own Event` (cap 256 default,
-  `gui.set_event_buffer(n)`), the `EventBuf`/`CmdBuf` mailboxes, and
-  the drain dispatcher; spawns `app`; runs `b.pump` inline on the
-  root task.
+- `gui.run(b, app)`: extends the event machinery from G1/G2
+  (mailboxes + dispatcher) with the full overflow policy; spawns
+  `app`; runs `b.pump` inline on the root task.
 - Backend `pump`: toolkit callbacks marshal → `Event`, `eb.post(e)`
   on the `EventBuf` (never blocks — lock, evict the first
   drop-eligible entry on full, append, `try_send` ping). A
@@ -67,7 +71,8 @@ Depends on: G2 (a real backend to post events).
 - Gate: selftest proves select-composability (UI click and timer
   interleave on one loop); overflow tests: saturated buf emits the
   marker; cap-1 and all-protected bufs still make progress;
-  `close_pending` exercised post → delivery → `dismiss_close`.
+  `close_pending` exercised post → delivery → `dismiss_close`;
+  `events_dropped()` reads the stashed count after `run` returns.
 
 ## G4 — widget tranche (AC5)
 

@@ -6,7 +6,7 @@ Status: accepted (WI-0005) — 2026-11-09
 
 Milestone G builds the charter's path (b): a portable widget layer in
 `.oxl` under `extra/gui`, over a `gui.Backend` iface (new/set_prop/
-attach/detach/destroy/pump/stop). Spec-level forks resolved:
+attach/detach/destroy/pump/stop/wake). Spec-level forks resolved:
 
 1. **UI-thread convention, not a language primitive** — the **root
    task** (the one executing `main`'s call chain) must call
@@ -14,8 +14,9 @@ attach/detach/destroy/pump/stop). Spec-level forks resolved:
    documented convention: the runtime pins the root task to the main
    OS thread and never pool-schedules it, while spawned tasks CAN
    migrate onto workers — so "the calling task" would be wrong, and
-   a `go`/`spawn`ed `gui.run` is a contract violation backends check
-   via the dev gate. A `pin` primitive stays parked and is revisited
+   a `go`/`spawn`ed `gui.run` is a contract violation `gui.run`
+   itself rejects unconditionally; backends additionally check
+   affinity via the dev gate. A `pin` primitive stays parked and is revisited
    at G6 with two backends' evidence. Reversible either way.
 2. **Single buffered `chan own Event`, app-side dispatch** — events are
    ordinary channel values `select`ed next to app channels; overflow
@@ -36,15 +37,17 @@ attach/detach/destroy/pump/stop). Spec-level forks resolved:
    bug-breeding place).
 7. **Commands are channel values too** (added at review) — events
    flow out on `events`; mutations flow back on `cmds`, a second
-   chan the `pump` drains on the root task. Widget mutators only
-   enqueue; reads are `Cmd`s carrying a reply chan. This resolves
+   mailbox (`CmdBuf`, not a chan) the `pump` drains on the root
+   task. Widget mutators only enqueue; reads are `Cmd`s carrying a
+   reply chan. This resolves
    the review-caught gap where the thread rule left event handlers
    no legal way to mutate widgets. Related fixes: `detach` never
    destroys (`destroy` is the single release op, idempotent on dead
    handles); `stop` is invoked by a `gui.run`-internal watcher task
    since a defer can't fire while `gui.run` still blocks; overflow
-   drops oldest *drop-eligible* events, degrading to blocking send
-   when only protected (`close_requested`) events remain.
+   drops oldest *drop-eligible* events, appending past `cap` —
+   bounded by the live-window protected surplus — when only
+   protected (`close_requested`) events remain.
 
 ## Rationale
 

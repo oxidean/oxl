@@ -83,7 +83,12 @@ checked by the same `post`, so a second OS close absorbs at post
 time whether the first request is still buffered, in flight to the
 dispatcher, or already delivered and awaiting the app's decision.
 The flag clears only on `destroy`/`gui.remove` (decision landed,
-request settled) or `gui.dismiss_close(w)` — an explicit
+request settled) or `gui.dismiss_close(w)`, and the clearing
+happens in the mutator wrapper at `CmdBuf.post` time — under the
+same buf mutex that sets it — not deferred to `pump` execution,
+so a settle-Cmd racing a second OS close serializes at post; the
+pump-side exit sweep clears any remainder wholesale at teardown.
+`gui.dismiss_close(w)` — an explicit
 fire-and-forget `Cmd` meaning "keep this window": it resolves the
 pending decision and re-arms the next user close. Without the flag
 a second close arriving after the dispatcher forwards the first
@@ -99,15 +104,27 @@ backlog behind a dead handle.
 Overflow reporting: `dropped` is a counter flag, NOT a queue entry.
 When the dispatcher is about to emit a marker it first does
 `n := eb.take_dropped()` — read-and-clear under the buf mutex —
-then sends `Event{kind: overflow, data: Index(n)}` ahead of the
-next real event. Drops landing during the blocked marker send are
-counted into the NEXT marker, so accounting never loses increments.
+then sends `Event{kind: overflow, target: 0, data: Index(n)}`
+ahead of the next real event. If that marker send is cancelled
+(grace expiry or scope cancel), `n` is credited back into
+`dropped` before unwind — a cancelled marker loses no increments
+either. Drops landing during the blocked marker send are counted
+into the NEXT marker, so accounting never loses increments.
 The marker costs no buf slot, can never starve delivery at any
 capacity, and a dropped `clicked` is always visible, never silent.
 
-Coalescing is backend-defined otherwise; `text_changed` MAY coalesce
-to latest-value inside `post` (payload stays current). FIFO ordering
-otherwise.
+`gui.events_dropped() -> int` is the pull-based loss report: it
+reads the cumulative `dropped` count and stays valid after `run`
+has returned or `events` observed `closed` — `run` stashes the
+final count into package state before returning, and the
+drain-grace/cancel path counts every still-unsent entry into
+`dropped` first, so loss stays inspectable post-mortem without
+holding a mailbox or chan slot.
+
+`text_changed` MAY coalesce to latest-value inside `post` — a
+core-side policy applied under the buf mutex (payload stays
+current); all other coalescing is backend-internal, merged before
+`post` is ever called. FIFO ordering otherwise.
 
 ## Dispatch
 
@@ -124,9 +141,10 @@ keeps global ordering and select-composability. Backend-internal
 scope around `gui.run` cannot run while `gui.run` itself is still
 blocking that task, and scope cancellation does not interrupt an
 inline foreign call. `gui.run` therefore wires the watcher
-internally — a supervisor task that observes the enclosing scope's
-cancellation and calls `b.stop()` — so plain `scope { gui.run(...) }`
-tears down correctly. Dispatcher lifecycle: it runs in an INNER
+internally — a supervisor task that parks for the enclosing scope's
+lifetime and whose `defer` calls `b.stop()` (a cancel-woken task
+dies at its resume point, so `stop` must ride the unwind, not the
+wake) — so plain `scope { gui.run(...) }` tears down correctly. Dispatcher lifecycle: it runs in an INNER
 scope owned by `gui.run`, and `eb` carries a `closed` flag next to
 `dropped`. After `pump` returns (stop honored or the toolkit loop
 ended) `run` sets `closed` and posts a final `try_send` ping — then

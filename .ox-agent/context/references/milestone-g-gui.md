@@ -18,7 +18,8 @@ second-backend sketch + docs.
 - Paradigm: retained widget tree over a backend iface (A).
 - Ownership: own-tree, scope-bound; `gui.Widget` iface for user-visible
   widget kinds, tree stays own-typed.
-- Events: buffered `chan gui.Event` consumed by `select`; pilot-style
+- Events: buffered `chan own gui.Event` consumed by `select`
+  (recorded before the `chan own T` syntax existed); pilot-style
   `gui_connect` stays backend-internal.
 - Backend: retained-widget protocol iface — new/set_prop/on_event/
   attach-detach/run; GTK4 first, DOM is the natural second backend.

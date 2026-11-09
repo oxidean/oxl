@@ -219,6 +219,11 @@ pub fn append(dir: &Path, key: &str, e: &Entry) -> Result<Append, String> {
         .append(true)
         .open(&p)
         .map_err(|e| format!("{}: {e}", p.display()))?;
+    // a file that lacks a trailing newline needs a separator before
+    // the entry, or this append would glue onto the last line
+    if !old.is_empty() && !old.ends_with('\n') {
+        writeln!(f).map_err(|x| format!("{}: {x}", p.display()))?;
+    }
     writeln!(f, "{}", entry_line(e)).map_err(|x| format!("{}: {x}", p.display()))?;
     Ok(Append::Added)
 }

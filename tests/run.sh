@@ -258,7 +258,7 @@ done
 echo "== stdmods (json/sync/time) =="
 out=$("$OXL" run tests/stdmods_test.oxl)
 grep -q '"name":"widget"' <<<"$out" || { echo "FAIL stdmods json: $out"; exit 1; }
-grep -q "^surr=3:4 0000$" <<<"$out" || { echo "FAIL stdmods surrogates: $out"; exit 1; }
+grep -q "^surr=3:4 00000$" <<<"$out" || { echo "FAIL stdmods surrogates: $out"; exit 1; }
 grep -q "^4000$" <<<"$out" || { echo "FAIL stdmods sync counter: $out"; exit 1; }
 [ "$(tail -1 <<<"$out")" = "done" ] || { echo "FAIL stdmods time: $out"; exit 1; }
 

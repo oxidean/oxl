@@ -97,7 +97,7 @@ jobs:
             echanged=$(git ls-files -- extra/)
             erange="HEAD"
           fi
-          if printf '%s\n' "$changed" | grep -qv '^extra/'; then
+          if [ -n "$changed" ] && printf '%s\n' "$changed" | grep -qv '^extra/'; then
             do_tool=true
             # recovery: a tag already on this sha (e.g. publish failed after
             # tagging) is reused instead of burning another version. The

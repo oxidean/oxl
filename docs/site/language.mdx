@@ -100,7 +100,7 @@ Import resolution runs one longest-prefix competition across every
 candidate tree: `std/...` (the shipped standard library), this module's
 path (resolved under the manifest's directory), `use`d workspace trees,
 `replace` directories, and required modules in the module cache at
-`$OXLMODCACHE` or `~/.oxl/mod`). Longest matching path wins; an exact tie
+`$OXLMODCACHE` or `~/.oxl/mod`. Longest matching path wins; an exact tie
 goes to the earlier source, and a `use`d module shadows a `require` on
 the same path. Packages under `internal/` may only be imported by code
 beneath the `internal` directory's parent, import cycles are a compile

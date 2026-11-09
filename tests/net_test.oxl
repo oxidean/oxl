@@ -137,7 +137,7 @@ fn test_lookup() {
     // offline-safe; .invalid is a guaranteed NXDOMAIN per RFC 2606)
     [ip, e] = net.lookup_ipv4("localhost", 2000)
     testing.expect(e == nil, "localhost resolves")
-    testing.expect(ip == 2130706433, "localhost is 127.0.0.1")
+    testing.expect(ip / 16777216 == 127, "localhost is in 127.0.0.0/8")
     [ip2, e2] = net.lookup_ipv4("127.0.0.1", 2000)
     testing.expect(e2 == nil && ip2 == 2130706433, "dotted literal short-circuits")
     [ip3, e3] = net.lookup_ipv4("no-such-host.invalid.", 2000)

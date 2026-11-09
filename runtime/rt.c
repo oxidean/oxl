@@ -3013,21 +3013,16 @@ int64_t rt_sock_connect_ipv4(int64_t fd, int64_t ip_h32, int64_t port, int64_t t
 
 /* getaddrinfo(AF_INET) -> packed h32 in the same order net.oxl's
  * parse_ipv4 produces (a<<24|b<<16|c<<8|d, then ntohl'd for the wire).
- * Blocking by contract: callers run this on the spawnBlocking pool —
+ * Blocking by contract: callers run this on a dedicated thread —
  * never inline on a scheduler worker, where a slow resolver would pin
  * the queue. Negative return is a platform error code for rt_errstr. */
-int64_t rt_lookup_ipv4(OxlStr host) {
-    char *h = malloc((size_t)host.n + 1);
-    if (!h) abort();
-    memcpy(h, host.p, (size_t)host.n);
-    h[host.n] = 0;
+static int64_t lookup_ipv4_raw(const char *h) {
 #ifdef _WIN32
     struct addrinfo hints, *res = NULL;
     memset(&hints, 0, sizeof hints);
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
     int rc = getaddrinfo(h, NULL, &hints, &res);
-    free(h);
     if (rc != 0 || !res) {
         if (res) freeaddrinfo(res);
         int64_t e = rc != 0 ? rc : WSAHOST_NOT_FOUND;
@@ -3043,7 +3038,6 @@ int64_t rt_lookup_ipv4(OxlStr host) {
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
     int rc = getaddrinfo(h, NULL, &hints, &res);
-    free(h);
     if (rc != 0 || !res) {
         if (res) freeaddrinfo(res);
         /* getaddrinfo codes (EAI_*) are not errno — map the common
@@ -3056,6 +3050,68 @@ int64_t rt_lookup_ipv4(OxlStr host) {
     freeaddrinfo(res);
     return ip;
 #endif
+}
+
+int64_t rt_lookup_ipv4(OxlStr host) {
+    char *h = malloc((size_t)host.n + 1);
+    if (!h) abort();
+    memcpy(h, host.p, (size_t)host.n);
+    h[host.n] = 0;
+    int64_t v = lookup_ipv4_raw(h);
+    free(h);
+    return v;
+}
+
+/* async resolver handle: getaddrinfo on a raw detached helper thread —
+ * deliberately NOT an RtTask. A scope-tracked blocking task would hold
+ * the caller's scope join open past the caller's deadline when the
+ * resolver hangs; this helper answers to no scope, and the RtLookup is
+ * refcounted across caller+helper so a timed-out caller can release
+ * immediately while a late result still lands in valid memory. The
+ * caller reads `cell` with sget: RT_LKP_PENDING means in flight. */
+#define RT_LKP_PENDING ((int64_t)1 << 32)
+typedef struct RtLookup {
+    RtShared cell;      /* val: RT_LKP_PENDING -> ip (>=0) or -errno */
+    volatile int refs;  /* caller + helper */
+    char *host;
+} RtLookup;
+
+static void *lookup_helper(void *p) {
+    RtLookup *l = p;
+    int64_t v = lookup_ipv4_raw(l->host);
+    rt_sset(&l->cell, v);
+    if (__sync_sub_and_fetch(&l->refs, 1) == 0) {
+        free(l->host);
+        free(l);
+    }
+    return 0;
+}
+
+RtShared *rt_lookup_start(OxlStr host) {
+    RtLookup *l = xcalloc(1, sizeof *l);
+    l->cell.val = RT_LKP_PENDING;
+    l->refs = 2;
+    l->host = xmalloc((size_t)host.n + 1);
+    memcpy(l->host, host.p, (size_t)host.n);
+    l->host[host.n] = 0;
+    oxl_thread_t th;
+    if (oxl_thread_spawn(&th, NULL, lookup_helper, l) == 0) {
+        oxl_thread_detach(th);
+    } else {
+        /* no thread left: finish inline — the caller's first poll sees
+         * the result; its deadline accounting is unchanged */
+        l->cell.val = lookup_ipv4_raw(l->host);
+        l->refs = 1;
+    }
+    return &l->cell;
+}
+
+void rt_lookup_release(RtShared *s) {
+    RtLookup *l = (RtLookup *)s;
+    if (__sync_sub_and_fetch(&l->refs, 1) == 0) {
+        free(l->host);
+        free(l);
+    }
 }
 
 /* portable receive timeout — SO_RCVTIMEO's constant differs by OS */

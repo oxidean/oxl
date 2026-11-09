@@ -31,7 +31,9 @@ extern fn rt_bind_any(fd: int, port: int) -> int
 
 extern fn rt_errstr(code: int) -> str
 
-extern fn rt_lookup_ipv4(host: str) -> int
+extern fn rt_lookup_start(host: str) -> shared
+
+extern fn rt_lookup_release(h: shared)
 
 extern fn rt_latch_alloc() -> shared
 
@@ -103,35 +105,44 @@ fn parse_ipv4(host: str) -> [int, err] {
     return ip * 256 + oct, nil
 }
 
-// lookup_send runs the blocking getaddrinfo on the spawnBlocking
-// pool and posts the h32 (or negative platform code) on done — a slow
-// resolver parks a pool worker, never a scheduler thread.
-fn lookup_send(host: str, done: chan) {
-    send(done, rt_lookup_ipv4(host))
-}
+// pending word for the lookup cell: one past every legal h32 — a real
+// result is 0..0xffffffff or a negative platform code, never 2^32
+let lkp_pending = 4294967296
+
+// poll slice for the wait loop: short enough that a finished lookup
+// wakes promptly, long enough that a stuck resolver doesn't churn
+// transient sleep timers — worst case tmo_ms/50 sleeps, each bounded
+// by the slice, and the loop stops the moment the helper posts
+let lkp_poll_ms = 50
 
 /// lookup_ipv4 resolves a hostname to a packed IPv4 h32 (the same
 /// order parse_ipv4 produces), bounded by tmo_ms. A dotted literal
-/// short-circuits the resolver entirely.
+/// short-circuits the resolver entirely. getaddrinfo runs on a
+/// detached runtime helper thread — deliberately not a scope task, so
+/// a stuck resolver can never hold the caller's scope join open past
+/// the deadline — and the handle is refcounted across caller and
+/// helper: whoever releases last frees it, so every exit path here
+/// (timeout, error, cancel-unwind via the defer) stays leak-free.
 fn lookup_ipv4(host: str, tmo_ms: int) -> [int, err] {
     [ip, pe] = parse_ipv4(host)
     if pe == nil {
         return ip, nil
     }
-    done := mkchan(1)
-    spawnBlocking lookup_send(host, done)
-    select {
-        v := recv(done) => {
-            if v < 0 {
-                return 0, errors.new("net: lookup " + host + ": " + rt_errstr(0 - v))
-            }
-            return v, nil
-        }
-        timeout(tmo_ms) => {
-            return 0, errors.new("net: lookup " + host + ": timed out")
-        }
+    h := rt_lookup_start(host)
+    defer rt_lookup_release(h)
+    v := sget(h)
+    deadline := now_ms() + tmo_ms
+    for v == lkp_pending && now_ms() < deadline {
+        msleep(lkp_poll_ms)
+        v = sget(h)
     }
-    return 0, errors.new("net: lookup " + host + ": failed")
+    if v == lkp_pending {
+        return 0, errors.new("net: lookup " + host + ": timed out")
+    }
+    if v < 0 {
+        return 0, errors.new("net: lookup " + host + ": " + rt_errstr(0 - v))
+    }
+    return v, nil
 }
 
 /// dial opens a TCP connection to host:port — host may be a dotted

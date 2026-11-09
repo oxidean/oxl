@@ -484,7 +484,10 @@ fn jparse_str(p: mut JCur) -> str {
                 // lone surrogates are an error (never CESU-8 output)
                 cp := hex4(substr(p.src, p.pos + 1, p.pos + 5))
                 if cp >= 55296 && cp < 56320 {
-                    if p.pos + 10 < len(p.src) && byteat(p.src, p.pos + 5) == 92 && byteat(p.src, p.pos + 6) == 117 {
+                    // the low surrogate's own \uXXXX must be valid hex
+                    // too — an invalid escape is malformed input, not a
+                    // different codepoint
+                    if p.pos + 10 < len(p.src) && byteat(p.src, p.pos + 5) == 92 && byteat(p.src, p.pos + 6) == 117 && is_hexdig(byteat(p.src, p.pos + 7)) && is_hexdig(byteat(p.src, p.pos + 8)) && is_hexdig(byteat(p.src, p.pos + 9)) && is_hexdig(byteat(p.src, p.pos + 10)) {
                         lo := hex4(substr(p.src, p.pos + 7, p.pos + 11))
                         if lo >= 56320 && lo < 57344 {
                             cp = 65536 + (cp - 55296) * 1024 + (lo - 56320)

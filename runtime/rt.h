@@ -346,7 +346,9 @@ int64_t rt_set_sndtimo(int64_t fd, int64_t secs);      /* SO_SNDTIMEO, portable 
 int64_t rt_set_reuseaddr(int64_t fd);                  /* SO_REUSEADDR, portable */
 int64_t rt_bind_any(int64_t fd, int64_t port);         /* bind INADDR_ANY, portable */
 int64_t rt_sock_connect_ipv4(int64_t fd, int64_t ip_h32, int64_t port, int64_t tmo_ms); /* timed IPv4 dial */
-int64_t rt_lookup_ipv4(OxlStr host);    /* getaddrinfo h32 — blocking, spawnBlocking pool */
+int64_t rt_lookup_ipv4(OxlStr host);    /* getaddrinfo h32 — blocking, dedicated thread */
+RtShared *rt_lookup_start(OxlStr host); /* detached-thread lookup — cell posts the result */
+void rt_lookup_release(RtShared *s);    /* caller's ref out; last ref frees the handle */
 int64_t rt_htons(int64_t v);
 int64_t rt_htonl(int64_t v);
 #endif /* OXL_NET */

@@ -2398,21 +2398,22 @@ fn publish(ver: &str) -> Result<(), String> {
         h1,
         tag: tag.clone(),
     };
-    match index::append(&idx, &key, &e)? {
-        index::Append::Already => println!("already published {mp} {ver}"),
-        index::Append::Added => {
-            // the index tree is itself versioned: commit the entry
-            // when it lives in a repo, and push when it has an origin
-            if git_ok(&idx, &["rev-parse", "--git-dir"]) {
-                gits(&idx, &["add", "--", &key])?;
-                gits(&idx, &["commit", "-m", &format!("publish {mp} {ver}")])?;
-                if git_ok(&idx, &["remote", "get-url", "origin"]) {
-                    gits(&idx, &["push", "origin", "HEAD"])
-                        .map_err(|e| format!("index push failed: {e}"))?;
-                }
-            }
-            println!("published {mp} {ver}");
+    let res = index::append(&idx, &key, &e)?;
+    // commit/push on both paths: a retry after a failed commit/push
+    // finds the line already present but still unpublished
+    if git_ok(&idx, &["rev-parse", "--git-dir"]) {
+        if !gits(&idx, &["status", "--porcelain", "--", &key])?.trim().is_empty() {
+            gits(&idx, &["add", "--", &key])?;
+            gits(&idx, &["commit", "-m", &format!("publish {mp} {ver}")])?;
         }
+        if git_ok(&idx, &["remote", "get-url", "origin"]) {
+            gits(&idx, &["push", "origin", "HEAD"])
+                .map_err(|e| format!("index push failed: {e}"))?;
+        }
+    }
+    match res {
+        index::Append::Already => println!("already published {mp} {ver}"),
+        index::Append::Added => println!("published {mp} {ver}"),
     }
     if let index::Root::Cloned(t) = &iroot {
         let _ = std::fs::remove_dir_all(t);

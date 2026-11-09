@@ -1539,8 +1539,15 @@ fn publish(ver: str) -> err {
         return te
     }
     sub := ""
-    if strings.startswith(root, top + "/") {
-        sub = substr(root, len(top) + 1, len(root))
+    if root != top {
+        if strings.startswith(root, top + "/") {
+            sub = substr(root, len(top) + 1, len(root))
+        } else {
+            if cloned == 1 {
+                os.remove_all(iroot)
+            }
+            return errors.new("module root " + root + " is not inside the git toplevel " + top)
+        }
     }
     sdir := sub
     if len(sdir) == 0 {
@@ -1714,41 +1721,48 @@ fn publish(ver: str) -> err {
         }
         return errors.new(conflict)
     }
-    if dupe == 1 {
-        println("already published " + mp + " " + ver)
-        if cloned == 1 {
-            os.remove_all(iroot)
-        }
-        return nil
-    }
-    de := os.mkdir_all(check.dir_of(ipath))
-    if de != nil {
-        if cloned == 1 {
-            os.remove_all(iroot)
-        }
-        return de
-    }
-    nl := idx_line(e) + "\n"
-    if writefile(ipath, old + nl) != 0 {
-        if cloned == 1 {
-            os.remove_all(iroot)
-        }
-        return errors.new("writing " + ipath + " failed")
-    }
-    // the index tree is itself versioned — commit the entry when the
-    // index lives in a repo, push when it has an origin
-    gst := git_probe(idx, args2("rev-parse", "--git-dir"))
-    if gst.status == 0 {
-        [ga, ge2] = git_run(idx, args3("add", "--", key))
-        if ge2 == nil {
-            [gc, ge3] = git_run(idx, args3("commit", "-m", "publish " + mp + " " + ver))
-            ge2 = ge3
-        }
-        if ge2 != nil {
+    // append the entry only when it's new — but run the git
+    // finalization on both paths: a retry after a failed commit or
+    // push finds the line present yet still unpublished
+    if dupe == 0 {
+        de := os.mkdir_all(check.dir_of(ipath))
+        if de != nil {
             if cloned == 1 {
                 os.remove_all(iroot)
             }
-            return ge2
+            return de
+        }
+        nl := idx_line(e) + "\n"
+        // a file that lacks a trailing newline needs a separator
+        // first, or this append glues onto the last line
+        if len(old) > 0 && !strings.endswith(old, "\n") {
+            nl = "\n" + nl
+        }
+        if writefile(ipath, old + nl) != 0 {
+            if cloned == 1 {
+                os.remove_all(iroot)
+            }
+            return errors.new("writing " + ipath + " failed")
+        }
+    }
+    // the index tree is itself versioned — commit the entry when the
+    // index lives in a repo (only when the key is dirty — a dupe may
+    // already be committed), push when it has an origin
+    gst := git_probe(idx, args2("rev-parse", "--git-dir"))
+    if gst.status == 0 {
+        kst := git_probe(idx, mkslice4_("status", "--porcelain", "--", key))
+        if len(strings.trim(kst.out)) > 0 {
+            [ga, ge2] = git_run(idx, args3("add", "--", key))
+            if ge2 == nil {
+                [gc, ge3] = git_run(idx, args3("commit", "-m", "publish " + mp + " " + ver))
+                ge2 = ge3
+            }
+            if ge2 != nil {
+                if cloned == 1 {
+                    os.remove_all(iroot)
+                }
+                return ge2
+            }
         }
         ost2 := git_probe(idx, args3("remote", "get-url", "origin"))
         if ost2.status == 0 {
@@ -1761,7 +1775,11 @@ fn publish(ver: str) -> err {
             }
         }
     }
-    println("published " + mp + " " + ver)
+    if dupe == 1 {
+        println("already published " + mp + " " + ver)
+    } else {
+        println("published " + mp + " " + ver)
+    }
     if cloned == 1 {
         os.remove_all(iroot)
     }

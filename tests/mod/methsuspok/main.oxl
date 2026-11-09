@@ -13,7 +13,34 @@ fn (c Client) request() -> int {
     return 0
 }
 
+fn (c Client) dup() -> Client {
+    select {
+        timeout(1) => {
+            return c
+        }
+    }
+    return c
+}
+
+// susp pair fn — its receiver lands in scope through a let2 bind
+fn open() -> [Client, err] {
+    select {
+        timeout(1) => {}
+    }
+    return Client{tmo: 2}, nil
+}
+
 fn main() {
     c := Client{tmo: 5}
     println(itoa(c.request()))
+    // receiver bound by let2 — a nested susp method call in an
+    // expression must still hoist (the hoist env binds let2 names)
+    [c2, e] = open()
+    if e == nil {
+        println(itoa(c2.request() + 1))
+    }
+    // receiver bound by a hoisted temp — _hN carries the call's type
+    // so x.dup() sees a susp callee too
+    x := c.dup()
+    println(itoa(x.request() + 1))
 }

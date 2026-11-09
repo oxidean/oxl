@@ -3003,6 +3003,11 @@ impl<'a> Gen<'a> {
                 };
                 if self.call_is_susp(&call) {
                     let tmp = self.fresh("_h");
+                    // bind the temp to the call's type before pushing —
+                    // a later `x := _hN` then resolves x's type, and a
+                    // nested `x.m()` sees its receiver through env
+                    let tt = self.expr_ty(&call);
+                    self.env.last_mut().unwrap().insert(tmp.clone(), tt);
                     pre.push(Stmt::Let {
                         name: tmp.clone(),
                         ty: None,
@@ -3176,6 +3181,19 @@ impl<'a> Gen<'a> {
                 let mut pre = Vec::new();
                 let c2 = self.hoist_call_args(call, &mut pre);
                 out.append(&mut pre);
+                // bind the destructured names so a later `a.m()` callee
+                // resolves during hoist — mirrors the Let arm; `b` is
+                // always the err half
+                let vt = match self.pair_call_info(call) {
+                    Some((_, t)) => t,
+                    None => Ty::Unknown,
+                };
+                if let Bind::Name(n) = a {
+                    self.env.last_mut().unwrap().insert(n.clone(), vt);
+                }
+                if let Bind::Name(n) = b {
+                    self.env.last_mut().unwrap().insert(n.clone(), Ty::Err);
+                }
                 out.push(Stmt::Let2 {
                     a: clone_bind(a),
                     b: clone_bind(b),

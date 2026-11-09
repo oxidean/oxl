@@ -2,9 +2,9 @@
   "schema_version": 1,
   "id": "WI-0004",
   "title": "plan remaining Phase-2 work post-T: milestone G spec + stage plan, R scope check, P-track sequencing",
-  "state": "shipping",
+  "state": "archived",
   "profile": "normal",
   "current_stage": "shipping",
   "created_at": "2026-11-08T16:29:23Z",
-  "updated_at": "2026-11-08T16:40:30Z"
+  "updated_at": "2026-11-09T09:57:36Z"
 }

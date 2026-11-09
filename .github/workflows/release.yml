@@ -97,27 +97,31 @@ jobs:
             echanged=$(git ls-files -- extra/)
             erange="HEAD"
           fi
-          # a manual dispatch on an already-tagged sha is a retry of a
-          # publish that died after tagging — changed is empty there, so
-          # let it through to the existing-tag recovery below
-          if [ "$EVENT_NAME" = "workflow_dispatch" ] || { [ -n "$changed" ] && printf '%s\n' "$changed" | grep -qv '^extra/'; }; then
+          # recovery: a toolchain tag already on this sha — or on the
+          # manifest-bump child this flow creates — is reused instead of
+          # burning another version. The docs-manifest sync below tags a
+          # bump commit one above the merge, so a retry's tag also lives
+          # on a direct child of sha.
+          tag=$(git tag --points-at "$SHA" | grep -xE 'v[0-9]+\.[0-9]+\.[0-9]+' | sort -V | tail -1 || true)
+          tagsha=""
+          if [ -z "$tag" ]; then
+            for child in $(git rev-list --all --children | awk -v s="$SHA" '$1==s {$1=""; print}'); do
+              # Only the manifest-bump commit this flow creates is a valid
+              # recovery target — a tagged child on another branch would
+              # publish an unrelated tree under this tag.
+              git merge-base --is-ancestor "$child" origin/main 2>/dev/null || continue
+              git log -1 --format=%s "$child" | grep -q '^chore(release): bump docs manifest to ' || continue
+              tag=$(git tag --points-at "$child" | grep -xE 'v[0-9]+\.[0-9]+\.[0-9]+' | sort -V | tail -1 || true)
+              [ -n "$tag" ] && { tagsha=$child; break; }
+            done
+          fi
+          # lane gate: non-extra paths changed since the last toolchain
+          # tag. A manual dispatch bypasses the path check only for tag
+          # recovery — an untagged sha has nothing to recover, so an
+          # extras-only dispatch must not mint a new toolchain release.
+          if { [ -n "$changed" ] && printf '%s\n' "$changed" | grep -qv '^extra/'; } || { [ "$EVENT_NAME" = "workflow_dispatch" ] && [ -n "$tag" ]; }; then
             do_tool=true
-            # recovery: a tag already on this sha (e.g. publish failed after
-            # tagging) is reused instead of burning another version. The
-            # docs-manifest sync below tags a bump commit one above the
-            # merge, so a retry's tag also lives on a direct child of sha.
-            tag=$(git tag --points-at "$SHA" | grep -xE 'v[0-9]+\.[0-9]+\.[0-9]+' | sort -V | tail -1 || true)
-            if [ -z "$tag" ]; then
-              for child in $(git rev-list --all --children | awk -v s="$SHA" '$1==s {$1=""; print}'); do
-                # Only the manifest-bump commit this flow creates is a valid
-                # recovery target — a tagged child on another branch would
-                # publish an unrelated tree under this tag.
-                git merge-base --is-ancestor "$child" origin/main 2>/dev/null || continue
-                git log -1 --format=%s "$child" | grep -q '^chore(release): bump docs manifest to ' || continue
-                tag=$(git tag --points-at "$child" | grep -xE 'v[0-9]+\.[0-9]+\.[0-9]+' | sort -V | tail -1 || true)
-                [ -n "$tag" ] && { SHA=$child; break; }
-              done
-            fi
+            [ -n "$tagsha" ] && SHA=$tagsha
             if [ -z "$tag" ]; then
               tag=$(scripts/release-version.sh next "$range")
             fi
@@ -169,7 +173,7 @@ jobs:
           git -c user.name="github-actions[bot]" \
               -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
               commit -am "chore(release): bump docs manifest to $ver"
-          git remote set-url origin "https://x-access-token:${GH_T.../${{ github.repository }}.git"
+          git remote set-url origin "https://x-access-token:*** github.repository }}.git"
           git fetch origin main -q
           # A previous attempt may have merged the bump but died before
           # tagging — reuse the commit that set the version rather than

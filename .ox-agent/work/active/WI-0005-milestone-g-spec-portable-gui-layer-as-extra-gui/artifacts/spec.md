@@ -57,7 +57,7 @@ extra/
 ```oxl
 // extra/gui
 iface Backend {
-    new(kind: WidgetKind, props: []Prop) -> int     // opaque handle
+    new(kind: WidgetKind, props: []Prop) -> [int, err] // opaque handle
     set_prop(h: int, p: Prop)
     attach(parent: int, child: int)
     detach(parent: int, child: int)
@@ -113,8 +113,8 @@ enum EventKind  { clicked, activated, text_changed, close_requested,
 // called on the root task (else gui.err_not_root()); run allocates
 // the mailboxes + `events`, calls `app(events)` synchronously inside
 // its inner scope — `app` is a non-susp trampoline whose body `go`s
-// the real worker (susp fns can't be fn values; spawn needs a static
-// callee) — spawns the dispatcher, then calls `pump` INLINE on that
+// the real worker (susp fns can't be fn values, so the go'd callee is
+// a named fn) — spawns the dispatcher, then calls `pump` INLINE on that
 // same root task; an internal watcher relays scope cancellation to
 // b.stop() — a defer on the blocked task can't run while pump blocks
 ```

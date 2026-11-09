@@ -48,8 +48,8 @@ struct CmdBuf   { /* mutex-guarded BOUNDED list of Cmd: cap,
 ## iface Backend
 
 ```oxl
-iface Backend {
-    new(kind: WidgetKind, props: []Prop) -> (int, err)
+interface Backend {
+    new(kind: WidgetKind, props: []Prop) -> [int, err]
     set_prop(h: int, p: Prop)
     attach(parent: int, child: int)
     detach(parent: int, child: int)
@@ -205,12 +205,18 @@ vtable rule above), and the caller's `recv` takes
 ownership (an ordinary drop after it reads `handle`/`val`/`e`).
 The chan itself is allocated bound to the **mailbox-owning scope**
 — the enclosing scope `gui.run` placed the mailboxes in — NOT the
-caller task's innermost scope: a caller cancelled mid-`recv`
+caller task's innermost scope (scope-bound chan lifetime is itself
+a G1 addition — `mkchan` gains an owning scope whose teardown frees
+the chan object; today chans are never freed): a caller cancelled
+mid-`recv`
 unwinds its inner scopes while its `Cmd` may still be queued, and
 a scope-bound chan freed then would leave `pump`'s `try_send`
 landing in reclaimed memory. The caller's unwind path instead
-`close`s its `reply` chan — a send on a closed chan fails, so
-`pump`'s `try_send` observing `false` is exactly the
+`close`s its `reply` chan — `try_send`'s contract pins `false`
+on a closed chan (an ordinary `send` on one completes silently
+under the documented v0 rule, so the nonblocking form must say
+so explicitly — see *Language additions*), making `pump`'s
+`try_send` observing `false` exactly the
 caller-is-gone signal, and `pump` reconciles by shape: for `read`
 it drops the `CmdResult` payload (ordinary `own` reclaim); for
 `new_kind` it issues `Backend.destroy` on the just-created handle
@@ -237,18 +243,21 @@ allocates `reply` as a **cap-1 channel per Cmd**, so `pump`'s
 it even if the caller has not reached its receive yet.
 Chans are drawn from a small **reply-chan pool bound to the same
 mailbox scope** so a long session does not accumulate a chan
-object per `read`: the wrapper `close`s the chan and returns it to
-the pool once its `recv` resolves (delivery already happened —
-reuse cannot alias a live wait); a cancelled caller's `close` can
-NOT recycle immediately, since its `Cmd` may still be queued, so
-that chan returns only when the Cmd resolves — `pump`'s `try_send`
-sees the closed chan, drops/destroys per the rule above, and
-returns it, and the residual-Cmd sweep at shutdown is the last
-return path. Reuse is therefore settle-before-recycle in both
-directions: no chan re-enters the pool while a queued `Cmd` still
-names it (a recycled chan would deliver a stale reply to the wrong
-caller), and every outstanding chan reaches its terminal state
-before the mailbox scope tears down.
+object per `read` — but only chans that are still OPEN and DRAINED
+may re-enter: the wrapper returns its chan to the pool once its
+`recv` resolves normally (reply consumed, chan never closed —
+reuse cannot alias a live wait or a stale payload). A cancelled
+caller's `close` makes its chan terminally dead (`close` is
+one-way; no reset primitive exists), so that chan is NEVER pooled
+— `pump`'s `try_send` sees `false`, drops/destroys per the rule
+above, and the chan is left for the mailbox scope's teardown
+rather than recycled. This is also why `false` on a closed chan is
+load-bearing: a silently-completing `try_send` would strand the
+reply AND misdiagnose the caller as live. Settle-before-recycle in
+both directions: no chan re-enters the pool while a queued `Cmd`
+still names it or while any close could still land on it, and
+every outstanding chan reaches its terminal state before the
+mailbox scope tears down.
 
 `button.set_label(s)` on any task = `cmds.post(Cmd{set_prop, h, ...})`
 + `b.wake()` when the post enqueued; `pump` applies it on the UI
@@ -283,8 +292,12 @@ caller block-receives `CmdResult{handle: h}` (or `e`) — handlers
 can create widgets too, and `attach` can name the returned handle.
 `gui.run` allocates both mailboxes — `CmdBuf`, `EventBuf`, their
 `closed` flags — plus `events`, bound to the **enclosing scope** it
-was called from, not its own inner scope: widget wrappers carry
-mailbox refs and are bound to that same scope, so a post-`run`
+was called from, not its own inner scope: widget wrappers reach the
+mailboxes through `shared` cells (a `ref`/`mut` borrow may not be
+stored in a heap object or cross a `spawn` boundary, so wrappers
+hold a value-struct of `shared`-cell handles, not a borrow — the
+same indirection the package-state `events_dropped` stash uses) and
+are bound to that same scope, so a post-`run`
 mutator call always finds a live `closed` flag and hits the
 accepted-and-dropped rule instead of dangling — and the reply
 chans the post path allocates bind there too (see `reply` above).
@@ -414,12 +427,14 @@ exactly. Calling `gui.run` from a `go`/`spawn`ed task is a contract
 violation `gui.run` itself enforces: the runtime knows the root
 task's identity — a G1 runtime addition marks it (an `is_root`
 flag set by `rt_run_root`; the existing `external` field cannot
-discriminate — `rt_spawnb_task` sets it too). `is_root` reads
-"driven inline by `rt_run_root`", which covers `main`'s task plus
-two intentional passes: spawn-fallback frame tasks and
-test-harness tasks are also `rt_run_root`-driven and pinned to
-their driving thread — and tests need it to drive `pump` — so
-`run` checks its
+discriminate — `rt_spawnb_task` sets it too). `is_root` marks the
+outermost entry only: `rt_run_root` sets it when entered with no
+enclosing task (`tls_task == NULL`) — true for `oxl_main` and the
+per-test harness (tests need it to drive `pump`), false inside
+`spawn_fallback`, which re-enters `rt_run_root` on the SPAWNING
+thread — possibly a pool worker, exactly the non-entry thread GTK
+must never run — so a fallback task reads unmarked and gets
+`err_not_root()` like any spawned task. `run` checks its
 caller up front and returns `gui.err_not_root()` on a spawned task:
 a named sentinel like `err_stopped()`, testable by the mock suite,
 fatal to that `run` call and nothing else — no dev gate,

@@ -38,8 +38,8 @@ reference app needs.
 **Retained widget tree in `.oxl` over a `gui.Backend` iface.**
 
 ```oxl
-iface Backend {
-    new(kind: WidgetKind, props: []Prop) -> int     // opaque handle
+interface Backend {
+    new(kind: WidgetKind, props: []Prop) -> [int, err] // opaque handle
     set_prop(h: int, p: Prop)
     attach(parent: int, child: int)
     detach(parent: int, child: int)

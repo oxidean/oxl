@@ -28,7 +28,9 @@ against the handles its typed wrappers hold.
 Two channels' worth of machinery, split at the backend boundary:
 
 - **App-facing:** `gui.run(b, app)` allocates `chan own Event` (cap
-  256 default; `gui.set_event_buffer(n)` before `run` for control),
+  256 default; `gui.set_event_buffer(n)` before `run` for control —
+  the same knob sets `EventBuf.cap`, the drop-eligible bound below:
+  one backlog budget, not two),
   calls `app(events)` synchronously inside `run`'s inner scope, then
   calls `b.pump(events_buf, cmds_buf)` **inline on the root task** —
   the same task `gui.run` was called on. `app` is a **non-suspending
@@ -175,8 +177,10 @@ coalescing is backend-internal, merged before
 
 Routing lives app-side: the app `select`s on `events` and dispatches
 on `(kind, target)`. `gui.on(w, kind, fn)` may grow as sugar over a
-handler map — with the same trampoline constraint as `app` (the
-registered fn is non-susp and `go`s the real handler) — but sugar,
+handler map — with the same trampoline constraint as `app`, one
+step stricter: the registered fn must be a NAMED non-susp fn, not
+a closure (closures may not contain `go`/`spawn` — the checker
+rejects it) — but sugar,
 not a second channel: the single stream
 keeps global ordering and select-composability. Backend-internal
 `gui_connect`-style trampolines remain invisible above the iface.
@@ -188,7 +192,11 @@ keeps global ordering and select-composability. Backend-internal
 scope around `gui.run` cannot run while `gui.run` itself is still
 blocking that task, and scope cancellation does not interrupt an
 inline foreign call. `gui.run` therefore wires the watcher
-internally — a supervisor task that parks for the enclosing scope's
+internally — a supervisor task spawned BEFORE `run` enters its own
+inner scope (`go` binds to the innermost active scope at call time,
+so spawning after the inner `scope` opens would bind the watcher to
+it and deadlock `join_scope` on the `retire` wait below) — a task
+that parks for the enclosing scope's
 lifetime, whose `defer` calls `b.stop()` (a cancel-woken task
 dies at its resume point, so `stop` must ride the unwind, not the
 wake), and which also `select`s on a `retire` chan `run` closes
@@ -209,7 +217,10 @@ immediately. During the window the dispatcher keeps forwarding the
 buffered tail (including a pending overflow marker) with ordinary
 blocking sends and signals a `done` chan on `closed`+empty. `run`
 `select`s on `done` vs a timeout arm (`gui.set_drain_grace(d)`;
-default ~250 ms):
+default ~250 ms — `d`/`n` knobs take `>= 1` like
+`set_cmd_buffer`; a 0 grace means cancel-immediately, which IS
+meaningful, so `set_drain_grace` accepts `0` explicitly and only
+rejects negatives):
 
 - App draining normally → every queued event (and the marker) is
   delivered; `done` fires; no cancel is ever issued. A
@@ -274,7 +285,11 @@ its first selftest):
   unread-tail reclaim rule could not free payload contents, so
   G1's scope is the type surface AND the destructor plumbing.
 - **`try_send(chan, v) -> bool`** — nonblocking send; `false`
-  means full. `select` has receive arms only, so the EventBuf
+  means full OR closed (an ordinary `send` on a closed chan
+  completes silently under the documented v0 rule — the
+  nonblocking form pins `false` explicitly so `pump`'s reply
+  publication can observe a cancelled caller). `select` has
+  receive arms only, so the EventBuf
   `ping` nudge and cap-1 reply channels need this primitive.
   `try_send` works on a bare word `chan` (`int`, `err`,
   `str`/slice words by reference — the `ping` use) AND on
@@ -298,9 +313,19 @@ its first selftest):
   surfaced app-side as a `cancel` builtin or a `std/task` API —
   and `gui.run` holds its dispatcher's inner scope as that handle.
   Without it the abort path above has no mechanism to fire.
-- **Scope-targeted `mkchan`** — a `mkchan` form taking a scope
-  handle (or a `rt_scope_adopt`-style rebind) so a chan can be
-  bound to a scope other than the caller's innermost one. The
+  Binding that named scope needs its own primitive too — an
+  exported `rt_scope` handle a spawned task can be targeted into
+  (scope-targeted `go`, or an `rt_scope_adopt`-style rebind):
+  `rt_scope_new` today enters on the caller's TLS with no
+  non-joining exit, so `run` cannot hand the dispatcher a scope it
+  still holds otherwise.
+- **Scope-bound chans + scope-targeted `mkchan`** — today
+  `mkchan`'s object is heap-allocated and never freed; this
+  addition gives a chan an OWNING SCOPE whose teardown frees it
+  (draining any buffered tail per the `chan own T` reclaim rule),
+  plus a `mkchan` form taking a scope handle (or an
+  `rt_scope_adopt`-style rebind) so the owner can be a scope other
+  than the caller's innermost one. The
   cap-1 `reply` chans need it: they bind to the mailbox-owning
   scope, never the caller's — a cancelled caller would otherwise
   free the chan under a queued `Cmd` (see `reply` lifetime in
@@ -311,7 +336,12 @@ cancellation must account for owned payloads exactly once:
 
 - a `send` that is cancelled before its value lands reverts
   ownership to the sender — the word is either delivered or
-  returned, never silently consumed. The dispatcher's unwind path
+  returned, never silently consumed. The mechanism: a parked send
+  leaves its `SendReq` node in the chan's send queue; on
+  cancel-resume the runtime unlinks that node under the chan mutex
+  (still queued = the payload was never consumed, ownership
+  reverts; already gone = it was delivered) and the checker
+  un-moves the binding. The dispatcher's unwind path
   then destroys the `own Event` it still holds (struct + `own`
   payloads) as an ordinary drop.
 - `close`d channel contents still drain before `recv` observes

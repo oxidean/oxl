@@ -818,6 +818,37 @@ chmod -R u+w "$ixw/cache" 2>/dev/null; rm -rf "$ixw/cache" && mkdir "$ixw/cache"
 ( cd "$ixw/app" && GIT_CONFIG_GLOBAL="$ixw/gitconfig" OXLMODINDEX="$ixw/idx" OXLMODCACHE="$ixw/cache" "$OXL" get "example.com/dep/extra@v1.0.0" ) > "$ixw/get4" 2>&1 && { echo "FAIL tamper accepted"; cat "$ixw/get4"; exit 1; }
 grep -q 'does not match the fetched tree' "$ixw/get4" || { echo "FAIL tamper text"; cat "$ixw/get4"; exit 1; }
 
+echo "== e3/e4 seed-driver parity =="
+# $OXL is the product driver at this point, so the e3/e4 fixtures
+# exercised only it — replay the same three paths under the seed:
+# publish (tag + index append), index-first get, and the vanity
+# candidate walk that finds the module one directory below a repo.
+sw="$scratch/seedx"
+mkdir -p "$sw/repo/extra/thing" "$sw/app/app" "$sw/cache" "$sw/idx/index"
+( cd "$sw/repo" && git init -q . && git config user.email t@t && git config user.name t
+  printf 'module example.com/repo/extra\noxl 0.3\n' > extra/oxl.mod
+  printf 'package thing\n\nfn val() -> int { return 5 }\n' > extra/thing/thing.oxl
+  git add -A && git commit -qm init )
+printf '[url "file://%s/"]\n\tinsteadOf = https://example.com/\n' "$sw" > "$sw/gitconfig"
+printf 'module local/seedapp\noxl 0.3\n' > "$sw/app/oxl.mod"
+printf 'package main\nimport "example.com/repo/extra/thing"\n\nfn main() { println("thing=" + itoa(thing.val())) }\n' > "$sw/app/app/main.oxl"
+( cd "$sw/repo/extra" && GIT_CONFIG_GLOBAL="$sw/gitconfig" OXLMODINDEX="$sw/idx" "$SEEDOXL" publish v1.0.0 ) > "$sw/pub" 2>&1 || { echo "FAIL seed publish rc"; cat "$sw/pub"; exit 1; }
+grep -q 'published example.com/repo/extra v1.0.0' "$sw/pub" || { echo "FAIL seed publish report"; cat "$sw/pub"; exit 1; }
+grep -q '"h1":"h1:' "$sw/idx/index/example.com/repo/extra.json" || { echo "FAIL seed index entry"; cat "$sw/idx/index/example.com/repo/extra.json"; exit 1; }
+( cd "$sw/app" && GIT_CONFIG_GLOBAL="$sw/gitconfig" OXLMODINDEX="$sw/idx" OXLMODCACHE="$sw/cache" "$SEEDOXL" get "example.com/repo/extra@v1.0.0" ) > "$sw/get1" 2>&1 || { echo "FAIL seed index get rc"; cat "$sw/get1"; exit 1; }
+grep -q 'added example.com/repo/extra@v1.0.0' "$sw/get1" || { echo "FAIL seed index get report"; cat "$sw/get1"; exit 1; }
+mv "$sw/repo" "$sw/repo-gone"
+( cd "$sw/app" && OXLMODINDEX="$sw/idx" OXLMODCACHE="$sw/cache" "$SEEDOXL" build app -o "$sw/appbin" ) || { echo "FAIL seed offline build"; exit 1; }
+[ "$("$sw/appbin")" = "thing=5" ] || { echo "FAIL seed offline run"; "$sw/appbin"; exit 1; }
+mv "$sw/repo-gone" "$sw/repo"
+mkdir -p "$sw/multi/lib"
+( cd "$sw/multi" && git init -q . && git config user.email t@t && git config user.name t
+  printf 'module file://%s/multi/lib\noxl 0.3\n' "$sw" > lib/oxl.mod
+  printf 'package lib\n\nfn v() -> int { return 3 }\n' > lib/l.oxl
+  git add -A && git commit -qm init && git tag lib/v2.0.0 )
+( cd "$sw/app" && GIT_CONFIG_GLOBAL="$sw/gitconfig" OXLMODCACHE="$sw/cache" "$SEEDOXL" get "file://$sw/multi/lib@v2.0.0" ) > "$sw/get2" 2>&1 || { echo "FAIL seed subdir get rc"; cat "$sw/get2"; exit 1; }
+grep -q "added file://$sw/multi/lib@v2.0.0" "$sw/get2" || { echo "FAIL seed subdir get report"; cat "$sw/get2"; exit 1; }
+
 echo "== v3 oxl mod commands =="
 # tidy syncs the manifest with what the source imports — an
 # un-required import is fetched through the same veneer (its dep's

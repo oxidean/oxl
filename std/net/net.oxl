@@ -132,11 +132,20 @@ fn lookup_ipv4(host: str, tmo_ms: int) -> [int, err] {
     defer rt_lookup_release(h)
     v := sget(h)
     deadline := now_ms() + tmo_ms
-    for v == lkp_pending && now_ms() < deadline {
-        msleep(lkp_poll_ms)
+    for v == lkp_pending {
+        rem := deadline - now_ms()
+        if rem <= 0 {
+            break
+        }
+        if rem > lkp_poll_ms {
+            rem = lkp_poll_ms
+        }
+        msleep(rem)
         v = sget(h)
     }
-    if v == lkp_pending {
+    // a result first observed after the deadline still counts as a
+    // timeout — the caller bounded the wait
+    if v == lkp_pending || now_ms() > deadline {
         return 0, errors.new("net: lookup " + host + ": timed out")
     }
     if v < 0 {

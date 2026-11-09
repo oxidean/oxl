@@ -3098,9 +3098,10 @@ RtShared *rt_lookup_start(OxlStr host) {
     if (oxl_thread_spawn(&th, NULL, lookup_helper, l) == 0) {
         oxl_thread_detach(th);
     } else {
-        /* no thread left: finish inline — the caller's first poll sees
-         * the result; its deadline accounting is unchanged */
-        l->cell.val = lookup_ipv4_raw(l->host);
+        /* no thread left: fail fast — an inline getaddrinfo would pin
+         * a scheduler worker past the caller's deadline. -EAGAIN is a
+         * retryable error in the errno domain rt_errstr decodes. */
+        l->cell.val = -(int64_t)EAGAIN;
         l->refs = 1;
     }
     return &l->cell;

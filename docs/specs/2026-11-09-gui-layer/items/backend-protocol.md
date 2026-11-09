@@ -75,6 +75,8 @@ entirely above the iface, in the `.oxl` tree.
   `pump` must never block on `events` or `cmds` themselves; its
   only waits are the toolkit's own event wait and `reply` sends on
   cap-1 channels (which cannot block by construction).
+  Before returning, `pump` releases every handle it still owns —
+  see the live-handle sweep in *Shutdown* below.
 - `stop` — idempotent, safe from any task: asks `pump` to unwind
   and return. Must be callable from a different task than the
   pump-blocked one — a `defer` inside the scope around `gui.run`
@@ -160,6 +162,23 @@ Post-close, `CmdBuf.post` still cannot block, but mutators check
 `gui.err_stopped()` is the sentinel err for "backend loop exited"
 (mirrors `io.eof()`-style sentinels; equality-comparable for
 `if e == gui.err_stopped()`).
+
+### Live-handle sweep
+
+`pump` does not return with live handles. A backend tracks every
+handle it has created that has not yet seen `destroy` (it needs
+that set anyway for the dead-handle checks above); on its exit
+path — `stop` honored or toolkit loop ended — it issues `destroy`
+for each surviving handle on the UI task itself. Toolkits whose
+parents cascade (a closed gtk window takes its children) already
+satisfy the contract for descendants and need only sweep the
+detached/top-level remainder; `destroy`'s idempotence makes a
+double release a no-op, not a protocol error.
+
+This is the only release path that survives shutdown: a widget
+left attached when the loop ends is freed by the sweep, so a
+`gui.remove` that would have named it afterwards degrades to the
+documented post-stop no-op instead of a leak.
 
 ## Prop protocol
 

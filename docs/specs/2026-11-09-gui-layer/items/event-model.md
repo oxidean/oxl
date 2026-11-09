@@ -117,3 +117,14 @@ outer cancellation path the enclosing scope's own teardown kills
 the dispatcher directly — no grace window, no delivery after the
 scope that owns the tree has closed (widget handles it names would
 already be destroyed).
+
+Once the dispatcher has unwound — `done` observed or the
+cancelled inner scope joined — `run` `close`s `events` before
+returning. Closure is the consumer-facing termination signal:
+close wakes every parked `recv`, the buffered tail still drains
+first (documented runtime semantics), and a `recv` that observes
+closed+empty returns the zero word — `nil` for the Event value,
+so `e == nil` is the termination test. A worker `select`ing on
+`events` therefore always resolves after `run` exits — with the
+drained tail, then with the closed signal — and cannot outlive
+`run` parked on a channel that will never produce again.

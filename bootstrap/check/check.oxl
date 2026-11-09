@@ -6125,10 +6125,21 @@ fn dep_manifest_reqs(text: str) -> own ModEnt {
     return reqs
 }
 
-// the dir a required module version occupies: version-specific
-// replace beats a blanket one, else the `path@ver` cache slot —
-// "" = not fetched (mirrors seed module_dir)
+// the dir a required module version occupies: a `use`d workspace
+// tree wins outright (it shadows the require for the whole build —
+// resolves imports ahead of replaces and needs no cache slot, so the
+// same ordering must hold for callers that look the module up by
+// (path, ver)); then version-specific replace beats a blanket one,
+// else the `path@ver` cache slot — "" = not fetched (mirrors seed
+// module_dir)
 fn module_dir(ck: ref Ck, mp: str, ver: str) -> DirRes {
+    u := ck.mod_uses
+    for u != nil {
+        if u.alias == mp {
+            return DirRes{dir: u.stem, err: ""}
+        }
+        u = u.next
+    }
     blanket := ""
     rl := ck.mod_reps
     for rl != nil {

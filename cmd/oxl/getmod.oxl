@@ -1155,6 +1155,20 @@ fn mod_verify(cwd: str) {
             l = l.next
             continue
         }
+        // a `use`d workspace tree supplies the module from a local
+        // dir — there is no cache slot to verify (same skip class
+        // as a dir replace)
+        u := ck.mod_uses
+        for u != nil {
+            if u.alias == mp {
+                mv = ""
+            }
+            u = u.next
+        }
+        if len(mv) == 0 {
+            l = l.next
+            continue
+        }
         d := ck.modcache + "/" + check.escape_path(mp) + "@" + check.escape_path(mv)
         if os.isdir(d) == false {
             eprintln("error: " + mp + "@" + mv + ": not in module cache")
@@ -1290,6 +1304,21 @@ fn mk_ctx(root: str, mtext: str, sums: ref check.SumEnt) -> [own check.Ck, err] 
     }
     if check.parse_sums(ck, sums_text(sums)) == 0 {
         return nil, errors.new("malformed oxl.sum")
+    }
+    // a found oxl.work extends discovery here exactly as it does in
+    // mod_ctx_load — without the use list, providers resolve a
+    // workspace-covered require through the cache (miss) and tidy
+    // would try to fetch a module the workspace supplies locally
+    wr := check.find_work(root)
+    if len(wr) > 0 {
+        ck.work_root = wr
+        if check.load_work(ck, wr) == 0 {
+            msg := "oxl.work: invalid"
+            if len(ck.diags) > 0 {
+                msg = ck.diags[0].msg
+            }
+            return nil, errors.new(msg)
+        }
     }
     check.mod_build_list(ck)
     ck.mod_on = 1
@@ -2298,6 +2327,19 @@ fn mod_tidy(cwd: str) {
         mp := l.alias
         mv := check.selected_ver(final_ctx, mp)
         if len(mv) == 0 || replace_covers(final_ctx, mp, mv) == 1 {
+            l = l.next
+            continue
+        }
+        // `use`d trees carry no oxl.sum lines either — the local
+        // dir, not a fetched slot, is the source of truth
+        u := final_ctx.mod_uses
+        for u != nil {
+            if u.alias == mp {
+                mv = ""
+            }
+            u = u.next
+        }
+        if len(mv) == 0 {
             l = l.next
             continue
         }

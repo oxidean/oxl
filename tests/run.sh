@@ -1255,6 +1255,39 @@ grep -q 'no required module provides package' "$tv/tidy5" || { echo "FAIL self t
 ;;
 esac
 
+echo "== extras: workspace module + tidy interplay (e2) =="
+# root oxl.work `use ./extra` resolves github.com/oxidean/oxl/extra
+# imports to the local tree — the require documents the published
+# floor for consumers outside the workspace. The test consumes the
+# package through its module path.
+out=$("$OXL" test tests/extra_testutil.oxl)
+grep -q "extra testutil ok" <<<"$out" || { echo "FAIL extra test: $out"; exit 1; }
+# the extra module also builds standalone from its own root
+( cd extra && "$OXL" build testutil -o /dev/null ) || { echo "FAIL extra module build"; exit 1; }
+# a `use`d+`require`d module: tidy keeps the require without a fetch,
+# verify needs no cache slot, and no oxl.sum lines are written for it
+wsw="$scratch/wsuse"
+mkdir -p "$wsw/extra/thing" "$wsw/app/app"
+printf 'module example.com/ws/extra\noxl 0.3\n' > "$wsw/extra/oxl.mod"
+printf 'package thing\n\nfn val() -> int { return 7 }\n' > "$wsw/extra/thing/thing.oxl"
+printf 'module example.com/app\noxl 0.3\n\nrequire example.com/ws/extra v0.0.0\n' > "$wsw/app/oxl.mod"
+printf 'oxlwork 0.3\n\nuse ../extra\n' > "$wsw/app/oxl.work"
+printf 'package main\nimport "example.com/ws/extra/thing"\n\nfn main() { println("thing=" + itoa(thing.val())) }\n' > "$wsw/app/app/main.oxl"
+( cd "$wsw/app" && "$OXL" mod tidy ) > "$wsw/tidy" 2>&1 || { echo "FAIL ws tidy rc"; cat "$wsw/tidy"; exit 1; }
+grep -q 'require example.com/ws/extra v0.0.0' "$wsw/app/oxl.mod" || { echo "FAIL ws tidy require"; cat "$wsw/app/oxl.mod"; exit 1; }
+if [ -f "$wsw/app/oxl.sum" ]; then
+    ! grep -q 'ws/extra' "$wsw/app/oxl.sum" || { echo "FAIL ws sum written"; cat "$wsw/app/oxl.sum"; exit 1; }
+fi
+( cd "$wsw/app" && "$OXL" mod verify ) > "$wsw/vfy" 2>&1 || { echo "FAIL ws verify rc"; cat "$wsw/vfy"; exit 1; }
+grep -q 'all modules verified' "$wsw/vfy" || { echo "FAIL ws verify text"; cat "$wsw/vfy"; exit 1; }
+( cd "$wsw/app" && "$OXL" build app -o "$wsw/appbin" ) || { echo "FAIL ws build"; exit 1; }
+[ "$("$wsw/appbin")" = "thing=7" ] || { echo "FAIL ws run"; "$wsw/appbin"; exit 1; }
+# seed driver parity on the same fixture
+( cd "$wsw/app" && "$SEEDOXL" mod tidy ) > "$wsw/stidy" 2>&1 || { echo "FAIL seed ws tidy rc"; cat "$wsw/stidy"; exit 1; }
+grep -q 'require example.com/ws/extra v0.0.0' "$wsw/app/oxl.mod" || { echo "FAIL seed ws tidy require"; cat "$wsw/app/oxl.mod"; exit 1; }
+( cd "$wsw/app" && "$SEEDOXL" mod verify ) > "$wsw/svfy" 2>&1 || { echo "FAIL seed ws verify rc"; cat "$wsw/svfy"; exit 1; }
+grep -q 'all modules verified' "$wsw/svfy" || { echo "FAIL seed ws verify text"; cat "$wsw/svfy"; exit 1; }
+
 echo "== a1 coroutine scale =="
 # spec bar: 10k spawned tasks parked on recv must cost heap frames,
 # not OS threads — assert on the per-task delta over this binary's

@@ -1,0 +1,53 @@
+package main
+
+// extras (E2): consume an extra/ package through the workspace —
+// the import resolves via the root oxl.work `use ./extra` tree,
+// shadowing the require line (which documents the published floor
+// for consumers outside the workspace).
+import "github.com/oxidean/oxl/extra/testutil"
+
+import "std/errors"
+
+import "std/os"
+
+import "std/testing"
+
+fn test_tempdir() {
+    [d, e] = testutil.tempdir("tutil")
+    testing.expect(e == nil, "tempdir allocates")
+    if e != nil {
+        return
+    }
+    testing.expect(os.isdir(d), "tempdir exists")
+    [f, fe] = os.create(d + "/probe.txt")
+    testing.expect(fe == nil, "create in tempdir")
+    f.close()
+    testing.expect(testutil.rmtree(d) == nil, "rmtree cleans")
+    testing.expect(!os.exists(d), "tempdir gone")
+}
+
+fn test_helpers() {
+    xs := mkslice(str, 3)
+    xs[0] = "a"
+    xs[1] = "b"
+    xs[2] = "c"
+    testing.expect(testutil.has(xs, "b"), "has finds member")
+    testing.expect(!testutil.has(xs, "z"), "has rejects absent")
+    testing.expect(testutil.approx(3.14159, 3.14, 0.01), "approx within tol")
+    testing.expect(!testutil.approx(3.14159, 3.9, 0.01), "approx outside tol")
+}
+
+fn test_err_asserts() {
+    testutil.expect_ok(nil, "nil err passes")
+    e := errors.new("dial: connection refused")
+    testutil.expect_err_contains(e, "refused", "msg substring match")
+    // a failing expect_err_contains traps — spot-check the passing
+    // path only; the assert() path is std/testing's own contract
+}
+
+fn main() {
+    test_tempdir()
+    test_helpers()
+    test_err_asserts()
+    println("extra testutil ok")
+}

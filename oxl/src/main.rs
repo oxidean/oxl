@@ -334,6 +334,68 @@ fn parse_work(src: &str) -> Result<(Option<String>, Vec<(usize, String)>), Strin
 /// `start`, parsed and floor-checked. Ok(None) = module-off mode —
 /// only `std/` imports resolve. Err = manifest found but malformed or
 /// above the toolchain floor (hard error when `loud`).
+/// load the `oxl.work` at workspace root `wr`, folding `use`d module
+/// trees into ctx. Shared by mod_ctx (disk state) and mk_ctx (tidy's
+/// in-memory state): both must honor the workspace or a require the
+/// workspace covers resolves through the cache instead of the local
+/// tree. Returns the check diagnostic text on failure.
+fn load_work(ctx: &mut ModCtx, wr: &Path) -> Result<(), String> {
+    let wpath = wr.join("oxl.work");
+    let wtext = std::fs::read_to_string(&wpath)
+        .map_err(|e| format!("{}: {e}", wpath.display()))?;
+    let (wfloor, wdirs) = parse_work(&wtext)?;
+    if let Some(fv) = wfloor {
+        let cur = ver_tuple(OXL_VERSION).unwrap_or((0, 0, 0));
+        if ver_tuple(&fv).map_or(false, |f| f > cur) {
+            return Err(format!("oxl.work: requires oxlwork {fv}, toolchain is {}", tool_ver()));
+        }
+    }
+    let root_canon = ctx
+        .root
+        .canonicalize()
+        .unwrap_or_else(|_| ctx.root.clone());
+    for (lineno, arg) in wdirs {
+        // `use` dirs anchor at the work file's dir, not the module root
+        let dir = {
+            let d = PathBuf::from(&arg);
+            if d.is_absolute() {
+                d
+            } else {
+                wr.join(&d)
+            }
+        };
+        let canon = dir.canonicalize().unwrap_or_else(|_| dir.clone());
+        if ctx.uses.iter().any(|(_, ud)| *ud == canon) {
+            return Err(format!("oxl.work:{lineno}: duplicate use \"{arg}\""));
+        }
+        let mpath2 = dir.join("oxl.mod");
+        let mtext = std::fs::read_to_string(&mpath2).unwrap_or_default();
+        if !mpath2.is_file() {
+            return Err(format!("oxl.work:{lineno}: use dir \"{arg}\" has no oxl.mod"));
+        }
+        match parse_manifest(&mtext) {
+            Err(e) => {
+                return Err(format!("oxl.work:{lineno}: use dir \"{arg}\": {e}"));
+            }
+            Ok((mp, _, _, _)) => {
+                // `use ./` at the main module's own root — same
+                // tree, nothing to add
+                if canon == root_canon {
+                    continue;
+                }
+                // a different tree declaring an already-seen path —
+                // another `use` or the main module's own — is an
+                // ambiguity, not shadowing
+                if mp == ctx.path || ctx.uses.iter().any(|(up, _)| *up == mp) {
+                    return Err(format!("oxl.work:{lineno}: duplicate use module \"{mp}\""));
+                }
+                ctx.uses.push((mp, canon));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn mod_ctx(start: &Path, loud: bool) -> Result<Option<ModCtx>, ()> {
     let Some(root) = find_root(start) else {
         return Ok(None);
@@ -405,88 +467,11 @@ fn mod_ctx(start: &Path, loud: bool) -> Result<Option<ModCtx>, ()> {
     // reaches here (no oxl.mod above the entry → work file ignored).
     ctx.work_root = find_work(start);
     if let Some(wr) = ctx.work_root.clone() {
-        let wpath = wr.join("oxl.work");
-        let wtext = match std::fs::read_to_string(&wpath) {
-            Ok(t) => t,
-            Err(e) => {
-                if loud {
-                    eprintln!("error [check] {}: {e}", wpath.display());
-                }
-                return Err(());
+        if let Err(e) = load_work(&mut ctx, &wr) {
+            if loud {
+                eprintln!("error [check] {e}");
             }
-        };
-        let (wfloor, wdirs) = match parse_work(&wtext) {
-            Ok(w) => w,
-            Err(e) => {
-                if loud {
-                    eprintln!("error [check] {e}");
-                }
-                return Err(());
-            }
-        };
-        if let Some(fv) = wfloor {
-            let cur = ver_tuple(OXL_VERSION).unwrap_or((0, 0, 0));
-            if ver_tuple(&fv).map_or(false, |f| f > cur) {
-                if loud {
-                    eprintln!("error [check] oxl.work: requires oxlwork {fv}, toolchain is {}", tool_ver());
-                }
-                return Err(());
-            }
-        }
-        let root_canon = ctx
-            .root
-            .canonicalize()
-            .unwrap_or_else(|_| ctx.root.clone());
-        for (lineno, arg) in wdirs {
-            // `use` dirs anchor at the work file's dir, not the module root
-            let dir = {
-                let d = PathBuf::from(&arg);
-                if d.is_absolute() {
-                    d
-                } else {
-                    wr.join(&d)
-                }
-            };
-            let canon = dir.canonicalize().unwrap_or_else(|_| dir.clone());
-            if ctx.uses.iter().any(|(_, ud)| *ud == canon) {
-                if loud {
-                    eprintln!("error [check] oxl.work:{lineno}: duplicate use \"{arg}\"");
-                }
-                return Err(());
-            }
-            let mpath2 = dir.join("oxl.mod");
-            let mtext = std::fs::read_to_string(&mpath2).unwrap_or_default();
-            if !mpath2.is_file() {
-                if loud {
-                    eprintln!("error [check] oxl.work:{lineno}: use dir \"{arg}\" has no oxl.mod");
-                }
-                return Err(());
-            }
-            match parse_manifest(&mtext) {
-                Err(e) => {
-                    if loud {
-                        eprintln!("error [check] oxl.work:{lineno}: use dir \"{arg}\": {e}");
-                    }
-                    return Err(());
-                }
-                Ok((mp, _, _, _)) => {
-                    // `use ./` at the main module's own root — same
-                    // tree, nothing to add
-                    if canon == root_canon {
-                        continue;
-                    }
-                    // a different tree declaring an already-seen path —
-                    // another `use` or the main module's own — is an
-                    // ambiguity, not shadowing
-                    if mp == ctx.path || ctx.uses.iter().any(|(up, _)| *up == mp) {
-                        if loud {
-                            eprintln!("error [check] oxl.work:{lineno}: duplicate use module \"{mp}\"");
-                        }
-                        return Err(());
-                    }
-                    ctx.uses.push((mp, canon));
-                }
-            }
+            return Err(());
         }
     }
     ctx.selected = build_list(&ctx);
@@ -510,6 +495,17 @@ enum Resolve {
 /// verified against oxl.sum before use — Err carries the familiar
 /// mismatch text for the caller's diagnostic.
 fn module_dir(ctx: &ModCtx, mp: &str, ver: &str) -> Result<Option<PathBuf>, String> {
+    // a `use`d workspace tree wins outright: it shadows the require
+    // for the whole build (resolve_imp already ranks it ahead of the
+    // require for import paths, so (path, ver) lookups must agree —
+    // tidy's provider and the build-list walk would otherwise miss
+    // the workspace tree and probe the cache/network for a module the
+    // workspace supplies locally)
+    for (up, udir) in &ctx.uses {
+        if up == mp {
+            return Ok(Some(udir.clone()));
+        }
+    }
     let mut blanket: Option<&PathBuf> = None;
     for (rp, rv, rd) in &ctx.replaces {
         if rp != mp {
@@ -2318,6 +2314,14 @@ fn mk_ctx(root: &Path, mtext: &str, sums: Vec<modcache::SumLine>) -> Result<ModC
         work_root: None,
         uses: Vec::new(),
     };
+    // a found oxl.work extends discovery here exactly as it does in
+    // mod_ctx — without the use list, providers resolve a
+    // workspace-covered require through the cache (miss) and tidy
+    // would try to fetch a module the workspace supplies locally
+    if let Some(wr) = find_work(root) {
+        ctx.work_root = Some(wr.clone());
+        load_work(&mut ctx, &wr)?;
+    }
     ctx.selected = build_list(&ctx);
     Ok(ctx)
 }
@@ -2354,6 +2358,12 @@ fn mod_verify(args: &[String], cwd: &Path) {
             continue;
         };
         if replace_covers(&ctx, mp, &mv) {
+            continue;
+        }
+        // a `use`d workspace tree supplies the module from a local
+        // dir — there is no cache slot to verify (same skip class
+        // as a dir replace)
+        if ctx.uses.iter().any(|(up, _)| up == mp) {
             continue;
         }
         let d = modcache::slot(&ctx.modcache, mp, &mv);
@@ -3025,6 +3035,11 @@ fn mod_tidy(args: &[String], cwd: &Path) {
             continue;
         };
         if replace_covers(&final_ctx, mp, &mv) {
+            continue;
+        }
+        // `use`d trees carry no oxl.sum lines either — the local
+        // dir, not a fetched slot, is the source of truth
+        if final_ctx.uses.iter().any(|(up, _)| up == mp) {
             continue;
         }
         for is_mod in [false, true] {

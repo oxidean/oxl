@@ -70,6 +70,14 @@ attach/detach/destroy/pump/stop/wake). Spec-level forks resolved:
   `gui.run`'s internal watcher task — a `defer` on the pump-blocked
   task cannot run while it blocks (see
   `docs/specs/2026-11-09-gui-layer/items/event-model.md`).
+- The language's suspend rules shape two surface details: `pump` is
+  an iface method, so it must stay non-susp-capable — replies go out
+  on `try_send` (widened to `chan own T` in G1 for exactly this
+  reason), never blocking `send`; and `app` is a non-susp trampoline
+  `fn(chan own Event)` — susp fns can't be fn values — whose body
+  `go`s the real worker into `run`'s inner scope. `gui.Widget`
+  likewise declares only non-susp methods; susp operations live on
+  the concrete typed wrappers.
 - Headless CI never blocks on a display: mock drives the protocol,
   gtk selftests are pkg-config-gated as today.
 - Parked with triggers: `pin` primitive (G6 revisit), dialogs/a11y/

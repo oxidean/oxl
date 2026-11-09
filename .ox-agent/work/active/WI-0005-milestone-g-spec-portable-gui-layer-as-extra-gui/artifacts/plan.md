@@ -14,10 +14,18 @@ milestone map's sketch; each stage is one PR through the usual loop
 
 Depends on: E2 (`extra/` layout) — landed.
 
+- Language additions landing in G1 (per the published plan):
+  `chan own T` + `drop_elem` destructor plumbing; `try_send` on
+  bare `chan` AND `chan own T` (the reply path needs it — `pump`
+  is an iface method and can't suspend); an `is_root` runtime
+  marker (`rt_run_root` sets it; `external` is shared with
+  `rt_spawnb_task`) backing `gui.err_not_root()`.
 - `extra/gui/gui.oxl`: `Backend` iface, `WidgetKind`/`EventKind`
   enums, `Prop`/`PropVal`, `Event`, own-typed tree (`Window`/`Button`/
   `Entry`/`Label`/`Box`/`List`/`Scrolled` typed wrappers over int
-  handles), `gui.append`/`gui.remove`, `gui.run(b, app)` — plus
+  handles), `gui.append`/`gui.remove`, `gui.run(b, app)` — `app`
+  is a non-susp trampoline `fn(chan own Event)` whose body `go`s
+  the real worker into `run`'s inner scope — plus
   the `CmdBuf`/`EventBuf` mailbox direction (mutators post +
   `wake`, `pump` drains on the root task), which mutators need
   from day one.
@@ -136,5 +144,6 @@ gtk-backend work split cleanly across files.
   tears down cleanly — verified by a mock-driven cancellation test.
   What teardown cannot ride is `defer` on the `gui.run` task itself
   (it can't fire while `pump` blocks that task) — the watcher exists
-  precisely for that; `stop`/a quit `Cmd` remains the in-band exit
-  path.
+  precisely for that; `stop` remains the in-band exit path (no
+  `quit` `Cmd` exists — `CmdBuf`'s `closed` flag carries the
+  post-stop semantics).

@@ -64,6 +64,17 @@ backend owns whatever the handle refers to; `destroy` releases it.
 Nothing `own`-typed crosses the boundary — the ownership story stays
 entirely above the iface, in the `.oxl` tree.
 
+**Suspendability bound.** Every `Backend` method must stay
+non-susp-capable: a method whose receiver satisfies an iface cannot
+suspend (vtable calls carry no task frame), so `pump`'s event posts
+are nonblocking `eb.post`s, its replies are `try_send`s, and
+`stop`/`wake` are flag-and-nudge operations. The same bound applies
+to `gui.Widget` (`shape.md`): the iface may only declare non-susp
+methods (`handle()`, `kind()`, …) — mutators that post to `CmdBuf`
+(which can park) and getters that block-receive a reply live on the
+concrete typed wrappers (`gui.Button`, …), where a direct call
+carries a task frame and suspending is legal.
+
 ## Method contracts
 
 - `new` — create a native object of `kind`, applying `props` in
@@ -97,8 +108,15 @@ entirely above the iface, in the `.oxl` tree.
   the queued `Cmd`s, oldest-first), executing each `Cmd` on this
   task. Returns when `stop` is honored or the toolkit loop ends.
   `pump` must never block on `events` or `cmds` themselves; its
-  only waits are the toolkit's own event wait and `reply` sends on
-  cap-1 channels (which cannot block by construction).
+  only wait is the toolkit's own event wait. Reply publication is
+  `try_send` on the cap-1 `reply` chan — NEVER a blocking `send`:
+  `pump` is an iface method, and a suspendable method cannot be
+  vtable-reachable (the checker rejects it — "vtable calls carry no
+  task frame"), so every backend's `pump` MUST stay non-susp-capable
+  end to end. `try_send` is legal here because the reply chan is
+  freshly allocated per `Cmd` and receives exactly one send — the
+  `false` branch is unreachable by construction — and because it is
+  a non-suspending builtin.
   Before returning, `pump` releases every handle it still owns —
   see the live-handle sweep in *Shutdown* below.
 - `stop` — idempotent, safe from any task: asks `pump` to unwind
@@ -136,30 +154,32 @@ struct Cmd {
 
 struct CmdResult { e: err, handle: int, val: PropVal }
 
-`new_kind` is the single create verb: `pump` passes `props`
-straight to `Backend.new(kind, props)`, then applies
-`attach(target, child)` when `target` is nonzero — so `new`'s
-"not yet attached anywhere" contract holds and a create-and-attach
-stays one `Cmd`. `read` selects its property by `prop.id`.
-
-`dismiss_close` is the fire-and-forget veto-keep verb: it clears the
-target's `close_pending` flag (see `items/event-model.md`), meaning
-"the app considered the pending `close_requested` and keeps the
-window". On a dead handle it is a no-op like `destroy`. It carries
-no reply — the dispatcher that posted the close does not need to
-learn the decision, only the flag's release matters.
-
-`CmdBuf.post` retains an OWNED copy of every `str` inside the `Cmd`
-(prop text, `props` entries, widget strings) at post time: the caller's scope may
-close before `pump` drains the queue, and a queued `Cmd` must never
-alias storage that can die underneath it. Same rule as event
-payloads — the copy boundary is the mailbox, not the pump.
+// `new_kind` is the single create verb: `pump` passes `props`
+// straight to `Backend.new(kind, props)`, then applies
+// `attach(target, child)` when `target` is nonzero — so `new`'s
+// "not yet attached anywhere" contract holds and a create-and-attach
+// stays one `Cmd`. `read` selects its property by `prop.id`.
+//
+// `dismiss_close` is the fire-and-forget veto-keep verb: it clears the
+// target's `close_pending` flag (see `items/event-model.md`), meaning
+// "the app considered the pending `close_requested` and keeps the
+// window". On a dead handle it is a no-op like `destroy`. It carries
+// no reply — the dispatcher that posted the close does not need to
+// learn the decision, only the flag's release matters.
+//
+// `CmdBuf.post` retains an OWNED copy of every `str` inside the `Cmd`
+// (prop text, `props` entries, widget strings) at post time: the
+// caller's scope may
+// close before `pump` drains the queue, and a queued `Cmd` must never
+// alias storage that can die underneath it. Same rule as event
+// payloads — the copy boundary is the mailbox, not the pump.
 ```
 
 `reply` is a **`chan own CmdResult`** — the same typed-channel
 feature the app-facing `events` chan uses, so the struct payload
 crosses with its ownership spelled out: `pump` allocates an owned
-`CmdResult`, `send` moves it in, and the caller's `recv` takes
+`CmdResult`, `try_send` moves it in (non-suspending, per the
+vtable rule above), and the caller's `recv` takes
 ownership (an ordinary drop after it reads `handle`/`val`/`e`). If
 the caller's scope is already gone, the reply chan's teardown
 reclaims the undelivered result under the `chan own T` reclaim
@@ -171,8 +191,8 @@ properties carry), `new_kind` fills `handle`, and both report
 failure in `e` (`e == nil` on success) — creation failure reaches
 the caller as an error, never as a dead handle. The layer
 allocates `reply` as a **cap-1 channel per Cmd**, so `pump`'s
-reply send can never block even if the caller has not reached its
-receive yet.
+`try_send` always lands — the chan is empty when `pump` touches
+it even if the caller has not reached its receive yet.
 
 `button.set_label(s)` on any task = `cmds.post(Cmd{set_prop, h, ...})`
 + `b.wake()`; `pump` applies it on the UI thread. `CmdBuf.post`
@@ -312,8 +332,12 @@ suspension the way a spawned task can. Root-task-only IS the pin —
 and it matches GTK's own hard requirement (a main-thread main loop)
 exactly. Calling `gui.run` from a `go`/`spawn`ed task is a contract
 violation `gui.run` itself enforces: the runtime knows the root
-task's identity (`rt_run_root` runs it), so `run` checks its
-caller up front and fails loudly on a spawned task — no dev gate,
+task's identity — a G1 runtime addition marks it (an `is_root`
+flag set by `rt_run_root`; the existing `external` field cannot
+discriminate — `rt_spawnb_task` sets it too) — so `run` checks its
+caller up front and returns `gui.err_not_root()` on a spawned task:
+a named sentinel like `err_stopped()`, testable by the mock suite,
+fatal to that `run` call and nothing else — no dev gate,
 no counting, no silent UB. A backend SHOULD additionally check
 thread affinity on `new`/`set_prop`/`pump` and report it via the
 dev gate to catch direct-iface misuse.

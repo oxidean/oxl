@@ -31,7 +31,9 @@ git-index publishing — that this layer is the first real consumer of.
   task on the process's main OS thread via its own park loop and
   never pool-schedules it — root-task-only is a real pin mechanism,
   not a documented convention, and it matches GTK's main-thread
-  requirement exactly.
+  requirement exactly. `run` rejects other callers with
+  `gui.err_not_root()` — which needs a G1 runtime marker (`is_root`
+  set by `rt_run_root`; `external` is shared with `rt_spawnb_task`).
 - **Narrow backend protocol.** Typed public setters
   (`button.set_label`) desugar to `set_prop(h, Prop{id, val})` on the
   backend; `Prop` serializes toward DOM attributes.
@@ -75,8 +77,9 @@ struct Cmd       { kind: CmdKind, target: int, widget: WidgetKind,
 //   attach-parent, 0 = detached); prop.id also selects for `read`;
 //   props feeds Backend.new(kind, props) on the new_kind path
 struct CmdResult { e: err, handle: int, val: PropVal }
-// reply is a cap-1 chan allocated per Cmd — pump's reply send
-// can never block waiting for the caller to receive
+// reply is a cap-1 chan allocated per Cmd — pump publishes it via
+// try_send (non-suspending: susp methods can't cross a vtable);
+// fresh+empty means the send always lands
 
 struct Prop   { id: int, val: PropVal }             // tagged union
 struct Event  { kind: EventKind, target: int, data: EventData }
@@ -91,7 +94,9 @@ enum EventKind  { clicked, activated, text_changed, close_requested,
 
 // typed kinds wrap handles: gui.Window/Button/Entry/... each with
 // concrete setters (set_title, set_label, set_text, ...) and a
-// common `gui.Widget` iface for kind-polymorphic app code
+// common `gui.Widget` iface for kind-polymorphic app code —
+// non-susp methods only (handle/kind): CmdBuf-posting mutators and
+// reply-blocking getters live on the concrete wrappers
 // tree: gui.append(parent, child) consumes child (own move into
 // the tree); gui.remove(parent, child) detaches + destroys
 // EventBuf / CmdBuf: core-owned mutex-guarded mailboxes (NOT chans)
@@ -99,9 +104,13 @@ enum EventKind  { clicked, activated, text_changed, close_requested,
 // never block; a dispatcher task inside run drains eb onto the
 // app-facing chan own Event, synthesizing the overflow marker from a
 // dropped-count flag (never a queue entry)
-// run: gui.run(b: Backend, app: fn(chan own Event)) — must be called
-// on the root task; run allocates the mailboxes + `events`, spawns
-// `app` and the dispatcher, then calls `pump` INLINE on that same
+// run: gui.run(b: Backend, app: fn(chan own Event)) -> err — must be
+// called on the root task (else gui.err_not_root()); run allocates
+// the mailboxes + `events`, calls `app(events)` synchronously inside
+// its inner scope — `app` is a non-susp trampoline whose body `go`s
+// the real worker (susp fns can't be fn values; spawn needs a static
+// callee) — spawns the dispatcher, then calls `pump` INLINE on that
+// same
 // root task; an internal watcher relays scope cancellation to
 // b.stop() — a defer on the blocked task can't run while pump blocks
 ```

@@ -29,20 +29,32 @@ Two channels' worth of machinery, split at the backend boundary:
 
 - **App-facing:** `gui.run(b, app)` allocates `chan own Event` (cap
   256 default; `gui.set_event_buffer(n)` before `run` for control),
-  spawns `app` as a task inside `run`'s inner scope, then calls
-  `b.pump(events_buf, cmds_buf)` **inline on the root task** — the
-  same task `gui.run` was called on. This is required, not
-  incidental: the root task is the only one the runtime pins to the
-  main OS thread (a spawned `pump` could pool-schedule onto a worker
-  and break the toolkit's thread rule), and running `pump` inline is
-  also what keeps the app's synchronous widget creation working —
-  `app` posts `new_kind` and blocks on its reply while the root task
-  is already inside `pump`'s `CmdBuf` drain, so the request is
-  serviced and the reply lands. `app(events)` returning does NOT end
+  calls `app(events)` synchronously inside `run`'s inner scope, then
+  calls `b.pump(events_buf, cmds_buf)` **inline on the root task** —
+  the same task `gui.run` was called on. `app` is a **non-suspending
+  trampoline**: its body `go`s the real worker
+  (`fn app(events: chan own Event) { go app_main(events) }`), and
+  the spawn lands in the inner scope because `go` binds to the
+  task's innermost *active* scope at call time, not to the callee's
+  lexical home. `app` MUST be non-susp: suspendable fns cannot be
+  passed as fn values (the checker rejects `suspendable fn … can't
+  be a value`), `run` cannot `spawn` a value (spawn lowers to a
+  static callee's task frame), and a susp `app` iface or closure is
+  banned for the same reasons — so the trampoline is the only legal
+  shape today (a later spec could relax this with susp-fn-values or
+  spawn-by-value, both `(v0.2)` bans the checker marks explicitly).
+  The `app_main` worker is what posts `new_kind` and blocks on its
+  reply while the root task is already inside `pump`'s `CmdBuf`
+  drain, so the request is serviced and the reply lands. This is
+  required, not incidental: the root task is the only one the
+  runtime pins to the main OS thread (a spawned `pump` could
+  pool-schedule onto a worker and break the toolkit's thread rule),
+  and running `pump` inline is also what keeps the app's synchronous
+  widget creation working. `app(events)` returning does NOT end
   the session — the GUI lives until `pump` exits; `app` is only the
-  startup callback that builds the tree and `go`s the workers that
-  `select` on it. This chan is the ONLY event channel user code
-  sees. `chan own Event` is a **typed
+  startup trampoline that builds the tree's first spawn; the workers
+  it `go`s `select` on `events`. This chan is the ONLY event channel
+  user code sees. `chan own Event` is a **typed
   channel** — a language addition this spec requires (see *Language
   additions* below): `send` moves the `own Event` pointer word,
   `recv` and `select` arm bindings come back typed `own Event`.
@@ -61,7 +73,7 @@ NEVER block: lock, evict if needed, append, unlock, `try_send(ping)`
 (nonblocking send returning a flag — `select` has receive arms
 only, so this needs the G1 runtime addition listed in the stage
 plan); cap-1 means a failed send implies a pending signal the
-dispatcher will already consume, so no wake is ever lost. Eviction on a full buf: scan head→tail for the first
+dispatcher will already consume, so no wake is ever lost. Eviction fires when a post would push the drop-eligible count past `cap`: scan head→tail for the first
 *drop-eligible* event and evict it, incrementing `dropped`, then
 append the incoming event — the incoming event always lands in the
 same post, so capacity-one bufs make progress and there is no
@@ -84,8 +96,11 @@ time whether the first request is still buffered, in flight to the
 dispatcher, or already delivered and awaiting the app's decision.
 The flag clears only on `destroy`/`gui.remove` (decision landed,
 request settled) or `gui.dismiss_close(w)`, and the clearing
-happens in the mutator wrapper at `CmdBuf.post` time — under the
-same buf mutex that sets it — not deferred to `pump` execution,
+happens in the mutator wrapper at `CmdBuf.post` time — the flag is
+guarded by the **EventBuf** mutex everywhere (set + dedup-checked by
+`eb.post`, cleared by the wrapper under that same lock before it
+takes `CmdBuf`'s, so the two mutexes never nest) — not deferred to
+`pump` execution,
 so a settle-Cmd racing a second OS close serializes at post; the
 pump-side exit sweep clears any remainder wholesale at teardown.
 `gui.dismiss_close(w)` — an explicit
@@ -130,7 +145,9 @@ current); all other coalescing is backend-internal, merged before
 
 Routing lives app-side: the app `select`s on `events` and dispatches
 on `(kind, target)`. `gui.on(w, kind, fn)` may grow as sugar over a
-handler map — but sugar, not a second channel: the single stream
+handler map — with the same trampoline constraint as `app` (the
+registered fn is non-susp and `go`s the real handler) — but sugar,
+not a second channel: the single stream
 keeps global ordering and select-composability. Backend-internal
 `gui_connect`-style trampolines remain invisible above the iface.
 
@@ -215,17 +232,20 @@ its first selftest):
 - **`try_send(chan, v) -> bool`** — nonblocking send; `false`
   means full. `select` has receive arms only, so the EventBuf
   `ping` nudge and cap-1 reply channels need this primitive.
-  **Payload is restricted to word-sized values in v1** (`int`,
-  `err`, `str`/slice words by reference — the `ping` and reply-chan
-  uses): the checker rejects `try_send` on an `own` argument, and
-  owned payloads use blocking `send`, whose cancelled-send
-  ownership contract below already covers every outcome. That
-  keeps the `false` branch unambiguous — the caller retains
-  ownership — instead of leaving implementations free to leak or
-  double-free on a result the caller cannot distinguish. If a
-  later spec widens `try_send` to `own` payloads the contract is
-  already pinned: `false` leaves ownership with the caller (retry
-  or drop is its choice), `true` moves it.
+  `try_send` works on a bare word `chan` (`int`, `err`,
+  `str`/slice words by reference — the `ping` use) AND on
+  `chan own T`, which the reply channels need: `pump` is an iface
+  method and suspendable methods cannot cross a vtable, so its
+  reply publication must be non-suspending and a blocking `send`
+  is off the table there. The ownership contract is pinned
+  regardless of payload kind: `true` moves the value in, `false`
+  leaves ownership with the caller (retry or drop is its choice)
+  — a conditional-move the checker special-cases on the builtin,
+  exactly like the cancelled-send revert below. For the `reply`
+  use the `false` branch is unreachable by construction: each
+  cap-1 reply chan is allocated fresh per `Cmd` and receives
+  exactly one send. A non-`own` `false` branch is unambiguous for
+  the same reason — nothing was moved.
 
 **Cancelled-send ownership contract.** Channel teardown and
 cancellation must account for owned payloads exactly once:

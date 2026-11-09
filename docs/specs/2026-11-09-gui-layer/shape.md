@@ -63,9 +63,15 @@ enum EventData  { None, Text(str), Index(int) }
 
 Typed kinds (`gui.Window`, `gui.Button`, …) wrap handles with
 concrete setters; a `gui.Widget` iface covers kind-polymorphic app
-code. `gui.append` consumes the child (`own` move into the tree);
+code — but may only declare non-susp methods (`handle()`, `kind()`):
+suspendable methods can't cross a vtable, so CmdBuf-posting mutators
+and reply-blocking getters live on the concrete wrappers (see
+`items/backend-protocol.md`). `gui.append` consumes the child (`own` move into the tree);
 `gui.remove` detaches + destroys (`detach` never destroys —
-`destroy` is the single release op).
+`destroy` is the single release op). `gui.run(b, app)` takes `app`
+as a non-suspending trampoline `fn(chan own Event)` — susp fns
+can't be fn values, so `app`'s body `go`s the real worker into
+`run`'s inner scope (see `items/event-model.md`).
 
 Two mailboxes cross the iface: `events` (an `EventBuf`) carries
 `Event`s out to a dispatcher, which forwards them onto the
@@ -91,9 +97,11 @@ Three backends matter:
 
 ## Key decisions
 
-- **UI-thread convention, not primitive.** The task that calls
-  `gui.run` owns the toolkit — documented as sharply as GTK's own
-  rule. A `pin` primitive stays parked; revisited at G6 with
+- **UI-thread convention, not primitive.** The **root task** must
+  call `gui.run` — enforced by `run` itself (`gui.err_not_root()`),
+  a mechanism matching GTK's main-loop rule, not a documented
+  convention (the runtime marks the root task; spawned tasks can't
+  satisfy it). A `pin` primitive stays parked; revisited at G6 with
   two-backend evidence (reversible either way).
 - **Events are channel values.** Backend posts `Event` structs into
   a bounded `EventBuf`; a dispatcher forwards them onto a buffered

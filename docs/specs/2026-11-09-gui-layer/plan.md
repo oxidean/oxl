@@ -18,7 +18,15 @@ you want verdicted, and again after the last fix commit.
       post + `wake`, `pump` drains on the root task) — `CmdBuf` and
       `post`/`wake` land here since mutators need them from day one;
       `try_send` builtin added to the runtime here (the `ping`
-      mechanism depends on it — `select` has receive arms only).
+      mechanism depends on it — `select` has receive arms only),
+      covering `chan own T` payloads too: `pump`'s reply publication
+      must be non-suspending (iface methods can't suspend across a
+      vtable), so `try_send` on `chan own CmdResult` is the legal
+      reply path — `true` moves the payload, `false` retains it.
+      Also here: the runtime marks the root task (`is_root` set by
+      `rt_run_root` — `external` can't discriminate it from
+      `rt_spawnb_task` tasks) so `gui.run`'s `err_not_root()` check
+      has something to test.
       `mock/`: pure-oxl backend recording protocol calls
       with a scriptable `pump`. `tests/gui_test.oxl` drives the
       whole surface headless.
@@ -88,6 +96,6 @@ G5. Within a stage, mock tests and backend work split cleanly.
 - `gui.run` inside a cancellable scope needs the `stop()` exit path
   documented and tested; root-task-only invocation needs the
   unconditional check in `gui.run` verified (a call from a spawned
-  task must fail loudly).
+  task must resolve `gui.err_not_root()`).
 - GTK availability: only gtk4-present environments run backend
   selftests; mock verification never blocks on a display.

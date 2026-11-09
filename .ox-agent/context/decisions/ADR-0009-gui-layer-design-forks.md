@@ -29,6 +29,17 @@ attach/detach/destroy/pump/stop). Spec-level forks resolved:
 6. **Copy at the boundary** — `str` getters return owned copies; no
    borrowed `cstr` aliases cross the public API (the pilot's named
    bug-breeding place).
+7. **Commands are channel values too** (added at review) — events
+   flow out on `events`; mutations flow back on `cmds`, a second
+   chan the `pump` drains on the pinned task. Widget mutators only
+   enqueue; reads are `Cmd`s carrying a reply chan. This resolves
+   the review-caught gap where the thread rule left event handlers
+   no legal way to mutate widgets. Related fixes: `detach` never
+   destroys (`destroy` is the single release op, idempotent on dead
+   handles); `stop` is invoked by a `gui.run`-internal watcher task
+   since a defer can't fire while `gui.run` still blocks; overflow
+   drops oldest *drop-eligible* events, degrading to blocking send
+   when only protected (`close_requested`) events remain.
 
 ## Rationale
 

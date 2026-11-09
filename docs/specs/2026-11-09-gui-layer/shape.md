@@ -44,8 +44,9 @@ iface Backend {
     attach(parent: int, child: int)
     detach(parent: int, child: int)
     destroy(h: int)
-    pump(events: chan Event)                        // blocks; pinned task
+    pump(events: chan Event, cmds: chan Cmd)        // blocks; pinned task
     stop()                                          // asks pump to return
+    wake()                                          // nudge a blocked pump
 }
 
 struct Prop   { id: int, val: PropVal }
@@ -60,9 +61,16 @@ enum EventData  { None, Text(str), Index(int) }
 ```
 
 Typed kinds (`gui.Window`, `gui.Button`, …) wrap handles with
-concrete setters that desugar to `set_prop`; a `gui.Widget` iface
-covers kind-polymorphic app code. `gui.append` consumes the child
-(`own` move into the tree); `gui.remove` detaches + destroys.
+concrete setters; a `gui.Widget` iface covers kind-polymorphic app
+code. `gui.append` consumes the child (`own` move into the tree);
+`gui.remove` detaches + destroys (`detach` never destroys —
+`destroy` is the single release op).
+
+Two channels cross the iface: `events` carries `Event`s out to the
+app; `cmds` carries `Cmd`s back in — widget mutators enqueue and
+`pump` executes them on the pinned task, which is how an event
+handler on an app task can update a widget without breaking the
+thread rule (see `items/backend-protocol.md`).
 
 Three backends matter:
 

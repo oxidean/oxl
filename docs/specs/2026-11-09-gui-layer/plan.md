@@ -11,7 +11,8 @@ Spec: `shape.md`. Design contracts: `items/backend-protocol.md`,
       `gui.oxl`: `Backend` iface, `WidgetKind`/`EventKind`,
       `Prop`/`PropVal`, `Event`/`EventData`, own-typed tree, typed
       kind wrappers, `gui.Widget` iface, `gui.append`/`gui.remove`,
-      `gui.run`. `mock/`: pure-oxl backend recording protocol calls
+      `gui.run`, the `Cmd` channel direction (mutators enqueue,
+      `pump` executes on the pinned task). `mock/`: pure-oxl backend recording protocol calls
       with a scriptable `pump`. `tests/gui_test.oxl` drives the
       whole surface headless.
       Gate: `oxl test` green on both checkers; zero gtk4 dependency.
@@ -23,9 +24,11 @@ Spec: `shape.md`. Design contracts: `items/backend-protocol.md`,
       churn RSS); copy-at-boundary verified; headless CI
       compile-only.
 - [not started] **G3 — chan event model** — `gui.run` allocates the
-      buffered `chan Event`; backend `pump` posts via try-send;
-      drop-oldest + `overflow` marker on saturation; demo mixing UI
-      events with a timer chan on one `select`.
+      buffered `chan Event` and the `cmds` chan; backend `pump`
+      posts via try-send; drop-oldest among drop-eligible +
+      `overflow` marker on saturation (protected events degrade to
+      blocking send); internal `stop`-watcher for scope teardown;
+      demo mixing UI events with a timer chan on one `select`.
       Gate: select-composability + overflow policy proven in
       selftests.
 - [not started] **G4 — widget tranche** — pilot parity: window,

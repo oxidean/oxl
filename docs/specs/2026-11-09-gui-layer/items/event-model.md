@@ -30,13 +30,18 @@ against the handles its typed wrappers hold.
   `app(events)` — typically inside the app's `scope`, so the app fn
   can `go` workers that `select` on it.
 - Backend `pump` marshals toolkit signals into `Event`s and
-  **try-sends**: on a full queue it drops the *oldest* pending event
-  and marks the next post `kind = overflow` — a dropped `clicked`
-  is a lost user action, so saturation is always visible, never
-  silent. Coalescing is backend-defined but `text_changed` MAY
-  coalesce to latest-value (payload stays current).
-- FIFO ordering otherwise. `close_requested` never coalesces and is
-  never drop-eligible (a lost close is a wedged app).
+  **try-sends**: on a full queue it scans from the head for the
+  first *drop-eligible* event and evicts it, then marks the next
+  post `kind = overflow` — a dropped `clicked` is a lost user
+  action, so saturation is always visible, never silent.
+  `close_requested` is never drop-eligible and never coalesces (a
+  lost close is a wedged app); if the queue holds ONLY protected
+  events — the degenerate case, an app that has stopped draining —
+  the post degrades to a blocking send, which stalls the pump
+  honestly rather than discarding shutdown.
+- Coalescing is backend-defined otherwise; `text_changed` MAY
+  coalesce to latest-value (payload stays current). FIFO ordering
+  otherwise.
 
 ## Dispatch
 
@@ -48,8 +53,14 @@ keeps global ordering and select-composability. Backend-internal
 
 ## Teardown
 
-`backend.stop()` asks `pump` to unwind; a scope closing around
-`gui.run` calls it from `defer`. `pump` returning leaves any queued
-events for the app to drain or drop — no event is delivered after
-the scope that owns the tree has closed (widget handles it names
-would already be destroyed).
+`backend.stop()` asks `pump` to unwind. It must be invoked from a
+*different* task than the pump-blocked one: a `defer` inside the
+scope around `gui.run` cannot run while `gui.run` itself is still
+blocking that task, and scope cancellation does not interrupt an
+inline foreign call. `gui.run` therefore wires the watcher
+internally — a supervisor task that observes the enclosing scope's
+cancellation and calls `b.stop()` — so plain `scope { gui.run(...) }`
+tears down correctly. `pump` returning leaves any queued events for
+the app to drain or drop — no event is delivered after the scope
+that owns the tree has closed (widget handles it names would
+already be destroyed).

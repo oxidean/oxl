@@ -317,6 +317,8 @@ void *rt_mkbuf(int64_t size);
 RtSlice rt_bytes_str(OxlStr s);        /* arena copy -> []byte      */
 OxlStr  rt_str_bytes(RtSlice b);       /* zero-copy view -> str     */
 int64_t rt_err_new(OxlStr msg);        /* interned -> stable code   */
+int64_t rt_err_wrap(OxlStr msg, int64_t cause); /* distinct entry, cause chain */
+int64_t rt_err_cause(int64_t code);    /* 0 at chain end            */
 OxlStr  rt_err_msg(int64_t code);      /* "" for unknown/0          */
 OxlStr rt_bufstr(void *buf, int64_t n);
 void rt_poke8(void *buf, int64_t off, int64_t v);
@@ -344,6 +346,7 @@ int64_t rt_set_sndtimo(int64_t fd, int64_t secs);      /* SO_SNDTIMEO, portable 
 int64_t rt_set_reuseaddr(int64_t fd);                  /* SO_REUSEADDR, portable */
 int64_t rt_bind_any(int64_t fd, int64_t port);         /* bind INADDR_ANY, portable */
 int64_t rt_sock_connect_ipv4(int64_t fd, int64_t ip_h32, int64_t port, int64_t tmo_ms); /* timed IPv4 dial */
+int64_t rt_lookup_ipv4(OxlStr host);    /* getaddrinfo h32 — blocking, spawnBlocking pool */
 int64_t rt_htons(int64_t v);
 int64_t rt_htonl(int64_t v);
 #endif /* OXL_NET */

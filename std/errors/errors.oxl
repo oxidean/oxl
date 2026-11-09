@@ -24,3 +24,33 @@ fn msg(e: err) -> str {
 fn code(e: err) -> int {
     return e
 }
+
+extern fn rt_err_wrap(msg: str, cause: err) -> err
+
+extern fn rt_err_cause(code: err) -> err
+
+/// wrap returns a new messaged err carrying e as its cause. Unlike
+/// new() the result is never interned — two wraps of the same text
+/// stay distinct so each keeps its own chain.
+fn wrap(msg: str, e: err) -> err {
+    return rt_err_wrap(msg, e)
+}
+
+/// unwrap returns the cause of e, or nil at the end of the chain.
+fn unwrap(e: err) -> err {
+    return rt_err_cause(e)
+}
+
+/// is reports whether target appears in e's cause chain — a plain
+/// code compare at each link, so interned sentinels match. A typed
+/// `as` stays parked: err is an int64 code and no runtime type
+/// descriptors exist to bind a target to.
+fn is(e: err, target: err) -> bool {
+    for e != nil {
+        if e == target {
+            return true
+        }
+        e = rt_err_cause(e)
+    }
+    return false
+}

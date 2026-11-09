@@ -37,7 +37,11 @@ extern fn rt_chmod(path: str, mode: int) -> int
 // ---------- fetch: the git veneer (fetch.rs) ----------
 // `git` is a documented toolchain dependency for get only; auth rides
 // git's own mechanisms (ssh agent, credential helpers).
-struct Fetched { ver: str, tar: []byte, manifest: []byte }
+// a resolved fetch: tar is the `git archive` of the module subtree
+// (entries carry the subdir prefix), manifest is <subdir>/oxl.mod's
+// bytes. subdir is the repo-relative module root — "" for a module at
+// the repo root, "extra" / "a/b" for a subdirectory module.
+struct Fetched { ver: str, tar: []byte, manifest: []byte, subdir: str }
 
 // repository-location vars are stripped, not overridden — an inherited
 // GIT_DIR et al would retarget our git invocations at a foreign repo and
@@ -142,6 +146,26 @@ fn args2(a: str, b: str) -> own []str {
     return new(v)
 }
 
+fn mkslice4_(a: str, b: str, c: str, d: str) -> own []str {
+    v := mkslice(str, 4)
+    v[0] = a
+    v[1] = b
+    v[2] = c
+    v[3] = d
+    return new(v)
+}
+
+fn mkslice6_(a: str, b: str, c: str, d: str, e: str, f: str) -> own []str {
+    v := mkslice(str, 6)
+    v[0] = a
+    v[1] = b
+    v[2] = c
+    v[3] = d
+    v[4] = e
+    v[5] = f
+    return new(v)
+}
+
 fn args3(a: str, b: str, c: str) -> own []str {
     v := mkslice(str, 3)
     v[0] = a
@@ -198,12 +222,14 @@ fn sanitize_tag(s: str) -> str {
     return r
 }
 
-// every v* tag, as (semver, tag-text) pairs — the tag text is kept so
-// the selected version preserves any build metadata byte-for-byte
+// every <pfx>v* tag, as (semver, tag-text) pairs — pfx is the
+// subdirectory tag prefix ("" or "extra/"); the version parse strips it
+// while the tag text is kept whole so rev-parse and the selected
+// version preserve build metadata byte-for-byte
 struct TagEnt { ver: check.SVer, tag: str, next: own TagEnt }
 
-fn fetch_tags(tmp: str) -> own TagEnt {
-    [out, ge] = git_text(tmp, args3("tag", "--list", "v*"))
+fn fetch_tags(tmp: str, pfx: str) -> own TagEnt {
+    [out, ge] = git_text(tmp, args3("tag", "--list", pfx + "v*"))
     if ge != nil {
         return nil
     }
@@ -212,10 +238,10 @@ fn fetch_tags(tmp: str) -> own TagEnt {
     for lines != nil {
         t := strings.trim(lines.v)
         lines = lines.next
-        if len(t) == 0 {
+        if len(t) <= len(pfx) {
             continue
         }
-        v := check.sver_parse(t)
+        v := check.sver_parse(substr(t, len(pfx), len(t)))
         if v.ok == 0 {
             continue
         }
@@ -236,14 +262,16 @@ fn rev_parse(tmp: str, r: str) -> [str, err] {
     return git_text(tmp, a)
 }
 
-// pseudo-version: the nearest semver tag ancestor bumps its patch and
-// gains -0.<yyyymmddhhmmss>-<sha12>; no ancestor tag starts from v0.0.0
-fn pseudo(tmp: str, sha: str) -> [str, err] {
+// pseudo-version: the nearest <pfx>v* tag ancestor bumps its patch and
+// gains -0.<yyyymmddhhmmss>-<sha12>; no ancestor tag starts from v0.0.0.
+// the prefix is stripped before parsing — the recorded version names
+// the module (vX.Y.Z-…), never the repo tag (<sub>/vX.Y.Z-…)
+fn pseudo(tmp: str, sha: str, pfx: str) -> [str, err] {
     a := mkslice(str, 5)
     a[0] = "describe"
     a[1] = "--tags"
     a[2] = "--abbrev=0"
-    a[3] = "--match=v*"
+    a[3] = "--match=" + pfx + "v*"
     a[4] = sha
     [base, be] = git_text(tmp, a) // ok to fail — no ancestor tag
     if be != nil {
@@ -266,6 +294,9 @@ fn pseudo(tmp: str, sha: str) -> [str, err] {
     maj := 0
     min := 0
     pat := 0
+    if len(base) > len(pfx) {
+        base = substr(base, len(pfx), len(base))
+    }
     v := check.sver_parse(base)
     if v.ok == 1 {
         maj = v.maj
@@ -311,9 +342,9 @@ fn pseudo_sha(query: str) -> str {
 
 struct ShaVer { sha: str, ver: str }
 
-fn fetch_resolve(tmp: str, query: str) -> [own ShaVer, err] {
+fn fetch_resolve(tmp: str, query: str, pfx: str) -> [own ShaVer, err] {
     if query == "latest" || len(query) == 0 {
-        tags := fetch_tags(tmp)
+        tags := fetch_tags(tmp, pfx)
         bv := check.SVer{ok: 0, maj: 0, min: 0, pat: 0, pre: ""}
         btag := ""
         l := tags
@@ -329,20 +360,21 @@ fn fetch_resolve(tmp: str, query: str) -> [own ShaVer, err] {
             if e != nil {
                 return nil, e
             }
-            return new(ShaVer{sha: sha, ver: btag}), nil
+            // the module version is the tag minus its subdir prefix
+            return new(ShaVer{sha: sha, ver: substr(btag, len(pfx), len(btag))}), nil
         }
         [sha, e] = rev_parse(tmp, "HEAD")
         if e != nil {
             return nil, e
         }
-        [v, e2] = pseudo(tmp, sha)
+        [v, e2] = pseudo(tmp, sha, pfx)
         if e2 != nil {
             return nil, e2
         }
         return new(ShaVer{sha: sha, ver: v}), nil
     }
     if byteat(query, 0) == 118 && check.sver_parse(query).ok == 1 {
-        [sha, e] = rev_parse(tmp, "refs/tags/" + query)
+        [sha, e] = rev_parse(tmp, "refs/tags/" + pfx + query)
         if e == nil {
             return new(ShaVer{sha: sha, ver: query}), nil
         }
@@ -360,7 +392,7 @@ fn fetch_resolve(tmp: str, query: str) -> [own ShaVer, err] {
     // a branch name first, then a raw commit-ish
     [sha, e] = rev_parse(tmp, "refs/heads/" + query)
     if e == nil {
-        [v, e2] = pseudo(tmp, sha)
+        [v, e2] = pseudo(tmp, sha, pfx)
         if e2 != nil {
             return nil, e2
         }
@@ -370,7 +402,7 @@ fn fetch_resolve(tmp: str, query: str) -> [own ShaVer, err] {
     if e3 != nil {
         return nil, errors.new("unknown revision " + query)
     }
-    [v, e4] = pseudo(tmp, sha2)
+    [v, e4] = pseudo(tmp, sha2, pfx)
     if e4 != nil {
         return nil, e4
     }
@@ -378,15 +410,16 @@ fn fetch_resolve(tmp: str, query: str) -> [own ShaVer, err] {
 }
 
 // clone --bare into a private dir, resolve the query, git archive the
-// selected tree, read its oxl.mod — one clone serves all three
-fn fetch(url: str, path: str, query: str) -> [own Fetched, err] {
+// selected subtree, read its oxl.mod — one clone serves all three.
+// sub is the repo-relative module root ("" or "extra" / "a/b")
+fn fetch(url: str, path: str, query: str, sub: str) -> [own Fetched, err] {
     tmp := mk_scratch_dir("oxl-get-" + sanitize(path))
-    [f, fe] = fetch_in(tmp, url, path, query)
+    [f, fe] = fetch_in(tmp, url, path, query, sub)
     os.remove_all(tmp)
     return f, fe
 }
 
-fn fetch_in(tmp: str, url: str, path: str, query: str) -> [own Fetched, err] {
+fn fetch_in(tmp: str, url: str, path: str, query: str, sub: str) -> [own Fetched, err] {
     a := mkslice(str, 4)
     a[0] = "clone"
     a[1] = "--bare"
@@ -402,46 +435,138 @@ fn fetch_in(tmp: str, url: str, path: str, query: str) -> [own Fetched, err] {
     if o.status != 0 {
         return nil, errors.new("git clone " + url + ": " + strings.trim(bytes.tostr(o.stderr)))
     }
-    [sv, re] = fetch_resolve(tmp, query)
+    pfx := ""
+    if len(sub) > 0 {
+        pfx = sub + "/"
+    }
+    [sv, re] = fetch_resolve(tmp, query, pfx)
     if re != nil {
         return nil, re
     }
     sha := sv.sha
     ver := sv.ver
-    [tar, te] = git_run(tmp, args3("archive", "--format=tar", sha))
+    // archive only the module subtree — entries keep the subdir prefix,
+    // so extraction roots the module at <dest>/<sub>
+    ta := mkslice(str, 3)
+    ta[0] = "archive"
+    ta[1] = "--format=tar"
+    ta[2] = sha
+    if len(sub) > 0 {
+        ta = push(ta, sub)
+    }
+    [tar, te] = git_run(tmp, ta)
     if te != nil {
         return nil, te
     }
-    [man, me] = git_run(tmp, args2("show", sha + ":oxl.mod"))
+    [man, me] = git_run(tmp, args2("show", sha + ":" + pfx + "oxl.mod"))
     if me != nil {
+        if len(sub) > 0 {
+            return nil, errors.new(path + "@" + ver + ": no oxl.mod at " + sub + "/")
+        }
         return nil, errors.new(path + "@" + ver + ": no oxl.mod at repo root")
     }
-    return new(Fetched{ver: ver, tar: tar.stdout, manifest: man.stdout}), nil
+    return new(Fetched{ver: ver, tar: tar.stdout, manifest: man.stdout, subdir: sub}), nil
+}
+
+// candidate (repo, subdir) splits of a module path: the full path
+// first (a module at the repo root), then each '/' cut inside the
+// path part right-to-left (progressively shorter repos with longer
+// subdirectory prefixes, like Go's vanity resolution). The repo part
+// must keep at least one path segment after its authority — a bare
+// host (or file:// scheme alone) can never be a repo.
+struct Cand { repo: str, sub: str, next: own Cand }
+
+fn fetch_cands(mp: str) -> own Cand {
+    // authority end: after "://" , after "host:" for scp-style git@,
+    // else after the first path segment (a bare host/path)
+    base := 0
+    i := 0
+    for i + 2 < len(mp) {
+        if byteat(mp, i) == 58 && byteat(mp, i + 1) == 47 && byteat(mp, i + 2) == 47 {
+            base = i + 3
+            break
+        }
+        i = i + 1
+    }
+    if base == 0 && strings.startswith(mp, "git@") {
+        i = 0
+        for i < len(mp) {
+            if byteat(mp, i) == 58 {
+                base = i + 1
+                break
+            }
+            i = i + 1
+        }
+    }
+    if base == 0 {
+        i = 0
+        for i < len(mp) {
+            if byteat(mp, i) == 47 {
+                base = i
+                break
+            }
+            i = i + 1
+        }
+    }
+    // '/' positions after the authority, ascending — each prepend puts
+    // the later (longer-repo) cut ahead, so the list reads longest
+    // repo … shortest repo; the full path wraps the head
+    let c: own Cand = nil
+    j := base + 1
+    for j < len(mp) {
+        if byteat(mp, j) == 47 {
+            c = new(Cand{repo: substr(mp, 0, j), sub: substr(mp, j + 1, len(mp)), next: c})
+        }
+        j = j + 1
+    }
+    return new(Cand{repo: mp, sub: "", next: c})
 }
 
 // fetch + the self-declared-path check: refuse modules whose oxl.mod
 // names a different path than the one they were fetched as — mis-
-// pinned forks have to be replaced explicitly
+// pinned forks have to be replaced explicitly. Each candidate repo
+// gets clone→resolve→manifest in turn; the first full success wins.
+// On total failure the first post-clone error (a real repo that
+// resolved badly) is reported over bare clone failures.
 fn fetch_mod(mp: str, query: str) -> [own Fetched, err] {
     if strings.startswith(mp, "-") {
         return nil, errors.new("invalid module path " + mp)
     }
-    [f, fe] = fetch(repo_url(mp), mp, query)
-    if fe != nil {
-        return nil, fe
-    }
-    ck := check.ck_new()
-    if check.parse_manifest(ck, bytes.tostr(f.manifest)) == 0 {
-        msg := "malformed oxl.mod"
-        if len(ck.diags) > 0 {
-            msg = ck.diags[0].msg
+    ferr := ""
+    cerr := ""
+    cs := fetch_cands(mp)
+    for cs != nil {
+        [f, fe] = fetch(repo_url(cs.repo), mp, query, cs.sub)
+        cs = cs.next
+        if fe != nil {
+            if len(ferr) == 0 {
+                ferr = errors.msg(fe)
+            }
+            continue
         }
-        return nil, errors.new(mp + "@" + f.ver + ": parsing oxl.mod: " + msg)
+        ck := check.ck_new()
+        if check.parse_manifest(ck, bytes.tostr(f.manifest)) == 0 {
+            msg := "malformed oxl.mod"
+            if len(ck.diags) > 0 {
+                msg = ck.diags[0].msg
+            }
+            if len(cerr) == 0 {
+                cerr = mp + "@" + f.ver + ": parsing oxl.mod: " + msg
+            }
+            continue
+        }
+        if ck.mod_path != mp {
+            if len(cerr) == 0 {
+                cerr = mp + "@" + f.ver + ": parsing oxl.mod: module declares its path as: " + ck.mod_path + ", but was required as: " + mp
+            }
+            continue
+        }
+        return f, nil
     }
-    if ck.mod_path != mp {
-        return nil, errors.new(mp + "@" + f.ver + ": parsing oxl.mod: module declares its path as: " + ck.mod_path + ", but was required as: " + mp)
+    if len(cerr) > 0 {
+        return nil, errors.new(cerr)
     }
-    return f, nil
+    return nil, errors.new(ferr)
 }
 
 // ---------- modcache write path (modcache.rs) ----------
@@ -717,12 +842,16 @@ fn slot_matches(slot: str, f: ref Fetched) -> [int, err] {
     if e != nil {
         return 0, e
     }
-    [_, ue] = untar(f.tar, tmp)
+    [ux, ue] = untar(f.tar, tmp)
     if ue != nil {
         remove_tree(tmp)
         return 0, ue
     }
-    fresh := check.dir_h1(tmp)
+    fresh_root := tmp
+    if len(f.subdir) > 0 {
+        fresh_root = tmp + "/" + f.subdir
+    }
+    fresh := check.dir_h1(fresh_root)
     cached := check.dir_h1(slot)
     remove_tree(tmp)
     if fresh == cached {
@@ -741,7 +870,7 @@ fn stage_tmp(cache: str, ver: str, f: ref Fetched) -> [str, err] {
     if e != nil {
         return "", e
     }
-    [_, ue] = untar(f.tar, tmp)
+    [ux, ue] = untar(f.tar, tmp)
     if ue != nil {
         remove_tree(tmp)
         return "", ue
@@ -795,7 +924,16 @@ fn install(cache: str, mp: str, f: ref Fetched) -> [str, err] {
     if se != nil {
         return "", se
     }
-    ce := commit_tmp(tmp, slot)
+    // a subdirectory module's root sits at <tmp>/<subdir> in the
+    // extracted tree — that subtree is what the slot holds
+    mroot := tmp
+    if len(f.subdir) > 0 {
+        mroot = tmp + "/" + f.subdir
+    }
+    ce := commit_tmp(mroot, slot)
+    if len(f.subdir) > 0 {
+        remove_tree(tmp)
+    }
     if ce != nil {
         return "", ce
     }
@@ -978,6 +1116,658 @@ fn pin_require(mtext: str, sums: own check.SumEnt, mp: str, f: ref Fetched, slot
 }
 
 // ---------- oxl get ----------
+// ---------- index: the git-backed registry veneer (index.rs) ----------
+// E4: index/<escaped-segments>/<leaf>.json JSONL {version,commit,h1,tag}
+// — `oxl get` consults OXLMODINDEX (a local dir or a git URL, shallow-
+// cloned) before direct git, `oxl publish` appends after pushing the
+// module tag. Contract: docs/specs/.../items/index-protocol.md.
+struct IndexEnt { ver: str, commit: str, h1: str, tag: str }
+
+fn idx_alpha(c: byte) -> bool {
+    if c >= 97 && c <= 122 {
+        return true
+    }
+    if c >= 65 && c <= 90 {
+        return true
+    }
+    if c >= 48 && c <= 57 {
+        return true
+    }
+    return c == 46 || c == 95 || c == 45
+}
+
+// index eligibility + key derivation — "" when the path cannot live
+// in an index (such paths keep the direct-git fallback and can never
+// derive a key that selects another module's entry). Mirrors
+// index.rs::key per index-protocol.md.
+fn index_key(mp: str) -> str {
+    segs := strings.split(mp, "/")
+    if segs == nil || segs.next == nil {
+        return ""
+    }
+    out := "index/"
+    s := segs
+    for s != nil {
+        is_leaf := 0
+        if s.next == nil {
+            is_leaf = 1
+        }
+        seg := s.v
+        if len(seg) == 0 {
+            return ""
+        }
+        i := 0
+        for i < len(seg) {
+            if !idx_alpha(byteat(seg, i)) {
+                return ""
+            }
+            i = i + 1
+        }
+        if check_component(seg) != nil {
+            return ""
+        }
+        if lwr(seg) == ".git" {
+            return ""
+        }
+        if is_leaf == 0 && strings.endswith(lwr(seg), ".json") {
+            return "" // non-leaf `x.json` must be a dir beside `x`.json
+        }
+        esc := check.escape_path(seg)
+        if len(esc) > 200 {
+            return ""
+        }
+        out = out + esc + "/"
+        s = s.next
+    }
+    out = substr(out, 0, len(out) - 1) + ".json"
+    if len(out) > 240 {
+        return ""
+    }
+    return out
+}
+
+// "k":"<v>" — values the index carries hold no escapes, so a lenient
+// scan is enough (entries are written by this same code path)
+fn idx_jget(line: str, k: str) -> str {
+    pat := "\"" + k + "\":\""
+    i := find(line, pat)
+    if i < 0 {
+        return ""
+    }
+    i = i + len(pat)
+    j := i
+    for j < len(line) {
+        if byteat(line, j) == 34 {
+            return substr(line, i, j)
+        }
+        j = j + 1
+    }
+    return ""
+}
+
+fn idx_parse_ent(line: str) -> [IndexEnt, err] {
+    t := strings.trim(line)
+    if len(t) < 2 || !strings.startswith(t, "{") || !strings.endswith(t, "}") {
+        return IndexEnt{ver: "", commit: "", h1: "", tag: ""}, errors.new("malformed index entry " + t)
+    }
+    e := IndexEnt{ver: idx_jget(t, "version"), commit: idx_jget(t, "commit"), h1: idx_jget(t, "h1"), tag: idx_jget(t, "tag")}
+    if check.sver_parse(e.ver).ok == 0 || len(e.commit) == 0 || len(e.h1) == 0 {
+        return IndexEnt{ver: "", commit: "", h1: "", tag: ""}, errors.new("malformed index entry " + t)
+    }
+    return e, nil
+}
+
+fn idx_line(e: IndexEnt) -> str {
+    return "{\"version\":\"" + e.ver + "\",\"commit\":\"" + e.commit + "\",\"h1\":\"" + e.h1 + "\",\"tag\":\"" + e.tag + "\"}"
+}
+
+// OXLMODINDEX resolution — shared by get and publish: a local path
+// is used in place; a git URL is shallow-cloned to a scratch dir the
+// caller removes (cloned=1).
+fn idx_open(v: str) -> [str, err] {
+    if strings.contains(v, "://") || strings.startswith(v, "git@") {
+        tmp := mk_scratch_dir("oxl-idx-")
+        a := mkslice(str, 4)
+        a[0] = "clone"
+        a[1] = "--depth"
+        a[2] = "1"
+        a[3] = v
+        a = push(a, tmp)
+        [og, ge] = git_run("", a)
+        if ge != nil {
+            return "", errors.new("cloning OXLMODINDEX " + v + ": " + errors.msg(ge))
+        }
+        return tmp, nil
+    }
+    return v, nil
+}
+
+fn idx_load(root: str, key: str) -> [own []IndexEnt, err] {
+    text := readfile(root + "/" + key)
+    ents := mkslice(IndexEnt, 0)
+    if len(text) == 0 {
+        return new(ents), nil // missing/empty index file — module isn't indexed
+    }
+    lines := strings.split(text, "\n")
+    for lines != nil {
+        t := strings.trim(lines.v)
+        lines = lines.next
+        if len(t) == 0 {
+            continue
+        }
+        [e, pe] = idx_parse_ent(t)
+        if pe != nil {
+            return nil, pe
+        }
+        ents = push(ents, e)
+    }
+    return new(ents), nil
+}
+
+// the entry answering `query` — `latest` is the max semver, an exact
+// vX.Y.Z names it; anything else can't be index-served → nil → the
+// caller runs direct-git resolution
+fn idx_select(ents: []IndexEnt, query: str) -> own IndexEnt {
+    bi := -1
+    i := 0
+    if len(query) == 0 || query == "latest" {
+        bv := check.sver_parse("v0.0.0")
+        for i < len(ents) {
+            v := check.sver_parse(ents[i].ver)
+            if v.ok == 1 && (bi < 0 || check.sver_cmp(v, bv) > 0) {
+                bi = i
+                bv = v
+            }
+            i = i + 1
+        }
+    } else {
+        for i < len(ents) {
+            if ents[i].ver == query {
+                bi = i
+            }
+            i = i + 1
+        }
+    }
+    if bi < 0 {
+        return nil
+    }
+    e := ents[bi]
+    return new(IndexEnt{ver: e.ver, commit: e.commit, h1: e.h1, tag: e.tag})
+}
+
+// `tag` back to the repo-relative module root: `extra/v1.2.3` →
+// `extra`, `v1.2.3` → "" (a root module's tag is the bare version).
+// Callers distinguish "" = root-module tag from malformed via the
+// `tag == ver` check, so this returns the suffix when it validates.
+fn idx_tag_subdir(tag: str, ver: str) -> str {
+    if tag == ver {
+        return ""
+    }
+    if strings.endswith(tag, "/" + ver) {
+        return substr(tag, 0, len(tag) - len(ver) - 1)
+    }
+    return tag // malformed: returned whole, caller tests startswith
+}
+
+// a `git` run that reports status without erroring — for probes whose
+// nonzero exit is meaningful (rev-parse of a missing ref, etc.)
+struct GitOut { out: str, status: int }
+
+fn git_probe(dir: str, args: []str) -> GitOut {
+    argv := mkslice(str, 0)
+    if len(dir) > 0 {
+        argv = push(argv, "-C")
+        argv = push(argv, dir)
+    }
+    i := 0
+    for i < len(args) {
+        argv = push(argv, args[i])
+        i = i + 1
+    }
+    cmd := exec.cmd_env("git", argv, git_env())
+    [o, ge] = cmd.output()
+    r := GitOut{out: "", status: -1}
+    if ge == nil {
+        r.out = bytes.tostr(o.stdout)
+        r.status = o.status
+    }
+    return r
+}
+
+// index-first resolution for `oxl get` — mirrors try_index_get: a
+// matching entry pins the fetch to `commit` and the entry's h1 is
+// verified against the fetched tree (mismatch is a hard error, never
+// a silent fallback). (nil,nil) = fall through to fetch_mod.
+fn try_index_get(mp: str, query: str) -> [own Fetched, err] {
+    key := index_key(mp)
+    if len(key) == 0 {
+        return nil, nil
+    }
+    iv := os.getenv("OXLMODINDEX")
+    if len(iv) == 0 {
+        return nil, nil
+    }
+    [iroot, re] = idx_open(iv)
+    if re != nil {
+        return nil, nil // an unreachable index must not hard-fail get
+    }
+    cloned := 0
+    if iroot != iv {
+        cloned = 1
+    }
+    [ents, le] = idx_load(iroot, key)
+    if le != nil {
+        if cloned == 1 {
+            os.remove_all(iroot)
+        }
+        return nil, le
+    }
+    e := idx_select(ents, query)
+    if e == nil {
+        if cloned == 1 {
+            os.remove_all(iroot)
+        }
+        return nil, nil
+    }
+    sub := idx_tag_subdir(e.tag, e.ver)
+    if e.tag != e.ver && (len(sub) == len(e.tag) || !strings.endswith(e.tag, "/" + e.ver)) {
+        if cloned == 1 {
+            os.remove_all(iroot)
+        }
+        return nil, errors.new("index entry tag \"" + e.tag + "\" does not end at version " + e.ver)
+    }
+    repo := mp
+    if len(sub) > 0 {
+        if !strings.endswith(mp, "/" + sub) {
+            if cloned == 1 {
+                os.remove_all(iroot)
+            }
+            return nil, errors.new("module path " + mp + " does not end at index subdir " + sub)
+        }
+        repo = substr(mp, 0, len(mp) - len(sub) - 1)
+    }
+    [f, fe] = fetch(repo_url(repo), mp, e.commit, sub)
+    if fe != nil {
+        if cloned == 1 {
+            os.remove_all(iroot)
+        }
+        return nil, errors.new(mp + "@" + e.ver + ": " + errors.msg(fe))
+    }
+    declared := mod_declared(mp, e.ver, f.manifest)
+    if len(declared) > 0 && declared != mp {
+        if cloned == 1 {
+            os.remove_all(iroot)
+        }
+        return nil, errors.new(mp + "@" + e.ver + ": parsing oxl.mod: module declares its path as: " + declared + ", but was required as: " + mp)
+    }
+    if len(declared) == 0 {
+        if cloned == 1 {
+            os.remove_all(iroot)
+        }
+        return nil, errors.new(mp + "@" + e.ver + ": parsing oxl.mod: empty module path")
+    }
+    // tamper check: entry h1 must equal the fetched tree's
+    tmp := mk_scratch_dir("oxl-idxv-")
+    [ux, ue] = untar(f.tar, tmp)
+    fresh := ""
+    if ue == nil {
+        r := tmp
+        if len(f.subdir) > 0 {
+            r = tmp + "/" + f.subdir
+        }
+        fresh = check.dir_h1(r)
+    }
+    os.remove_all(tmp)
+    if cloned == 1 {
+        os.remove_all(iroot)
+    }
+    if ue != nil {
+        return nil, ue
+    }
+    if fresh != e.h1 {
+        return nil, errors.new(mp + "@" + e.ver + ": index entry h1 " + e.h1 + " does not match the fetched tree " + fresh + " — the index entry or the published tag was tampered with")
+    }
+    f.ver = e.ver
+    return f, nil
+}
+
+// the module path a fetched manifest declares ("" on parse failure —
+// the caller reports it)
+fn mod_declared(mp: str, ver: str, manifest: []byte) -> str {
+    mr := check.parse_manifest_to("", bytes.tostr(manifest))
+    if mr == nil || len(mr.errt) > 0 {
+        return ""
+    }
+    return mr.path
+}
+
+// package dirs under `root` — every dir holding a `.oxl` file,
+// skipping nested module roots and non-package trees (.git, target,
+// dot-dirs). `oxl publish` builds each one.
+fn pkg_dirs(root: str, top: str) -> own []str {
+    out := mkslice(str, 0)
+    if root != top && os.exists(root + "/oxl.mod") {
+        return new(out)
+    }
+    names := os.ls(root)
+    has_oxl := 0
+    subs := mkslice(str, 0)
+    i := 0
+    for i < len(names) {
+        p := root + "/" + names[i]
+        if os.isdir(p) {
+            subs = push(subs, names[i])
+        } else if strings.endswith(names[i], ".oxl") {
+            has_oxl = 1
+        }
+        i = i + 1
+    }
+    if has_oxl == 1 {
+        out = push(out, root)
+    }
+    i = 0
+    for i < len(subs) {
+        n := subs[i]
+        if n != ".git" && n != "target" && !strings.startswith(n, ".") {
+            more := pkg_dirs(root + "/" + n, top)
+            j := 0
+            for j < len(more) {
+                out = push(out, more[j])
+                j = j + 1
+            }
+        }
+        i = i + 1
+    }
+    return new(out)
+}
+
+fn cmd_publish() {
+    if argc() != 3 || strings.startswith(argv(2), "-") || check.sver_parse(argv(2)).ok == 0 {
+        eprintln("usage: oxl publish v<semver>")
+        exit(2)
+    }
+    pe := publish(argv(2))
+    if pe != nil {
+        eprintln("error: " + errors.msg(pe))
+        exit(1)
+    }
+}
+
+// `oxl publish vX.Y.Z` — tag the module's commit as `<subdir>/vX` (or
+// `vX` for a root module), push when an origin exists, then append
+// the index entry — in that order so an entry never names a tag
+// consumers cannot reach. Eligibility runs first: an unpublishable
+// path cannot strand a pushed tag. Mirrors publish() in main.rs.
+fn publish(ver: str) -> err {
+    cwd := os.fullpath(".")
+    root := check.find_root(cwd)
+    if len(root) == 0 {
+        return errors.new("no oxl.mod in current directory or any parent")
+    }
+    mtext := readfile(root + "/oxl.mod")
+    mr := check.parse_manifest_to(root, mtext)
+    if mr == nil {
+        return errors.new("parsing oxl.mod: unparseable manifest")
+    }
+    if len(mr.errt) > 0 {
+        return errors.new("parsing oxl.mod: " + mr.errt)
+    }
+    mp := mr.path
+    key := index_key(mp)
+    if len(key) == 0 {
+        return errors.new("module path " + mp + " is not index-eligible")
+    }
+    iv := os.getenv("OXLMODINDEX")
+    if len(iv) == 0 {
+        return errors.new("OXLMODINDEX is not set — nothing to publish to")
+    }
+    [iroot, re] = idx_open(iv)
+    if re != nil {
+        return re
+    }
+    cloned := 0
+    idx := iroot
+    if iroot != iv {
+        cloned = 1
+    }
+
+    [top, te] = git_text(root, args2("rev-parse", "--show-toplevel"))
+    if te != nil {
+        if cloned == 1 {
+            os.remove_all(iroot)
+        }
+        return te
+    }
+    sub := ""
+    if strings.startswith(root, top + "/") {
+        sub = substr(root, len(top) + 1, len(root))
+    }
+    sdir := sub
+    if len(sdir) == 0 {
+        sdir = "."
+    }
+    sts := git_probe(top, mkslice4_("status", "--porcelain", "--", sdir))
+    if len(strings.trim(sts.out)) > 0 {
+        if cloned == 1 {
+            os.remove_all(iroot)
+        }
+        return errors.new("uncommitted changes under " + root)
+    }
+    [commit, ce] = git_text(top, args2("rev-parse", "HEAD"))
+    if ce != nil {
+        if cloned == 1 {
+            os.remove_all(iroot)
+        }
+        return ce
+    }
+
+    // every package dir under the module must compile — argv(0) is
+    // this same toolchain binary
+    pkgs := pkg_dirs(root, root)
+    pi := 0
+    for pi < len(pkgs) {
+        ta := mkslice(str, 2)
+        ta[0] = "test"
+        ta[1] = pkgs[pi]
+        cmd := exec.cmd(argv(0), ta)
+        [o, oe] = cmd.output()
+        if oe != nil || o.status != 0 {
+            if cloned == 1 {
+                os.remove_all(iroot)
+            }
+            msg := ""
+            if oe != nil {
+                msg = errors.msg(oe)
+            } else {
+                msg = strings.trim(bytes.tostr(o.stderr))
+            }
+            return errors.new("oxl test " + pkgs[pi] + ": " + msg)
+        }
+        pi = pi + 1
+    }
+
+    tag := ver
+    if len(sub) > 0 {
+        tag = sub + "/" + ver
+    }
+    tagref := "refs/tags/" + tag
+    lsha := git_probe(top, mkslice4_("rev-parse", "--verify", "-q", tagref + "^{commit}"))
+    if lsha.status == 0 {
+        if strings.trim(lsha.out) != commit {
+            if cloned == 1 {
+                os.remove_all(iroot)
+            }
+            return errors.new("tag " + tag + " exists at " + strings.trim(lsha.out) + " — expected " + commit + "; refusing to republish a moved tag")
+        }
+    } else {
+        [gt, tge] = git_run(top, mkslice6_("tag", "-a", tag, "-m", mp + " " + ver, commit))
+        if tge != nil {
+            if cloned == 1 {
+                os.remove_all(iroot)
+            }
+            return tge
+        }
+    }
+    ost := git_probe(top, args3("remote", "get-url", "origin"))
+    if ost.status == 0 {
+        remr := git_probe(top, mkslice4_("ls-remote", "--tags", "origin", tag))
+        rsha := ""
+        rl := strings.split(remr.out, "\n")
+        for rl != nil {
+            l := strings.trim(rl.v)
+            rl = rl.next
+            if len(l) == 0 {
+                continue
+            }
+            tab := find(l, "\t")
+            if tab < 0 {
+                continue
+            }
+            s := substr(l, 0, tab)
+            r := strings.trim(substr(l, tab + 1, len(l)))
+            if r == tagref + "^{}" {
+                rsha = s
+            } else if r == tagref && len(rsha) == 0 {
+                rsha = s
+            }
+        }
+        if len(rsha) == 0 {
+            [gp1, pge] = git_run(top, args3("push", "origin", tagref))
+            if pge != nil {
+                if cloned == 1 {
+                    os.remove_all(iroot)
+                }
+                return errors.new("tag push failed — nothing published: " + errors.msg(pge))
+            }
+        } else if rsha != commit {
+            if cloned == 1 {
+                os.remove_all(iroot)
+            }
+            return errors.new("remote tag " + tag + " exists at " + rsha + " — expected " + commit + "; refusing to republish")
+        }
+    } else {
+        eprintln("warning: no origin remote — tag " + tag + " is local only")
+    }
+
+    // h1 over the tagged tree exactly as a consumer's fetch archives
+    // it — worktree files git ignores never enter the sum
+    tmp := mk_scratch_dir("oxl-pub-")
+    aa := mkslice(str, 3)
+    aa[0] = "archive"
+    aa[1] = "--format=tar"
+    aa[2] = commit
+    aa = push(aa, sdir)
+    [ao, ae] = git_run(top, aa)
+    h1 := ""
+    if ae == nil {
+        [ux2, ue] = untar(ao.stdout, tmp)
+        if ue == nil {
+            r := tmp
+            if len(sub) > 0 {
+                r = tmp + "/" + sub
+            }
+            h1 = check.dir_h1(r)
+        } else {
+            ae = ue
+        }
+    }
+    os.remove_all(tmp)
+    if ae != nil {
+        if cloned == 1 {
+            os.remove_all(iroot)
+        }
+        return ae
+    }
+
+    // append the entry — idempotent: the same line is already-
+    // published success, a conflicting same-version entry refuses
+    e := IndexEnt{ver: ver, commit: commit, h1: h1, tag: tag}
+    ipath := idx + "/" + key
+    old := readfile(ipath)
+    conflict := ""
+    dupe := 0
+    ol := strings.split(old, "\n")
+    for ol != nil {
+        t := strings.trim(ol.v)
+        ol = ol.next
+        if len(t) == 0 {
+            continue
+        }
+        [x, pe] = idx_parse_ent(t)
+        if pe != nil {
+            if cloned == 1 {
+                os.remove_all(iroot)
+            }
+            return pe
+        }
+        if x.ver == ver {
+            if x.commit == commit && x.h1 == h1 && x.tag == tag {
+                dupe = 1
+            } else {
+                conflict = "index already has " + ver + " with different content (" + x.commit + "@" + x.h1 + "); refusing to publish a divergent entry"
+            }
+        }
+    }
+    if len(conflict) > 0 {
+        if cloned == 1 {
+            os.remove_all(iroot)
+        }
+        return errors.new(conflict)
+    }
+    if dupe == 1 {
+        println("already published " + mp + " " + ver)
+        if cloned == 1 {
+            os.remove_all(iroot)
+        }
+        return nil
+    }
+    de := os.mkdir_all(check.dir_of(ipath))
+    if de != nil {
+        if cloned == 1 {
+            os.remove_all(iroot)
+        }
+        return de
+    }
+    nl := idx_line(e) + "\n"
+    if writefile(ipath, old + nl) != 0 {
+        if cloned == 1 {
+            os.remove_all(iroot)
+        }
+        return errors.new("writing " + ipath + " failed")
+    }
+    // the index tree is itself versioned — commit the entry when the
+    // index lives in a repo, push when it has an origin
+    gst := git_probe(idx, args2("rev-parse", "--git-dir"))
+    if gst.status == 0 {
+        [ga, ge2] = git_run(idx, args3("add", "--", key))
+        if ge2 == nil {
+            [gc, ge3] = git_run(idx, args3("commit", "-m", "publish " + mp + " " + ver))
+            ge2 = ge3
+        }
+        if ge2 != nil {
+            if cloned == 1 {
+                os.remove_all(iroot)
+            }
+            return ge2
+        }
+        ost2 := git_probe(idx, args3("remote", "get-url", "origin"))
+        if ost2.status == 0 {
+            [gp, pge2] = git_run(idx, args3("push", "origin", "HEAD"))
+            if pge2 != nil {
+                if cloned == 1 {
+                    os.remove_all(iroot)
+                }
+                return errors.new("index push failed: " + errors.msg(pge2))
+            }
+        }
+    }
+    println("published " + mp + " " + ver)
+    if cloned == 1 {
+        os.remove_all(iroot)
+    }
+    return nil
+}
+
 fn cmd_get() {
     if argc() != 3 || strings.startswith(argv(2), "-") {
         eprintln("usage: oxl get <path>@<query>")
@@ -1009,10 +1799,20 @@ fn cmd_get() {
         eprintln("error: no oxl.mod in current directory or any parent")
         exit(1)
     }
-    [f, fe] = fetch_mod(mpath, query)
+    [f, fe] = try_index_get(mpath, query)
     if fe != nil {
         eprintln("error: " + errors.msg(fe))
         exit(1)
+    }
+    if f == nil {
+        // `[g, ge] =` re-binds in this block — assign out so the outer f
+        // carries the fetched module past the if
+        [g, ge] = fetch_mod(mpath, query)
+        if ge != nil {
+            eprintln("error: " + errors.msg(ge))
+            exit(1)
+        }
+        f = g
     }
     cache := check.modcache_dir()
     [slot, ie] = install(cache, mpath, f)
@@ -1571,15 +2371,21 @@ struct SatState {
     report: []str,
 }
 
-struct ProbeSnap { ok: int, ver: str, tar: []byte, manifest: []byte }
+struct ProbeSnap {
+    ok: int,
+    ver: str,
+    tar: []byte,
+    manifest: []byte,
+    subdir: str,
+}
 
 fn probe_get(l: ref ProbeEnt, m: str) -> own ProbeSnap {
     for l != nil {
         if l.m == m {
             if l.ok == 0 {
-                return new(ProbeSnap{ok: 0, ver: "", tar: mkslice(byte, 0), manifest: mkslice(byte, 0)})
+                return new(ProbeSnap{ok: 0, ver: "", tar: mkslice(byte, 0), manifest: mkslice(byte, 0), subdir: ""})
             }
-            return new(ProbeSnap{ok: 1, ver: l.f.ver, tar: l.f.tar, manifest: l.f.manifest})
+            return new(ProbeSnap{ok: 1, ver: l.f.ver, tar: l.f.tar, manifest: l.f.manifest, subdir: l.f.subdir})
         }
         l = l.next
     }
@@ -1837,14 +2643,14 @@ fn tidy_satisfy(imp: str, dep_root: str, ck: ref check.Ck, st: mut SatState) -> 
             if ps.ok == 0 {
                 continue
             }
-            f = new(Fetched{ver: ps.ver, tar: ps.tar, manifest: ps.manifest})
+            f = new(Fetched{ver: ps.ver, tar: ps.tar, manifest: ps.manifest, subdir: ps.subdir})
         } else {
             [nf, nfe] = fetch_mod(m, "latest")
             if nfe != nil {
                 st.probed = new(ProbeEnt{m: m, f: nil, ok: 0, next: st.probed})
                 continue
             }
-            f = new(Fetched{ver: nf.ver, tar: nf.tar, manifest: nf.manifest})
+            f = new(Fetched{ver: nf.ver, tar: nf.tar, manifest: nf.manifest, subdir: nf.subdir})
             st.probed = new(ProbeEnt{m: m, f: nf, ok: 1, next: st.probed})
         }
         rest := ""
@@ -1863,6 +2669,9 @@ fn tidy_satisfy(imp: str, dep_root: str, ck: ref check.Ck, st: mut SatState) -> 
             }
             tmp = t
             base = t
+            if len(f.subdir) > 0 {
+                base = t + "/" + f.subdir
+            }
         }
         contains := 0
         if len(rest) == 0 || os.isdir(base + "/" + rest) {
@@ -1879,7 +2688,10 @@ fn tidy_satisfy(imp: str, dep_root: str, ck: ref check.Ck, st: mut SatState) -> 
         installing := 0
         if len(tmp) > 0 {
             installing = 1
-            ce := commit_tmp(tmp, slot)
+            ce := commit_tmp(base, slot)
+            if len(f.subdir) > 0 {
+                remove_tree(tmp)
+            }
             if ce != nil {
                 return 0, ce
             }

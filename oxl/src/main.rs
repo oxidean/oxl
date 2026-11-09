@@ -9,6 +9,7 @@ mod codegen;
 mod diag;
 mod fetch;
 mod fmt;
+mod index;
 mod modcache;
 mod lexer;
 mod parser;
@@ -26,7 +27,7 @@ fn main() {
         return;
     }
     if args.len() < 2 {
-        eprintln!("oxl — one toolchain binary\n\n  oxl build [<pkg dir>|<file.oxl>...] [-o out]\n  oxl run [<pkg dir>|<file.oxl>...]\n  oxl test [<pkg dir>|<file.oxl>...]\n  oxl fmt <file.oxl>...\n  oxl doc <file.oxl>\n  oxl get <path>@<query>\n  oxl mod <init|tidy|verify|list> ...\n  oxl list -m all\n  oxl lsp");
+        eprintln!("oxl — one toolchain binary\n\n  oxl build [<pkg dir>|<file.oxl>...] [-o out]\n  oxl run [<pkg dir>|<file.oxl>...]\n  oxl test [<pkg dir>|<file.oxl>...]\n  oxl fmt <file.oxl>...\n  oxl doc <file.oxl>\n  oxl get <path>@<query>\n  oxl publish v<semver>\n  oxl mod <init|tidy|verify|list> ...\n  oxl list -m all\n  oxl lsp");
         exit(2);
     }
     match args[1].as_str() {
@@ -36,6 +37,7 @@ fn main() {
         "fmt" => cmd_fmt(&args),
         "doc" => cmd_doc(&args),
         "get" => cmd_get(&args),
+        "publish" => cmd_publish(&args),
         "mod" => cmd_mod(&args),
         "list" => cmd_list(&args),
         "lsp" => cmd_lsp(),
@@ -1744,6 +1746,7 @@ fn emit_and_cc(c_src: &str, out: &Path) -> bool {
         "rt_set_sndtimo",
         "rt_htons",
         "rt_htonl",
+        "rt_lookup_ipv4",
     ]
     .iter()
     .any(|p| c_src.contains(p));
@@ -1993,8 +1996,15 @@ fn cmd_get(args: &[String]) {
         eprintln!("error: no oxl.mod in current directory or any parent");
         exit(1);
     };
-    let f = match fetch_mod(&mpath, query) {
-        Ok(f) => f,
+    let f = match try_index_get(&mpath, query) {
+        Ok(Some(f)) => f,
+        Ok(None) => match fetch_mod(&mpath, query) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("error: {e}");
+                exit(1);
+            }
+        },
         Err(e) => {
             eprintln!("error: {e}");
             exit(1);
@@ -2049,19 +2059,365 @@ fn cmd_get(args: &[String]) {
 /// fetch + the self-declared-path check (refuse modules whose
 /// oxl.mod names a different path than the one they were fetched as —
 /// mis-pinned forks have to be replaced explicitly)
+/// candidate (repo, subdir) splits of a module path: the full path
+/// first (a module at the repo root), then each '/' cut inside the
+/// path part right-to-left — progressively shorter repos with longer
+/// subdirectory prefixes, like Go's vanity resolution. The repo part
+/// must keep at least one path segment after its authority — a bare
+/// host (or file:// scheme alone) can never be a repo.
+fn fetch_cands(mp: &str) -> Vec<(String, String)> {
+    // authority end: after "://" , after "host:" for scp-style git@,
+    // else the first '/' (a bare host/path — authority is segment one)
+    let base = mp
+        .find("://")
+        .map(|i| i + 3)
+        .or_else(|| {
+            mp.starts_with("git@").then(|| mp.find(':').map(|i| i + 1)).flatten()
+        })
+        .unwrap_or_else(|| mp.find('/').unwrap_or(mp.len()));
+    let mut cands = vec![(mp.to_string(), String::new())];
+    for (i, c) in mp.char_indices().rev() {
+        if i <= base {
+            break;
+        }
+        if c == '/' {
+            cands.push((mp[..i].to_string(), mp[i + 1..].to_string()));
+        }
+    }
+    cands
+}
+
+/// fetch + the self-declared-path check: refuse modules whose oxl.mod
+/// names a different path than the one they were fetched as — mis-
+/// pinned forks have to be replaced explicitly. Each candidate repo
+/// gets clone→resolve→manifest in turn; the first full success wins.
+/// On total failure the first post-clone error (a real repo that
+/// resolved badly) is reported over bare clone failures.
 fn fetch_mod(mp: &str, query: &str) -> Result<fetch::Fetched, String> {
-    let f = fetch::fetch(&fetch::repo_url(mp), mp, query)?;
+    if mp.starts_with('-') {
+        return Err(format!("invalid module path {mp}"));
+    }
+    let mut ferr: Option<String> = None;
+    let mut cerr: Option<String> = None;
+    for (repo, sub) in fetch_cands(mp) {
+        let f = match fetch::fetch(&fetch::repo_url(&repo), mp, query, &sub) {
+            Ok(f) => f,
+            Err(e) => {
+                ferr.get_or_insert(e);
+                continue;
+            }
+        };
+        let declared = std::str::from_utf8(&f.manifest)
+            .map_err(|e| e.to_string())
+            .and_then(|t| parse_manifest(t).map(|(p, _, _, _)| p))
+            .map_err(|e| format!("{mp}@{}: parsing oxl.mod: {e}", f.ver));
+        match declared {
+            Ok(d) if d == mp => return Ok(f),
+            Ok(d) => {
+                cerr.get_or_insert(format!(
+                    "{mp}@{}: parsing oxl.mod: module declares its path as: {d}, but was required as: {mp}",
+                    f.ver
+                ));
+            }
+            Err(e) => {
+                cerr.get_or_insert(e);
+            }
+        }
+    }
+    Err(cerr.or(ferr).unwrap_or_else(|| format!("{mp}: no fetchable repository candidate")))
+}
+
+/// index-first resolution for `oxl get`: when OXLMODINDEX names an
+/// index and the module path is index-eligible, a matching entry pins
+/// the fetch to `commit` and the entry's `h1` is verified against the
+/// fetched tree — a mismatch is a hard error (index tamper or a
+/// republished tag), never a silent fallback. No index configured /
+/// no entry / ineligible path / unreachable index → Ok(None), and the
+/// caller runs the direct-git resolution.
+fn try_index_get(mp: &str, query: &str) -> Result<Option<fetch::Fetched>, String> {
+    let Some(key) = index::key(mp) else {
+        return Ok(None);
+    };
+    let root = match index::root() {
+        Ok(r) => r,
+        Err(_) => None, // an unreachable index must not hard-fail get
+    };
+    let Some(root) = root else {
+        return Ok(None);
+    };
+    let ents = index::load(&root, &key)?;
+    let Some(e) = index::select(&ents, query) else {
+        if let index::Root::Cloned(t) = &root {
+            let _ = std::fs::remove_dir_all(t);
+        }
+        return Ok(None);
+    };
+    // entry.tag = "<subdir>/<ver>" or bare "<ver>" for a root module —
+    // the repo is the module path minus its subdir suffix
+    let sub = index::tag_subdir(&e.tag, &e.version).ok_or_else(|| {
+        format!("index entry tag {:?} does not end at version {}", e.tag, e.version)
+    })?;
+    let repo = if sub.is_empty() {
+        mp.to_string()
+    } else {
+        mp.strip_suffix(&sub)
+            .and_then(|p| p.strip_suffix('/'))
+            .ok_or_else(|| format!("module path {mp} does not end at index subdir {sub}"))?
+            .to_string()
+    };
+    let mut f = fetch::fetch(&fetch::repo_url(&repo), mp, &e.commit, &sub)
+        .map_err(|x| format!("{mp}@{}: {x}", e.version))?;
     let declared = std::str::from_utf8(&f.manifest)
-        .map_err(|e| e.to_string())
+        .map_err(|x| x.to_string())
         .and_then(|t| parse_manifest(t).map(|(p, _, _, _)| p))
-        .map_err(|e| format!("{mp}@{}: parsing oxl.mod: {e}", f.ver))?;
+        .map_err(|x| format!("{mp}@{}: parsing oxl.mod: {x}", e.version))?;
     if declared != mp {
+        if let index::Root::Cloned(t) = &root {
+            let _ = std::fs::remove_dir_all(t);
+        }
         return Err(format!(
             "{mp}@{}: parsing oxl.mod: module declares its path as: {declared}, but was required as: {mp}",
-            f.ver
+            e.version
         ));
     }
-    Ok(f)
+    // tamper check: the entry's h1 must equal the fetched tree's —
+    // mismatch means the index entry or the published tag moved
+    let tmp = std::env::temp_dir().join(format!("oxl-idxv-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let chk = std::fs::create_dir_all(&tmp)
+        .map_err(|x| x.to_string())
+        .and_then(|_| modcache::untar(&f.tar, &tmp))
+        .and_then(|_| {
+            let r = if f.subdir.is_empty() { tmp.clone() } else { tmp.join(&f.subdir) };
+            modcache::dir_h1(&r)
+        });
+    let _ = std::fs::remove_dir_all(&tmp);
+    let fresh = chk?;
+    if let index::Root::Cloned(t) = &root {
+        let _ = std::fs::remove_dir_all(t);
+    }
+    if fresh != e.h1 {
+        return Err(format!(
+            "{mp}@{}: index entry h1 {} does not match the fetched tree {} — the index entry or the published tag was tampered with",
+            e.version, e.h1, fresh
+        ));
+    }
+    f.ver = e.version.clone();
+    Ok(Some(f))
+}
+
+/// `git` in `dir` → stdout, or the command's stderr as the error. The
+/// publish veneer shares fetch's rules: no interactive auth prompts.
+fn gits(dir: &Path, args: &[&str]) -> Result<String, String> {
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env("TZ", "UTC")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .map_err(|e| format!("git {}: {e}", args.join(" ")))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        return Err(format!("git {}: {err}", args.join(" ")));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+fn git_ok(dir: &Path, args: &[&str]) -> bool {
+    Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// package dirs under `root` — every dir holding a `.oxl` file,
+/// skipping nested module roots and the usual non-package trees
+/// (.git, target, the module cache). Publish builds each one.
+fn pkg_dirs(root: &Path, top: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
+    if root != top && root.join("oxl.mod").exists() {
+        return Ok(()); // a nested module root is not this module's pkg
+    }
+    let mut has_oxl = false;
+    let rd = std::fs::read_dir(root).map_err(|e| format!("{}: {e}", root.display()))?;
+    let mut subdirs = Vec::new();
+    for e in rd {
+        let e = e.map_err(|x| x.to_string())?;
+        let p = e.path();
+        let ft = e.file_type().map_err(|x| x.to_string())?;
+        if ft.is_dir() {
+            subdirs.push(p);
+        } else if ft.is_file() && p.extension().map(|x| x == "oxl").unwrap_or(false) {
+            has_oxl = true;
+        }
+    }
+    if has_oxl {
+        out.push(root.to_path_buf());
+    }
+    subdirs.sort();
+    for d in subdirs {
+        let name = d.file_name().unwrap_or_default().to_string_lossy();
+        if name == ".git" || name == "target" || name.starts_with('.') {
+            continue;
+        }
+        pkg_dirs(&d, top, out)?;
+    }
+    Ok(())
+}
+
+fn cmd_publish(args: &[String]) {
+    if args.len() != 3 || args[2].starts_with('-') || semver::parse(&args[2]).is_none() {
+        eprintln!("usage: oxl publish v<semver>");
+        exit(2);
+    }
+    let ver = args[2].clone();
+    if let Err(e) = publish(&ver) {
+        eprintln!("error: {e}");
+        exit(1);
+    }
+}
+
+/// `oxl publish vX.Y.Z`: tag the module's commit as `<subdir>/vX` (or
+/// `vX` for a root module), push the tag when the repo has an origin,
+/// then append the index entry — in that order so an entry never
+/// names a tag consumers cannot reach. Eligibility is checked first:
+/// an unpublishable path cannot strand a pushed tag. Retry is
+/// idempotent end to end per the protocol contract.
+fn publish(ver: &str) -> Result<(), String> {
+    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+    let root = find_root(&cwd).ok_or("no oxl.mod in current directory or any parent")?;
+    let mtext = std::fs::read_to_string(root.join("oxl.mod")).map_err(|e| e.to_string())?;
+    let (mp, _, _, _) = parse_manifest(&mtext).map_err(|e| format!("parsing oxl.mod: {e}"))?;
+    let key = index::key(&mp).ok_or_else(|| format!("module path {mp} is not index-eligible"))?;
+    let iroot = index::root()?.ok_or("OXLMODINDEX is not set — nothing to publish to")?;
+    let idx = iroot.path().to_path_buf();
+
+    let top = PathBuf::from(gits(&root, &["rev-parse", "--show-toplevel"])?.trim());
+    let root_c = root.canonicalize().map_err(|e| e.to_string())?;
+    let sub = root_c
+        .strip_prefix(&top)
+        .map_err(|_| format!("{} is not inside repo {}", root.display(), top.display()))?
+        .to_string_lossy()
+        .replace('\\', "/");
+    let scope = if sub.is_empty() { ".".to_string() } else { sub.clone() };
+    if !gits(&top, &["status", "--porcelain", "--", &scope])?.trim().is_empty() {
+        return Err(format!("uncommitted changes under {}", root.display()));
+    }
+    let commit = gits(&top, &["rev-parse", "HEAD"])?.trim().to_string();
+
+    // every package dir under the module must compile
+    let mut pkgs = Vec::new();
+    pkg_dirs(&root_c, &root_c, &mut pkgs)?;
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    for d in &pkgs {
+        let out = Command::new(&exe)
+            .args(["test"])
+            .arg(d)
+            .output()
+            .map_err(|e| format!("oxl test {}: {e}", d.display()))?;
+        if !out.status.success() {
+            return Err(format!(
+                "oxl test {}:\n{}",
+                d.display(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+    }
+
+    // tag "<subdir>/vX" — or bare "vX" for a repo-root module
+    let tag = if sub.is_empty() { ver.to_string() } else { format!("{sub}/{ver}") };
+    let tagref = format!("refs/tags/{tag}");
+    let local = gits(&top, &["rev-parse", "--verify", "-q", &format!("{tagref}^{{commit}}")]);
+    match local {
+        Ok(sha) if sha.trim() == commit => {}
+        Ok(sha) => {
+            return Err(format!(
+                "tag {tag} exists at {} — expected {commit}; refusing to republish a moved tag",
+                sha.trim()
+            ))
+        }
+        Err(_) => {
+            gits(&top, &["tag", "-a", &tag, "-m", &format!("{mp} {ver}"), &commit])?;
+        }
+    }
+    let has_origin = git_ok(&top, &["remote", "get-url", "origin"]);
+    if has_origin {
+        // a remote tag at the same commit is already-published; a
+        // moved one is refused; absent → push the local tag
+        let rem = gits(&top, &["ls-remote", "--tags", "origin", &tag])?;
+        let mut rsha = String::new();
+        for l in rem.lines() {
+            let mut it = l.split_whitespace();
+            let (s, r) = (it.next().unwrap_or(""), it.next().unwrap_or(""));
+            if r == format!("{tagref}^{{}}") || r == tagref {
+                if r.ends_with("^{}") || rsha.is_empty() {
+                    rsha = s.to_string();
+                }
+            }
+        }
+        if rsha.is_empty() {
+            gits(&top, &["push", "origin", &tagref])
+                .map_err(|e| format!("tag push failed — nothing published: {e}"))?;
+        } else if rsha != commit {
+            return Err(format!(
+                "remote tag {tag} exists at {rsha} — expected {commit}; refusing to republish"
+            ));
+        }
+    } else {
+        eprintln!("warning: no origin remote — tag {tag} is local only");
+    }
+
+    // h1 over the tagged tree exactly as a consumer's fetch archives
+    // it — worktree files git ignores never enter the sum
+    let tmp = std::env::temp_dir().join(format!("oxl-pub-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).map_err(|e| e.to_string())?;
+    let tar = Command::new("git")
+        .args(["archive", "--format=tar", &commit])
+        .arg(if sub.is_empty() { "." } else { sub.as_str() })
+        .current_dir(&top)
+        .output()
+        .map_err(|e| format!("git archive: {e}"))?;
+    if !tar.status.success() {
+        let err = String::from_utf8_lossy(&tar.stderr).trim().to_string();
+        return Err(format!("git archive {commit}: {err}"));
+    }
+    let h1 = modcache::untar(&tar.stdout, &tmp)
+        .and_then(|_| {
+            let r = if sub.is_empty() { tmp.clone() } else { tmp.join(&sub) };
+            modcache::dir_h1(&r)
+        });
+    let _ = std::fs::remove_dir_all(&tmp);
+    let h1 = h1?;
+
+    let e = index::Entry {
+        version: ver.to_string(),
+        commit: commit.clone(),
+        h1,
+        tag: tag.clone(),
+    };
+    match index::append(&idx, &key, &e)? {
+        index::Append::Already => println!("already published {mp} {ver}"),
+        index::Append::Added => {
+            // the index tree is itself versioned: commit the entry
+            // when it lives in a repo, and push when it has an origin
+            if git_ok(&idx, &["rev-parse", "--git-dir"]) {
+                gits(&idx, &["add", "--", &key])?;
+                gits(&idx, &["commit", "-m", &format!("publish {mp} {ver}")])?;
+                if git_ok(&idx, &["remote", "get-url", "origin"]) {
+                    gits(&idx, &["push", "origin", "HEAD"])
+                        .map_err(|e| format!("index push failed: {e}"))?;
+                }
+            }
+            println!("published {mp} {ver}");
+        }
+    }
+    if let index::Root::Cloned(t) = &iroot {
+        let _ = std::fs::remove_dir_all(t);
+    }
+    Ok(())
 }
 
 /// does the cached slot's tree hash equal the fetched archive's? The
@@ -2076,7 +2432,12 @@ fn slot_matches(slot: &Path, f: &fetch::Fetched) -> Result<bool, String> {
     let r = std::fs::create_dir_all(&tmp)
         .and_then(|_| modcache::untar(&f.tar, &tmp).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)))
         .map_err(|e| e.to_string())
-        .and_then(|_| modcache::dir_h1(&tmp))
+        .and_then(|_| {
+            // a subdirectory module hashes its subtree, not the
+            // extraction wrapper
+            let root = if f.subdir.is_empty() { tmp.clone() } else { tmp.join(&f.subdir) };
+            modcache::dir_h1(&root)
+        })
         .and_then(|fresh| modcache::dir_h1(slot).map(|cached| fresh == cached));
     modcache::remove_tree(&tmp);
     r
@@ -2136,7 +2497,14 @@ fn install(cache: &Path, mp: &str, f: &fetch::Fetched) -> Result<PathBuf, String
         };
     }
     let tmp = stage_tmp(cache, &f.ver, f)?;
-    commit_tmp(&tmp, &slot)?;
+    // a subdirectory module's root sits at <tmp>/<subdir> — that
+    // subtree is what the slot holds; the wrapper is dropped after
+    let mroot = if f.subdir.is_empty() { tmp.clone() } else { tmp.join(&f.subdir) };
+    let r = commit_tmp(&mroot, &slot);
+    if !f.subdir.is_empty() {
+        modcache::remove_tree(&tmp);
+    }
+    r?;
     Ok(slot)
 }
 
@@ -2698,7 +3066,9 @@ fn tidy_satisfy(
             (slot.clone(), None)
         } else {
             let t = stage_tmp(&cache, &f.ver, &f)?;
-            (t.clone(), Some(t))
+            // a subdirectory module's packages live under its subtree
+            let b = if f.subdir.is_empty() { t.clone() } else { t.join(&f.subdir) };
+            (b, Some(t))
         };
         let contains = rest.is_empty() || base.join(rest).is_dir();
         if !contains {
@@ -2710,7 +3080,11 @@ fn tidy_satisfy(
         }
         let installing = tmp.is_some();
         if let Some(t) = tmp {
-            commit_tmp(&t, &slot)?;
+            let r = commit_tmp(&base, &slot);
+            if !f.subdir.is_empty() {
+                modcache::remove_tree(&t);
+            }
+            r?;
         } else if !slot_matches(&slot, &f)? {
             return Err(format!(
                 "cached {m}@{} does not match the fetched archive — remove the slot and get again",

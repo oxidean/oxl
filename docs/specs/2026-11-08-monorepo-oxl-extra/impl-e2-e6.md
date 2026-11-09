@@ -1,6 +1,10 @@
 # Impl notes — E2–E6 (one-PR landing of remaining milestone E)
 
 Branch `feat/e2-e6-monorepo`. Status legend: `[x]` done+verified.
+Landed as one PR: suite green, extras section, e3 subdir fetch +
+e4 index publish/get/tamper fixtures run under the product driver;
+E6 coverage in stdmods (surrogates), io_test (err chain), net_test
+(localhost lookup).
 
 ## E2 — extra/ + workspace (done, in-tree)
 
@@ -26,7 +30,7 @@ Branch `feat/e2-e6-monorepo`. Status legend: `[x]` done+verified.
   scratch workspace tidy/verify/build/run on BOTH drivers; in-repo
   `mod verify` → "all modules verified"; `mod list` shows the require.
 
-## E3 — subdir-module fetch (pending)
+## E3 — subdir-module fetch (done, in-tree)
 
 Design: `fetch_mod` tries full module path as repo (subdir=""); on
 clone failure / resolve failure / missing or mismatched manifest it
@@ -39,7 +43,7 @@ manifest read from `<sha>:<subdir>oxl.mod`; slot + sums keyed on full
 mp — checker resolution unchanged. Self-driver only (get is not
 parity-tested on the seed; builds of cached slots are layout-identical).
 
-## E4 — git index (pending)
+## E4 — git index (done, in-tree)
 
 index/<escaped-segments>/<leaf>.json JSONL {version,commit,h1,tag}.
 OXLMODINDEX local path or git URL. `oxl publish vX.Y.Z` (new cmd in
@@ -51,7 +55,7 @@ append idempotent entry (same entry ok, conflicting reject); commit
 repo = mp minus tag-prefix, fetch @commit, dir_h1 vs entry.h1 tamper
 check → install + pin. `mod verify` unchanged.
 
-## E5 — extras release lane (pending)
+## E5 — extras release lane (done, in-tree)
 
 release-version.sh: optional tag-prefix arg (`latest [PFX]`,
 `next [RANGE] [PFX]`) globs `<pfx>v*`; release.yml: toolchain lane
@@ -59,7 +63,7 @@ only when non-`extra/` paths changed since last v* tag (pathspec
 exclude), extras lane when `extra/` changed → `extra/v*` tag +
 separate GH release, no toolchain tarball. CI gates extra/ build+test.
 
-## E6 — polish (pending)
+## E6 — polish (done, in-tree)
 
 - #26 json: combine \uD800–\uDBFF + \uDC00–\uDFFF pairs → 4-byte UTF-8;
   lone surrogate stays an error (existing strictness, no CESU-8).

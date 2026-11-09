@@ -160,6 +160,22 @@ fn test_fmt() {
     testing.expect_streq(fmt.sprinti(7), "7", "sprinti")
 }
 
+fn test_err_chain() {
+    // e6 #27 — wrap builds a cause chain; is() walks it
+    base := errors.new("disk full")
+    w := errors.wrap("save failed", base)
+    testing.expect(errors.is(w, base), "is finds cause")
+    testing.expect(errors.is(w, w), "is finds self")
+    testing.expect(errors.unwrap(w) == base, "unwrap returns cause")
+    testing.expect(errors.unwrap(base) == nil, "unwrap ends at nil")
+    testing.expect(!errors.is(w, errors.new("other")), "is misses absent")
+    w2 := errors.wrap("save failed", base)
+    testing.expect(w != w2, "wraps stay distinct")
+    testing.expect(errors.msg(w) == "save failed", "wrap keeps msg")
+    w3 := errors.wrap("outer", w)
+    testing.expect(errors.is(w3, base), "is walks whole chain")
+}
+
 fn test_errs() {
     testing.expect(io.eof() == io.eof(), "eof interned")
     e := errors.new("EOF")

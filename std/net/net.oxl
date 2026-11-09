@@ -31,6 +31,8 @@ extern fn rt_bind_any(fd: int, port: int) -> int
 
 extern fn rt_errstr(code: int) -> str
 
+extern fn rt_lookup_ipv4(host: str) -> int
+
 extern fn rt_latch_alloc() -> shared
 
 extern fn rt_latch_free(s: shared)
@@ -101,20 +103,53 @@ fn parse_ipv4(host: str) -> [int, err] {
     return ip * 256 + oct, nil
 }
 
-/// dial opens a TCP connection to host:port — host must be a dotted
-/// IPv4 literal ("127.0.0.1"), connect bounded at 30s (the usual
-/// transport timeout). Returns [conn, nil] or an error.
+// lookup_send runs the blocking getaddrinfo on the spawnBlocking
+// pool and posts the h32 (or negative platform code) on done — a slow
+// resolver parks a pool worker, never a scheduler thread.
+fn lookup_send(host: str, done: chan) {
+    send(done, rt_lookup_ipv4(host))
+}
+
+/// lookup_ipv4 resolves a hostname to a packed IPv4 h32 (the same
+/// order parse_ipv4 produces), bounded by tmo_ms. A dotted literal
+/// short-circuits the resolver entirely.
+fn lookup_ipv4(host: str, tmo_ms: int) -> [int, err] {
+    [ip, pe] = parse_ipv4(host)
+    if pe == nil {
+        return ip, nil
+    }
+    done := mkchan(1)
+    spawnBlocking lookup_send(host, done)
+    select {
+        v := recv(done) => {
+            if v < 0 {
+                return 0, errors.new("net: lookup " + host + ": " + rt_errstr(0 - v))
+            }
+            return v, nil
+        }
+        timeout(tmo_ms) => {
+            return 0, errors.new("net: lookup " + host + ": timed out")
+        }
+    }
+    return 0, errors.new("net: lookup " + host + ": failed")
+}
+
+/// dial opens a TCP connection to host:port — host may be a dotted
+/// IPv4 literal ("127.0.0.1") or a hostname resolved through
+/// lookup_ipv4; connect bounded at 30s (the usual transport
+/// timeout). Returns [conn, nil] or an error.
 fn dial(host: str, port: int) -> [Conn, err] {
     return dial_timeout(host, port, 30000)
 }
 
-/// dial_timeout is dial with a caller-set connect deadline in ms — a
-/// dropped SYN otherwise hangs the call forever (connect has no
-/// timeout of its own).
+/// dial_timeout is dial with a caller-set deadline in ms applied to
+/// both phases — a dropped SYN or a stuck resolver otherwise hangs
+/// the call forever. The phases are sequential, so the bound is
+/// 2*tmo_ms in the worst case.
 fn dial_timeout(host: str, port: int, tmo_ms: int) -> [Conn, err] {
-    [ip, pe] = parse_ipv4(host)
-    if pe != nil {
-        return Conn{fd: -1, st: dead_st, g: 0}, pe
+    [ip, le] = lookup_ipv4(host, tmo_ms)
+    if le != nil {
+        return Conn{fd: -1, st: dead_st, g: 0}, le
     }
     if port <= 0 || port > 65535 {
         return Conn{fd: -1, st: dead_st, g: 0}, errors.new("net: dial: bad port " + itoa(port))

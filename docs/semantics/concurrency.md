@@ -130,6 +130,14 @@ select {
 
   spawnBlocking blocking_call(fd)
   ```
+- `usleep(us)` is the deliberate exception to "everything suspends":
+  it blocks the calling thread outright — no parking, no cancel
+  delivery, no worker yield. It exists for bounded waits inside code
+  that already owns a blocking-pool thread (e.g. net's listener retry
+  backoff, which runs via `spawnBlocking`) or for intervals below
+  timer granularity. On a scheduler worker it pins that worker for the
+  full duration — reach for `time.sleep_ms` (which parks) anywhere
+  else, and never treat `usleep` as a cheap `sleep_ms`.
 - Scale: parking does not hold a thread — a channel-parked task costs
   only its suspended frame; a parked frame sender additionally holds one
   `SendReq` on the channel's send queue, and a parked `select` holds one

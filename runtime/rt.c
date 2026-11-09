@@ -13,6 +13,7 @@
 #include <string.h>
 #ifndef _WIN32
 #include <sys/socket.h>
+#include <netdb.h>
 #endif
 #include <time.h>
 #ifndef _WIN32
@@ -2696,7 +2697,7 @@ OxlStr rt_str_bytes(RtSlice b) {
 #define RT_ERR_BUCKETS 512
 #define RT_ERR_MAX 65536
 
-typedef struct { int64_t next; int64_t mlen; char *msg; } RtErrEnt;
+typedef struct { int64_t next; int64_t mlen; int64_t cause; char *msg; } RtErrEnt;
 static RtErrEnt *rt_err_tab;
 static int64_t rt_err_n, rt_err_cap;
 static int64_t rt_err_ovf = -1;
@@ -2728,6 +2729,7 @@ static int64_t err_put_locked(OxlStr msg) {
     int64_t b = (int64_t)(rt_err_hash(msg) % RT_ERR_BUCKETS);
     rt_err_tab[rt_err_n].next = rt_err_bkt[b];
     rt_err_tab[rt_err_n].mlen = msg.n;
+    rt_err_tab[rt_err_n].cause = 0;
     rt_err_tab[rt_err_n].msg = m;
     rt_err_bkt[b] = rt_err_n + 1;
     return RT_ERR_BASE + rt_err_n++;
@@ -2776,6 +2778,54 @@ int64_t rt_err_new(OxlStr msg) {
     int64_t code = err_put_locked(msg);
     oxl_mu_unlock(&rt_err_mu);
     return code;
+}
+
+/* rt_err_wrap appends WITHOUT dedupe: a wrapped error is a distinct
+ * value even when its text repeats, so the cause slot survives —
+ * interning by message would collapse two wraps around different
+ * causes into one code and silently drop the later chain. Cap
+ * behaviour matches rt_err_new: past it, the shared sentinel answers. */
+int64_t rt_err_wrap(OxlStr msg, int64_t cause) {
+    oxl_mu_lock(&rt_err_mu);
+    if (!rt_err_tab) {
+        for (size_t i = 0; i < sizeof(rt_err_seeds) / sizeof(*rt_err_seeds); i++)
+            err_put_locked((OxlStr){ (char *)rt_err_seeds[i],
+                                     (int64_t)strlen(rt_err_seeds[i]) });
+    }
+    if (rt_err_ovf >= 0) { oxl_mu_unlock(&rt_err_mu); return rt_err_ovf; }
+    if (rt_err_n == RT_ERR_MAX - 1) {
+        static const char om[] = "error registry full";
+        rt_err_ovf = err_put_locked((OxlStr){ (char *)om, sizeof(om) - 1 });
+        oxl_mu_unlock(&rt_err_mu);
+        return rt_err_ovf;
+    }
+    if (rt_err_n == rt_err_cap) {
+        rt_err_cap = rt_err_cap ? rt_err_cap * 2 : 64;
+        if (rt_err_cap > RT_ERR_MAX) rt_err_cap = RT_ERR_MAX;
+        rt_err_tab = realloc(rt_err_tab,
+                             (size_t)rt_err_cap * sizeof(RtErrEnt));
+        if (!rt_err_tab) { oxl_mu_unlock(&rt_err_mu); abort(); }
+    }
+    char *m = malloc((size_t)msg.n + 1);
+    if (!m) { oxl_mu_unlock(&rt_err_mu); abort(); }
+    memcpy(m, msg.p, (size_t)msg.n);
+    m[msg.n] = 0;
+    rt_err_tab[rt_err_n].next = 0; /* not hashed — never deduped */
+    rt_err_tab[rt_err_n].mlen = msg.n;
+    rt_err_tab[rt_err_n].cause = cause;
+    rt_err_tab[rt_err_n].msg = m;
+    int64_t code = RT_ERR_BASE + rt_err_n++;
+    oxl_mu_unlock(&rt_err_mu);
+    return code;
+}
+
+int64_t rt_err_cause(int64_t code) {
+    int64_t i = code - RT_ERR_BASE;
+    if (i < 0) return 0;
+    oxl_mu_lock(&rt_err_mu);
+    int64_t r = i < rt_err_n ? rt_err_tab[i].cause : 0;
+    oxl_mu_unlock(&rt_err_mu);
+    return r;
 }
 
 OxlStr rt_err_msg(int64_t code) {
@@ -2952,6 +3002,53 @@ int64_t rt_sock_connect_ipv4(int64_t fd, int64_t ip_h32, int64_t port, int64_t t
         fcntl((int)fd, F_SETFL, fl);
         return rc == 0 ? 0 : -(int64_t)(err ? err : errno);
     }
+#endif
+}
+
+/* getaddrinfo(AF_INET) -> packed h32 in the same order net.oxl's
+ * parse_ipv4 produces (a<<24|b<<16|c<<8|d, then ntohl'd for the wire).
+ * Blocking by contract: callers run this on the spawnBlocking pool —
+ * never inline on a scheduler worker, where a slow resolver would pin
+ * the queue. Negative return is a platform error code for rt_errstr. */
+int64_t rt_lookup_ipv4(OxlStr host) {
+    char *h = malloc((size_t)host.n + 1);
+    if (!h) abort();
+    memcpy(h, host.p, (size_t)host.n);
+    h[host.n] = 0;
+#ifdef _WIN32
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    int rc = getaddrinfo(h, NULL, &hints, &res);
+    free(h);
+    if (rc != 0 || !res) {
+        if (res) freeaddrinfo(res);
+        int64_t e = rc != 0 ? rc : WSAHOST_NOT_FOUND;
+        return -((int64_t)e | RT_GLE_TAG);
+    }
+    struct sockaddr_in *a = (struct sockaddr_in *)res->ai_addr;
+    int64_t ip = ntohl(a->sin_addr.s_addr);
+    freeaddrinfo(res);
+    return ip;
+#else
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    int rc = getaddrinfo(h, NULL, &hints, &res);
+    free(h);
+    if (rc != 0 || !res) {
+        if (res) freeaddrinfo(res);
+        /* getaddrinfo codes (EAI_*) are not errno — map the common
+         * ones onto EINVAL/ENOENT-shaped returns the caller formats,
+         * so a bad name reads "lookup failed" not a bogus errno text */
+        return -(int64_t)ENOENT;
+    }
+    struct sockaddr_in *a = (struct sockaddr_in *)res->ai_addr;
+    int64_t ip = (int64_t)ntohl(a->sin_addr.s_addr);
+    freeaddrinfo(res);
+    return ip;
 #endif
 }
 

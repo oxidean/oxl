@@ -3,7 +3,7 @@ name: release
 on:
   push:
     branches: [main]
-    tags: ["v*"]
+    tags: ["v*", "extra/v*"]
   workflow_dispatch:
 
 permissions:
@@ -23,6 +23,9 @@ jobs:
     outputs:
       tag: ${{ steps.v.outputs.tag }}
       sha: ${{ steps.sha.outputs.sha }}
+      etag: ${{ steps.v.outputs.etag }}
+      do_tool: ${{ steps.v.outputs.do_tool }}
+      do_extra: ${{ steps.v.outputs.do_extra }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -41,15 +44,28 @@ jobs:
             echo "workflow_dispatch releases only from main" >&2
             exit 1
           fi
+          echo "do_tool=false" >> "$GITHUB_OUTPUT"
+          echo "do_extra=false" >> "$GITHUB_OUTPUT"
+          echo "etag=" >> "$GITHUB_OUTPUT"
           if [ "$REF_TYPE" = "tag" ]; then
             tag_sha=$(git rev-list -n1 "$REF_NAME")
-            # a v* tag may only release commits that are on main — otherwise a
-            # tag push could ship unreviewed code (fetch-depth:0 gives origin/main)
+            # a release tag may only release commits that are on main —
+            # otherwise a tag push could ship unreviewed code
+            # (fetch-depth:0 gives origin/main)
             if ! git merge-base --is-ancestor "$tag_sha" origin/main; then
               echo "tag $REF_NAME points at $tag_sha, which is not on main" >&2
               exit 1
             fi
-            echo "tag=$REF_NAME" >> "$GITHUB_OUTPUT"
+            case "$REF_NAME" in
+              extra/v*)
+                echo "do_extra=true" >> "$GITHUB_OUTPUT"
+                echo "etag=$REF_NAME" >> "$GITHUB_OUTPUT"
+                ;;
+              *)
+                echo "do_tool=true" >> "$GITHUB_OUTPUT"
+                echo "tag=$REF_NAME" >> "$GITHUB_OUTPUT"
+                ;;
+            esac
             echo "sha=$tag_sha" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -60,26 +76,57 @@ jobs:
           else
             range="$EVENT_BEFORE..$SHA"
           fi
-          # recovery: a tag already on this sha (e.g. publish failed after
-          # tagging) is reused instead of burning another version. The
-          # docs-manifest sync below tags a bump commit one above the
-          # merge, so a retry's tag also lives on a direct child of sha.
-          tag=$(git tag --points-at "$SHA" | grep -xE 'v[0-9]+\.[0-9]+\.[0-9]+' | sort -V | tail -1 || true)
-          if [ -z "$tag" ]; then
-            for child in $(git rev-list --all --children | awk -v s="$SHA" '$1==s {$1=""; print}'); do
-              # Only the manifest-bump commit this flow creates is a valid
-              # recovery target — a tagged child on another branch would
-              # publish an unrelated tree under this tag.
-              git merge-base --is-ancestor "$child" origin/main 2>/dev/null || continue
-              git log -1 --format=%s "$child" | grep -q '^chore(release): bump docs manifest to ' || continue
-              tag=$(git tag --points-at "$child" | grep -xE 'v[0-9]+\.[0-9]+\.[0-9]+' | sort -V | tail -1 || true)
-              [ -n "$tag" ] && { SHA=$child; break; }
-            done
+          # lane split: the toolchain releases when anything outside
+          # extra/ moved since the last bare v* tag; extras get their own
+          # extra/v* tag series when paths under extra/ moved since the
+          # last extra/v* tag. A pure-extras merge ships only the extras
+          # lane; a pure-toolchain merge only the toolchain lane.
+          latest_v=$(scripts/release-version.sh latest)
+          if [ -n "$latest_v" ]; then
+            vbase=$(git rev-list -n1 "v$latest_v")
+            changed=$(git diff --name-only "$vbase" "$SHA")
+          else
+            changed=$(git ls-files)
           fi
-          if [ -z "$tag" ]; then
-            tag=$(scripts/release-version.sh next "$range")
+          latest_e=$(scripts/release-version.sh latest extra/)
+          if [ -n "$latest_e" ]; then
+            ebase=$(git rev-list -n1 "extra/v$latest_e")
+            echanged=$(git diff --name-only "$ebase" "$SHA" -- extra/)
+            erange="$ebase..$SHA"
+          else
+            echanged=$(git ls-files -- extra/)
+            erange="HEAD"
           fi
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if printf '%s\n' "$changed" | grep -qv '^extra/'; then
+            do_tool=true
+            # recovery: a tag already on this sha (e.g. publish failed after
+            # tagging) is reused instead of burning another version. The
+            # docs-manifest sync below tags a bump commit one above the
+            # merge, so a retry's tag also lives on a direct child of sha.
+            tag=$(git tag --points-at "$SHA" | grep -xE 'v[0-9]+\.[0-9]+\.[0-9]+' | sort -V | tail -1 || true)
+            if [ -z "$tag" ]; then
+              for child in $(git rev-list --all --children | awk -v s="$SHA" '$1==s {$1=""; print}'); do
+                # Only the manifest-bump commit this flow creates is a valid
+                # recovery target — a tagged child on another branch would
+                # publish an unrelated tree under this tag.
+                git merge-base --is-ancestor "$child" origin/main 2>/dev/null || continue
+                git log -1 --format=%s "$child" | grep -q '^chore(release): bump docs manifest to ' || continue
+                tag=$(git tag --points-at "$child" | grep -xE 'v[0-9]+\.[0-9]+\.[0-9]+' | sort -V | tail -1 || true)
+                [ -n "$tag" ] && { SHA=$child; break; }
+              done
+            fi
+            if [ -z "$tag" ]; then
+              tag=$(scripts/release-version.sh next "$range")
+            fi
+            echo "do_tool=true" >> "$GITHUB_OUTPUT"
+            echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          fi
+          if [ -n "$echanged" ]; then
+            etag=$(git tag --points-at "$SHA" | grep -xE 'extra/v[0-9]+\.[0-9]+\.[0-9]+' | sort -V | tail -1 || true)
+            [ -z "$etag" ] && etag=$(scripts/release-version.sh next "$erange" extra/)
+            echo "do_extra=true" >> "$GITHUB_OUTPUT"
+            echo "etag=$etag" >> "$GITHUB_OUTPUT"
+          fi
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
 
       # The docs bundle packs from the tagged tree and the packer gates the
@@ -173,6 +220,7 @@ jobs:
 
   release:
     needs: version
+    if: needs.version.outputs.do_tool == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -249,6 +297,64 @@ jobs:
         with:
           tag_name: ${{ needs.version.outputs.tag }}
           files: dist/oxl-toolchain-linux-x86_64.tar.gz
+          generate_release_notes: true
+
+
+  # The extras lane publishes the extra/ module on its own extra/v*
+  # tag series: same "gate first, then tag, then release" order, but no
+  # toolchain tarball — consumers fetch the module through OXLMODINDEX.
+  extra:
+    needs: version
+    if: needs.version.outputs.do_extra == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.version.outputs.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: build oxl
+        run: cargo build --release --manifest-path oxl/Cargo.toml
+      - name: extras gate (test every package)
+        run: |
+          set -eu
+          for d in $(find extra -name '*.oxl' -exec dirname {} \; | sort -u); do
+            echo "== test $d"
+            ( cd "$d" && "$OLDPWD"/oxl/target/release/oxl test )
+          done
+      - name: tag commit
+        if: github.ref_type != 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.version.outputs.etag }}
+          SHA: ${{ needs.version.outputs.sha }}
+        run: |
+          set -eu
+          exists=$(gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/$TAG" --jq length)
+          if [ "$exists" != "0" ]; then
+            ref_obj=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" \
+              --jq '.object | "\(.sha) \(.type)"')
+            actual=${ref_obj% *}
+            if [ "${ref_obj##* }" = "tag" ]; then
+              actual=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$actual" --jq .object.sha)
+            fi
+            if [ "$actual" != "$SHA" ]; then
+              echo "tag $TAG points at $actual, expected $SHA" >&2
+              exit 1
+            fi
+            echo "tag $TAG already exists on $SHA — reusing"
+            exit 0
+          fi
+          tag_obj=$(gh api "repos/$GITHUB_REPOSITORY/git/tags" \
+            -f tag="$TAG" -f message="release $TAG" \
+            -f object="$SHA" -f type=commit --jq .sha)
+          gh api "repos/$GITHUB_REPOSITORY/git/refs" \
+            -f ref="refs/tags/$TAG" -f sha="$tag_obj"
+      - name: github release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.version.outputs.etag }}
+          name: oxl extras ${{ needs.version.outputs.etag }}
           generate_release_notes: true
 
   # Docs pack runs as a job in this workflow rather than its own push.tags

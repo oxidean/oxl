@@ -442,6 +442,7 @@ struct Ck {
     retk: int, // current fn's return kind
     ret1: int,
     in_let2: int,
+    in_spawn: int, // inside `spawn`/`goin` callee — no calls edge (seed in_spawn)
     in_cl: int, // inside `{ |..| }` — ret feeds cl_ret
     cl_ret: int, // inferred closure return ty (-1 none)
     clcks: own ClChk, // deferred closure susp checks
@@ -2098,6 +2099,29 @@ fn ty_parse(ck: mut Ck, s: str) -> int {
 }
 
 // variant ctor lookup `E.V` — returns the enum-table idx or -1
+// `==` semantics gate: an enum with any payload-carrying variant
+// can't tag-compare (seed's BinOp::Eq check mirrors this).
+fn enum_has_payload(ck: ref Ck, t: int) -> bool {
+    if ck.tyv[t].k != k_enum() {
+        return false
+    }
+    if !collections.map_has(ck.enums, ck.tyv[t].name) {
+        return false
+    }
+    [ei, err] = collections.map_get(ck.enums, ck.tyv[t].name)
+    if err != nil {
+        return false
+    }
+    vl := ck.enumsv[ei].vars
+    for vl != nil {
+        if vl.v.fields != nil {
+            return true
+        }
+        vl = vl.next
+    }
+    return false
+}
+
 fn enum_variant(ck: ref Ck, path: str) -> int {
     ld := last_dot(path)
     if ld < 0 {
@@ -2988,6 +3012,11 @@ fn bin_expr(ck: mut Ck, op: str, l: ref parser.Node, r: ref parser.Node, env: mu
             diag(ck, "type", "fn values aren't comparable (v0.2)")
         } else if lk == k_iface() && rk != k_err() || rk == k_iface() && lk != k_err() {
             diag(ck, "type", "iface values aren't comparable except against nil (v0.2)")
+        } else if lk == k_enum() && enum_has_payload(ck, lt) {
+            // `==` on a payload enum can't be a tag compare — it
+            // needs deep equality the language doesn't define.
+            // Unit enums compare fine (tag is the whole value).
+            diag(ck, "type", "`" + ty_name(ck, lt) + "` has payload variants — compare enums with `match`, not `==`")
         } else {
             assignable(ck, lt, rt)
         }
@@ -3432,7 +3461,10 @@ fn call(ck: mut Ck, f: ref parser.Node, args: ref parser.NList, env: mut Env) ->
                 }
             }
         }
-        if collections.map_has(ck.fns, qn) {
+        if collections.map_has(ck.fns, qn) && ck.in_spawn == 0 {
+            // no calls edge on the spawn callee: it runs on its own
+            // task, so its susp must not propagate to the caller —
+            // `goin`'s susp gate reads the callee's susp directly.
             add_edge(ck, qn)
         }
         // ---------- builtin table ----------
@@ -3880,7 +3912,10 @@ fn call(ck: mut Ck, f: ref parser.Node, args: ref parser.NList, env: mut Env) ->
         if recv != nil && wl != nil {
             // receiver slot: `*x`/`&x` adapt — `&` needs an lvalue
             want := subst_ty(ck, wl.v, bind)
+            sp := ck.in_spawn
+            ck.in_spawn = 0
             got := expr(ck, recv, env)
+            ck.in_spawn = sp
             wk2 := ck.tyv[want].k
             gk2 := ck.tyv[got].k
             if (wk2 == k_own() || wk2 == k_ref() || wk2 == k_mut()) && (gk2 == k_struct() || gk2 == k_enum()) && !is_lvalue(recv) {
@@ -3889,13 +3924,25 @@ fn call(ck: mut Ck, f: ref parser.Node, args: ref parser.NList, env: mut Env) ->
             got = recv_adapt_ty(ck, want, got)
             assignable(ck, want, got)
             move_for(ck, recv, want, env)
+            if sp != 0 && (wk2 == k_slice() || wk2 == k_ref() || wk2 == k_mut()) {
+                diag(ck, "check", "`spawn` arg of `[]T`/`ref`/`mut` escapes into the task — the backing dies with the scope; pass `own` or a value")
+            }
             wl = wl.next
         }
         for al != nil && wl != nil {
             want := subst_ty(ck, wl.v, bind)
+            sp := ck.in_spawn
+            ck.in_spawn = 0
             gt := expr(ck, al.v, env)
+            ck.in_spawn = sp
             assignable(ck, want, gt)
             move_for(ck, al.v, want, env)
+            if sp != 0 {
+                wk3 := ck.tyv[want].k
+                if wk3 == k_slice() || wk3 == k_ref() || wk3 == k_mut() {
+                    diag(ck, "check", "`spawn` arg of `[]T`/`ref`/`mut` escapes into the task — the backing dies with the scope; pass `own` or a value")
+                }
+            }
             wl = wl.next
             al = al.next
         }
@@ -3932,8 +3979,17 @@ fn call_fnvalue(ck: mut Ck, ps: ref IList, r: int, args: ref parser.NList, env: 
     wl := ps
     al := args
     for al != nil && wl != nil {
+        sp := ck.in_spawn
+        ck.in_spawn = 0
         gt := expr(ck, al.v, env)
+        ck.in_spawn = sp
         assignable(ck, wl.v, gt)
+        if sp != 0 {
+            wk4 := ck.tyv[wl.v].k
+            if wk4 == k_slice() || wk4 == k_ref() || wk4 == k_mut() {
+                diag(ck, "check", "`spawn` arg of `[]T`/`ref`/`mut` escapes into the task — the backing dies with the scope; pass `own` or a value")
+            }
+        }
         wl = wl.next
         al = al.next
     }
@@ -4194,17 +4250,12 @@ fn stmt(ck: mut Ck, s: ref parser.Node, env: mut Env) {
 
 fn spawn_stmt(ck: mut Ck, e: ref parser.Node, env: mut Env) {
     if e != nil && nk(e) == 8 {
-        match e {
-            parser.Node.Call{f, args} => {
-                n := callee_name(f)
-                if len(n) > 0 {
-                    add_edge(ck, resolve_named(ck, n))
-                }
-            }
-            _ => {
-            }
-        }
+        // no calls edge: spawn doesn't suspend the caller, so the
+        // callee's susp must not propagate here — `goin`'s susp gate
+        // reads ck.susp directly in the post-pass scan.
+        ck.in_spawn = 1
         expr(ck, e, env)
+        ck.in_spawn = 0
         return
     }
     diag(ck, "check", "`spawn` requires a call")

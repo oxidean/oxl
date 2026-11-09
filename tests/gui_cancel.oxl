@@ -1,0 +1,52 @@
+package main
+
+// gui_cancel — the G1 cancellation gate: `scope { gui.run(...) }`
+// cancelled while the root task sits inside `pump` must wake the
+// watcher (bound to the enclosing scope), whose defer calls
+// `b.stop()`; `pump` observes the flag, `run` returns, and the
+// canceller's scope joins. A hang anywhere on that path fails the
+// test by timeout — run.sh builds + runs the binary directly.
+import "github.com/oxidean/oxl/extra/gui"
+
+import "github.com/oxidean/oxl/extra/gui/mock"
+
+import "std/time"
+
+let g_m: mock.Mock = mock.backend()
+
+let g_sc: scope = nil
+
+fn app(events: chan own gui.Event) {}
+
+// canceller parks until the enclosing scope handle is stashed AND
+// the backend pump is actually spinning (watcher is bound before
+// pump starts — same sequential root task), then cancels it.
+fn canceller() {
+    for g_sc == nil {
+        time.sleep_ms(1)
+    }
+    for g_m.count("pump") == 0 {
+        time.sleep_ms(1)
+    }
+    println("canceller: scancel")
+    scancel(g_sc)
+    println("canceller: done")
+}
+
+fn main() {
+    g_m = mock.backend()
+    sc := mkscope()
+    goin(sc, canceller())
+    scope {
+        g_sc = curscope()
+        e := gui.run(g_m, app)
+        if e != nil {
+            println("run err")
+        }
+        println("run returned")
+    }
+    println("scope exited")
+    rc := sjoin(sc)
+    assert(rc == 0)
+    println("cancel ok")
+}

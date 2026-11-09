@@ -649,13 +649,25 @@ fn defer_caps(g: &Gen, call: &Expr) -> Vec<(String, Ty)> {
     fn walk(e: &Expr, g: &Gen, out: &mut Vec<(String, Ty)>) {
         match &e.kind {
             ExprKind::Ident(n) => {
-                if g.env.iter().skip(1).any(|s| s.contains_key(n))
-                    || g.fslots.iter().any(|s| s.contains_key(n))
-                {
-                    if !g.globals.contains_key(n)
-                        && !out.iter().any(|(m, _)| m == n)
+                // `b.stop` arrives flattened — the env binding is the
+                // longest bound prefix (`b`), not the whole name; a
+                // qualified global prefix needs no capture (it emits
+                // as `o_g_*` directly).
+                let mut m = n.as_str();
+                loop {
+                    if g.env.iter().skip(1).any(|s| s.contains_key(m))
+                        || g.fslots.iter().any(|s| s.contains_key(m))
                     {
-                        out.push((n.clone(), g.lookup(n)));
+                        if !g.globals.contains_key(m)
+                            && !out.iter().any(|(x, _)| x == m)
+                        {
+                            out.push((m.to_string(), g.lookup(m)));
+                        }
+                        break;
+                    }
+                    match m.rfind('.') {
+                        Some(i) => m = &m[..i],
+                        None => break,
                     }
                 }
             }
@@ -915,29 +927,33 @@ impl<'a> Gen<'a> {
 
     /// write each registered o_drop_<n>: frees own fields recursively then
     /// rt_free's the object. Bodies reference one another, so prototypes
-    /// go first; emission order is irrelevant.
+    /// go first; emission order is irrelevant. The sets drain on emit —
+    /// `drain` runs per unit, so without clearing every unit would
+    /// re-emit all previously-registered defs (duplicate `static`s).
     fn emit_drops(&mut self) {
         if self.drop_tys.is_empty() && !self.drop_word {
             return;
         }
+        let drop_tys = std::mem::take(&mut self.drop_tys);
+        let drop_word = std::mem::take(&mut self.drop_word);
         let mut src = String::new();
-        if self.drop_word {
+        if drop_word {
             src.push_str("static void o_drop_word(int64_t _v) { rt_free((void*)_v); }\n");
         }
-        for n in self.drop_tys.clone() {
-            let ct = self.cty(&match self.structs.contains_key(&n) {
+        for n in drop_tys.iter() {
+            let ct = self.cty(&match self.structs.contains_key(n) {
                 true => Ty::Struct(n.clone()),
                 false => Ty::Enum(n.clone()),
             });
-            src.push_str(&format!("static void o_drop_{0}(int64_t _v);\n", cname(&n)));
+            src.push_str(&format!("static void o_drop_{0}(int64_t _v);\n", cname(n)));
             let _ = ct;
         }
-        for n in self.drop_tys.clone() {
-            let cn = cname(&n);
-            if self.structs.contains_key(&n) {
+        for n in drop_tys.iter() {
+            let cn = cname(n);
+            if self.structs.contains_key(n) {
                 let mut body = format!(
                     "static void o_drop_{cn}(int64_t _v) {{ struct o_s_{cn} *p = (struct o_s_{cn} *)_v; if (!p) return;\n");
-                for (f, ft) in self.structs.get(&n).cloned().unwrap_or_default() {
+                for (f, ft) in self.structs.get(n).cloned().unwrap_or_default() {
                     body.push_str(&self.drop_field(&format!("p->f_{f}"), &ft));
                 }
                 body.push_str("    rt_free(p);\n}\n");
@@ -945,7 +961,7 @@ impl<'a> Gen<'a> {
             } else {
                 let mut body = format!(
                     "static void o_drop_{cn}(int64_t _v) {{ struct o_en_{cn} *p = (struct o_en_{cn} *)_v; if (!p) return; switch (p->tag) {{\n");
-                for (i, (_vn, ft)) in self.enum_fields.get(&n).cloned().unwrap_or_default().iter().enumerate() {
+                for (i, (_vn, ft)) in self.enum_fields.get(n).cloned().unwrap_or_default().iter().enumerate() {
                     if matches!(ft, Ty::Own(_)) {
                         body.push_str(&format!("    case {i}: {}break;\n",
                             self.drop_field(&format!("p->u.v{i}"), ft)));
@@ -1971,6 +1987,11 @@ impl<'a> Gen<'a> {
                     && self.dt(&lt) == Ty::Str
                 {
                     format!("(rt_str_cmp({lv}, {rv}) {cop} 0)")
+                } else if matches!(op, BinOp::Eq | BinOp::Ne) && matches!(lt, Ty::Enum(_)) {
+                    // unit enums: the tag is the whole value (payload
+                    // enums are rejected at check). The parens matter —
+                    // `.tag` on the compound-literal RHS needs them.
+                    format!("(({lv}).tag {cop} ({rv}).tag)")
                 } else if matches!(op, BinOp::Eq | BinOp::Ne)
                     && (matches!(self.dt(&lt), Ty::Iface(_))
                         || matches!(self.dt(&self.expr_ty(r)), Ty::Iface(_)))
@@ -2573,7 +2594,7 @@ impl<'a> Gen<'a> {
             return CallPlan::Fn { q: name.clone(), recv: None };
         }
         if let Some((objp, mname)) = name.rsplit_once('.') {
-            if let Some(oe) = unflatten(objp, f.span) {
+            if let Some(oe) = self.obj_expr(objp, f.span) {
                 let ot = self.dt(&self.expr_ty(&oe));
                 if let Some(mt) = self.m_target(&ot, mname) {
                     return match mt {
@@ -2600,6 +2621,38 @@ impl<'a> Gen<'a> {
             Ty::Iface(w) => Some(w.clone()),
             Ty::Var(v) => self.subst.get(v).and_then(|t| self.iface_name(t)),
             _ => None,
+        }
+    }
+
+    /// `unflatten` that respects qualified decl names: a same-module
+    /// global's object path (`pkg.g` in `pkg.g.inc`) is ONE binding —
+    /// `Field{pkg, g}` would emit a literal `pkg.g`. Picks the longest
+    /// leading prefix bound as a frame slot, local, or global, then
+    /// Field-chains the rest; falls back to naive `unflatten`.
+    fn obj_expr(&self, path: &str, span: crate::diag::Span) -> Option<Expr> {
+        let mut cut = path.len();
+        loop {
+            let head = &path[..cut];
+            let bound = self.fslots.iter().rev().any(|s| s.contains_key(head))
+                || self.env.iter().any(|s| s.contains_key(head))
+                || self.globals.contains_key(head);
+            if bound {
+                let mut e = Expr { kind: ExprKind::Ident(head.to_string()), span };
+                let mut rest = &path[cut..];
+                while let Some(seg) = rest.strip_prefix('.') {
+                    let end = seg.find('.').unwrap_or(seg.len());
+                    e = Expr {
+                        kind: ExprKind::Field {
+                            obj: Box::new(e),
+                            name: seg[..end].to_string(),
+                        },
+                        span,
+                    };
+                    rest = &seg[end..];
+                }
+                return Some(e);
+            }
+            cut = path[..cut].rfind('.')?;
         }
     }
 

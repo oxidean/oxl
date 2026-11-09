@@ -1825,9 +1825,24 @@ fn gdefer(g: mut G, call: own parser.Node) {
     let caps: own GBnd = nil
     u := sc.l
     for u != nil {
-        t := gx_lookup(g, u.v)
-        if t >= 0 {
-            caps = gbnd(u.v, "", t, caps)
+        // a dotted name arrives whole (`b.stop`); the capturable
+        // binding is its longest env-bound prefix — qualified
+        // globals/module heads emit directly and capture nothing
+        // (seed defer_caps).
+        n := u.v
+        for len(n) > 0 {
+            t := gx_lookup(g, n)
+            if t >= 0 {
+                if g_local(g, n) {
+                    caps = gbnd(n, "", t, caps)
+                }
+                break
+            }
+            ld := check.last_dot(n)
+            if ld < 0 {
+                break
+            }
+            n = substr(n, 0, ld)
         }
         u = u.next
     }
@@ -2348,6 +2363,12 @@ fn gxbin(g: mut G, op: str, l: ref parser.Node, r: ref parser.Node, e: ref parse
     }
     if (op == "<" || op == "<=" || op == ">" || op == ">=") && ltk == check.k_str() {
         return "(rt_str_cmp(" + lv + ", " + rv + ") " + op + " 0)"
+    }
+    // unit enums: the tag is the whole value (payload enums are
+    // rejected at check). The parens matter — `.tag` on the
+    // compound-literal RHS needs them (seed binary op mirrors).
+    if (op == "==" || op == "!=") && tyk(g, gsub(g, lt)) == check.k_enum() {
+        return "((" + lv + ").tag " + op + " (" + rv + ").tag)"
     }
     // iface eq/ne compares the erased data ptr (seed binary op)
     if op == "==" || op == "!=" {

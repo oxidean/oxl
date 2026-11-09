@@ -887,11 +887,10 @@ impl<'a> Checker<'a> {
             Stmt::Scope { body, .. } => self.block(body, env),
             Stmt::Spawn { call, scope, span, .. } => {
                 match &call.kind {
-                    ExprKind::Call { f, .. } => {
-                        // mark suspend-relevant edge
-                        if let ExprKind::Ident(n) = &f.kind {
-                            self.calls.entry(self.cur_fn.clone()).or_default().insert(n.clone());
-                        }
+                    ExprKind::Call { .. } => {
+                        // no calls edge: spawn doesn't suspend the caller,
+                        // so the callee's susp must not propagate here —
+                        // `goin`'s susp gate reads `suspend` directly.
                         if let Some(se) = scope {
                             let st = self.expr(se, env);
                             self.assignable(&Ty::Scope, &st, se.span);
@@ -1011,7 +1010,7 @@ impl<'a> Checker<'a> {
                 }
                 // method / iface dispatch — same resolution as `call`
                 if let Some((objp, mname)) = n.rsplit_once('.') {
-                    if let Some(oe) = unflatten(objp, f.span) {
+                    if let Some(oe) = self.obj_expr(objp, f.span, env) {
                         let ot = self.expr(&oe, env);
                         return match self.method_target(&ot, mname) {
                             MTarget::Fn(q) => self.fns.get(&q).map(|s| s.ret.clone()),
@@ -1188,6 +1187,35 @@ impl<'a> Checker<'a> {
     /// where a method lookup leads: a direct `T.m` fn, a vtable slot's
     /// declared sig (params + ret — receiver is the implicit data ptr),
     /// or nowhere
+    /// `unflatten` that respects qualified decl names: a same-module
+    /// global's object path (`pkg.g` in `pkg.g.inc`) is ONE binding,
+    /// not `Field{pkg, g}` — `pkg` is no value inside its own package.
+    /// Picks the longest leading prefix bound in `env`/`globals`, then
+    /// Field-chains the remainder; falls back to naive `unflatten`.
+    fn obj_expr(&self, path: &str, span: Span, env: &Env) -> Option<Expr> {
+        let mut cut = path.len();
+        loop {
+            let head = &path[..cut];
+            if env.get(head).is_some() || self.globals.contains_key(head) {
+                let mut e = Expr { kind: ExprKind::Ident(head.to_string()), span };
+                let mut rest = &path[cut..];
+                while let Some(seg) = rest.strip_prefix('.') {
+                    let end = seg.find('.').unwrap_or(seg.len());
+                    e = Expr {
+                        kind: ExprKind::Field {
+                            obj: Box::new(e),
+                            name: seg[..end].to_string(),
+                        },
+                        span,
+                    };
+                    rest = &seg[end..];
+                }
+                return Some(e);
+            }
+            cut = path[..cut].rfind('.')?;
+        }
+    }
+
     fn method_target(&self, t: &Ty, m: &str) -> MTarget {
         match t {
             Ty::Struct(s) | Ty::Enum(s) => {
@@ -1639,7 +1667,22 @@ impl<'a> Checker<'a> {
                             self.diags.push(Diag::err(e.span, "type",
                                 "iface values aren't comparable except against nil (v0.2)"));
                         } else {
-                            self.assignable(&lt, &rt, e.span);
+                            // `==` on a payload enum can't be a tag
+                            // compare — it needs deep equality the
+                            // language doesn't define. Unit enums
+                            // compare fine (tag is the whole value).
+                            let payload = match &lt {
+                                Ty::Enum(en) => self.enums.get(en)
+                                    .map(|vs| vs.iter().any(|(_, fs)| !fs.is_empty()))
+                                    .unwrap_or(false),
+                                _ => false,
+                            };
+                            if payload {
+                                self.diags.push(Diag::err(e.span, "type",
+                                    format!("`{}` has payload variants — compare enums with `match`, not `==`", lt.name())));
+                            } else {
+                                self.assignable(&lt, &rt, e.span);
+                            }
                         }
                         Ty::Bool
                     }
@@ -1984,7 +2027,7 @@ impl<'a> Checker<'a> {
             let mut qname = name.clone();
             if !self.fns.contains_key(name) {
                 if let Some((objp, mname)) = name.rsplit_once('.') {
-                    if let Some(oe) = unflatten(objp, f.span) {
+                    if let Some(oe) = self.obj_expr(objp, f.span, env) {
                         let ot = self.expr(&oe, env);
                         if ot == Ty::Unknown {
                             return Ty::Unknown;
@@ -2043,7 +2086,12 @@ impl<'a> Checker<'a> {
             };
             let name = qname.as_str();
             if self.fns.contains_key(name) {
-                self.calls.entry(self.cur_fn.clone()).or_default().insert(name.to_string());
+                // no calls edge on the spawn callee: it runs on its own
+                // task, so its susp must not propagate to the caller —
+                // `goin`'s susp gate reads the callee's susp directly.
+                if !self.in_spawn {
+                    self.calls.entry(self.cur_fn.clone()).or_default().insert(name.to_string());
+                }
                 self.rec_use(self.member_span(f), name);
             }
             match name {

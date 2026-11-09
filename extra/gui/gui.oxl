@@ -1,0 +1,1002 @@
+package gui
+
+// extra/gui — portable widget layer core (milestone G, G1 core).
+//
+// A retained widget tree over a Backend iface. Two core-owned mailboxes
+// cross the iface: an EventBuf (never-blocking posts, drop-eligible cap,
+// overflow markers) carries Events out to a dispatcher that forwards
+// them onto the app-facing `chan own Event`; a CmdBuf (bounded, parks
+// posters when full) carries mutation Cmds back in to `pump`, which
+// executes them on the root task. Contracts:
+// docs/specs/2026-11-09-gui-layer/items/.
+import "std/errors"
+
+import "std/sync"
+
+// ---- public protocol types ----
+enum WidgetKind { window, vbox, hbox, label, button, entry, list, scrolled, }
+
+enum EventKind {
+    clicked,
+    activated,
+    text_changed,
+    close_requested,
+    row_activated,
+    overflow,
+}
+
+enum PropVal { Text(str), Flag(bool), Num(int), }
+
+enum EventData { None, Text(str), Index(int), }
+
+struct Prop { id: int, val: PropVal }
+
+struct Event { kind: EventKind, target: int, data: EventData }
+
+enum CmdKind {
+    new_kind,
+    set_prop,
+    attach,
+    detach,
+    destroy,
+    read,
+    dismiss_close,
+}
+
+struct Cmd {
+    kind: CmdKind,
+    target: int,
+    widget: WidgetKind,
+    prop: Prop,
+    props: own []Prop,
+    arg: int,
+    reply: chan own CmdResult,
+}
+
+struct CmdResult { e: err, handle: int, val: PropVal }
+
+// ---- sentinel errors ----
+fn err_not_root() -> err {
+    return errors.new("gui: root task required")
+}
+
+fn err_stopped() -> err {
+    return errors.new("gui: backend stopped")
+}
+
+fn err_gone() -> err {
+    return errors.new("gui: widget gone")
+}
+
+// ---- protocol prop ids ----
+let P_TEXT = 1
+
+let P_TITLE = 2
+
+let P_PLACEHOLDER = 3
+
+// ---- knobs (set before run) ----
+let g_event_cap = 256
+
+let g_cmd_cap = 512
+
+let g_drain_ms = 250
+
+let g_running = 0
+
+fn set_event_buffer(n: int) {
+    if n < 1 {
+        println("gui: set_event_buffer requires n >= 1")
+        exit(2)
+    }
+    g_event_cap = n
+}
+
+fn set_cmd_buffer(n: int) {
+    if n < 1 {
+        println("gui: set_cmd_buffer requires n >= 1")
+        exit(2)
+    }
+    g_cmd_cap = n
+}
+
+fn set_drain_grace(d: int) {
+    if d < 0 {
+        println("gui: set_drain_grace requires d >= 0")
+        exit(2)
+    }
+    g_drain_ms = d
+}
+
+// ---- EventBuf ----
+// Mutex-guarded queue, head = NEWEST entry. cap bounds drop-eligible
+// entries only; protected entries (live close_requests) may push size
+// past cap. Own-list surgery uses the take-and-relink idiom.
+struct EN { v: own Event, elig: int, next: own EN }
+
+struct WN {
+    h: int,
+    kind: int,
+    alive: int,
+    pend: int,
+    parent: int,
+    next: own WN,
+}
+
+struct ENR { list: own EN, found: own EN }
+
+struct EventBuf {
+    mu: shared,
+    closed: shared,
+    dropped: shared,
+    dp: shared,
+    ping: chan,
+    cap: int,
+    elig: int,
+    q: own EN,
+    wt: own WN,
+}
+
+fn en_cons(v: own Event, elig: int, next: own EN) -> own EN {
+    c := new(EN)
+    c.v = v
+    c.elig = elig
+    c.next = next
+    return c
+}
+
+// remove the deepest (oldest) node — FIFO pop for the dispatcher
+fn en_rm_last(l: own EN) -> ENR {
+    r := ENR{list: nil, found: nil}
+    if l == nil {
+        return r
+    }
+    if l.next == nil {
+        r.found = l
+        return r
+    }
+    rest := l.next
+    l.next = nil
+    rr := en_rm_last(rest)
+    l.next = rr.list
+    r.list = l
+    r.found = rr.found
+    return r
+}
+
+// remove the deepest drop-eligible node — FIFO-fair eviction
+fn en_rm_last_elig(l: own EN) -> ENR {
+    r := ENR{list: nil, found: nil}
+    if l == nil {
+        return r
+    }
+    rest := l.next
+    l.next = nil
+    rr := en_rm_last_elig(rest)
+    if rr.found == nil && l.elig == 1 {
+        l.next = nil
+        r.list = rr.list
+        r.found = l
+        return r
+    }
+    l.next = rr.list
+    r.list = l
+    r.found = rr.found
+    return r
+}
+
+// flip queued close_requests for handle h to drop-eligible; bumps
+// b.elig by the number flipped. Called with b.mu held.
+fn en_flip_close(b: mut EventBuf, l: own EN, h: int) -> own EN {
+    if l == nil {
+        return nil
+    }
+    if l.v.kind == EventKind.close_requested && l.v.target == h && l.elig == 0 {
+        l.elig = 1
+        b.elig = b.elig + 1
+    }
+    l.next = en_flip_close(b, l.next, h)
+    return l
+}
+
+fn en_len(l: ref EN) -> int {
+    n := 0
+    for l != nil {
+        n = n + 1
+        l = l.next
+    }
+    return n
+}
+
+// ---- widget table (inside EventBuf, guarded by eb.mu) ----
+struct WTR { found: int, alive: int, pend: int, parent: int }
+
+fn wt_get(l: ref WN, h: int) -> WTR {
+    r := WTR{found: 0, alive: 0, pend: 0, parent: 0}
+    for l != nil {
+        if l.h == h {
+            r.found = 1
+            r.alive = l.alive
+            r.pend = l.pend
+            r.parent = l.parent
+            return r
+        }
+        l = l.next
+    }
+    return r
+}
+
+// which: 1 = alive, 2 = pend, 3 = parent
+fn wt_set(l: own WN, h: int, which: int, v: int) -> own WN {
+    if l == nil {
+        return nil
+    }
+    if l.h == h {
+        if which == 1 {
+            l.alive = v
+        }
+        if which == 2 {
+            l.pend = v
+        }
+        if which == 3 {
+            l.parent = v
+        }
+        return l
+    }
+    rest := l.next
+    l.next = wt_set(rest, h, which, v)
+    return l
+}
+
+fn wt_put(l: own WN, h: int, kind: int) -> own WN {
+    if l == nil {
+        c := new(WN)
+        c.h = h
+        c.kind = kind
+        c.alive = 1
+        c.pend = 0
+        c.parent = 0
+        c.next = nil
+        return c
+    }
+    if l.h == h {
+        l.alive = 1
+        l.kind = kind
+        return l
+    }
+    rest := l.next
+    l.next = wt_put(rest, h, kind)
+    return l
+}
+
+// ---- EventBuf ops ----
+
+// is this event drop-eligible at post time?
+fn ev_eligible(b: mut EventBuf, e: ref Event) -> int {
+    if e.kind == EventKind.close_requested {
+        w := wt_get(b.wt, e.target)
+        if w.alive == 1 {
+            return 0
+        }
+    }
+    return 1
+}
+
+// EventBuf.post — never blocks: absorb dup closes, coalesce a same-
+// target text_changed tail, evict the oldest drop-eligible entry when
+// the eligible count hits cap, append, then nudge the dispatcher.
+fn (b mut EventBuf) post(e: own Event) -> int {
+    sync.mlock(b.mu)
+    if sget(b.closed) == 1 {
+        sset(b.dropped, sget(b.dropped) + 1)
+        sync.munlock(b.mu)
+        return 0
+    }
+    if e.kind == EventKind.close_requested {
+        w := wt_get(b.wt, e.target)
+        if w.alive == 1 {
+            if w.pend == 1 {
+                sync.munlock(b.mu)
+                return 1
+            }
+            b.wt = wt_set(b.wt, e.target, 2, 1)
+        }
+    }
+    if e.kind == EventKind.text_changed && b.q != nil {
+        if b.q.v.kind == EventKind.text_changed && b.q.v.target == e.target {
+            b.q.v = e
+            sync.munlock(b.mu)
+            try_send(b.ping, 1)
+            return 1
+        }
+    }
+    elig := ev_eligible(b, e)
+    if elig == 1 && b.elig >= b.cap {
+        rr := en_rm_last_elig(b.q)
+        b.q = rr.list
+        if rr.found != nil {
+            b.elig = b.elig - 1
+            sset(b.dropped, sget(b.dropped) + 1)
+            sset(b.dp, sget(b.dp) + 1)
+        }
+    }
+    b.q = en_cons(e, elig, b.q)
+    b.elig = b.elig + elig
+    sync.munlock(b.mu)
+    try_send(b.ping, 1)
+    return 1
+}
+
+// dispatcher-side pop: oldest entry, or nil.
+fn (b mut EventBuf) pop() -> own Event {
+    sync.mlock(b.mu)
+    rr := en_rm_last(b.q)
+    b.q = rr.list
+    if rr.found == nil {
+        sync.munlock(b.mu)
+        return nil
+    }
+    if rr.found.elig == 1 {
+        b.elig = b.elig - 1
+    }
+    v := rr.found.v
+    sync.munlock(b.mu)
+    return v
+}
+
+// read-and-clear the pending marker count (dropped is untouched).
+fn (b mut EventBuf) take_dp() -> int {
+    sync.mlock(b.mu)
+    n := sget(b.dp)
+    sset(b.dp, 0)
+    sync.munlock(b.mu)
+    return n
+}
+
+fn (b mut EventBuf) add_dropped(n: int) {
+    sync.mlock(b.mu)
+    sset(b.dropped, sget(b.dropped) + n)
+    sset(b.dp, sget(b.dp) + n)
+    sync.munlock(b.mu)
+}
+
+fn (b mut EventBuf) closed_empty() -> int {
+    sync.mlock(b.mu)
+    r := 0
+    if sget(b.closed) == 1 && b.q == nil {
+        r = 1
+    }
+    sync.munlock(b.mu)
+    return r
+}
+
+// dead-handle bookkeeping: clear liveness + pending close, flip any
+// queued close_requests for h to drop-eligible. Called with mu held.
+fn eb_mark_dead(b: mut EventBuf, h: int) {
+    b.wt = wt_set(b.wt, h, 1, 0)
+    b.wt = wt_set(b.wt, h, 2, 0)
+    b.q = en_flip_close(b, b.q, h)
+}
+
+// ---- CmdBuf ----
+// Bounded queue (head = newest, drains oldest-first). post parks only
+// while full — bounded admission IS the mutator backpressure; commands
+// are never silently dropped while the buf is open.
+struct CN { v: own Cmd, next: own CN }
+
+struct PN { ch: chan own CmdResult, next: own PN }
+
+struct CNR { list: own CN, found: own CN }
+
+struct CmdBuf {
+    mu: shared,
+    closed: shared,
+    room: chan,
+    cap: int,
+    len: int,
+    q: own CN,
+    pool: own PN,
+    pool_n: int,
+}
+
+fn cn_cons(v: own Cmd, next: own CN) -> own CN {
+    c := new(CN)
+    c.v = v
+    c.next = next
+    return c
+}
+
+fn cn_rev(l: own CN) -> own CN {
+    let out: own CN = nil
+    for l != nil {
+        n := l.next
+        l.next = out
+        out = l
+        l = n
+    }
+    return out
+}
+
+// take the whole queue, oldest-first; wakes parked posters for the
+// freed slots (room holds one nudge per freed slot).
+fn (b mut CmdBuf) drain() -> own CN {
+    sync.mlock(b.mu)
+    l := b.q
+    n := b.len
+    b.q = nil
+    b.len = 0
+    sync.munlock(b.mu)
+    i := 0
+    for i < n {
+        try_send(b.room, 1)
+        i = i + 1
+    }
+    return cn_rev(l)
+}
+
+// post — returns 1 enqueued, 0 closed. Parks on `room` only while full.
+fn (b mut CmdBuf) post(c: own Cmd) -> int {
+    for 1 == 1 {
+        sync.mlock(b.mu)
+        if sget(b.closed) == 1 {
+            sync.munlock(b.mu)
+            return 0
+        }
+        if b.len < b.cap {
+            b.q = cn_cons(c, b.q)
+            b.len = b.len + 1
+            sync.munlock(b.mu)
+            try_send(b.room, 1)
+            return 1
+        }
+        sync.munlock(b.mu)
+        recv(b.room)
+    }
+}
+
+interface Backend {
+    new(kind: WidgetKind, props: own []Prop) -> [int, err],
+    set_prop(h: int, p: Prop),
+    attach(parent: int, child: int),
+    detach(parent: int, child: int),
+    destroy(h: int),
+    pump(events: mut EventBuf, cmds: mut CmdBuf),
+    stop(),
+    wake(),
+}
+
+// ---- session state ----
+struct Session {
+    b: Backend,
+    events: chan own Event,
+    done: chan,
+    retire: chan,
+    mscope: scope,
+    disp: scope,
+}
+
+let g_eb: own EventBuf = nil
+
+let g_cb: own CmdBuf = nil
+
+let g_sess: own Session = nil
+
+let g_last_dropped: shared = nil
+
+fn last_dropped_cell() {
+    if g_last_dropped == nil {
+        g_last_dropped = mkshared(0)
+    }
+}
+
+// ---- reply chans (pool bound to the mailbox scope) ----
+fn reply_chan() -> chan own CmdResult {
+    sync.mlock(g_cb.mu)
+    p := g_cb.pool
+    if p != nil {
+        g_cb.pool = p.next
+        g_cb.pool_n = g_cb.pool_n - 1
+        sync.munlock(g_cb.mu)
+        return p.ch
+    }
+    sync.munlock(g_cb.mu)
+    return smkchan(CmdResult, 1, g_sess.mscope)
+}
+
+fn reply_free(c: chan own CmdResult) {
+    sync.mlock(g_cb.mu)
+    if g_cb.pool_n < 8 {
+        p := new(PN)
+        p.ch = c
+        p.next = g_cb.pool
+        g_cb.pool = p
+        g_cb.pool_n = g_cb.pool_n + 1
+    }
+    sync.munlock(g_cb.mu)
+}
+
+// ---- cmd posting ----
+fn mk_cmd(kind: CmdKind, target: int, arg: int) -> own Cmd {
+    c := new(Cmd)
+    c.kind = kind
+    c.target = target
+    c.widget = WidgetKind.window
+    c.prop = Prop{id: 0, val: PropVal.Num(0)}
+    c.props = nil
+    c.arg = arg
+    c.reply = nil
+    return c
+}
+
+// fire-and-forget: enqueued Cmds get a backend wake; post-close posts
+// are accepted-and-dropped silently.
+fn post_ff(c: own Cmd) {
+    if g_cb == nil {
+        return
+    }
+    if g_cb.post(c) == 1 {
+        g_sess.b.wake()
+    }
+}
+
+// reply-carrying post: short-circuits err_stopped without enqueueing.
+fn post_reply(c: own Cmd) -> err {
+    sync.mlock(g_cb.mu)
+    cl := sget(g_cb.closed)
+    sync.munlock(g_cb.mu)
+    if cl == 1 {
+        return err_stopped()
+    }
+    if g_cb.post(c) == 0 {
+        return err_stopped()
+    }
+    g_sess.b.wake()
+    return nil
+}
+
+// ---- dispatcher ----
+// Own scope nested inside run's inner scope — the drain-grace abort
+// cancels this scope alone, never application work.
+fn credit_unless(sent: shared, n: int) {
+    if sget(sent) == 0 {
+        g_eb.add_dropped(n)
+    }
+}
+
+// blocking send of the overflow marker; a cancelled send credits n back.
+fn send_marked(n: int) {
+    sent := mkshared(0)
+    defer credit_unless(sent, n)
+    m := new(Event)
+    m.kind = EventKind.overflow
+    m.target = 0
+    m.data = EventData.Index(n)
+    send(g_sess.events, m)
+    sset(sent, 1)
+}
+
+// blocking send of one event; a cancelled send counts it as dropped.
+fn send_event(e: own Event) {
+    sent := mkshared(0)
+    defer credit_unless(sent, 1)
+    send(g_sess.events, e)
+    sset(sent, 1)
+}
+
+fn dispatch_loop() {
+    for 1 == 1 {
+        n := g_eb.take_dp()
+        if n > 0 {
+            send_marked(n)
+        }
+        e := g_eb.pop()
+        if e == nil {
+            if g_eb.closed_empty() == 1 {
+                try_send(g_sess.done, 1)
+                return
+            }
+            recv(g_eb.ping)
+            continue
+        }
+        send_event(e)
+    }
+}
+
+// watcher — spawned into the enclosing scope BEFORE run's inner scope
+// opens. Parks on retire; its defer calls stop on any unwind path.
+fn watcher(b: Backend, rt: chan) {
+    defer b.stop()
+    recv(rt)
+}
+
+// ---- run ----
+
+// run-side teardown accounting: every still-unsent entry is counted
+// into dropped before unwind so a cancelled tail never vanishes silently.
+fn eb_count_rest() {
+    sync.mlock(g_eb.mu)
+    n := en_len(g_eb.q)
+    g_eb.q = nil
+    sset(g_eb.dropped, sget(g_eb.dropped) + n)
+    sset(g_eb.dp, sget(g_eb.dp) + n)
+    sync.munlock(g_eb.mu)
+}
+
+// run drains residual Cmds itself, answering every reply carrier with
+// err_stopped so blocked callers unwind instead of hanging.
+fn cb_shutdown() {
+    sync.mlock(g_cb.mu)
+    sset(g_cb.closed, 1)
+    l := g_cb.q
+    g_cb.q = nil
+    g_cb.len = 0
+    sync.munlock(g_cb.mu)
+    close(g_cb.room)
+    l = cn_rev(l)
+    for l != nil {
+        c := l.v
+        r := l.next
+        l.next = nil
+        if c.kind == CmdKind.read || c.kind == CmdKind.new_kind {
+            rc := new(CmdResult)
+            rc.e = err_stopped()
+            rc.handle = 0
+            rc.val = PropVal.Num(0)
+            try_send(c.reply, rc)
+        }
+        l = r
+    }
+}
+
+// app-facing stop: safe from any task, idempotent.
+fn stop() {
+    if g_sess != nil {
+        g_sess.b.stop()
+    }
+}
+
+// pull-based loss report — valid during run and after it returns.
+fn events_dropped() -> int {
+    if g_eb != nil {
+        return sget(g_eb.dropped)
+    }
+    if g_last_dropped != nil {
+        return sget(g_last_dropped)
+    }
+    return 0
+}
+
+// is a close decision currently pending for this handle? (core table)
+fn close_pending(w: Widget) -> int {
+    sync.mlock(g_eb.mu)
+    w2 := wt_get(g_eb.wt, w.handle())
+    sync.munlock(g_eb.mu)
+    return w2.pend
+}
+
+fn run(b: Backend, app: fn(chan own Event)) -> err {
+    if !is_root() {
+        return err_not_root()
+    }
+    if g_running == 1 {
+        return errors.new("gui: already running")
+    }
+    g_running = 1
+    last_dropped_cell()
+
+    g_eb = new(EventBuf)
+    g_eb.mu = sync.mutex()
+    g_eb.closed = mkshared(0)
+    g_eb.dropped = mkshared(0)
+    g_eb.dp = mkshared(0)
+    g_eb.ping = mkchan(1)
+    g_eb.cap = g_event_cap
+    g_eb.elig = 0
+    g_eb.q = nil
+    g_eb.wt = nil
+
+    g_cb = new(CmdBuf)
+    g_cb.mu = sync.mutex()
+    g_cb.closed = mkshared(0)
+    g_cb.room = mkchan(g_cmd_cap)
+    g_cb.cap = g_cmd_cap
+    g_cb.len = 0
+    g_cb.q = nil
+    g_cb.pool = nil
+    g_cb.pool_n = 0
+
+    ev := smkchan(Event, g_event_cap, curscope())
+    g_sess = new(Session)
+    g_sess.b = b
+    g_sess.events = ev
+    g_sess.done = mkchan(1)
+    g_sess.retire = mkchan(1)
+    g_sess.mscope = curscope()
+
+    spawn watcher(b, g_sess.retire)
+    scope {
+        disp := mkscope()
+        g_sess.disp = disp
+        goin(disp, dispatch_loop())
+        app(ev)
+        g_sess.b.pump(g_eb, g_cb)
+        close(g_sess.retire)
+        cb_shutdown()
+        sync.mlock(g_eb.mu)
+        sset(g_eb.closed, 1)
+        sync.munlock(g_eb.mu)
+        try_send(g_eb.ping, 1)
+        ms := g_drain_ms
+        select {
+            recv(g_sess.done) => {}
+            timeout(ms) => {
+                scancel(disp)
+            }
+        }
+        sjoin(disp)
+        eb_count_rest()
+        dp := g_eb.take_dp()
+        if dp > 0 {
+            m := new(Event)
+            m.kind = EventKind.overflow
+            m.target = 0
+            m.data = EventData.Index(dp)
+            try_send(ev, m)
+        }
+        close(ev)
+    }
+    sset(g_last_dropped, sget(g_eb.dropped))
+    g_sess = nil
+    g_eb = nil
+    g_cb = nil
+    g_running = 0
+    return nil
+}
+
+// ---- widget iface + typed wrappers ----
+interface Widget { handle() -> int, kind() -> WidgetKind }
+
+struct Window { h: int }
+
+struct VBox { h: int }
+
+struct HBox { h: int }
+
+struct Label { h: int }
+
+struct Button { h: int }
+
+struct Entry { h: int }
+
+fn (w Window) handle() -> int {
+    return w.h
+}
+
+fn (w Window) kind() -> WidgetKind {
+    return WidgetKind.window
+}
+
+fn (w VBox) handle() -> int {
+    return w.h
+}
+
+fn (w VBox) kind() -> WidgetKind {
+    return WidgetKind.vbox
+}
+
+fn (w HBox) handle() -> int {
+    return w.h
+}
+
+fn (w HBox) kind() -> WidgetKind {
+    return WidgetKind.hbox
+}
+
+fn (l Label) handle() -> int {
+    return l.h
+}
+
+fn (l Label) kind() -> WidgetKind {
+    return WidgetKind.label
+}
+
+fn (b Button) handle() -> int {
+    return b.h
+}
+
+fn (b Button) kind() -> WidgetKind {
+    return WidgetKind.button
+}
+
+fn (e Entry) handle() -> int {
+    return e.h
+}
+
+fn (e Entry) kind() -> WidgetKind {
+    return WidgetKind.entry
+}
+
+// ---- creation ----
+fn props1(id: int, v: PropVal) -> own []Prop {
+    p := mkslice(Prop, 1)
+    p[0] = Prop{id: id, val: v}
+    return new(p)
+}
+
+// core create: posts new_kind, block-receives the handle.
+fn create(kind: WidgetKind, parent: int, props: own []Prop) -> [int, err] {
+    if g_cb == nil {
+        return 0, err_stopped()
+    }
+    rc := reply_chan()
+    c := mk_cmd(CmdKind.new_kind, parent, 0)
+    c.widget = kind
+    c.props = props
+    c.reply = rc
+    e := post_reply(c)
+    if e != nil {
+        return 0, e
+    }
+    r := recv(rc)
+    reply_free(rc)
+    if r.e != nil {
+        return 0, r.e
+    }
+    h := r.handle
+    sync.mlock(g_eb.mu)
+    g_eb.wt = wt_put(g_eb.wt, h, 1)
+    if parent != 0 {
+        g_eb.wt = wt_set(g_eb.wt, h, 3, parent)
+    }
+    sync.munlock(g_eb.mu)
+    return h, nil
+}
+
+fn window(title: str) -> [Window, err] {
+    [h, e] = create(WidgetKind.window, 0, props1(P_TITLE, PropVal.Text(title)))
+    if e != nil {
+        return Window{h: 0}, e
+    }
+    return Window{h: h}, nil
+}
+
+fn vbox() -> [VBox, err] {
+    [h, e] = create(WidgetKind.vbox, 0, nil)
+    if e != nil {
+        return VBox{h: 0}, e
+    }
+    return VBox{h: h}, nil
+}
+
+fn hbox() -> [HBox, err] {
+    [h, e] = create(WidgetKind.hbox, 0, nil)
+    if e != nil {
+        return HBox{h: 0}, e
+    }
+    return HBox{h: h}, nil
+}
+
+fn label(text: str) -> [Label, err] {
+    [h, e] = create(WidgetKind.label, 0, props1(P_TEXT, PropVal.Text(text)))
+    if e != nil {
+        return Label{h: 0}, e
+    }
+    return Label{h: h}, nil
+}
+
+fn button(text: str) -> [Button, err] {
+    [h, e] = create(WidgetKind.button, 0, props1(P_TEXT, PropVal.Text(text)))
+    if e != nil {
+        return Button{h: 0}, e
+    }
+    return Button{h: h}, nil
+}
+
+fn entry(placeholder: str) -> [Entry, err] {
+    [h, e] = create(WidgetKind.entry, 0, props1(P_PLACEHOLDER, PropVal.Text(placeholder)))
+    if e != nil {
+        return Entry{h: 0}, e
+    }
+    return Entry{h: h}, nil
+}
+
+// ---- tree ops ----
+
+// attach child under parent; records the edge for remove's detach.
+fn append(parent: Widget, child: Widget) {
+    sync.mlock(g_eb.mu)
+    g_eb.wt = wt_set(g_eb.wt, child.handle(), 3, parent.handle())
+    sync.munlock(g_eb.mu)
+    post_ff(mk_cmd(CmdKind.attach, parent.handle(), child.handle()))
+}
+
+// detach + destroy — destroy is the single release op.
+fn remove(w: Widget) {
+    if g_eb == nil {
+        return
+    }
+    h := w.handle()
+    sync.mlock(g_eb.mu)
+    wt := wt_get(g_eb.wt, h)
+    eb_mark_dead(g_eb, h)
+    sync.munlock(g_eb.mu)
+    if wt.parent != 0 {
+        post_ff(mk_cmd(CmdKind.detach, wt.parent, h))
+    }
+    post_ff(mk_cmd(CmdKind.destroy, h, 0))
+}
+
+// keep the window: resolves the pending close decision and re-arms the
+// next user close. The flag clears only after the settle Cmd enqueues —
+// a cancelled poster leaves it set, which is the correct state.
+fn dismiss_close(w: Widget) {
+    c := mk_cmd(CmdKind.dismiss_close, w.handle(), 0)
+    if g_cb.post(c) == 1 {
+        g_sess.b.wake()
+        sync.mlock(g_eb.mu)
+        g_eb.wt = wt_set(g_eb.wt, w.handle(), 2, 0)
+        sync.munlock(g_eb.mu)
+    }
+}
+
+// ---- setters (enqueue set_prop; pump applies on the UI thread) ----
+fn set_prop(h: int, id: int, v: PropVal) {
+    c := mk_cmd(CmdKind.set_prop, h, 0)
+    c.prop = Prop{id: id, val: v}
+    post_ff(c)
+}
+
+fn (w Window) set_title(s: str) {
+    set_prop(w.h, P_TITLE, PropVal.Text(s))
+}
+
+fn (l Label) set_text(s: str) {
+    set_prop(l.h, P_TEXT, PropVal.Text(s))
+}
+
+fn (b Button) set_label(s: str) {
+    set_prop(b.h, P_TEXT, PropVal.Text(s))
+}
+
+fn (e Entry) set_text(s: str) {
+    set_prop(e.h, P_TEXT, PropVal.Text(s))
+}
+
+// ---- read (reply-carrying; owned str across the boundary) ----
+fn read_prop(h: int, id: int) -> [PropVal, err] {
+    if g_cb == nil {
+        return PropVal.Num(0), err_stopped()
+    }
+    rc := reply_chan()
+    c := mk_cmd(CmdKind.read, h, 0)
+    c.prop = Prop{id: id, val: PropVal.Num(0)}
+    c.reply = rc
+    e := post_reply(c)
+    if e != nil {
+        return PropVal.Num(0), e
+    }
+    r := recv(rc)
+    reply_free(rc)
+    if r.e != nil {
+        return PropVal.Num(0), r.e
+    }
+    return r.val, nil
+}
+
+fn (e Entry) text() -> [str, err] {
+    [v, err] = read_prop(e.h, P_TEXT)
+    if err != nil {
+        return "", err
+    }
+    match v {
+        PropVal.Text(t) => {
+            return t, nil
+        }
+        PropVal.Flag(f) => {
+            return "", err_gone()
+        }
+        PropVal.Num(n) => {
+            return "", err_gone()
+        }
+    }
+}

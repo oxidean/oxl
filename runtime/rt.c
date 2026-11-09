@@ -983,8 +983,20 @@ int rt_run_root(RtFrame *fr) {
     return trapped;
 }
 
-/* cooperative cancel check -- tasks observe at suspend points */
-int rt_cancelled(void) { return tls_scope && tls_scope->cancel; }
+/* cooperative cancel check — a task is doomed when the scope it was
+ * SPAWNED INTO (or a bound ancestor — cancels mark the whole subtree)
+ * is cancelled. Tasks merely ENTERED into a cancelled `scope {}` are
+ * not: their parks register on t->scope so no cancel wake reaches
+ * them, and the entered scope can't tear down before the task's own
+ * scope{} exit joins and finishes it — a bound chan teardown still
+ * claims any parked waiters. This is what lets `gui.run`'s root-task
+ * teardown outlive the enclosing scope's cancel: the dispatcher dies
+ * bound, the run task unwinds its own scope boundary, joins the
+ * dispatcher scope, and returns instead of trapping mid-teardown. */
+int rt_cancelled(void) {
+    RtTask *t = tls_task;
+    return t && t->scope && t->scope->cancel;
+}
 
 /* the gui.run gate: set only on the task rt_run_root was ENTERED for
  * with no enclosing task (oxl_main, the test-harness task) — the one

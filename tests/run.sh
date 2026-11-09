@@ -1512,6 +1512,20 @@ out=$("$OXL" run tests/select.oxl)
 echo "== g1 typed chans + named scopes =="
 out=$("$OXL" run tests/chan_own.oxl)
 [ "$(tail -1 <<<"$out")" = "chan_own done" ] || { echo "FAIL chan_own: $out"; exit 1; }
+
+echo "== g1 gui: mock backend + cancel gate =="
+out=$("$OXL" run tests/gui_mock.oxl)
+[ "$(tail -1 <<<"$out")" = "done" ] || { echo "FAIL gui_mock: $out"; exit 1; }
+# cancellation: `scope { gui.run(...) }` + scancel while `pump` waits —
+# the watcher's defer fires `b.stop()`, `run` returns, the canceller's
+# scope joins (spec G1 gate). Build + run directly so a hang shows as
+# with_timeout's 124 rather than a driver-side kill.
+"$OXL" build tests/gui_cancel.oxl -o "$scratch/gui_cancel$EXE" || {
+    echo "FAIL gui_cancel: compile failed"; exit 1; }
+rc=0
+out=$(with_timeout 30 "$scratch/gui_cancel$EXE") || rc=$?
+[ "$rc" -eq 0 ] && [ "$(tail -1 <<<"$out")" = "cancel ok" ] || {
+    echo "FAIL gui_cancel: rc=$rc: $out"; exit 1; }
 # parked select must unwedge on sibling trap — exits nonzero, not a hang.
 # 124 = with_timeout expiry = the hang this test exists to catch. Build
 # first so a compile error fails the check instead of passing as a

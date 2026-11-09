@@ -4,7 +4,6 @@ package main
 // `chan own T` moves owned payloads; `try_send` never parks; `mkscope`
 // hands a named child scope to `goin`/`sjoin`/`scancel`; `is_root` marks
 // the rt_run_root-entered task; `smkchan` binds a chan's drain to a scope.
-
 import "std/time"
 
 struct Ev { kind: int, x: int }
@@ -43,7 +42,9 @@ fn main() {
 
     // typed chan: own payloads move through send/recv
     c := mkchan(Ev, 4)
-    scope { go producer(c) }
+    scope {
+        spawn producer(c)
+    }
     e := recv(c)
     assert(e.kind == 7 && e.x == 42)
     e2 := recv(c)
@@ -77,8 +78,12 @@ fn main() {
     send(c3, e3)
     got := 0
     select {
-        v := recv(c3) => { got = v.kind }
-        timeout(50) => { println("select timed out — BUG") }
+        v := recv(c3) => {
+            got = v.kind
+        }
+        timeout(50) => {
+            println("select timed out — BUG")
+        }
     }
     assert(got == 99)
 

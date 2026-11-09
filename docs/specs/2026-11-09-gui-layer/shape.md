@@ -94,7 +94,11 @@ Three backends matter:
   drop-oldest + an `overflow` marker event — input events must not
   silently vanish. Shutdown: a bounded drain-grace window
   (`gui.set_drain_grace(d)`) preserves the buffered tail on pump
-  exit; post-exit commands resolve with `gui.err_stopped()`.
+  exit; post-exit reply-carrying commands (`read`, `new_kind`)
+  resolve with `gui.err_stopped()` — while fire-and-forget
+  commands (`set_prop`, `attach`, `detach`, `destroy`) are
+  accepted-and-dropped, so callers must not rely on an error to
+  detect a dropped mutation.
 - **Copy at the boundary.** Text getters return owned `str`; no
   borrowed `cstr` aliases cross the public API.
 - **The protocol is the milestone,** not widget count — pilot parity

@@ -180,6 +180,20 @@ left attached when the loop ends is freed by the sweep, so a
 `gui.remove` that would have named it afterwards degrades to the
 documented post-stop no-op instead of a leak.
 
+The sweep can never outrun a live close decision, because
+`close_requested` is **veto-backed**: a backend posting it must
+first veto the toolkit's native teardown (gtk: `delete-event`
+returns TRUE; the window survives untouched). The toolkit loop's
+natural end — last toplevel gone — is therefore unreachable while
+a close decision is still pending: the app answers with
+`gui.remove` (window dies, loop may then end) or keeps the window
+(loop simply continues). A `close_requested` that arrives during
+the event drain-grace consequently always refers to a still-live
+handle *unless* shutdown was app-initiated (`stop`): on that path
+the veto is moot — the app already chose teardown — the sweep
+takes the widget, and reads against it resolve `err_stopped()`,
+which is the documented "inspect after teardown" answer.
+
 ## Prop protocol
 
 `Prop{id: int, val: PropVal}` with `PropVal` a payload enum

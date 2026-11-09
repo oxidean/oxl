@@ -31,7 +31,9 @@ Two channels' worth of machinery, split at the backend boundary:
   default; `gui.set_event_buffer(n)` before `run` for control) and
   invokes `app(events)` — typically inside the app's `scope`, so the
   app fn can `go` workers that `select` on it. This chan is the ONLY
-  event channel user code sees.
+  event channel user code sees. Channels carry word-sized owned
+  values, so `Event` travels as `own Event` — the send moves the
+  pointer word; `recv` returns it typed back to `own Event`.
 - **Backend-facing:** `pump` does NOT send on that chan directly.
   `gui.run` also allocates an `EventBuf` — a core-owned bounded deque
   guarded by a `sync` mutex, carrying a `dropped` count and a cap-1
@@ -123,7 +125,7 @@ cancelled inner scope joined — `run` `close`s `events` before
 returning. Closure is the consumer-facing termination signal:
 close wakes every parked `recv`, the buffered tail still drains
 first (documented runtime semantics), and a `recv` that observes
-closed+empty returns the zero word — `nil` for the Event value,
+closed+empty returns the zero word — a `nil` `own Event` —
 so `e == nil` is the termination test. A worker `select`ing on
 `events` therefore always resolves after `run` exits — with the
 drained tail, then with the closed signal — and cannot outlive

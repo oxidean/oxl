@@ -82,13 +82,17 @@ structs are not generic.
 
 ## Limits (v0.2)
 
-- **Methods may not suspend** — `spawn`/`select`/`recv`/`send`/`sleep`
-  inside a method body is a compile error; vtable calls carry no task
-  frame.
+- **Vtable-reachable methods may not suspend** — a method that
+  transitively suspends (`spawn`/`select`/`recv`/`send`/`sleep`) is a
+  compile error when some interface declares that method *and* the
+  receiver type satisfies it, since vtable calls carry no task frame.
+  Methods no interface can dispatch — e.g. `http.Client.get` — may
+  suspend normally; the checker reports the claiming interface in the
+  diagnostic when the ban applies.
 - No associated types, no interface generics, no embedding; structs
   aren't generic, so only *method* ty params pin through a vtab slot.
 - A fn-valued struct field `x.m` shadows a method `m` — `x.m()` calls
   the field.
-- The bootstrap codegen (`bootstrap/codegen.oxl`) does not lower
-  method dispatch — parser and checker handle `fn (r T) m` receivers
-  and interface sigs; lowering stays on the seed pipeline.
+- Generic instantiation of suspend-capable functions is queued per
+  call site on both pipelines; a susp method on a generic receiver is
+  not parsed (structs aren't generic — see above).

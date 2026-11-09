@@ -148,7 +148,7 @@ echo "== oxl test: io (s2) =="
 out=$("$OXL" test tests/io_test.oxl)
 printf '%s
 ' "$out" >&2
-for t in test_bytes test_strconv test_fmt test_errs test_fill_keeps_err_bytes test_flush_keeps_unwritten test_fill_nop_progress test_stdstreams test_io_files; do
+for t in test_bytes test_strconv test_fmt test_errs test_fill_keeps_err_bytes test_flush_keeps_unwritten test_fill_nop_progress test_stdstreams test_io_files test_err_chain; do
     grep -q "$t ... ok" <<<"$out" || { echo "FAIL io: $out"; exit 1; }
 done
 # char literals decode to their scalar (scratch, not corpus — fmt
@@ -223,7 +223,7 @@ done
 out=$("$OXL" test tests/net_test.oxl)
 printf '%s
 ' "$out" >&2
-for t in test_echo test_refused test_badip; do
+for t in test_echo test_closer test_refused test_lookup test_badip; do
     grep -q "$t ... ok" <<<"$out" || { echo "FAIL net: $out"; exit 1; }
 done
 
@@ -258,6 +258,7 @@ done
 echo "== stdmods (json/sync/time) =="
 out=$("$OXL" run tests/stdmods_test.oxl)
 grep -q '"name":"widget"' <<<"$out" || { echo "FAIL stdmods json: $out"; exit 1; }
+grep -q "^surr=3:4 00000$" <<<"$out" || { echo "FAIL stdmods surrogates: $out"; exit 1; }
 grep -q "^4000$" <<<"$out" || { echo "FAIL stdmods sync counter: $out"; exit 1; }
 [ "$(tail -1 <<<"$out")" = "done" ] || { echo "FAIL stdmods time: $out"; exit 1; }
 
@@ -371,16 +372,35 @@ D3EOF
 if "$OXL" build "$scratch/d3sat.oxl" -o "$scratch/d3sat" 2>/dev/null; then
     echo "FAIL: unsatisfied iface compiled"; exit 1
 fi
-# methods can't suspend — vtable calls carry no task frame
+# a susp method that an interface can dispatch can't compile —
+# vtable calls carry no task frame
 cat > "$scratch/d3susp.oxl" <<'D3EOF'
 package main
+interface Waiter { wait() }
 struct S { n: int }
 fn (s S) wait() { sleep(1) }
 fn main() { s := S{n: 0}; s.wait() }
 D3EOF
 if "$OXL" build "$scratch/d3susp.oxl" -o "$scratch/d3susp" 2>/dev/null; then
-    echo "FAIL: suspending method compiled"; exit 1
+    echo "FAIL: vtable-reachable suspending method compiled"; exit 1
 fi
+diag=$("$OXL" build "$scratch/d3susp.oxl" -o "$scratch/d3susp" 2>&1 || true)
+grep -q 'satisfies interface `Waiter`' <<<"$diag" || { echo "FAIL d3susp diag: $diag"; exit 1; }
+# a susp method no interface claims is legal — direct call gets a frame
+cat > "$scratch/d3suspok.oxl" <<'D3EOF'
+package main
+struct S { n: int }
+fn (s S) wait() -> int {
+    select {
+        timeout(5) => { return s.n + 1 }
+    }
+    return 0
+}
+fn main() { s := S{n: 3}; println(itoa(s.wait())) }
+D3EOF
+"$OXL" build "$scratch/d3suspok.oxl" -o "$scratch/d3suspok$EXE" || { echo "FAIL: off-vtable suspending method rejected"; exit 1; }
+out=$(with_timeout 10 "$scratch/d3suspok$EXE")
+[ "$out" = "4" ] || { echo "FAIL susp method run: $out"; exit 1; }
 
 echo "== move tracking (d2) =="
 # use-after-move must be a compile error naming the binding
@@ -707,6 +727,127 @@ rm "$getwork/app/oxl.sum"
 ( cd "$getwork/app" && OXLMODCACHE="$getwork/cache" "$scratch/selfcheck$EXE" app ) > "$getwork/nosum.self" 2>&1 && { echo "FAIL missing-sum accepted (self)"; exit 1; }
 grep -q 'missing oxl.sum entry for module' "$getwork/nosum.seed" || { echo "FAIL missing-sum text"; cat "$getwork/nosum.seed"; exit 1; }
 diff "$getwork/nosum.seed" "$getwork/nosum.self" >/dev/null || { echo "FAIL missing-sum parity"; cat "$getwork/nosum.seed" "$getwork/nosum.self"; exit 1; }
+
+echo "== e3 subdirectory-module fetch =="
+# one repo may host several modules under subdirectories — the module
+# path's repo prefix is discovered by trying progressively shorter
+# repos (`file://$getwork/sub/extra` resolves repo `sub` + subdir
+# `extra`), each module carries its own `<sub>/v*` tag series, and the
+# cache slot + oxl.sum cover only the module subtree.
+subwork="$scratch/subwork"
+mkdir -p "$subwork/sub/extra/thing" "$subwork/sub/tool" "$subwork/app/app" "$subwork/cache"
+( cd "$subwork/sub" && git init -q . && git config user.email t@t && git config user.name t
+  printf 'module file://%s/sub/extra\noxl 0.3\n' "$subwork" > extra/oxl.mod
+  printf 'package thing\n\nfn val() -> int { return 7 }\n' > extra/thing/thing.oxl
+  printf 'package main\nfn main() { println("tool") }\n' > tool/main.oxl
+  git add -A && git commit -qm init && git tag extra/v1.0.0 && git tag v1.0.0 )
+printf 'module local/subapp\noxl 0.3\n' > "$subwork/app/oxl.mod"
+printf 'package main\nimport "file://%s/sub/extra/thing"\n\nfn main() { println("thing=" + itoa(thing.val())) }\n' "$subwork" > "$subwork/app/app/main.oxl"
+( cd "$subwork/app" && OXLMODCACHE="$subwork/cache" "$OXL" get "file://$subwork/sub/extra@v1.0.0" ) > "$subwork/get1" 2>&1 || { echo "FAIL subdir get rc"; cat "$subwork/get1"; exit 1; }
+grep -q "added file://$subwork/sub/extra@v1.0.0" "$subwork/get1" || { echo "FAIL subdir get report"; cat "$subwork/get1"; exit 1; }
+grep -q "require file://$subwork/sub/extra v1.0.0" "$subwork/app/oxl.mod" || { echo "FAIL subdir require"; cat "$subwork/app/oxl.mod"; exit 1; }
+[ "$(grep -c ' h1:' "$subwork/app/oxl.sum")" = 2 ] || { echo "FAIL subdir sum"; cat "$subwork/app/oxl.sum"; exit 1; }
+# the sealed slot names the module path (…/sub/extra@…), not the repo
+slot=$(find "$subwork/cache" -type d -name 'extra@v1.0.0')
+[ -n "$slot" ] || { echo "FAIL subdir slot missing"; find "$subwork/cache"; exit 1; }
+[ -f "$slot/oxl.mod" ] && [ -f "$slot/thing/thing.oxl" ] && [ ! -e "$slot/tool" ] || { echo "FAIL subdir slot shape"; find "$slot"; exit 1; }
+# resolve offline: repo moved away, the app still builds from cache
+mv "$subwork/sub" "$subwork/sub-gone"
+( cd "$subwork/app" && OXLMODCACHE="$subwork/cache" "$OXL" build app -o "$subwork/appbin" ) || { echo "FAIL subdir offline build"; exit 1; }
+[ "$("$subwork/appbin")" = "thing=7" ] || { echo "FAIL subdir run"; "$subwork/appbin"; exit 1; }
+mv "$subwork/sub-gone" "$subwork/sub"
+# the self-declared-path check refuses the repo prefix — fetching
+# `file://$subwork/sub` would clone fine but its root has no oxl.mod
+# declaring that path (the module lives at sub/extra)
+# the repo root carries a bare v1.0.0 so resolution reaches the
+# manifest check — which must refuse: no oxl.mod declares `…/sub` at
+# the repo root (the module lives at sub/extra)
+( cd "$subwork/app" && OXLMODCACHE="$subwork/cache" "$OXL" get "file://$subwork/sub@v1.0.0" ) > "$subwork/getbad" 2>&1 && { echo "FAIL repo-prefix fetch accepted"; cat "$subwork/getbad"; exit 1; }
+grep -q 'no oxl.mod at' "$subwork/getbad" || { echo "FAIL repo-prefix text"; cat "$subwork/getbad"; exit 1; }
+
+echo "== e4 git-backed index =="
+# OXLMODINDEX maps module paths to {version,commit,h1,tag} JSONL
+# entries: `oxl publish` tags the module + appends the entry, `oxl
+# get` resolves the index first and verifies the entry h1 against the
+# fetched tree. git's url.insteadOf rewires the example.com path to a
+# local repo so the publish→get round-trip stays offline.
+ixw="$scratch/idxwork"
+mkdir -p "$ixw/idx/index" "$ixw/dep/extra/thing" "$ixw/app/app" "$ixw/cache"
+( cd "$ixw/idx" && git init -q . && git config user.email t@t && git config user.name t
+  git commit -qm init --allow-empty )
+( cd "$ixw/dep" && git init -q . && git config user.email t@t && git config user.name t
+  printf 'module example.com/dep/extra\noxl 0.3\n' > extra/oxl.mod
+  printf 'package thing\n\nfn val() -> int { return 7 }\n' > extra/thing/thing.oxl
+  git add -A && git commit -qm init )
+printf '[url "file://%s/"]\n\tinsteadOf = https://example.com/\n' "$ixw" > "$ixw/gitconfig"
+printf 'module local/ixapp\noxl 0.3\n' > "$ixw/app/oxl.mod"
+printf 'package main\nimport "example.com/dep/extra/thing"\n\nfn main() { println("thing=" + itoa(thing.val())) }\n' > "$ixw/app/app/main.oxl"
+# publish: tag + per-package compile + index entry, committed in idx
+( cd "$ixw/dep/extra" && GIT_CONFIG_GLOBAL="$ixw/gitconfig" OXLMODINDEX="$ixw/idx" "$OXL" publish v1.0.0 ) > "$ixw/pub" 2>&1 || { echo "FAIL publish rc"; cat "$ixw/pub"; exit 1; }
+grep -q 'published example.com/dep/extra v1.0.0' "$ixw/pub" || { echo "FAIL publish report"; cat "$ixw/pub"; exit 1; }
+git -C "$ixw/dep" rev-parse --verify -q "refs/tags/extra/v1.0.0^{commit}" >/dev/null || { echo "FAIL publish tag"; exit 1; }
+grep -q '"tag":"extra/v1.0.0"' "$ixw/idx/index/example.com/dep/extra.json" || { echo "FAIL index entry"; cat "$ixw/idx/index/example.com/dep/extra.json"; exit 1; }
+# an identical republish is already-published; a moved commit refuses
+( cd "$ixw/dep/extra" && GIT_CONFIG_GLOBAL="$ixw/gitconfig" OXLMODINDEX="$ixw/idx" "$OXL" publish v1.0.0 ) > "$ixw/pub2" 2>&1 || { echo "FAIL republish rc"; cat "$ixw/pub2"; exit 1; }
+grep -q 'already published' "$ixw/pub2" || { echo "FAIL republish report"; cat "$ixw/pub2"; exit 1; }
+( cd "$ixw/dep" && printf 'package thing\n\nfn val() -> int { return 8 }\n' > extra/thing/thing.oxl
+  git add -A && git commit -qm bump )
+( cd "$ixw/dep/extra" && GIT_CONFIG_GLOBAL="$ixw/gitconfig" OXLMODINDEX="$ixw/idx" "$OXL" publish v1.0.0 ) > "$ixw/pub3" 2>&1 && { echo "FAIL moved-tag accepted"; cat "$ixw/pub3"; exit 1; }
+grep -q 'refusing to republish' "$ixw/pub3" || { echo "FAIL moved-tag text"; cat "$ixw/pub3"; exit 1; }
+( cd "$ixw/dep" && git checkout -q extra/thing/thing.oxl )
+# get resolves through the index: pinned commit + h1 verify + install
+( cd "$ixw/app" && GIT_CONFIG_GLOBAL="$ixw/gitconfig" OXLMODINDEX="$ixw/idx" OXLMODCACHE="$ixw/cache" "$OXL" get "example.com/dep/extra@v1.0.0" ) > "$ixw/get1" 2>&1 || { echo "FAIL index get rc"; cat "$ixw/get1"; exit 1; }
+grep -q 'added example.com/dep/extra@v1.0.0' "$ixw/get1" || { echo "FAIL index get report"; cat "$ixw/get1"; exit 1; }
+mv "$ixw/dep" "$ixw/dep-gone"
+( cd "$ixw/app" && OXLMODINDEX="$ixw/idx" OXLMODCACHE="$ixw/cache" "$OXL" build app -o "$ixw/appbin" ) || { echo "FAIL index offline build"; exit 1; }
+[ "$("$ixw/appbin")" = "thing=7" ] || { echo "FAIL index run"; "$ixw/appbin"; exit 1; }
+mv "$ixw/dep-gone" "$ixw/dep"
+# an entry the index lacks falls back to direct git (tagged but
+# unpublished — the bump commit above)
+( cd "$ixw/dep" && git tag extra/v1.1.0 )
+( cd "$ixw/app" && GIT_CONFIG_GLOBAL="$ixw/gitconfig" OXLMODINDEX="$ixw/idx" OXLMODCACHE="$ixw/cache" "$OXL" get "example.com/dep/extra@v1.1.0" ) > "$ixw/get2" 2>&1 || { echo "FAIL fallback get rc"; cat "$ixw/get2"; exit 1; }
+grep -q 'v1.1.0' "$ixw/get2" || { echo "FAIL fallback get report"; cat "$ixw/get2"; exit 1; }
+# a git-URL OXLMODINDEX takes the shallow-clone path — same answer
+chmod -R u+w "$ixw/cache" 2>/dev/null; rm -rf "$ixw/cache" && mkdir "$ixw/cache"
+sed 's|example.com/dep/extra v1.1.0|example.com/dep/extra v1.0.0|' "$ixw/app/oxl.mod" > "$ixw/app/m.tmp" && mv "$ixw/app/m.tmp" "$ixw/app/oxl.mod" && rm -f "$ixw/app/oxl.sum"
+( cd "$ixw/app" && GIT_CONFIG_GLOBAL="$ixw/gitconfig" OXLMODINDEX="file://$ixw/idx" OXLMODCACHE="$ixw/cache" "$OXL" get "example.com/dep/extra@v1.0.0" ) > "$ixw/get3" 2>&1 || { echo "FAIL cloned-index get rc"; cat "$ixw/get3"; exit 1; }
+grep -q 'v1.0.0' "$ixw/get3" || { echo "FAIL cloned-index report"; cat "$ixw/get3"; exit 1; }
+# a tampered entry h1 hard-fails — never a silent fallback to git
+sed 's|"h1":"h1:|"h1":"h2:|' "$ixw/idx/index/example.com/dep/extra.json" > "$ixw/idx/e.tmp" && mv "$ixw/idx/e.tmp" "$ixw/idx/index/example.com/dep/extra.json"
+chmod -R u+w "$ixw/cache" 2>/dev/null; rm -rf "$ixw/cache" && mkdir "$ixw/cache" && rm -f "$ixw/app/oxl.sum"
+( cd "$ixw/app" && GIT_CONFIG_GLOBAL="$ixw/gitconfig" OXLMODINDEX="$ixw/idx" OXLMODCACHE="$ixw/cache" "$OXL" get "example.com/dep/extra@v1.0.0" ) > "$ixw/get4" 2>&1 && { echo "FAIL tamper accepted"; cat "$ixw/get4"; exit 1; }
+grep -q 'does not match the fetched tree' "$ixw/get4" || { echo "FAIL tamper text"; cat "$ixw/get4"; exit 1; }
+
+echo "== e3/e4 seed-driver parity =="
+# $OXL is the product driver at this point, so the e3/e4 fixtures
+# exercised only it — replay the same three paths under the seed:
+# publish (tag + index append), index-first get, and the vanity
+# candidate walk that finds the module one directory below a repo.
+sw="$scratch/seedx"
+mkdir -p "$sw/repo/extra/thing" "$sw/app/app" "$sw/cache" "$sw/idx/index"
+( cd "$sw/repo" && git init -q . && git config user.email t@t && git config user.name t
+  printf 'module example.com/repo/extra\noxl 0.3\n' > extra/oxl.mod
+  printf 'package thing\n\nfn val() -> int { return 5 }\n' > extra/thing/thing.oxl
+  git add -A && git commit -qm init )
+printf '[url "file://%s/"]\n\tinsteadOf = https://example.com/\n' "$sw" > "$sw/gitconfig"
+printf 'module local/seedapp\noxl 0.3\n' > "$sw/app/oxl.mod"
+printf 'package main\nimport "example.com/repo/extra/thing"\n\nfn main() { println("thing=" + itoa(thing.val())) }\n' > "$sw/app/app/main.oxl"
+( cd "$sw/repo/extra" && GIT_CONFIG_GLOBAL="$sw/gitconfig" OXLMODINDEX="$sw/idx" "$SEEDOXL" publish v1.0.0 ) > "$sw/pub" 2>&1 || { echo "FAIL seed publish rc"; cat "$sw/pub"; exit 1; }
+grep -q 'published example.com/repo/extra v1.0.0' "$sw/pub" || { echo "FAIL seed publish report"; cat "$sw/pub"; exit 1; }
+grep -q '"h1":"h1:' "$sw/idx/index/example.com/repo/extra.json" || { echo "FAIL seed index entry"; cat "$sw/idx/index/example.com/repo/extra.json"; exit 1; }
+( cd "$sw/app" && GIT_CONFIG_GLOBAL="$sw/gitconfig" OXLMODINDEX="$sw/idx" OXLMODCACHE="$sw/cache" "$SEEDOXL" get "example.com/repo/extra@v1.0.0" ) > "$sw/get1" 2>&1 || { echo "FAIL seed index get rc"; cat "$sw/get1"; exit 1; }
+grep -q 'added example.com/repo/extra@v1.0.0' "$sw/get1" || { echo "FAIL seed index get report"; cat "$sw/get1"; exit 1; }
+mv "$sw/repo" "$sw/repo-gone"
+( cd "$sw/app" && OXLMODINDEX="$sw/idx" OXLMODCACHE="$sw/cache" "$SEEDOXL" build app -o "$sw/appbin" ) || { echo "FAIL seed offline build"; exit 1; }
+[ "$("$sw/appbin")" = "thing=5" ] || { echo "FAIL seed offline run"; "$sw/appbin"; exit 1; }
+mv "$sw/repo-gone" "$sw/repo"
+mkdir -p "$sw/multi/lib"
+( cd "$sw/multi" && git init -q . && git config user.email t@t && git config user.name t
+  printf 'module file://%s/multi/lib\noxl 0.3\n' "$sw" > lib/oxl.mod
+  printf 'package lib\n\nfn v() -> int { return 3 }\n' > lib/l.oxl
+  git add -A && git commit -qm init && git tag lib/v2.0.0 )
+( cd "$sw/app" && GIT_CONFIG_GLOBAL="$sw/gitconfig" OXLMODCACHE="$sw/cache" "$SEEDOXL" get "file://$sw/multi/lib@v2.0.0" ) > "$sw/get2" 2>&1 || { echo "FAIL seed subdir get rc"; cat "$sw/get2"; exit 1; }
+grep -q "added file://$sw/multi/lib@v2.0.0" "$sw/get2" || { echo "FAIL seed subdir get report"; cat "$sw/get2"; exit 1; }
 
 echo "== v3 oxl mod commands =="
 # tidy syncs the manifest with what the source imports — an
@@ -1254,6 +1395,44 @@ printf 'package main\nimport "file://%s/nosuch/pkg"\n\nfn main() {}\n' "$tv" > "
 grep -q 'no required module provides package' "$tv/tidy5" || { echo "FAIL self tidy5 text"; cat "$tv/tidy5"; exit 1; }
 ;;
 esac
+
+echo "== extras: workspace module + tidy interplay (e2) =="
+# root oxl.work `use ./extra` resolves github.com/oxidean/oxl/extra
+# imports to the local tree — the require documents the published
+# floor for consumers outside the workspace. The test consumes the
+# package through its module path.
+out=$("$OXL" test tests/extra_testutil.oxl)
+for t in test_tempdir test_helpers test_err_asserts; do
+    grep -q "$t ... ok" <<<"$out" || { echo "FAIL extra: $out"; exit 1; }
+done
+# the extra module also builds standalone from its own root
+# a library package compile-checks through `oxl test` (its driver
+# main means no package-main requirement — same path the extras
+# release gate runs)
+( cd extra && "$OXL" test testutil ) || { echo "FAIL extra module build"; exit 1; }
+# a `use`d+`require`d module: tidy keeps the require without a fetch,
+# verify needs no cache slot, and no oxl.sum lines are written for it
+wsw="$scratch/wsuse"
+mkdir -p "$wsw/extra/thing" "$wsw/app/app"
+printf 'module example.com/ws/extra\noxl 0.3\n' > "$wsw/extra/oxl.mod"
+printf 'package thing\n\nfn val() -> int { return 7 }\n' > "$wsw/extra/thing/thing.oxl"
+printf 'module example.com/app\noxl 0.3\n\nrequire example.com/ws/extra v0.0.0\n' > "$wsw/app/oxl.mod"
+printf 'oxlwork 0.3\n\nuse ../extra\n' > "$wsw/app/oxl.work"
+printf 'package main\nimport "example.com/ws/extra/thing"\n\nfn main() { println("thing=" + itoa(thing.val())) }\n' > "$wsw/app/app/main.oxl"
+( cd "$wsw/app" && "$OXL" mod tidy ) > "$wsw/tidy" 2>&1 || { echo "FAIL ws tidy rc"; cat "$wsw/tidy"; exit 1; }
+grep -q 'require example.com/ws/extra v0.0.0' "$wsw/app/oxl.mod" || { echo "FAIL ws tidy require"; cat "$wsw/app/oxl.mod"; exit 1; }
+if [ -f "$wsw/app/oxl.sum" ]; then
+    ! grep -q 'ws/extra' "$wsw/app/oxl.sum" || { echo "FAIL ws sum written"; cat "$wsw/app/oxl.sum"; exit 1; }
+fi
+( cd "$wsw/app" && "$OXL" mod verify ) > "$wsw/vfy" 2>&1 || { echo "FAIL ws verify rc"; cat "$wsw/vfy"; exit 1; }
+grep -q 'all modules verified' "$wsw/vfy" || { echo "FAIL ws verify text"; cat "$wsw/vfy"; exit 1; }
+( cd "$wsw/app" && "$OXL" build app -o "$wsw/appbin" ) || { echo "FAIL ws build"; exit 1; }
+[ "$("$wsw/appbin")" = "thing=7" ] || { echo "FAIL ws run"; "$wsw/appbin"; exit 1; }
+# seed driver parity on the same fixture
+( cd "$wsw/app" && "$SEEDOXL" mod tidy ) > "$wsw/stidy" 2>&1 || { echo "FAIL seed ws tidy rc"; cat "$wsw/stidy"; exit 1; }
+grep -q 'require example.com/ws/extra v0.0.0' "$wsw/app/oxl.mod" || { echo "FAIL seed ws tidy require"; cat "$wsw/app/oxl.mod"; exit 1; }
+( cd "$wsw/app" && "$SEEDOXL" mod verify ) > "$wsw/svfy" 2>&1 || { echo "FAIL seed ws verify rc"; cat "$wsw/svfy"; exit 1; }
+grep -q 'all modules verified' "$wsw/svfy" || { echo "FAIL seed ws verify text"; cat "$wsw/svfy"; exit 1; }
 
 echo "== a1 coroutine scale =="
 # spec bar: 10k spawned tasks parked on recv must cost heap frames,

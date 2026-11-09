@@ -323,14 +323,30 @@ pub fn check(c: &Crate, files: &[String], diags: &mut Diags) -> Checked {
             });
         }
     }
-    // D3: methods can't suspend — vtable/indirect calls don't carry a
-    // task frame. Checked post-hoc since `suspend` needs all bodies.
+    // D3: a suspendable method is unsafe only when vtable-reachable —
+    // its receiver satisfies an interface declaring that method name,
+    // and indirect calls carry no task frame. Direct calls suspend
+    // like plain fns, so other methods may suspend freely. Checked
+    // post-hoc since `suspend` needs all bodies.
     for (m, (sp, f)) in &ck.method_spans {
-        if checked.suspend.contains(m) {
+        if !checked.suspend.contains(m) {
+            continue;
+        }
+        let Some((recv, short)) = m.rsplit_once('.') else { continue };
+        let mut hit: Option<&str> = None;
+        for (iname, d) in &ck.ifaces {
+            if d.methods.iter().any(|mm| mm.name == short)
+                && ck.impl_satisfies(recv, iname)
+                && hit.is_none_or(|h| iname.as_str() < h)
+            {
+                hit = Some(iname);
+            }
+        }
+        if let Some(iname) = hit {
             ck.diags.push(Diag {
                 file: f.clone(),
                 ..Diag::err(*sp, "check",
-                    format!("suspendable method `{m}` — methods may not suspend (v0.2)"))
+                    format!("suspendable method `{m}` — `{recv}` satisfies interface `{iname}`; vtable calls carry no task frame"))
             });
         }
     }

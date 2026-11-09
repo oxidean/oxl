@@ -96,13 +96,26 @@ Directives: `module` (this module's path), `oxl` (minimum toolchain
 version), `require` (a dependency at a version, also in a parenthesized
 block), and `replace` (pin a dependency to a local directory).
 
-Import resolution order: `std/...` (the shipped standard library) → this
-module's path (resolved under the manifest's directory) → required modules
-(longest path wins; `replace` directories first, then the module cache at
-`$OXLMODCACHE` or `~/.oxl/mod`). Packages under `internal/` may only be
-imported by code beneath the `internal` directory's parent, import cycles
-are a compile error that prints the cycle chain, and an import the file
-never references doesn't build either.
+Import resolution runs one longest-prefix competition across every
+candidate tree: `std/...` (the shipped standard library), this module's
+path (resolved under the manifest's directory), `use`d workspace trees,
+`replace` directories, and required modules in the module cache at
+`$OXLMODCACHE` or `~/.oxl/mod`. Longest matching path wins; an exact tie
+goes to the earlier source, and a `use`d module shadows a `require` on
+the same path. Packages under `internal/` may only be imported by code
+beneath the `internal` directory's parent, import cycles are a compile
+error that prints the cycle chain, and an import the file never
+references doesn't build either.
+
+An `oxl.work` file (`oxlwork 0.3` plus `use` lines naming module
+directories relative to the work file, discovered by walking up from
+the entry) stitches several local modules into one build — imports under
+a `use`d module's path resolve to the local tree ahead of `replace` and
+the cache, an exact-path tie goes to the `use` tree, and `use`d modules
+need no cache slots or `oxl.sum` entries. File mode (no `oxl.mod` found)
+ignores workspaces entirely. The oxl repo itself is one: packages outside
+`std/` live in `extra/` (`module github.com/oxidean/oxl/extra`), wired
+through the root `oxl.work`.
 
 `oxl get <path>@<query>` fetches a module through `git`, doing a bare
 clone plus `git archive` of the resolved commit (canonical tree bytes,

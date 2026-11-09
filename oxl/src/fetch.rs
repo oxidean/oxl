@@ -37,11 +37,17 @@ pub struct Fetched {
     pub ver: String,
     pub tar: Vec<u8>,
     pub manifest: Vec<u8>,
+    /// repo-relative module root — "" for a module at the repo root,
+    /// "extra" / "a/b" for a subdirectory module
+    pub subdir: String,
 }
 
 /// resolve `query` against `url` and return the selected version plus
-/// the canonical `git archive` of its tree. One bare clone serves both.
-pub fn fetch(url: &str, path: &str, query: &str) -> Result<Fetched, String> {
+/// the canonical `git archive` of its subtree. One bare clone serves
+/// both. `subdir` is the repo-relative module root ("" or "extra" /
+/// "a/b") — it selects the `<subdir>/v*` tag series and slices the
+/// archive + manifest to that subtree.
+pub fn fetch(url: &str, path: &str, query: &str, subdir: &str) -> Result<Fetched, String> {
     let tmp = std::env::temp_dir().join(format!("oxl-get-{}-{}", std::process::id(), sanitize(path)));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).map_err(|e| e.to_string())?;
@@ -62,9 +68,20 @@ pub fn fetch(url: &str, path: &str, query: &str) -> Result<Fetched, String> {
                     ))
                 }
             })?;
-        let (sha, ver) = resolve(&tmp, query)?;
+        let pfx = if subdir.is_empty() {
+            String::new()
+        } else {
+            format!("{subdir}/")
+        };
+        let (sha, ver) = resolve(&tmp, query, &pfx)?;
+        // archive only the module subtree — entries keep the subdir
+        // prefix, so extraction roots the module at <dest>/<subdir>
+        let mut args = vec!["archive", "--format=tar", sha.as_str()];
+        if !subdir.is_empty() {
+            args.push(subdir);
+        }
         let out = Command::new("git")
-            .args(["archive", "--format=tar", &sha])
+            .args(&args)
             .current_dir(&tmp)
             .output()
             .map_err(|e| format!("git archive {sha}: {e}"))?;
@@ -77,16 +94,18 @@ pub fn fetch(url: &str, path: &str, query: &str) -> Result<Fetched, String> {
         // the manifest bytes come from the archived tree, not a
         // checkout — same bytes the sum will verify later
         let manifest = Command::new("git")
-            .args(["show", &format!("{sha}:oxl.mod")])
+            .args(["show", &format!("{sha}:{pfx}oxl.mod")])
             .current_dir(&tmp)
             .output()
             .map_err(|e| e.to_string())?;
         let manifest = if manifest.status.success() {
             manifest.stdout
-        } else {
+        } else if subdir.is_empty() {
             return Err(format!("{path}@{ver}: no oxl.mod at repo root"));
+        } else {
+            return Err(format!("{path}@{ver}: no oxl.mod at {subdir}/"));
         };
-        Ok(Fetched { ver, tar: out.stdout, manifest })
+        Ok(Fetched { ver, tar: out.stdout, manifest, subdir: subdir.to_string() })
     })();
     let _ = std::fs::remove_dir_all(&tmp);
     res
@@ -96,12 +115,19 @@ fn sanitize(s: &str) -> String {
     s.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect()
 }
 
-/// every tag pointing at commits, as semver — `vX.Y.Z` names only
-fn tags(repo: &Path) -> Result<Vec<(semver::Ver, String)>, String> {
-    let out = git(repo, &["tag", "--list", "v*"])?;
+/// every `<pfx>v*` tag, as (semver, tag-text) pairs — the prefix is
+/// stripped before the semver parse while the tag text is kept whole
+/// for rev-parse; versions name the module, tags name the repo ref
+fn tags(repo: &Path, pfx: &str) -> Result<Vec<(semver::Ver, String)>, String> {
+    let out = git(repo, &["tag", "--list", &format!("{pfx}v*")])?;
     Ok(out
         .lines()
-        .filter_map(|l| semver::parse(l.trim()).map(|v| (v, l.trim().to_string())))
+        .filter_map(|l| {
+            let t = l.trim();
+            t.strip_prefix(pfx)
+                .and_then(semver::parse)
+                .map(|v| (v, t.to_string()))
+        })
         .collect())
 }
 
@@ -112,13 +138,16 @@ fn rev_parse(repo: &Path, r: &str) -> Result<String, String> {
 /// Pseudo-version shape: the commit's nearest semver tag ancestor bumps
 /// its patch and gains `-0.<yyyymmddhhmmss>-<sha12>`; no ancestor tag
 /// at all starts from v0.0.0
-fn pseudo(repo: &Path, sha: &str) -> Result<String, String> {
-    let base = git(repo, &["describe", "--tags", "--abbrev=0", "--match", "v*", sha]).ok();
+/// `pfx` selects the tag series (`extra/v*` for a subdirectory
+/// module); the recorded version is the module's — the prefix is
+/// stripped before the semver bump
+fn pseudo(repo: &Path, sha: &str, pfx: &str) -> Result<String, String> {
+    let base = git(repo, &["describe", "--tags", "--abbrev=0", "--match", &format!("{pfx}v*"), sha]).ok();
     let ts = git(repo, &["show", "-s", "--format=%cd", "--date=format:%Y%m%d%H%M%S", sha])?;
     let ts = ts.trim();
     let short = &sha[..12.min(sha.len())];
     let v = base
-        .and_then(|b| semver::parse(b.trim()))
+        .and_then(|b| semver::parse(b.trim().strip_prefix(pfx).unwrap_or(b.trim())))
         .map(|mut v| {
             v.pat += 1;
             v
@@ -127,31 +156,31 @@ fn pseudo(repo: &Path, sha: &str) -> Result<String, String> {
     Ok(format!("v{}.{}.{}-0.{ts}-{short}", v.maj, v.min, v.pat))
 }
 
-fn resolve(repo: &Path, query: &str) -> Result<(String, String), String> {
+fn resolve(repo: &Path, query: &str, pfx: &str) -> Result<(String, String), String> {
     match query {
         "latest" | "" => {
-            let ts = tags(repo)?;
+            let ts = tags(repo, pfx)?;
             match ts.iter().max_by(|a, b| semver::compare(&a.0, &b.0)) {
                 Some((v, tag)) => Ok((rev_parse(repo, tag)?, fmt_ver(v))),
                 None => {
                     let sha = rev_parse(repo, "HEAD")?;
-                    Ok((sha.clone(), pseudo(repo, &sha)?))
+                    Ok((sha.clone(), pseudo(repo, &sha, pfx)?))
                 }
             }
         }
         q if q.starts_with('v') && semver::parse(q).is_some() => {
-            let sha = rev_parse(repo, &format!("refs/tags/{q}"))
+            let sha = rev_parse(repo, &format!("refs/tags/{pfx}{q}"))
                 .map_err(|_| format!("unknown revision {q}"))?;
             Ok((sha, q.to_string()))
         }
         q => {
             // branch name first, then a raw commit-ish
             if let Ok(sha) = rev_parse(repo, &format!("refs/heads/{q}")) {
-                let v = pseudo(repo, &sha)?;
+                let v = pseudo(repo, &sha, pfx)?;
                 return Ok((sha, v));
             }
             let sha = rev_parse(repo, q).map_err(|_| format!("unknown revision {q}"))?;
-            let v = pseudo(repo, &sha)?;
+            let v = pseudo(repo, &sha, pfx)?;
             Ok((sha, v))
         }
     }

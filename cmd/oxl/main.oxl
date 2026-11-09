@@ -382,6 +382,7 @@ fn emit_and_cc(csrc: str, out: str, entry: str) -> int {
     nets = push(nets, "rt_set_sndtimo")
     nets = push(nets, "rt_htons")
     nets = push(nets, "rt_htonl")
+    nets = push(nets, "rt_lookup_ipv4")
     i := 0
     for i < len(nets) {
         if strings.contains(csrc, nets[i]) {
@@ -594,7 +595,7 @@ fn cmd_list() {
 
 fn main() {
     if argc() < 2 {
-        eprintln("oxl — one toolchain binary\n\n  oxl build [<pkg dir>|<file.oxl>...] [-o out]\n  oxl run [<pkg dir>|<file.oxl>...]\n  oxl test [<pkg dir>|<file.oxl>...]\n  oxl fmt <file.oxl>...\n  oxl doc <file.oxl>\n  oxl get <path>@<query>\n  oxl mod <init|tidy|verify|list> ...\n  oxl list -m all\n  oxl lsp")
+        eprintln("oxl — one toolchain binary\n\n  oxl build [<pkg dir>|<file.oxl>...] [-o out]\n  oxl run [<pkg dir>|<file.oxl>...]\n  oxl test [<pkg dir>|<file.oxl>...]\n  oxl fmt <file.oxl>...\n  oxl doc <file.oxl>\n  oxl get <path>@<query>\n  oxl publish v<semver>\n  oxl mod <init|tidy|verify|list> ...\n  oxl list -m all\n  oxl lsp")
         exit(2)
     }
     c := argv(1)
@@ -612,6 +613,8 @@ fn main() {
         cmd_doc()
     } else if c == "get" {
         cmd_get()
+    } else if c == "publish" {
+        cmd_publish()
     } else if c == "mod" {
         cmd_mod()
     } else if c == "lsp" {

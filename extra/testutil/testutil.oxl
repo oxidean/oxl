@@ -1,0 +1,79 @@
+package testutil
+
+// extra/testutil — assertion and scratch-dir helpers for tests,
+// consumable through a workspace `use` or a fetched `extra/v*` tag.
+// std/testing's expect* trio covers bool/int/str equality; this
+// package holds the richer helpers test files kept rewriting
+// locally — temp dirs, slice membership, float compare, and the
+// err assertions std/testing lacks.
+import "std/errors"
+
+import "std/os"
+
+/// tempdir makes a fresh, uniquely named directory under the OS
+/// scratch dir and returns it. Retries the name so two test
+/// binaries racing the same millisecond can't collide. Clean up
+/// with rmtree.
+fn tempdir(prefix: str) -> [str, err] {
+    i := 0
+    for i < 100 {
+        d := os.temp_dir() + "/oxl-test-" + prefix + "-" + itoa(now_ms()) + "-" + itoa(i)
+        if os.mkdir(d) == nil {
+            return d, nil
+        }
+        i = i + 1
+    }
+    return "", errors.new("testutil: tempdir: could not allocate a unique name under " + os.temp_dir())
+}
+
+/// rmtree removes a tempdir tree; a missing path is not an error,
+/// matching the remove_all contract.
+fn rmtree(dir: str) -> err {
+    return os.remove_all(dir)
+}
+
+/// has reports whether xs contains want — the []str-membership
+/// helper every list-touching test was rewriting locally.
+fn has(xs: []str, want: str) -> bool {
+    i := 0
+    for i < len(xs) {
+        if xs[i] == want {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+/// approx reports |a-b| < tol — the float comparison tests kept
+/// inlining (math.abs works too; this keeps the tolerance call
+/// one line at the assert site).
+fn approx(a: float, b: float, tol: float) -> bool {
+    d := a - b
+    if d < 0.0 {
+        d = 0.0 - d
+    }
+    return d < tol
+}
+
+/// expect_ok traps when e is non-nil — the err assertion half
+/// std/testing lacks.
+fn expect_ok(e: err, msg: str) {
+    if e != nil {
+        println("FAILED: " + msg + " err=" + errors.msg(e))
+        assert(false)
+    }
+}
+
+/// expect_err_contains traps when e is nil or its message lacks
+/// part — negative-path asserts without coupling to exact codes.
+fn expect_err_contains(e: err, part: str, msg: str) {
+    if e == nil {
+        println("FAILED: " + msg + " expected error containing " + part + ", got nil")
+        assert(false)
+    }
+    if find(errors.msg(e), part) < 0 {
+        println("FAILED: " + msg + " err=" + errors.msg(e) + " missing " + part)
+        assert(false)
+    }
+}

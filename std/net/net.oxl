@@ -31,6 +31,10 @@ extern fn rt_bind_any(fd: int, port: int) -> int
 
 extern fn rt_errstr(code: int) -> str
 
+extern fn rt_lookup_start(host: str) -> shared
+
+extern fn rt_lookup_release(h: shared)
+
 extern fn rt_latch_alloc() -> shared
 
 extern fn rt_latch_free(s: shared)
@@ -101,20 +105,71 @@ fn parse_ipv4(host: str) -> [int, err] {
     return ip * 256 + oct, nil
 }
 
-/// dial opens a TCP connection to host:port — host must be a dotted
-/// IPv4 literal ("127.0.0.1"), connect bounded at 30s (the usual
-/// transport timeout). Returns [conn, nil] or an error.
+// pending word for the lookup cell: one past every legal h32 — a real
+// result is 0..0xffffffff or a negative platform code, never 2^32
+let lkp_pending = 4294967296
+
+// poll slice for the wait loop: short enough that a finished lookup
+// wakes promptly, long enough that a stuck resolver doesn't churn
+// transient sleep timers — worst case tmo_ms/50 sleeps, each bounded
+// by the slice, and the loop stops the moment the helper posts
+let lkp_poll_ms = 50
+
+/// lookup_ipv4 resolves a hostname to a packed IPv4 h32 (the same
+/// order parse_ipv4 produces), bounded by tmo_ms. A dotted literal
+/// short-circuits the resolver entirely. getaddrinfo runs on a
+/// detached runtime helper thread — deliberately not a scope task, so
+/// a stuck resolver can never hold the caller's scope join open past
+/// the deadline — and the handle is refcounted across caller and
+/// helper: whoever releases last frees it, so every exit path here
+/// (timeout, error, cancel-unwind via the defer) stays leak-free.
+fn lookup_ipv4(host: str, tmo_ms: int) -> [int, err] {
+    [ip, pe] = parse_ipv4(host)
+    if pe == nil {
+        return ip, nil
+    }
+    h := rt_lookup_start(host)
+    defer rt_lookup_release(h)
+    v := sget(h)
+    deadline := now_ms() + tmo_ms
+    for v == lkp_pending {
+        rem := deadline - now_ms()
+        if rem <= 0 {
+            break
+        }
+        if rem > lkp_poll_ms {
+            rem = lkp_poll_ms
+        }
+        msleep(rem)
+        v = sget(h)
+    }
+    // a result first observed after the deadline still counts as a
+    // timeout — the caller bounded the wait
+    if v == lkp_pending || now_ms() > deadline {
+        return 0, errors.new("net: lookup " + host + ": timed out")
+    }
+    if v < 0 {
+        return 0, errors.new("net: lookup " + host + ": " + rt_errstr(0 - v))
+    }
+    return v, nil
+}
+
+/// dial opens a TCP connection to host:port — host may be a dotted
+/// IPv4 literal ("127.0.0.1") or a hostname resolved through
+/// lookup_ipv4; connect bounded at 30s (the usual transport
+/// timeout). Returns [conn, nil] or an error.
 fn dial(host: str, port: int) -> [Conn, err] {
     return dial_timeout(host, port, 30000)
 }
 
-/// dial_timeout is dial with a caller-set connect deadline in ms — a
-/// dropped SYN otherwise hangs the call forever (connect has no
-/// timeout of its own).
+/// dial_timeout is dial with a caller-set deadline in ms applied to
+/// both phases — a dropped SYN or a stuck resolver otherwise hangs
+/// the call forever. The phases are sequential, so the bound is
+/// 2*tmo_ms in the worst case.
 fn dial_timeout(host: str, port: int, tmo_ms: int) -> [Conn, err] {
-    [ip, pe] = parse_ipv4(host)
-    if pe != nil {
-        return Conn{fd: -1, st: dead_st, g: 0}, pe
+    [ip, le] = lookup_ipv4(host, tmo_ms)
+    if le != nil {
+        return Conn{fd: -1, st: dead_st, g: 0}, le
     }
     if port <= 0 || port > 65535 {
         return Conn{fd: -1, st: dead_st, g: 0}, errors.new("net: dial: bad port " + itoa(port))

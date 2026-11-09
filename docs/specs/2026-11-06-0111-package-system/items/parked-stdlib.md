@@ -52,3 +52,16 @@ machinery they need.
   rides on it later.
 - `crypto/rand`, `math/big`, `time/tzdata`, `syscall` — platform or
   precision machinery deferred until a real consumer exists.
+
+## Parked pending runtime type descriptors
+
+- `fmt %v` (issue #28) — a generic default-format verb needs runtime
+  reflection over the value's type; `err` codes, `own` graph nodes,
+  and struct fields carry no type descriptors at runtime, so `%v`
+  cannot discover what it would print. The explicit verbs (`%d`,
+  `%s`, `%f`, `%q`…) stay the contract until rt carries type
+  metadata; re-open when descriptors land.
+- `errors.As` (issue #27, partial) — the cause chain (`wrap`,
+  `unwrap`, `is`) is live, but `as` binds a *typed* target and err is
+  an int64 code with no type identity to match against. Same
+  descriptor gap as `%v` — both unblock together.

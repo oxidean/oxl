@@ -1573,30 +1573,35 @@ impl<'a> Gen<'a> {
             }
             if let ExprKind::Ident(fn_name) = &f.kind {
                 let fn_name = &fn_name.clone();
-                // suspendable callee → frame task (heap frame + poll driver)
-                if self.susp.contains(fn_name) {
-                    let (mangled, bind) = match call_bindings(self, fn_name, args) {
+                // suspendable callee → frame task (heap frame + poll driver);
+                // method callees resolve through the plan — receiver rides
+                // param 0 of the `T.m` frame like an ordinary call
+                if let Some((cn, srecv)) = self.susp_call_plan(f, args) {
+                    let mut eff: Vec<Expr> = srecv.iter().cloned().collect();
+                    eff.extend_from_slice(args);
+                    let (mangled, bind) = match call_bindings(self, &cn, &eff) {
                         Some(bind) => {
-                            let m = inst_name(fn_name, &bind);
+                            let m = inst_name(&cn, &bind);
                             if !self.inst_done.contains(&m) {
-                                self.insts.push((fn_name.clone(), bind));
+                                self.insts.push((cn.clone(), bind));
                             }
                             (m, true)
                         }
-                        None => (fn_name.clone(), false),
+                        None => (cn.clone(), false),
                     };
                     let _ = bind;
                     let pnames: Vec<String> = self
                         .ast_fns
-                        .get(fn_name)
-                        .map(|af| af.params.iter().map(|p| p.name.clone()).collect())
+                        .get(&cn)
+                        .map(|af| all_params(af).iter().map(|p| p.name.clone()).collect())
                         .unwrap_or_default();
                     let _ = writeln!(self.out,
                         "    {{ struct o_frm_{} *_t = (struct o_frm_{} *)rt_task_new(o_poll_{}, (int64_t)sizeof(struct o_frm_{}));",
                         cname(&mangled), cname(&mangled), cname(&mangled), cname(&mangled));
-                    let ptys = self.decl_param_tys(fn_name, args);
-                    for (i, arg) in args.iter().enumerate() {
+                    let ptys = self.decl_param_tys(&cn, &eff);
+                    for (i, arg) in eff.iter().enumerate() {
                         let v = match ptys.as_ref().and_then(|p| p.get(i)).cloned() {
+                            Some(pt) if i == 0 && srecv.is_some() => self.adapt_recv(arg, &pt),
                             Some(pt) => self.conv(arg, &pt),
                             None => self.expr(arg),
                         };
@@ -2923,18 +2928,35 @@ impl<'a> Gen<'a> {
 
     /// is this expr a call to a susp callee?
     fn call_is_susp(&self, e: &Expr) -> bool {
-        if let ExprKind::Call { f, .. } = &e.kind {
+        if let ExprKind::Call { f, args } = &e.kind {
             if let ExprKind::Ident(n) = &f.kind {
-                return self.susp_name(n);
+                if self.susp_name(n) {
+                    return true;
+                }
             }
+            // `x.m()` arrives flattened — resolve through call_plan so a
+            // susp *method* callee is seen (D3: susp methods are legal
+            // off-vtable; only the emit needed teaching)
+            return matches!(self.call_plan(f, args), CallPlan::Fn { q, .. } if self.susp.contains(&q));
         }
         false
+    }
+
+    /// resolve a susp call's target — qualified fn name + receiver to
+    /// prepend (method calls carry it as param 0). Plain fns return
+    /// (name, None); vtable/leaf/non-susp calls return None.
+    fn susp_call_plan(&self, f: &Expr, args: &[Expr]) -> Option<(String, Option<Expr>)> {
+        match self.call_plan(f, args) {
+            CallPlan::Fn { q, recv } if self.susp.contains(&q) => Some((q, recv)),
+            _ => None,
+        }
     }
 
     fn expr_has_susp(&self, e: &Expr) -> bool {
         match &e.kind {
             ExprKind::Call { f, args } => {
                 matches!(&f.kind, ExprKind::Ident(n) if self.susp_name(n))
+                    || matches!(self.call_plan(f, args), CallPlan::Fn { q, .. } if self.susp.contains(&q))
                     || args.iter().any(|a| self.expr_has_susp(a))
                     || self.expr_has_susp(f)
             }
@@ -2981,6 +3003,11 @@ impl<'a> Gen<'a> {
                 };
                 if self.call_is_susp(&call) {
                     let tmp = self.fresh("_h");
+                    // bind the temp to the call's type before pushing —
+                    // a later `x := _hN` then resolves x's type, and a
+                    // nested `x.m()` sees its receiver through env
+                    let tt = self.expr_ty(&call);
+                    self.env.last_mut().unwrap().insert(tmp.clone(), tt);
                     pre.push(Stmt::Let {
                         name: tmp.clone(),
                         ty: None,
@@ -3136,6 +3163,13 @@ impl<'a> Gen<'a> {
                 let mut pre = Vec::new();
                 let i2 = self.hoist_expr(init, &mut pre);
                 out.append(&mut pre);
+                // bind as we walk — fstmt does the same at emit; hoist
+                // needs it earlier for `name.m()` callee resolution
+                let bt = match ty {
+                    Some(tr) => self.ty_of_ref(tr),
+                    None => self.expr_ty(&i2),
+                };
+                self.env.last_mut().unwrap().insert(name.clone(), bt);
                 out.push(Stmt::Let {
                     name: name.clone(),
                     ty: ty.clone(),
@@ -3147,6 +3181,19 @@ impl<'a> Gen<'a> {
                 let mut pre = Vec::new();
                 let c2 = self.hoist_call_args(call, &mut pre);
                 out.append(&mut pre);
+                // bind the destructured names so a later `a.m()` callee
+                // resolves during hoist — mirrors the Let arm; `b` is
+                // always the err half
+                let vt = match self.pair_call_info(call) {
+                    Some((_, t)) => t,
+                    None => Ty::Unknown,
+                };
+                if let Bind::Name(n) = a {
+                    self.env.last_mut().unwrap().insert(n.clone(), vt);
+                }
+                if let Bind::Name(n) = b {
+                    self.env.last_mut().unwrap().insert(n.clone(), Ty::Err);
+                }
                 out.push(Stmt::Let2 {
                     a: clone_bind(a),
                     b: clone_bind(b),
@@ -3177,28 +3224,28 @@ impl<'a> Gen<'a> {
                 }
                 // `return suspPair()` forwards as [v, err] — desugar to let2
                 if vals.len() == 1 && self.call_is_susp(&vals[0]) {
-                    if let ExprKind::Call { f, .. } = &vals[0].kind {
-                        if let ExprKind::Ident(n) = &f.kind {
-                            if let Some((_, Ret::Pair(_))) = self.fns.get(n) {
-                                let mut pre = Vec::new();
-                                let c2 = self.hoist_call_args(&vals[0], &mut pre);
-                                out.append(&mut pre);
-                                let (pa, pe) = (self.fresh("_pa"), self.fresh("_pe"));
-                                out.push(Stmt::Let2 {
-                                    a: Bind::Name(pa.clone()),
-                                    b: Bind::Name(pe.clone()),
-                                    call: c2,
-                                    span: *span,
-                                });
-                                out.push(Stmt::Return {
-                                    vals: vec![
-                                        Self::eident(&pa, *span),
-                                        Self::eident(&pe, *span),
-                                    ],
-                                    span: *span,
-                                });
-                                return;
-                            }
+                    if let ExprKind::Call { .. } = &vals[0].kind {
+                        // call_plan_ret sees through method callees — the
+                        // raw ident `w.fetch` is not the fns key `T.fetch`
+                        if matches!(self.call_plan_ret(&vals[0]), Some(crate::check::Ret::Pair(_))) {
+                            let mut pre = Vec::new();
+                            let c2 = self.hoist_call_args(&vals[0], &mut pre);
+                            out.append(&mut pre);
+                            let (pa, pe) = (self.fresh("_pa"), self.fresh("_pe"));
+                            out.push(Stmt::Let2 {
+                                a: Bind::Name(pa.clone()),
+                                b: Bind::Name(pe.clone()),
+                                call: c2,
+                                span: *span,
+                            });
+                            out.push(Stmt::Return {
+                                vals: vec![
+                                    Self::eident(&pa, *span),
+                                    Self::eident(&pe, *span),
+                                ],
+                                span: *span,
+                            });
+                            return;
                         }
                     }
                 }
@@ -3212,10 +3259,19 @@ impl<'a> Gen<'a> {
                 let mut pre = Vec::new();
                 let c2 = self.hoist_expr(cond, &mut pre);
                 out.append(&mut pre);
+                self.env.push(HashMap::new());
+                let then2 = self.hoist_block(then);
+                self.env.pop();
+                let els2 = els.as_ref().map(|e| {
+                    self.env.push(HashMap::new());
+                    let eb = self.hoist_block(e);
+                    self.env.pop();
+                    eb
+                });
                 out.push(Stmt::If {
                     cond: c2,
-                    then: self.hoist_block(then),
-                    els: els.as_ref().map(|e| self.hoist_block(e)),
+                    then: then2,
+                    els: els2,
                     span: *span,
                 });
             }
@@ -3223,20 +3279,27 @@ impl<'a> Gen<'a> {
                 let mut pre = Vec::new();
                 let c2 = self.hoist_expr(cond, &mut pre);
                 out.append(&mut pre);
+                self.env.push(HashMap::new());
+                let body2 = self.hoist_block(body);
+                self.env.pop();
                 out.push(Stmt::For {
                     cond: c2,
-                    body: self.hoist_block(body),
+                    body: body2,
                     span: *span,
                 });
             }
-            Stmt::Scope { body, span } => out.push(Stmt::Scope {
-                body: self.hoist_block(body),
-                span: *span,
-            }),
-            Stmt::Unsafe { body, span } => out.push(Stmt::Unsafe {
-                body: self.hoist_block(body),
-                span: *span,
-            }),
+            Stmt::Scope { body, span } => {
+                self.env.push(HashMap::new());
+                let b2 = self.hoist_block(body);
+                self.env.pop();
+                out.push(Stmt::Scope { body: b2, span: *span });
+            }
+            Stmt::Unsafe { body, span } => {
+                self.env.push(HashMap::new());
+                let b2 = self.hoist_block(body);
+                self.env.pop();
+                out.push(Stmt::Unsafe { body: b2, span: *span });
+            }
             Stmt::Spawn { call, pinned, blocking, span } => {
                 let mut pre = Vec::new();
                 let c2 = self.hoist_call_args(call, &mut pre);
@@ -3348,17 +3411,26 @@ impl<'a> Gen<'a> {
 
     /// emit a suspend point for an oxl-fn call: allocate the child frame,
     /// poll it, propagate PENDING/CANCEL, bind the result on READY
-    fn fsusp_call(&mut self, name: &str, args: &[Expr], dest: FDest) {
-        let (frty, poll) = self.susp_frame_ty(name, args);
+    /// susp fn call through the frame machinery — `recv` is the method
+    /// receiver (param 0 of `T.m` decls) when the callee resolved
+    /// through call_plan, None for plain fns
+    fn fsusp_call(&mut self, name: &str, recv: Option<Expr>, args: &[Expr], dest: FDest) {
+        let mut eff: Vec<Expr> = Vec::with_capacity(args.len() + usize::from(recv.is_some()));
+        if let Some(r) = &recv {
+            eff.push(r.clone());
+        }
+        eff.extend_from_slice(args);
+        let (frty, poll) = self.susp_frame_ty(name, &eff);
         let frname = frty.trim_start_matches("o_frm_").to_string();
         let pnames: Vec<String> = self
             .ast_fns
             .get(name)
-            .map(|af| af.params.iter().map(|p| p.name.clone()).collect())
+            .map(|af| all_params(af).iter().map(|p| p.name.clone()).collect())
             .unwrap_or_default();
-        let ptys = self.decl_param_tys(name, args);
-        let argvs: Vec<String> = args.iter().enumerate()
+        let ptys = self.decl_param_tys(name, &eff);
+        let argvs: Vec<String> = eff.iter().enumerate()
             .map(|(i, a)| match ptys.as_ref().and_then(|p| p.get(i)).cloned() {
+                Some(pt) if i == 0 && recv.is_some() => self.adapt_recv(a, &pt),
                 Some(pt) => self.conv(a, &pt),
                 None => self.expr(a),
             })
@@ -3433,12 +3505,15 @@ impl<'a> Gen<'a> {
     }
 
     /// is the stmt's payload call a suspend point? returns the callee name
-    fn stmt_susp_call<'x>(&self, e: &'x Expr) -> Option<&'x str> {
-        if let ExprKind::Call { f, .. } = &e.kind {
+    fn stmt_susp_call(&self, e: &Expr) -> Option<(String, Option<Expr>)> {
+        if let ExprKind::Call { f, args } = &e.kind {
             if let ExprKind::Ident(n) = &f.kind {
                 if self.susp_name(n) {
-                    return Some(n);
+                    return Some((n.clone(), None));
                 }
+            }
+            if let Some((q, recv)) = self.susp_call_plan(f, args) {
+                return Some((q, recv));
             }
         }
         None
@@ -3525,8 +3600,8 @@ impl<'a> Gen<'a> {
                             let n = n.clone();
                             if matches!(n.as_str(), "recv" | "send" | "sleep" | "msleep") {
                                 self.fsusp_leaf(&n, args, FDest::Field(fd));
-                            } else {
-                                self.fsusp_call(&n, args, FDest::Field(fd));
+                            } else if let Some((cn, recv)) = self.susp_call_plan(f, args) {
+                                self.fsusp_call(&cn, recv, args, FDest::Field(fd));
                             }
                         }
                     }
@@ -3546,12 +3621,14 @@ impl<'a> Gen<'a> {
                 if let ExprKind::Call { f, args } = &call.kind {
                     if let ExprKind::Ident(fn_name) = &f.kind {
                         let fn_name = fn_name.clone();
-                        if self.susp.contains(&fn_name) {
+                        if let Some((cn, recv)) = self.susp_call_plan(f, args) {
+                            let mut eff: Vec<Expr> = recv.iter().cloned().collect();
+                            eff.extend_from_slice(args);
                             let fa = match a {
                                 Bind::Name(na) => {
-                                    let vt = match self.fns.get(&fn_name).map(|x| x.1.clone()) {
+                                    let vt = match self.fns.get(&cn).map(|x| x.1.clone()) {
                                         Some(Ret::Pair(t)) => {
-                                            match call_bindings(self, &fn_name, args) {
+                                            match call_bindings(self, &cn, &eff) {
                                                 Some(bind) => {
                                                     let m: HashMap<String, Ty> =
                                                         bind.into_iter().collect();
@@ -3580,7 +3657,8 @@ impl<'a> Gen<'a> {
                                 }
                                 Bind::Blank => None,
                             };
-                            self.fsusp_call(&fn_name, args, FDest::Pair(fa, fb));
+                            let _ = fn_name;
+                            self.fsusp_call(&cn, recv, args, FDest::Pair(fa, fb));
                             return;
                         }
                     }
@@ -3629,8 +3707,8 @@ impl<'a> Gen<'a> {
                             let n = n.clone();
                             if matches!(n.as_str(), "recv" | "send" | "sleep" | "msleep") {
                                 self.fsusp_leaf(&n, args, FDest::Assign(tc));
-                            } else {
-                                self.fsusp_call(&n, args, FDest::Assign(tc));
+                            } else if let Some((cn, recv)) = self.susp_call_plan(f, args) {
+                                self.fsusp_call(&cn, recv, args, FDest::Assign(tc));
                             }
                         }
                     }
@@ -3653,8 +3731,8 @@ impl<'a> Gen<'a> {
                             let n = n.clone();
                             if matches!(n.as_str(), "recv" | "send" | "sleep" | "msleep") {
                                 self.fsusp_leaf(&n, args, FDest::Void);
-                            } else {
-                                self.fsusp_call(&n, args, FDest::Void);
+                            } else if let Some((cn, recv)) = self.susp_call_plan(f, args) {
+                                self.fsusp_call(&cn, recv, args, FDest::Void);
                             }
                             return;
                         }
@@ -3679,7 +3757,7 @@ impl<'a> Gen<'a> {
                 self.exit_drained = false;
                 if !vals.is_empty() {
                     if self.cur_ret_pair && vals.len() == 1 {
-                        if let Some(cn) = self.stmt_susp_call(&vals[0]).map(str::to_string) {
+                        if let Some((cn, crecv)) = self.stmt_susp_call(&vals[0]) {
                             // `return suspPair()` — run the child through
                             // the frame machinery, convert its .val
                             if let ExprKind::Call { args, .. } = &vals[0].kind {
@@ -3688,7 +3766,7 @@ impl<'a> Gen<'a> {
                                     let ct = self.cty(&vt);
                                     let pa = self.fslot(&format!("_pa{n}"), &ct);
                                     let pe = self.fslot(&format!("_pe{n}"), "int64_t");
-                                    self.fsusp_call(&cn, args,
+                                    self.fsusp_call(&cn, crecv, args,
                                         FDest::Pair(Some(pa.clone()), Some(pe.clone())));
                                     let want = self.cur_ret_ty.clone();
                                     let cv = self.conv_v(&vals[0], format!("fr->{pa}"), &want);
@@ -3709,7 +3787,7 @@ impl<'a> Gen<'a> {
                                 if matches!(cn.as_str(), "recv" | "send" | "sleep" | "msleep") {
                                     self.fsusp_leaf(&cn, args, FDest::Field(fd.clone()));
                                 } else {
-                                    self.fsusp_call(&cn, args, FDest::Field(fd.clone()));
+                                    self.fsusp_call(&cn, crecv, args, FDest::Field(fd.clone()));
                                 }
                                 let want = self.cur_ret_ty.clone();
                                 let cv = self.conv_v(&vals[0], format!("fr->{fd}"), &want);
@@ -3918,7 +3996,6 @@ impl<'a> Gen<'a> {
     /// emit `struct o_frm_<e>` + `int o_poll_<e>` driver for a susp fn
     /// (or its monomorphized instantiation when `ename` is mangled)
     fn func_frame(&mut self, f: &Fn, ename: &str) {
-        let hoisted = self.hoist_fn(f);
         self.in_frame = true;
         self.fslots = vec![HashMap::new()];
         self.frame_decls = Vec::new();
@@ -3931,8 +4008,15 @@ impl<'a> Gen<'a> {
         self.cur_ret_pair = matches!(f.ret, RetTy::Pair(_));
         self.defers.clear();
         self.env.push(HashMap::new());
+        // hoist needs receiver+param types bound — `c.m()` callee
+        // resolution runs expr_ty on the receiver ident mid-hoist
+        for p in all_params(f) {
+            let t = self.ty_of_ref(&p.ty);
+            self.env.last_mut().unwrap().insert(p.name.clone(), t);
+        }
+        let hoisted = self.hoist_fn(f);
         let mut pfields = String::new();
-        for p in &f.params {
+        for p in all_params(f) {
             let t = self.ty_of_ref(&p.ty);
             let _ = write!(pfields, " {} p_{};", self.cty(&t), p.name);
             self.env.last_mut().unwrap().insert(p.name.clone(), t);

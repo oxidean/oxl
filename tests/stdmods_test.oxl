@@ -29,6 +29,12 @@ fn main() {
     }
     println(itoa(sync.cval(c)))
 
+    // e6 #26 — \uXXXX surrogate pairs decode to one 4-byte seq;
+    // lone halves and non-pair tails stay malformed-input errors
+    emo := json.jparse("\"\\uD83D\\uDE00\"")
+    print("surr=" + itoa(emo.kind) + ":" + itoa(len(emo.s)))
+    println(" " + itoa(json.jparse("\"\\uD800\"").kind) + itoa(json.jparse("\"\\uD83D\\u0041\"").kind) + itoa(json.jparse("\"\\uDE00\"").kind) + itoa(json.jparse("\"\\uD83D\\uD83D\"").kind) + itoa(json.jparse("\"\\uD83D\\uDCZZ\"").kind))
+
     println(itoa(time.unix_ms()))
     time.sleep_ms(1)
     println("done")

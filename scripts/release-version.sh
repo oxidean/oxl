@@ -1,10 +1,13 @@
 #!/bin/sh
 # Compute the next release tag from conventional commit subjects.
 #
-#   release-version.sh latest          highest vX.Y.Z tag (semver order); 0.0.0 if none
-#   release-version.sh bump            read `git log --format=%H` SHAs on stdin -> major|minor|patch
-#   release-version.sh bump-msg        read one commit message on stdin   -> major|minor|patch
-#   release-version.sh next [RANGE]    latest tag + bump over RANGE (default HEAD) -> vX.Y.Z
+#   release-version.sh latest [PFX]        highest <pfx>vX.Y.Z tag (semver order); bare if none
+#   release-version.sh bump                read `git log --format=%H` SHAs on stdin -> major|minor|patch
+#   release-version.sh bump-msg            read one commit message on stdin   -> major|minor|patch
+#   release-version.sh next [RANGE] [PFX]  latest tag + bump over RANGE (default HEAD) -> vX.Y.Z
+#
+# PFX names a tag-series prefix (`extra/` for the extras lane): it selects
+# the '<pfx>vX.Y.Z' tags and keeps the emitted tag prefixed.
 #
 # Bump rules (commit-check.sh grammar: type(scope)!: subject):
 #   '!' marker or BREAKING CHANGE/-CHANGE footer -> major (minor while major==0)
@@ -41,12 +44,14 @@ bump)
     echo "$best"
     ;;
 latest)
-    tags=$(git tag -l 'v*')
-    printf '%s\n' "$tags" | grep -xE 'v[0-9]+\.[0-9]+\.[0-9]+' | sort -V | tail -1 | sed 's/^v//' || true
+    pfx=${2:-}
+    tags=$(git tag -l "${pfx}v*")
+    printf '%s\n' "$tags" | grep -xE "${pfx}v[0-9]+\.[0-9]+\.[0-9]+" | sort -V | tail -1 | sed "s|^${pfx}v||" || true
     ;;
 next)
     range=${2:-HEAD}
-    latest=$("$0" latest); latest=${latest:-0.0.0}
+    pfx=${3:-}
+    latest=$("$0" latest "$pfx"); latest=${latest:-0.0.0}
     IFS=. read -r M m p <<EOF2
 $latest
 EOF2
@@ -57,9 +62,9 @@ EOF2
         minor) m=$((m+1)); p=0;;
         *)     p=$((p+1));;
     esac
-    echo "v$M.$m.$p"
+    echo "${pfx}v$M.$m.$p"
     ;;
 *)
-    echo "usage: $0 {latest|bump|bump-msg|next [RANGE]}" >&2; exit 2
+    echo "usage: $0 {latest [PFX]|bump|bump-msg|next [RANGE] [PFX]}" >&2; exit 2
     ;;
 esac

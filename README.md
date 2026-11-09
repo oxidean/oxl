@@ -160,18 +160,45 @@ block), and `replace` (pin a dependency to a local directory). The
 toolchain walks up from the entry file to the nearest `oxl.mod`;
 without one, only `std/` imports resolve.
 
-Import resolution order:
-
-1. `std/...` — the toolchain's shipped standard library
-2. this module's path — resolved under the manifest's directory
-3. required modules — longest path wins; `replace` directories first,
-   then the module cache (`$OXLMODCACHE` or `~/.oxl/mod`)
-4. anything else — `cannot find package`
+Import resolution runs one longest-prefix competition across every
+candidate tree: `std/...` (the toolchain's shipped standard library),
+this module's path (resolved under the manifest's directory), `use`d
+workspace trees (below), `replace` directories, and required modules in
+the module cache (`$OXLMODCACHE` or `~/.oxl/mod`). Longest matching
+path wins; an exact tie goes to the earlier source, and a `use`d module
+shadows a `require` on the same path. Anything no tree provides is
+`cannot find package`.
 
 Packages under `internal/` may only be imported by code beneath the
 `internal` directory's parent. Import cycles are a compile error and
 print the cycle chain. And an import the file never references is a
 compile error too — unused imports do not build.
+
+### Workspaces
+
+An `oxl.work` file at a project root stitches several local modules
+into one build:
+
+```
+oxlwork 0.3
+
+use ./
+use ./extra
+```
+
+Each `use` line names a module directory relative to the work file, and
+the file is discovered by walking up from the entry the same way
+`oxl.mod` is (file mode — no `oxl.mod` found — ignores workspaces
+entirely). Imports under a `use`d module's path resolve to the local
+tree ahead of `replace` and the cache, and an exact-path tie goes to
+the `use` tree — the `require` line still documents the published floor
+for consumers outside the workspace. `use`d modules need no cache slots
+and no `oxl.sum` entries: `oxl mod tidy` keeps the require without
+fetching and `oxl mod verify` has nothing to check.
+
+This repo is itself a workspace: packages outside `std/` live in the
+`extra/` module (`module github.com/oxidean/oxl/extra`), wired through
+the root `oxl.work`. `extra/testutil` is the first citizen.
 
 ### Fetching dependencies
 
@@ -246,7 +273,9 @@ runtime/       rt.c/rt.h — arenas, ObjHdr checks, scopes/traps, executor, chan
 docs/          design doc, semantics annex, prototype report
 std/           the standard library, written in the language (strings, testing, http/net, json, csv, base64, hex, binary, sync, time, os, errors, io, bytes, bufio, fmt, strconv, path, filepath, sort, slices, maps, cmp, math, rand, unicode/utf8, flag, log, net, net/http, hash, crypto/{sha256,md5,hmac}, collections, regexp)
 bootstrap/     self-host components — lexlib, parser, check libraries + cmd/ drivers (docs/self-hosting.md)
+extra/         the extras module (`github.com/oxidean/oxl/extra`) — packages outside std, resolved via the root oxl.work workspace
 oxl.mod        this repo's module manifest (`module oxl`)
+oxl.work       workspace file — `use ./` + `use ./extra`
 examples/      pilot programs (see above)
 tests/         tests/run.sh end-to-end suite + tests/diag/ checker-diagnostic corpus (runs in CI)
 scripts/       commit-check.sh — commit grammar + no-AI-attribution gate

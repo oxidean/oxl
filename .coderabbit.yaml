@@ -34,9 +34,15 @@ reviews:
   auto_approvals:
     enabled: true
   auto_review:
+    # Reviews are manual-only: trigger with `@coderabbitai review` on the PR.
+    # Auto-review on every push burned the repo's rate-limit budget on rapid
+    # fix-commit rounds; manual triggers keep each pass meaningful.
+    enabled: false
+    auto_incremental_review: false
     ignore_title_keywords:
-      # Bot-opened manifest-sync PRs from release.yml must merge unattended —
-      # required_review_thread_resolution would deadlock them on a stray comment.
+      # Inert while auto_review.enabled is false; kept so a future re-enable
+      # still skips bot-opened manifest-sync PRs from release.yml, which must
+      # merge unattended and never stall on review threads.
       - "bump docs manifest to"
   pre_merge_checks:
     docstrings:

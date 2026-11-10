@@ -1838,6 +1838,10 @@ out=$(OXL_HOME="$tch" "$SHIM" toolchain uninstall "v0.1.0/../../../$scratch/keep
     echo "FAIL uninstall-traversal: rc=$rc $out"; exit 1; }
 [ -d "$tch/versions/v0.1.0" ] || { echo "FAIL uninstall-traversal removed real dir"; exit 1; }
 
+# the pipeline section resolves via tch2's default-version — clear the
+# oxl.mod pin the traversal checks left behind
+rm -f "$tcw/oxl.mod"
+
 echo "== i60 install pipeline — file:// release fixture =="
 # end-to-end: download -> sha256 verify -> stage -> atomic mv -> verbs.
 # OXL_RELEASE_BASE takes file:// so the whole pipeline runs offline.

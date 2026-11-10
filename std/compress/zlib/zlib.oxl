@@ -1,0 +1,175 @@
+package zlib
+
+// std/compress/zlib — RFC 1950 zlib streams: a 2-byte header, a
+// deflate payload, and a big-endian ADLER32 of the plain text. The
+// reader wraps flate's decompressor, accumulates the checksum over
+// everything it hands out, and verifies the trailer through flate's
+// drain() so bytes the bit reader buffered aren't lost.
+import "std/io"
+
+import "std/errors"
+
+import "std/compress/flate"
+
+import "std/hash"
+
+import "std/encoding/binary"
+
+/// Reader decompresses a zlib stream — an io.Reader of plain text.
+struct Reader {
+    fl: flate.Reader, // payload decoder (also owns the byte pump)
+    adl: hash.Hash, // adler32 over emitted plain text
+    done: int, // trailer verified; stream is over
+    zerr: err, // latched terminal error
+}
+
+/// newreader starts a zlib decoder on r. The 2-byte header is checked
+/// up front: compression method must be 8 (deflate), the FCHECK field
+/// must make CMF*256+FLG a multiple of 31, and FDICT preset-
+/// dictionary streams are rejected (no dictionary support).
+fn newreader(r: io.Reader) -> [Reader, err] {
+    z := Reader{fl: flate.newreader(r), adl: hash.new_adler32(), done: 0, zerr: nil}
+    // the header comes through flate's own pump (drain before the
+    // first decode serves the source directly) so header reads and
+    // payload reads share one position — nothing double-buffers
+    hdr := mkslice(byte, 2)
+    e := z.xfull(hdr)
+    if e != nil {
+        if e == io.eof() {
+            return z, errors.new("zlib: unexpected EOF in header")
+        }
+        return z, e
+    }
+    cmf := hdr[0]
+    flg := hdr[1]
+    if cmf % 16 != 8 {
+        return z, errors.new("zlib: unsupported compression method")
+    }
+    if cmf / 16 > 7 {
+        return z, errors.new("zlib: invalid window size")
+    }
+    if (cmf * 256 + flg) % 31 != 0 {
+        return z, errors.new("zlib: bad header check")
+    }
+    if (flg & 32) != 0 {
+        return z, errors.new("zlib: preset dictionary not supported")
+    }
+    return z, nil
+}
+
+// xfull fills buf from the post-stream pump — readfull over drain().
+fn (z mut Reader) xfull(buf: []byte) -> err {
+    got := 0
+    dry := 0
+    for got < len(buf) {
+        [n, e] = z.fl.drain(buf[got:])
+        if n > 0 {
+            got = got + n
+            dry = 0
+        }
+        if e != nil {
+            return e
+        }
+        if n <= 0 {
+            dry = dry + 1
+            if dry >= 100 {
+                return io.noprogress()
+            }
+        }
+    }
+    return nil
+}
+
+// trailer verifies the big-endian ADLER32 that follows the deflate
+// stream — read through drain() so pump-buffered bytes count.
+fn (z mut Reader) trailer() -> err {
+    buf := mkslice(byte, 4)
+    e := z.xfull(buf)
+    if e != nil {
+        return e
+    }
+    want := binary.be_u32(buf, 0)
+    sum := z.adl.sum(nil)
+    if binary.be_u32(sum, 0) != want {
+        return errors.new("zlib: adler32 mismatch")
+    }
+    return nil
+}
+
+/// read yields decompressed bytes; io.eof after the checksum passes.
+/// A bad adler32, a corrupt payload, or a truncated stream reports a
+/// real error instead.
+fn (z mut Reader) read(b: []byte) -> [int, err] {
+    if z.done != 0 {
+        return 0, io.eof()
+    }
+    if z.zerr != nil {
+        return 0, z.zerr
+    }
+    [n, e] = z.fl.read(b)
+    if n > 0 {
+        [_w, _we] = z.adl.write(b[0:n])
+    }
+    if e == nil {
+        return n, nil
+    }
+    if e != io.eof() {
+        z.zerr = e
+        return n, e
+    }
+    te := z.trailer()
+    if te != nil {
+        z.zerr = te
+        return n, te
+    }
+    z.done = 1
+    if n > 0 {
+        return n, nil
+    }
+    return 0, io.eof()
+}
+
+/// asreader boxes a borrow of this Reader as an io.Reader (`&z`).
+fn (z mut Reader) asreader() -> io.Reader {
+    return z
+}
+
+// slicereader is the minimal io.Reader over a []byte — the
+// decompress() source.
+struct slicereader { b: []byte, i: int }
+
+fn (s mut slicereader) read(b: []byte) -> [int, err] {
+    if s.i >= len(s.b) {
+        return 0, io.eof()
+    }
+    n := len(s.b) - s.i
+    if n > len(b) {
+        n = len(b)
+    }
+    j := 0
+    for j < n {
+        b[j] = s.b[s.i + j]
+        j = j + 1
+    }
+    s.i = s.i + n
+    return n, nil
+}
+
+fn (s mut slicereader) asreader() -> io.Reader {
+    return s
+}
+
+/// decompress decodes a whole zlib stream held in src.
+/// [contents, err] — nil contents on failure.
+fn decompress(src: []byte) -> [own []byte, err] {
+    sr := slicereader{b: src, i: 0}
+    [z, e] = newreader(sr.asreader())
+    if e != nil {
+        return nil, e
+    }
+    [s, e2] = io.readall(z.asreader())
+    if e2 != nil {
+        return nil, e2
+    }
+    return new(s as []byte), nil
+}

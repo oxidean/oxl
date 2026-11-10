@@ -1,0 +1,336 @@
+package gzip
+
+// std/compress/gzip — RFC 1952 gzip streams. A member is a fixed 10
+// byte header, optional FEXTRA/FNAME/FCOMMENT/FHCRC fields, a deflate
+// payload, and a little-endian CRC32+ISIZE trailer; a file may hold
+// several members back to back and the reader decodes them as one
+// concatenated stream. Header reads run through flate's drain() so
+// header bytes, payload bytes, and trailer bytes all share the one
+// byte pump — no shadow buffering between members.
+import "std/io"
+
+import "std/errors"
+
+import "std/compress/flate"
+
+import "std/hash"
+
+import "std/encoding/binary"
+
+/// Reader decompresses gzip members — an io.Reader of plain text.
+/// Header fields of the member currently being read are exposed:
+/// name and comment are "" when absent.
+struct Reader {
+    fl: flate.Reader, // payload decoder (owns the shared byte pump)
+    crc: hash.Hash, // crc32 over emitted plain text, per member
+    hcrc: hash.Hash, // header crc for FHCRC
+    isize: int, // emitted byte count this member
+    name: str, // FNAME field ("" when absent)
+    comment: str, // FCOMMENT field ("" when absent)
+    mtime: int, // MTIME field
+    xfl: int, // XFL byte
+    os: int, // OS byte
+    text: int, // FTEXT flag
+    done: int, // last member consumed
+    gerr: err, // latched terminal error
+}
+
+/// newreader starts a gzip decoder on r and parses the first member
+/// header. Bad magic, a non-deflate method, or reserved flag bits
+/// fail here rather than on first read.
+fn newreader(r: io.Reader) -> [Reader, err] {
+    g := Reader{fl: flate.newreader(r), crc: hash.new_crc32(), hcrc: hash.new_crc32(), isize: 0, name: "", comment: "", mtime: 0, xfl: 0, os: 0, text: 0, done: 0, gerr: nil}
+    e := g.fixedhdr()
+    if e != nil {
+        if e == io.eof() {
+            return g, errors.new("gzip: unexpected EOF in header")
+        }
+        return g, e
+    }
+    return g, nil
+}
+
+// xfull fills buf from the post-stream pump — readfull over drain().
+fn (g mut Reader) xfull(buf: []byte) -> err {
+    got := 0
+    dry := 0
+    for got < len(buf) {
+        [n, e] = g.fl.drain(buf[got:])
+        if n > 0 {
+            got = got + n
+            dry = 0
+        }
+        if e != nil {
+            return e
+        }
+        if n <= 0 {
+            dry = dry + 1
+            if dry >= 100 {
+                return io.noprogress()
+            }
+        }
+    }
+    return nil
+}
+
+// fixedhdr reads the 10 fixed header bytes through the pump and
+// validates them; the bytes also feed the FHCRC accumulator.
+fn (g mut Reader) fixedhdr() -> err {
+    h := mkslice(byte, 10)
+    e := g.xfull(h)
+    if e != nil {
+        return e
+    }
+    [_w, _we] = g.hcrc.write(h)
+    if h[0] != 31 || h[1] != 139 {
+        return errors.new("gzip: bad magic")
+    }
+    if h[2] != 8 {
+        return errors.new("gzip: unsupported compression method")
+    }
+    if (h[3] & 224) != 0 {
+        return errors.new("gzip: reserved flag bits set")
+    }
+    g.text = h[3] & 1
+    g.mtime = binary.le_u32(h, 4)
+    g.xfl = h[8]
+    g.os = h[9]
+    return g.varhdr(h[3])
+}
+
+// varhdr parses the flag-controlled header fields (FEXTRA, FNAME,
+// FCOMMENT, FHCRC) after the fixed part — called by fixedhdr for the
+// first member, and by member_end for continuation members whose
+// fixed part was already consumed.
+fn (g mut Reader) varhdr(flg: int) -> err {
+    if (flg & 4) != 0 {
+        xb := mkslice(byte, 2)
+        e := g.xfull(xb)
+        if e != nil {
+            return errors.new("gzip: unexpected EOF in extra field")
+        }
+        [_w, _we] = g.hcrc.write(xb)
+        xl := binary.le_u16(xb, 0)
+        xtra := mkslice(byte, xl)
+        e2 := g.xfull(xtra)
+        if e2 != nil {
+            return errors.new("gzip: unexpected EOF in extra field")
+        }
+        [_w2, _we2] = g.hcrc.write(xtra)
+    }
+    if (flg & 8) != 0 {
+        [s, e3] = g.readcstr()
+        if e3 != nil {
+            return e3
+        }
+        g.name = s
+    }
+    if (flg & 16) != 0 {
+        [s2, e4] = g.readcstr()
+        if e4 != nil {
+            return e4
+        }
+        g.comment = s2
+    }
+    if (flg & 2) != 0 {
+        hb := mkslice(byte, 2)
+        e5 := g.xfull(hb)
+        if e5 != nil {
+            return errors.new("gzip: unexpected EOF in header crc")
+        }
+        sum := g.hcrc.sum(nil)
+        if binary.be_u32(sum, 0) % 65536 != binary.le_u16(hb, 0) {
+            return errors.new("gzip: header crc mismatch")
+        }
+    }
+    return nil
+}
+
+// readcstr pulls a NUL-terminated string through the pump, feeding
+// every byte (NUL included) to the header crc.
+fn (g mut Reader) readcstr() -> [str, err] {
+    out := mkslice(byte, 0)
+    one := mkslice(byte, 1)
+    dry := 0
+    for true {
+        [n, e] = g.fl.drain(one)
+        if n > 0 {
+            dry = 0
+            [_w, _we] = g.hcrc.write(one)
+            if one[0] == 0 {
+                return out as str, nil
+            }
+            out = push(out, one[0])
+        }
+        if e != nil {
+            return "", errors.new("gzip: unexpected EOF in header string")
+        }
+        if n <= 0 {
+            dry = dry + 1
+            if dry >= 100 {
+                return "", io.noprogress()
+            }
+        }
+    }
+    return "", nil
+}
+
+// member_end runs at deflate-stream end: verify the CRC32+ISIZE
+// trailer, then either report done (clean source EOF) or parse the
+// next member's header and re-arm the decoder. Multi-member files
+// concatenate transparently.
+fn (g mut Reader) member_end() -> err {
+    tr := mkslice(byte, 8)
+    e := g.xfull(tr)
+    if e != nil {
+        return errors.new("gzip: unexpected EOF in trailer")
+    }
+    sum := g.crc.sum(nil)
+    if binary.le_u32(tr, 0) != binary.be_u32(sum, 0) {
+        return errors.new("gzip: crc32 mismatch")
+    }
+    if binary.le_u32(tr, 4) != g.isize % 4294967296 {
+        return errors.new("gzip: size mismatch")
+    }
+    // probe for a continuation member: a clean EOF here means done
+    one := mkslice(byte, 1)
+    dry := 0
+    for true {
+        [n, e2] = g.fl.drain(one)
+        if n > 0 {
+            // first byte of the next member's header — finish it
+            h := mkslice(byte, 10)
+            h[0] = one[0]
+            e3 := g.xfull(h[1:10])
+            if e3 != nil {
+                return errors.new("gzip: truncated member header")
+            }
+            g.hcrc = hash.new_crc32()
+            [_w, _we] = g.hcrc.write(h)
+            if h[0] != 31 || h[1] != 139 {
+                return errors.new("gzip: bad magic")
+            }
+            if h[2] != 8 {
+                return errors.new("gzip: unsupported compression method")
+            }
+            if (h[3] & 224) != 0 {
+                return errors.new("gzip: reserved flag bits set")
+            }
+            g.text = h[3] & 1
+            g.mtime = binary.le_u32(h, 4)
+            g.xfl = h[8]
+            g.os = h[9]
+            g.name = ""
+            g.comment = ""
+            e4 := g.varhdr(h[3])
+            if e4 != nil {
+                return e4
+            }
+            g.crc = hash.new_crc32()
+            g.isize = 0
+            g.fl.reset()
+            return nil
+        }
+        if e2 == io.eof() {
+            g.done = 1
+            return nil
+        }
+        if e2 != nil {
+            return e2
+        }
+        dry = dry + 1
+        if dry >= 100 {
+            return io.noprogress()
+        }
+    }
+    return nil
+}
+
+/// read yields decompressed bytes across all members; io.eof only
+/// after the last member's trailer verifies. A corrupt trailer, bad
+/// member magic, or truncated stream reports a real error.
+fn (g mut Reader) read(b: []byte) -> [int, err] {
+    if g.done != 0 {
+        return 0, io.eof()
+    }
+    if g.gerr != nil {
+        return 0, g.gerr
+    }
+    gave := 0
+    for gave < len(b) {
+        [n, e] = g.fl.read(b[gave:])
+        if n > 0 {
+            [_w, _we] = g.crc.write(b[gave:gave + n])
+            g.isize = g.isize + n
+            gave = gave + n
+        }
+        if e == nil {
+            return gave, nil
+        }
+        if e != io.eof() {
+            g.gerr = e
+            return gave, e
+        }
+        me := g.member_end()
+        if me != nil {
+            g.gerr = me
+            return gave, me
+        }
+        if g.done != 0 {
+            if gave > 0 {
+                return gave, nil
+            }
+            return 0, io.eof()
+        }
+        if n <= 0 && gave == len(b) {
+            return gave, nil
+        }
+        // else: next member armed — keep filling b
+    }
+    return gave, nil
+}
+
+/// asreader boxes a borrow of this Reader as an io.Reader (`&g`).
+fn (g mut Reader) asreader() -> io.Reader {
+    return g
+}
+
+// slicereader is the minimal io.Reader over a []byte — the
+// decompress() source.
+struct slicereader { b: []byte, i: int }
+
+fn (s mut slicereader) read(b: []byte) -> [int, err] {
+    if s.i >= len(s.b) {
+        return 0, io.eof()
+    }
+    n := len(s.b) - s.i
+    if n > len(b) {
+        n = len(b)
+    }
+    j := 0
+    for j < n {
+        b[j] = s.b[s.i + j]
+        j = j + 1
+    }
+    s.i = s.i + n
+    return n, nil
+}
+
+fn (s mut slicereader) asreader() -> io.Reader {
+    return s
+}
+
+/// decompress decodes a whole gzip stream held in src — all members
+/// concatenated. [contents, err] — nil contents on failure.
+fn decompress(src: []byte) -> [own []byte, err] {
+    sr := slicereader{b: src, i: 0}
+    [g, e] = newreader(sr.asreader())
+    if e != nil {
+        return nil, e
+    }
+    [s, e2] = io.readall(g.asreader())
+    if e2 != nil {
+        return nil, e2
+    }
+    return new(s as []byte), nil
+}

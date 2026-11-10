@@ -1,0 +1,82 @@
+package main
+
+// archive acceptance: std/archive/zip — central-directory walk,
+// stored + deflate members, dir entries, lookup, CRC-32 verify, and
+// the corrupt-archive failure surfaces.
+import "std/archive/zip"
+
+import "std/encoding/hex"
+
+import "std/errors"
+
+import "std/testing"
+
+fn ck(e: err, m: str) {
+    testing.expect(e == nil, m + ": " + errors.msg(e))
+}
+
+// python -m zipfile equivalent: a.txt (stored), b/b.txt (deflate)
+fn fixture() -> str {
+    [b, e] = hex.decode("504b030414000000000012046b5dcc66ebf60e0000000e00000005000000612e74787473746f7265642d636f6e74656e74504b030414000000080012046b5dcba2c4d7100000006e00000007000000622f622e7478744b494dcb492c4955c84d5548a13d1300504b0102140314000000000012046b5dcc66ebf60e0000000e000000050000000000000000000000800100000000612e747874504b0102140314000000080012046b5dcba2c4d7100000006e000000070000000000000000000000800131000000622f622e747874504b0506000000000200020068000000660000000000")
+    ck(e, "fixture hex")
+    return b as str
+}
+
+fn test_read() {
+    [z, e] = zip.newreader(fixture() as []byte)
+    ck(e, "newreader")
+    testing.expect_eq(z.nfiles(), 2, "member count")
+
+    f := z.file(0)
+    testing.expect_streq(f.name, "a.txt", "stored member name")
+    testing.expect_eq(f.meth, 0, "stored method")
+    testing.expect_eq(f.usize, 14, "stored usize")
+    testing.expect_eq(f.dir, 0, "not a dir")
+
+    f = z.file(1)
+    testing.expect_streq(f.name, "b/b.txt", "deflate member name")
+    testing.expect_eq(f.meth, 8, "deflate method")
+    testing.expect_eq(f.usize, 110, "deflate usize")
+}
+
+fn test_open() {
+    [z, e] = zip.newreader(fixture() as []byte)
+    ck(e, "newreader")
+
+    [a, ea] = z.open(0)
+    ck(ea, "open stored")
+    testing.expect_streq(a as str, "stored-content", "stored payload")
+
+    [b, eb] = z.open(1)
+    ck(eb, "open deflate")
+    testing.expect_streq(b as str, "deflate me deflate me deflate me deflate me deflate me deflate me deflate me deflate me deflate me deflate me ", "deflate payload")
+}
+
+fn test_lookup() {
+    [z, e] = zip.newreader(fixture() as []byte)
+    ck(e, "newreader")
+    testing.expect_eq(z.lookup("b/b.txt"), 1, "lookup hit")
+    testing.expect_eq(z.lookup("missing"), 0 - 1, "lookup miss")
+}
+
+fn test_corrupt() {
+    // not a zip at all
+    [_z, e] = zip.newreader("definitely not a zip archive" as []byte)
+    testing.expect(e != nil, "non-zip rejected")
+
+    // EOCD found but central directory signature trashed
+    bad := fixture() as []byte
+    bad[102] = 88
+    [_z2, e2] = zip.newreader(bad)
+    testing.expect(e2 != nil, "broken central dir rejected")
+
+    // member payload corrupted -> crc mismatch on open
+    bad2 := fixture() as []byte
+    bad2[40] = bad2[40] ^ 255
+    [z3, e3] = zip.newreader(bad2)
+    ck(e3, "corrupt-payload zip parses")
+    [_o, e4] = z3.open(0)
+    testing.expect(e4 != nil, "corrupt payload fails crc")
+}
+
+fn main() {}

@@ -1,0 +1,188 @@
+package main
+
+// archive acceptance: std/archive/tar — writer produces blocks the
+// reader round-trips (fields, payload, padding), long names go
+// through ustar prefix-splitting and PAX 'x'/GNU 'L' overrides, and
+// the trailer marker is honoured.
+import "std/io"
+
+import "std/archive/tar"
+
+import "std/bytes"
+
+import "std/errors"
+
+import "std/testing"
+
+fn ck(e: err, m: str) {
+    testing.expect(e == nil, m + ": " + errors.msg(e))
+}
+
+fn hdr(name: str, size: int, tf: int) -> tar.Header {
+    return tar.Header{name: name, mode: 420, uid: 1000, gid: 100, size: size, mtime: 1700000000, typeflag: tf, linkname: "", uname: "jesse", gname: "users", devmajor: 0, devminor: 0}
+}
+
+// write_one emits a single-member archive via the writer.
+fn write_one(w: mut tar.Writer, name: str, payload: str) {
+    h := hdr(name, len(payload), tar.TREG)
+    ck(w.writeheader(h), "writeheader " + name)
+    if len(payload) > 0 {
+        [_n, e] = w.write(payload as []byte)
+        ck(e, "write " + name)
+        testing.expect_eq(_n, len(payload), "write count " + name)
+    }
+}
+
+fn test_roundtrip() {
+    buf := bytes.newbuffer()
+    w := new(tar.newwriter(buf.aswriter()))
+    d := hdr("adir", 0, tar.TDIR)
+    ck(w.writeheader(d), "dir header")
+    write_one(w, "adir/hello.txt", "hello tar!!!")
+    write_one(w, "empty.bin", "")
+    l := hdr("link", 0, tar.TSYMLINK)
+    l.linkname = "adir/hello.txt"
+    ck(w.writeheader(l), "link header")
+    ck(w.close(), "close")
+
+    data := buf.str()
+    testing.expect_eq(len(data) % 512, 0, "archive is block-aligned")
+
+    rb := bytes.newbuffer()
+    [_n, _e] = rb.write(data as []byte)
+    tr := tar.newreader(rb.asreader())
+
+    [h0, e0] = tr.next()
+    ck(e0, "next dir")
+    testing.expect_streq(h0.name, "adir", "dir name")
+    testing.expect_eq(h0.typeflag, tar.TDIR, "dir typeflag")
+
+    [h1, e1] = tr.next()
+    ck(e1, "next file")
+    testing.expect_streq(h1.name, "adir/hello.txt", "file name")
+    testing.expect_eq(h1.size, 12, "file size")
+    testing.expect_eq(h1.mode, 420, "file mode")
+    testing.expect_eq(h1.uid, 1000, "file uid")
+    testing.expect_streq(h1.uname, "jesse", "file uname")
+    [s1, re1] = io.readall(tr.asreader())
+    ck(re1, "read payload")
+    testing.expect_streq(s1, "hello tar!!!", "file payload")
+
+    [h2, e2] = tr.next()
+    ck(e2, "next empty")
+    testing.expect_streq(h2.name, "empty.bin", "empty name")
+    [_s2, re2] = io.readall(tr.asreader())
+    ck(re2, "empty payload read")
+
+    [h3, e3] = tr.next()
+    ck(e3, "next link")
+    testing.expect_eq(h3.typeflag, tar.TSYMLINK, "symlink type")
+    testing.expect_streq(h3.linkname, "adir/hello.txt", "symlink target")
+
+    [_h4, e4] = tr.next()
+    testing.expect(e4 == io.eof(), "clean archive EOF")
+}
+
+// A name longer than 100 bytes splits into prefix + name at '/'.
+fn test_prefix_split() {
+    buf := bytes.newbuffer()
+    w := new(tar.newwriter(buf.aswriter()))
+    lname := "deep/deep/deep/deep/deep/deep/deep/deep/deep/deep/deep/deep/deep/deep/deep/deep/deep/deep/deep/deep/file.txt"
+    testing.expect(len(lname) > 100, "fixture name is long")
+    write_one(w, lname, "x")
+    ck(w.close(), "close long")
+    testing.expect_streq(read_first_name(buf.str()), lname, "prefix-split name reassembled")
+}
+
+fn read_first_name(data: str) -> str {
+    rb := bytes.newbuffer()
+    [_n, _e] = rb.write(data as []byte)
+    tr := tar.newreader(rb.asreader())
+    [h, e] = tr.next()
+    ck(e, "read_first_name next")
+    return h.name
+}
+
+// Hand-assembled PAX 'x' member carrying a 120-char path — the reader
+// folds it into the following header's name.
+fn test_pax_longname() {
+    buf := bytes.newbuffer()
+    w := new(tar.newwriter(buf.aswriter()))
+    lname := "paxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.txt"
+    rec := " path=" + lname + "\n"
+    // record format: "<len> <body>" with len counting itself
+    ln := len(rec) + 2
+    // widen until the digit count stabilises
+    for len(itoa(ln)) + len(rec) != ln {
+        ln = len(rec) + len(itoa(ln))
+    }
+    rec = itoa(ln) + rec
+    ph := hdr("PaxHeader", len(rec), tar.TPAX)
+    ck(w.writeheader(ph), "pax header")
+    [_n, we] = w.write(rec as []byte)
+    ck(we, "pax payload")
+    write_one(w, "short.txt", "pax!")
+    ck(w.close(), "pax close")
+
+    rb := bytes.newbuffer()
+    [_n2, _e2] = rb.write(buf.str() as []byte)
+    tr := tar.newreader(rb.asreader())
+    [h, e] = tr.next()
+    ck(e, "pax next")
+    testing.expect_streq(h.name, lname, "pax path override applied")
+    [s, re] = io.readall(tr.asreader())
+    ck(re, "pax member payload")
+    testing.expect_streq(s, "pax!", "pax member contents")
+}
+
+// The GNU 'L' longname block — payload is the next member's name.
+fn test_gnu_longname() {
+    buf := bytes.newbuffer()
+    w := new(tar.newwriter(buf.aswriter()))
+    lname := "gnu-long-name-that-will-never-ever-fit-in-one-hundred-bytes-so-it-needs-the-gnu-extension-block.bin"
+    lh := hdr("././@LongLink", len(lname) + 1, tar.TLONGNAME)
+    ck(w.writeheader(lh), "L header")
+    // NUL-terminate the longname payload — push onto a []byte view
+    lb := lname as []byte
+    lb = push(lb, 0)
+    [_n, we] = w.write(lb)
+    ck(we, "L payload")
+    write_one(w, "s.txt", "z")
+    ck(w.close(), "L close")
+
+    rb := bytes.newbuffer()
+    [_n2, _e2] = rb.write(buf.str() as []byte)
+    tr := tar.newreader(rb.asreader())
+    [h, e] = tr.next()
+    ck(e, "L next")
+    testing.expect_streq(h.name, lname, "GNU longname applied")
+}
+
+// Skipping a member's payload mid-read still lands on the next header.
+fn test_skip_payload() {
+    buf := bytes.newbuffer()
+    w := new(tar.newwriter(buf.aswriter()))
+    big := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaax"
+    write_one(w, "big.bin", big)
+    write_one(w, "after.txt", "B")
+    ck(w.close(), "skip close")
+    rb := bytes.newbuffer()
+    [_n, _e] = rb.write(buf.str() as []byte)
+    tr := tar.newreader(rb.asreader())
+    [h, e] = tr.next()
+    ck(e, "skip next 1")
+    testing.expect_eq(h.size, len(big), "big member size")
+    // read only a piece, then move on — next() must discard the rest
+    piece := mkslice(byte, 10)
+    [rn, re] = tr.read(piece)
+    ck(re, "partial read")
+    testing.expect_eq(rn, 10, "partial read count")
+    [h2, e2] = tr.next()
+    ck(e2, "skip next 2")
+    testing.expect_streq(h2.name, "after.txt", "header after skip")
+    [s, re2] = io.readall(tr.asreader())
+    ck(re2, "after payload")
+    testing.expect_streq(s, "B", "after contents")
+}
+
+fn main() {}

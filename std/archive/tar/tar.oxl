@@ -1,0 +1,713 @@
+package tar
+
+// std/archive/tar — USTAR archives (512-byte blocks): sequential
+// Reader over io.Reader plus a Writer. Numeric fields come back as
+// octal or GNU base-256; long names ride in via PAX 'x' records and
+// the GNU 'L'/'K' longname blocks. The writer emits plain ustar
+// (prefix-split names up to 255 bytes) — PAX records it understands
+// on read are for interop, not something it produces.
+import "std/io"
+
+import "std/errors"
+
+// typeflag values (the raw header byte; NUL is reported as '0')
+let TREG = 48
+
+let TDIR = 53
+
+let TSYMLINK = 50
+
+let TLINK = 49
+
+let TPAX = 120
+
+let TPAXG = 103
+
+let TLONGLINK = 76
+
+let TLONGNAME = 75
+
+/// Header is one archive member's metadata. size is the payload
+/// length in bytes for regular files (0 for links/dirs). typeflag is
+/// the T* constant above; NUL headers are normalised to TREG.
+struct Header {
+    name: str,
+    mode: int,
+    uid: int,
+    gid: int,
+    size: int,
+    mtime: int,
+    typeflag: int,
+    linkname: str,
+    uname: str,
+    gname: str,
+    devmajor: int,
+    devminor: int,
+}
+
+// nulstr views b up to the first NUL — tar name fields are NUL-
+// terminated or fill their field exactly.
+fn nulstr(b: []byte) -> str {
+    i := 0
+    for i < len(b) {
+        if b[i] == 0 {
+            return b[0:i] as str
+        }
+        i = i + 1
+    }
+    return b as str
+}
+
+// parnum decodes a numeric field: ASCII octal (spaces/NUL padded) or
+// GNU base-256 binary (first byte 0x80 set — the rest is a big-endian
+// magnitude).
+fn parnum(b: []byte) -> [int, err] {
+    if len(b) > 0 && (b[0] & 128) != 0 {
+        v := b[0] & 127
+        i := 1
+        for i < len(b) {
+            v = v * 256 + b[i]
+            i = i + 1
+        }
+        return v, nil
+    }
+    i := 0
+    for i < len(b) && (b[i] == 32 || b[i] == 0) {
+        i = i + 1
+    }
+    v := 0
+    any := 0
+    for i < len(b) {
+        c := b[i]
+        if c == 0 || c == 32 {
+            break
+        }
+        if c < 48 || c > 55 {
+            return 0, errors.new("tar: invalid octal digit")
+        }
+        v = v * 8 + (c - 48)
+        any = 1
+        i = i + 1
+    }
+    if any == 0 {
+        return 0, errors.new("tar: empty numeric field")
+    }
+    return v, nil
+}
+
+/// Reader walks a tar stream sequentially — next() yields the next
+/// Header, read() drains that member's payload.
+struct Reader {
+    r: io.Reader,
+    left: int, // undelivered payload bytes of current member
+    pad: int, // block padding owed after the payload
+    stash: []byte, // a block peeked past an end marker
+    has_stash: int,
+    lname: str, // pending name override ('x'/'L' records)
+    llink: str, // pending link override ('x'/'K' records)
+    done: int,
+}
+
+/// newreader wraps r as a tar reader — the first next() call parses
+/// the first header.
+fn newreader(r: io.Reader) -> Reader {
+    return Reader{r: r, left: 0, pad: 0, stash: nil, has_stash: 0, lname: "", llink: "", done: 0}
+}
+
+// xfull fills buf from the source — readfull with a spin guard.
+fn (t mut Reader) xfull(buf: []byte) -> err {
+    got := 0
+    dry := 0
+    for got < len(buf) {
+        [n, e] = t.r.read(buf[got:])
+        if n > 0 {
+            got = got + n
+            dry = 0
+        }
+        if e != nil {
+            return e
+        }
+        if n <= 0 {
+            dry = dry + 1
+            if dry >= 100 {
+                return io.noprogress()
+            }
+        }
+    }
+    return nil
+}
+
+// skip drains n bytes (payload leftovers, block padding).
+fn (t mut Reader) skip(n: int) -> err {
+    scr := mkslice(byte, 512)
+    left := n
+    for left > 0 {
+        m := left
+        if m > 512 {
+            m = 512
+        }
+        [rn, e] = t.r.read(scr[0:m])
+        if rn > 0 {
+            left = left - rn
+        }
+        if e != nil {
+            return e
+        }
+        if rn <= 0 && e == nil {
+            return io.noprogress()
+        }
+    }
+    return nil
+}
+
+// block returns the next raw 512-byte block — from the peek stash if
+// one is armed — or nil on a clean end-of-archive (a zero block
+// confirmed by a second zero block or by EOF).
+fn (t mut Reader) block() -> [own []byte, err] {
+    if t.has_stash != 0 {
+        t.has_stash = 0
+        return new(t.stash), nil
+    }
+    b := mkslice(byte, 512)
+    got := 0
+    e := t.xfull(b)
+    if e != nil {
+        if e == io.eof() && got == 0 {
+            // hmm — xfull hides partial progress; treat any EOF at
+            // block boundary as end, mid-block EOF is handled below
+        }
+        return nil, e
+    }
+    // zero block? peek at what follows to confirm the end marker
+    zero := true
+    i := 0
+    for i < 512 {
+        if b[i] != 0 {
+            zero = false
+            break
+        }
+        i = i + 1
+    }
+    if !zero {
+        return new(b), nil
+    }
+    nb := mkslice(byte, 512)
+    e2 := t.xfull(nb)
+    if e2 == io.eof() {
+        return nil, io.eof()
+    }
+    if e2 != nil {
+        return nil, e2
+    }
+    zero = true
+    i = 0
+    for i < 512 {
+        if nb[i] != 0 {
+            zero = false
+            break
+        }
+        i = i + 1
+    }
+    if zero {
+        return nil, io.eof()
+    }
+    // a real block sits after a single zero — keep it for next time
+    t.stash = nb
+    t.has_stash = 1
+    return nil, io.eof()
+}
+
+// parse decodes one 512-byte header block: fields, checksum, ustar
+// extensions. The block is consumed (the name/linkname strs view the
+// block copy — kept in the returned own slice's backing).
+fn (t mut Reader) parse(b: []byte) -> [Header, err] {
+    h := Header{name: "", mode: 0, uid: 0, gid: 0, size: 0, mtime: 0, typeflag: TREG, linkname: "", uname: "", gname: "", devmajor: 0, devminor: 0}
+    // checksum: sum the whole block with the chksum field as spaces
+    sum := 0
+    i := 0
+    for i < 512 {
+        c := b[i]
+        if i >= 148 && i < 156 {
+            c = 32
+        }
+        sum = sum + c
+        i = i + 1
+    }
+    [ck, e0] = parnum(b[148:156])
+    if e0 != nil {
+        return h, errors.new("tar: bad checksum field")
+    }
+    if ck != sum {
+        return h, errors.new("tar: checksum mismatch")
+    }
+    h.name = nulstr(b[0:100])
+    [mo, e1] = parnum(b[100:108])
+    if e1 == nil {
+        h.mode = mo
+    }
+    [ui, e2] = parnum(b[108:116])
+    if e2 == nil {
+        h.uid = ui
+    }
+    [gi, e3] = parnum(b[116:124])
+    if e3 == nil {
+        h.gid = gi
+    }
+    [sz, e4] = parnum(b[124:136])
+    if e4 != nil {
+        return h, errors.new("tar: bad size field")
+    }
+    h.size = sz
+    [mt, e5] = parnum(b[136:148])
+    if e5 == nil {
+        h.mtime = mt
+    }
+    h.typeflag = b[156]
+    if h.typeflag == 0 {
+        h.typeflag = TREG
+    }
+    h.linkname = nulstr(b[157:257])
+    // ustar: "ustar\0" "00" — also accept the GNU "ustar " variant;
+    // non-ustar (v7) blocks just lack the extension fields
+    if b[257] == 117 && b[258] == 115 && b[259] == 116 && b[260] == 97 && b[261] == 114 {
+        h.uname = nulstr(b[265:297])
+        h.gname = nulstr(b[297:329])
+        [dmaj, _e6] = parnum(b[329:337])
+        h.devmajor = dmaj
+        [dmin, _e7] = parnum(b[337:345])
+        h.devminor = dmin
+        pre := nulstr(b[345:500])
+        if len(pre) > 0 {
+            h.name = pre + "/" + h.name
+        }
+    }
+    if len(t.lname) > 0 {
+        h.name = t.lname
+        t.lname = ""
+    }
+    if len(t.llink) > 0 {
+        h.linkname = t.llink
+        t.llink = ""
+    }
+    return h, nil
+}
+
+// paxname scans one 'x' record block for path=/linkpath= keys —
+// records are "<len> <key>=<val>\n" where <len> counts itself.
+fn paxname(rec: []byte, want: str) -> str {
+    i := 0
+    for i < len(rec) {
+        // record length: decimal up to the space
+        j := i
+        v := 0
+        for j < len(rec) && rec[j] >= 48 && rec[j] <= 57 {
+            v = v * 10 + (rec[j] - 48)
+            j = j + 1
+        }
+        if j >= len(rec) || rec[j] != 32 || v <= 0 {
+            return ""
+        }
+        body := rec[j + 1:i + v]
+        // body is "key=value\n"
+        eq := 0
+        for eq < len(body) && body[eq] != 61 {
+            eq = eq + 1
+        }
+        if eq < len(body) {
+            k := body[0:eq] as str
+            val := body[eq + 1:len(body)]
+            if len(val) > 0 && val[len(val) - 1] == 10 {
+                val = val[0:len(val) - 1]
+            }
+            if k == want {
+                return val as str
+            }
+        }
+        i = i + v
+    }
+    return ""
+}
+
+// pax reads a pax/GNU meta member's payload and folds the parts the
+// reader tracks into lname/llink, then skips the padding.
+fn (t mut Reader) pax(size: int, flag: int) -> err {
+    rec := mkslice(byte, size)
+    e := t.xfull(rec)
+    if e != nil {
+        return errors.new("tar: unexpected EOF in meta block")
+    }
+    if flag == TLONGNAME {
+        t.lname = nulstr(rec)
+    } else if flag == TLONGLINK {
+        t.llink = nulstr(rec)
+    } else if flag == TPAX {
+        p := paxname(rec, "path")
+        if len(p) > 0 {
+            t.lname = p
+        }
+        lp := paxname(rec, "linkpath")
+        if len(lp) > 0 {
+            t.llink = lp
+        }
+    }
+    // 'g' (TPAXG) records apply to the whole archive — the reader is
+    // minimal and ignores them; the member itself still consumes its
+    // payload here
+    pd := (512 - size % 512) % 512
+    return t.skip(pd)
+}
+
+/// next returns the next member's Header. io.eof ends the archive —
+// either confirmed marker (two zero blocks) or a clean block-aligned
+// EOF. Unread payload and padding are skipped automatically.
+fn (t mut Reader) next() -> [Header, err] {
+    h := Header{name: "", mode: 0, uid: 0, gid: 0, size: 0, mtime: 0, typeflag: TREG, linkname: "", uname: "", gname: "", devmajor: 0, devminor: 0}
+    if t.done != 0 {
+        return h, io.eof()
+    }
+    e := t.skip(t.left)
+    if e != nil {
+        t.done = 1
+        return h, e
+    }
+    t.left = 0
+    e2 := t.skip(t.pad)
+    if e2 != nil {
+        t.done = 1
+        return h, e2
+    }
+    t.pad = 0
+    [b, e3] = t.block()
+    if e3 != nil {
+        t.done = 1
+        return h, e3
+    }
+    [ph, e4] = t.parse(b)
+    if e4 != nil {
+        t.done = 1
+        return h, e4
+    }
+    // meta members carry their payload in-band — fold it into the
+    // pending overrides and recurse for the real header that follows
+    if ph.typeflag == TPAX || ph.typeflag == TPAXG || ph.typeflag == TLONGNAME || ph.typeflag == TLONGLINK {
+        e5 := t.pax(ph.size, ph.typeflag)
+        if e5 != nil {
+            t.done = 1
+            return h, e5
+        }
+        return t.next()
+    }
+    t.left = ph.size
+    t.pad = (512 - ph.size % 512) % 512
+    return ph, nil
+}
+
+/// read yields the current member's payload; io.eof at its end —
+/// per-member, like archive readers in other languages. next() moves
+/// to the following member.
+fn (t mut Reader) read(b: []byte) -> [int, err] {
+    if t.left <= 0 {
+        return 0, io.eof()
+    }
+    want := t.left
+    if want > len(b) {
+        want = len(b)
+    }
+    got := 0
+    dry := 0
+    for got < want {
+        [n, e] = t.r.read(b[got:want])
+        if n > 0 {
+            got = got + n
+            t.left = t.left - n
+            dry = 0
+        }
+        if e != nil {
+            if got > 0 {
+                return got, nil
+            }
+            return 0, e
+        }
+        if n <= 0 {
+            dry = dry + 1
+            if dry >= 100 {
+                return got, io.noprogress()
+            }
+        }
+    }
+    return got, nil
+}
+
+/// asreader boxes a borrow of this Reader as an io.Reader — reads
+/// drain the current member's payload (`&t`).
+fn (t mut Reader) asreader() -> io.Reader {
+    return t
+}
+
+// ---- writer ----
+
+/// Writer emits a tar stream: writeheader() opens a member, write()
+// appends its payload (exactly Header.size bytes), close() pads and
+// writes the end marker.
+struct Writer {
+    w: io.Writer,
+    left: int, // payload bytes still owed for the open member
+    pad: int, // padding owed after the open member
+    closed: int,
+}
+
+/// newwriter wraps w — nothing is emitted until writeheader.
+fn newwriter(w: io.Writer) -> Writer {
+    return Writer{w: w, left: 0, pad: 0, closed: 0}
+}
+
+// putoct writes v as width-1 octal digits + NUL into b at off.
+fn putoct(b: []byte, off: int, width: int, v: int) -> err {
+    i := width - 2
+    x := v
+    for i >= 0 {
+        b[off + i] = 48 + x % 8
+        x = x / 8
+        i = i - 1
+    }
+    if x != 0 {
+        return errors.new("tar: numeric field overflow")
+    }
+    b[off + width - 1] = 0
+    return nil
+}
+
+// putstr copies s into b at off (NUL pad follows implicitly — the
+// block starts zeroed).
+fn putstr(b: []byte, off: int, width: int, s: str) -> err {
+    if len(s) > width {
+        return errors.new("tar: field overflow")
+    }
+    i := 0
+    for i < len(s) {
+        b[off + i] = byteat(s, i)
+        i = i + 1
+    }
+    return nil
+}
+
+// wfull pushes all of buf to the sink — write() may report short
+// progress; anything but an error means retry.
+fn (t mut Writer) wfull(buf: []byte) -> err {
+    sent := 0
+    for sent < len(buf) {
+        [n, e] = t.w.write(buf[sent:])
+        if n > 0 {
+            sent = sent + n
+        }
+        if e != nil {
+            return e
+        }
+        if n <= 0 && e == nil {
+            return io.shortwrite()
+        }
+    }
+    return nil
+}
+
+// emit writes one 512-byte block.
+fn (t mut Writer) emit(b: []byte) -> err {
+    return t.wfull(b)
+}
+
+/// writeheader opens a member: the ustar header block goes out, then
+/// exactly h.size payload bytes are expected through write(). Names
+// over 100 bytes split into the ustar prefix field at the last '/';
+// names that can't split that way are rejected.
+fn (t mut Writer) writeheader(h: Header) -> err {
+    if t.closed != 0 {
+        return errors.new("tar: writer closed")
+    }
+    if t.left > 0 {
+        return errors.new("tar: previous entry payload incomplete")
+    }
+    if t.pad > 0 {
+        e := t.zeros(t.pad)
+        if e != nil {
+            return e
+        }
+        t.pad = 0
+    }
+    name := h.name
+    prefix := ""
+    if len(name) > 100 {
+        // split at the deepest '/' that fits prefix<=155 and rest<=100
+        cut := -1
+        i := 0
+        for i < len(name) {
+            if byteat(name, i) == 47 && i <= 155 && len(name) - i - 1 <= 100 && len(name) - i - 1 > 0 {
+                cut = i
+            }
+            i = i + 1
+        }
+        if cut < 0 {
+            return errors.new("tar: name too long")
+        }
+        prefix = substr(name, 0, cut)
+        name = substr(name, cut + 1, len(name))
+    }
+    if len(h.linkname) > 100 {
+        return errors.new("tar: linkname too long")
+    }
+    b := mkslice(byte, 512)
+    e := putstr(b, 0, 100, name)
+    if e != nil {
+        return e
+    }
+    e = putoct(b, 100, 8, h.mode & 4095)
+    if e != nil {
+        return e
+    }
+    e = putoct(b, 108, 8, h.uid)
+    if e != nil {
+        return e
+    }
+    e = putoct(b, 116, 8, h.gid)
+    if e != nil {
+        return e
+    }
+    e = putoct(b, 124, 12, h.size)
+    if e != nil {
+        return e
+    }
+    e = putoct(b, 136, 12, h.mtime)
+    if e != nil {
+        return e
+    }
+    // checksum field is spaces during the sum, then 6 digits+NUL+sp
+    i := 148
+    for i < 156 {
+        b[i] = 32
+        i = i + 1
+    }
+    tf := h.typeflag
+    if tf == 0 {
+        tf = TREG
+    }
+    b[156] = tf
+    e = putstr(b, 157, 100, h.linkname)
+    if e != nil {
+        return e
+    }
+    b[257] = 117
+    b[258] = 115
+    b[259] = 116
+    b[260] = 97
+    b[261] = 114
+    b[262] = 0
+    b[263] = 48
+    b[264] = 48
+    e = putstr(b, 265, 32, h.uname)
+    if e != nil {
+        return e
+    }
+    e = putstr(b, 297, 32, h.gname)
+    if e != nil {
+        return e
+    }
+    e = putoct(b, 329, 8, h.devmajor)
+    if e != nil {
+        return e
+    }
+    e = putoct(b, 337, 8, h.devminor)
+    if e != nil {
+        return e
+    }
+    e = putstr(b, 345, 155, prefix)
+    if e != nil {
+        return e
+    }
+    sum := 0
+    i = 0
+    for i < 512 {
+        sum = sum + b[i]
+        i = i + 1
+    }
+    // chksum: six octal digits, NUL, space
+    x := sum
+    i = 153
+    for i >= 148 {
+        b[i] = 48 + x % 8
+        x = x / 8
+        i = i - 1
+    }
+    if x != 0 {
+        return errors.new("tar: checksum overflow")
+    }
+    b[154] = 0
+    b[155] = 32
+    e = t.emit(b)
+    if e != nil {
+        return e
+    }
+    t.left = h.size
+    t.pad = (512 - h.size % 512) % 512
+    return nil
+}
+
+/// write appends payload to the open member — never more than the
+/// declared size; short writes report what was taken.
+fn (t mut Writer) write(b: []byte) -> [int, err] {
+    if t.closed != 0 {
+        return 0, errors.new("tar: writer closed")
+    }
+    if t.left <= 0 {
+        return 0, errors.new("tar: write outside entry")
+    }
+    n := len(b)
+    if n > t.left {
+        n = t.left
+    }
+    sent := 0
+    for sent < n {
+        [m, e] = t.w.write(b[sent:n])
+        if m > 0 {
+            sent = sent + m
+            t.left = t.left - m
+        }
+        if e != nil {
+            return sent, e
+        }
+        if m <= 0 && e == nil {
+            return sent, io.shortwrite()
+        }
+    }
+    return sent, nil
+}
+
+// zeros writes n zero bytes.
+fn (t mut Writer) zeros(n: int) -> err {
+    z := mkslice(byte, 512)
+    left := n
+    for left > 0 {
+        m := left
+        if m > 512 {
+            m = 512
+        }
+        e := t.wfull(z[0:m])
+        if e != nil {
+            return e
+        }
+        left = left - m
+    }
+    return nil
+}
+
+/// close pads the final member to its block boundary and writes the
+/// two zero blocks that end the archive. Always call it — an unclosed
+/// writer leaves a truncated archive.
+fn (t mut Writer) close() -> err {
+    if t.closed != 0 {
+        return nil
+    }
+    if t.left > 0 {
+        return errors.new("tar: last entry payload incomplete")
+    }
+    t.closed = 1
+    return t.zeros(t.pad + 1024)
+}

@@ -1,0 +1,812 @@
+package flate
+
+// std/compress/flate — RFC 1951 DEFLATE decompression. Reader pulls a
+// deflate bit stream off an io.Reader through a small byte window and
+// emits into a rolling output history (the last 32 KiB are kept for
+// LZ77 back-references; everything older is dropped once the caller
+// has read it). inflate() is the one-shot []byte form. The pump
+// deliberately buffers at most one window ahead: bytes pulled but not
+// consumed by the bit stream stay reachable through drain(), which is
+// how zlib/gzip read their trailers without losing data.
+import "std/io"
+
+import "std/errors"
+
+/// Huf is a canonical Huffman decoding table: count[l] holds how many
+/// symbols have code length l (1..15), sym lists the symbols sorted by
+/// (length, symbol) — the puff-layout tables decode() walks. left is
+/// construct()'s completeness report: 0 = complete, <0 = over-
+/// subscribed, >0 = incomplete.
+struct Huf { count: []int, sym: []int, left: int }
+
+/// Reader is a DEFLATE decompressor — an io.Reader of plain text.
+struct Reader {
+    src: io.Reader, // byte source
+    sbuf: []byte, // pull window (bufio-style ri/wi window)
+    si: int, // first unconsumed byte in sbuf
+    sn: int, // end of valid bytes in sbuf
+    stuck: err, // first source error, latched
+    bitbuf: int, // bit accumulator, next bit in bit 0
+    nbits: int, // live bits in bitbuf (< 8 + multiples of 8)
+    out: []byte, // output history tail + undelivered bytes
+    pos: int, // out[..pos] already handed to callers
+    final: int, // saw BFINAL
+    block_open: int, // inside a Huffman-coded block right now
+    lit: Huf, // live literal/length table
+    dt: Huf, // live distance table
+    fixed_ok: int, // fixed tables already built
+    derr: err, // terminal decode state (io.eof or a failure)
+}
+
+/// newreader decompresses the deflate stream on r.
+fn newreader(r: io.Reader) -> Reader {
+    tables()
+    return Reader{src: r, sbuf: mkslice(byte, 4096), si: 0, sn: 0, stuck: nil, bitbuf: 0, nbits: 0, out: mkslice(byte, 0), pos: 0, final: 0, block_open: 0, lit: Huf{count: nil, sym: nil, left: 0}, dt: Huf{count: nil, sym: nil, left: 0}, fixed_ok: 0, derr: nil}
+}
+
+// ---- shared tables (lazy) ----
+let lbase_t: own []int = nil
+
+let lext_t: own []int = nil
+
+let dbase_t: own []int = nil
+
+let dext_t: own []int = nil
+
+let clord_t: own []int = nil
+
+// tables builds the constant RFC 1951 tables once: length/distance
+// bases+extra bits and the code-length-code order.
+fn tables() {
+    if lbase_t != nil {
+        return
+    }
+    lb := mkslice(int, 29)
+    lb[0] = 3
+    lb[1] = 4
+    lb[2] = 5
+    lb[3] = 6
+    lb[4] = 7
+    lb[5] = 8
+    lb[6] = 9
+    lb[7] = 10
+    lb[8] = 11
+    lb[9] = 13
+    lb[10] = 15
+    lb[11] = 17
+    lb[12] = 19
+    lb[13] = 23
+    lb[14] = 27
+    lb[15] = 31
+    lb[16] = 35
+    lb[17] = 43
+    lb[18] = 51
+    lb[19] = 59
+    lb[20] = 67
+    lb[21] = 83
+    lb[22] = 99
+    lb[23] = 115
+    lb[24] = 131
+    lb[25] = 163
+    lb[26] = 195
+    lb[27] = 227
+    lb[28] = 258
+    lbase_t = new(lb)
+
+    le := mkslice(int, 29)
+    le[0] = 0
+    le[1] = 0
+    le[2] = 0
+    le[3] = 0
+    le[4] = 0
+    le[5] = 0
+    le[6] = 0
+    le[7] = 0
+    le[8] = 1
+    le[9] = 1
+    le[10] = 1
+    le[11] = 1
+    le[12] = 2
+    le[13] = 2
+    le[14] = 2
+    le[15] = 2
+    le[16] = 3
+    le[17] = 3
+    le[18] = 3
+    le[19] = 3
+    le[20] = 4
+    le[21] = 4
+    le[22] = 4
+    le[23] = 4
+    le[24] = 5
+    le[25] = 5
+    le[26] = 5
+    le[27] = 5
+    le[28] = 0
+    lext_t = new(le)
+
+    db := mkslice(int, 30)
+    db[0] = 1
+    db[1] = 2
+    db[2] = 3
+    db[3] = 4
+    db[4] = 5
+    db[5] = 7
+    db[6] = 9
+    db[7] = 13
+    db[8] = 17
+    db[9] = 25
+    db[10] = 33
+    db[11] = 49
+    db[12] = 65
+    db[13] = 97
+    db[14] = 129
+    db[15] = 193
+    db[16] = 257
+    db[17] = 385
+    db[18] = 513
+    db[19] = 769
+    db[20] = 1025
+    db[21] = 1537
+    db[22] = 2049
+    db[23] = 3073
+    db[24] = 4097
+    db[25] = 6145
+    db[26] = 8193
+    db[27] = 12289
+    db[28] = 16385
+    db[29] = 24577
+    dbase_t = new(db)
+
+    de := mkslice(int, 30)
+    de[0] = 0
+    de[1] = 0
+    de[2] = 0
+    de[3] = 0
+    de[4] = 1
+    de[5] = 1
+    de[6] = 2
+    de[7] = 2
+    de[8] = 3
+    de[9] = 3
+    de[10] = 4
+    de[11] = 4
+    de[12] = 5
+    de[13] = 5
+    de[14] = 6
+    de[15] = 6
+    de[16] = 7
+    de[17] = 7
+    de[18] = 8
+    de[19] = 8
+    de[20] = 9
+    de[21] = 9
+    de[22] = 10
+    de[23] = 10
+    de[24] = 11
+    de[25] = 11
+    de[26] = 12
+    de[27] = 12
+    de[28] = 13
+    de[29] = 13
+    dext_t = new(de)
+
+    co := mkslice(int, 19)
+    co[0] = 16
+    co[1] = 17
+    co[2] = 18
+    co[3] = 0
+    co[4] = 8
+    co[5] = 7
+    co[6] = 9
+    co[7] = 6
+    co[8] = 10
+    co[9] = 5
+    co[10] = 11
+    co[11] = 4
+    co[12] = 12
+    co[13] = 3
+    co[14] = 13
+    co[15] = 2
+    co[16] = 14
+    co[17] = 1
+    co[18] = 15
+    clord_t = new(co)
+}
+
+// p2 is 2**k — there is no shift operator; k stays under 60.
+fn p2(k: int) -> int {
+    v := 1
+    i := 0
+    for i < k {
+        v = v * 2
+        i = i + 1
+    }
+    return v
+}
+
+fn corrupt(msg: str) -> err {
+    return errors.new("flate: corrupt input: " + msg)
+}
+
+fn truncated() -> err {
+    return errors.new("flate: unexpected EOF")
+}
+
+// fill compacts the window then pulls once — mirrors bufio's fill:
+// bytes that arrived with an error stay usable; the error latches in
+// stuck so later pulls see it again instead of re-reading the source.
+fn (d mut Reader) fill() -> err {
+    if d.stuck != nil {
+        return d.stuck
+    }
+    if d.si > 0 {
+        i := 0
+        for i < d.sn - d.si {
+            d.sbuf[i] = d.sbuf[d.si + i]
+            i = i + 1
+        }
+        d.sn = d.sn - d.si
+        d.si = 0
+    }
+    if d.sn >= len(d.sbuf) {
+        return errors.new("flate: internal buffer full")
+    }
+    i := 0
+    for i < 100 {
+        [n, e] = d.src.read(d.sbuf[d.sn:])
+        if n > 0 {
+            d.sn = d.sn + n
+            if e != nil {
+                d.stuck = e
+                return e
+            }
+            return nil
+        }
+        if e != nil {
+            d.stuck = e
+            return e
+        }
+        i = i + 1
+    }
+    d.stuck = io.noprogress()
+    return d.stuck
+}
+
+// take returns the next n bits (n <= 56, LSB-first per RFC 1951).
+// Source EOF mid-stream is "unexpected EOF" — a clean end only ever
+// comes through step()'s BFINAL path.
+fn (d mut Reader) take(n: int) -> [int, err] {
+    for d.nbits < n {
+        if d.si >= d.sn {
+            e := d.fill()
+            if e != nil {
+                if e == io.eof() {
+                    return 0, truncated()
+                }
+                return 0, e
+            }
+        }
+        d.bitbuf = d.bitbuf | d.sbuf[d.si] * p2(d.nbits)
+        d.si = d.si + 1
+        d.nbits = d.nbits + 8
+    }
+    v := d.bitbuf % p2(n)
+    d.bitbuf = d.bitbuf / p2(n)
+    d.nbits = d.nbits - n
+    return v, nil
+}
+
+// align drops the 0..7 padding bits up to the next byte boundary —
+// required between a stored header and its payload, at stream end so
+// drain() serves bytes cleanly, and between gzip members.
+fn (d mut Reader) align() {
+    drop := d.nbits % 8
+    if drop == 0 {
+        return
+    }
+    d.bitbuf = d.bitbuf / p2(drop)
+    d.nbits = d.nbits - drop
+}
+
+// construct builds the puff-style decode tables for code lengths
+// `lengths` (n symbols); h.left reports completeness (0 = complete,
+// <0 = over-subscribed, >0 = incomplete). An all-zero length set is
+// legal (empty code — an unused distance table, say).
+fn construct(lengths: []int, n: int) -> Huf {
+    h := Huf{count: mkslice(int, 16), sym: mkslice(int, n), left: 0}
+    i := 0
+    for i < n {
+        h.count[lengths[i]] = h.count[lengths[i]] + 1
+        i = i + 1
+    }
+    if h.count[0] == n {
+        return h
+    }
+    h.left = 1
+    l := 1
+    for l <= 15 {
+        h.left = h.left * 2
+        h.left = h.left - h.count[l]
+        if h.left < 0 {
+            return h
+        }
+        l = l + 1
+    }
+    // offs folds counts into per-length insert cursors — symbols land
+    // sorted by (length, symbol) in h.sym
+    offs := mkslice(int, 16)
+    l = 1
+    for l < 15 {
+        offs[l + 1] = offs[l] + h.count[l]
+        l = l + 1
+    }
+    i = 0
+    for i < n {
+        if lengths[i] != 0 {
+            h.sym[offs[lengths[i]]] = i
+            offs[lengths[i]] = offs[lengths[i]] + 1
+        }
+        i = i + 1
+    }
+    return h
+}
+
+// decode reads one Huffman-coded symbol — canonical decode walking
+// code/first/index a bit at a time, puff.c's algorithm.
+fn (d mut Reader) decode(h: Huf) -> [int, err] {
+    code := 0
+    first := 0
+    index := 0
+    l := 1
+    for l <= 15 {
+        [bit, e] = d.take(1)
+        if e != nil {
+            return 0, e
+        }
+        code = code | bit
+        count := h.count[l]
+        if code - count < first {
+            return h.sym[index + (code - first)], nil
+        }
+        index = index + count
+        first = first + count
+        first = first * 2
+        code = code * 2
+        l = l + 1
+    }
+    return 0, corrupt("huffman code exceeds 15 bits")
+}
+
+// compact drops consumed history beyond the 32 KiB LZ77 window —
+// out views share the backing store, so the dead prefix goes away on
+// the next push's realloc.
+fn (d mut Reader) compact() {
+    if d.pos > 32768 && d.pos == len(d.out) {
+        cut := d.pos - 32768
+        d.out = d.out[cut:]
+        d.pos = d.pos - cut
+    }
+}
+
+// storedblk reads a BTYPE=00 block: align, LEN/NLEN, then LEN literal
+// bytes through the bit reader (byte-aligned, so each take(8) is one
+// input byte).
+fn (d mut Reader) storedblk() -> err {
+    d.align()
+    [b0, e0] = d.take(8)
+    if e0 != nil {
+        return e0
+    }
+    [b1, e1] = d.take(8)
+    if e1 != nil {
+        return e1
+    }
+    [b2, e2] = d.take(8)
+    if e2 != nil {
+        return e2
+    }
+    [b3, e3] = d.take(8)
+    if e3 != nil {
+        return e3
+    }
+    ln := b0 + b1 * 256
+    nl := b2 + b3 * 256
+    if nl != 65535 - ln {
+        return corrupt("stored block length mismatch")
+    }
+    i := 0
+    for i < ln {
+        [v, ev] = d.take(8)
+        if ev != nil {
+            return ev
+        }
+        d.out = push(d.out, v)
+        i = i + 1
+    }
+    return nil
+}
+
+// fixedtabs loads the RFC 1951 §3.2.6 fixed literal/distance tables
+// into the live slots (built once per stream).
+fn (d mut Reader) fixedtabs() {
+    if d.fixed_ok != 0 {
+        return
+    }
+    ll := mkslice(int, 288)
+    i := 0
+    for i < 144 {
+        ll[i] = 8
+        i = i + 1
+    }
+    for i < 256 {
+        ll[i] = 9
+        i = i + 1
+    }
+    for i < 280 {
+        ll[i] = 7
+        i = i + 1
+    }
+    for i < 288 {
+        ll[i] = 8
+        i = i + 1
+    }
+    d.lit = construct(ll, 288)
+    dl := mkslice(int, 32)
+    i = 0
+    for i < 32 {
+        dl[i] = 5
+        i = i + 1
+    }
+    d.dt = construct(dl, 32)
+    d.fixed_ok = 1
+}
+
+// dyntabs parses a BTYPE=10 block header: the code-length code, then
+// the literal/length and distance code lengths (with the 16/17/18
+// repeat ops), then builds both decode tables.
+fn (d mut Reader) dyntabs() -> err {
+    tables()
+    [hlit, e0] = d.take(5)
+    if e0 != nil {
+        return e0
+    }
+    nlen := hlit + 257
+    [hdist, e1] = d.take(5)
+    if e1 != nil {
+        return e1
+    }
+    ndist := hdist + 1
+    [hclen, e2] = d.take(4)
+    if e2 != nil {
+        return e2
+    }
+    ncl := hclen + 4
+    cll := mkslice(int, 19)
+    i := 0
+    for i < ncl {
+        [v, ev] = d.take(3)
+        if ev != nil {
+            return ev
+        }
+        cll[clord_t[i]] = v
+        i = i + 1
+    }
+    clh := construct(cll, 19)
+    if clh.left != 0 {
+        return corrupt("code-length code is not complete")
+    }
+    all := mkslice(int, nlen + ndist)
+    i = 0
+    for i < nlen + ndist {
+        [s, es] = d.decode(clh)
+        if es != nil {
+            return es
+        }
+        if s < 16 {
+            all[i] = s
+            i = i + 1
+        } else if s == 16 {
+            if i == 0 {
+                return corrupt("repeat with no previous length")
+            }
+            [r2, e4] = d.take(2)
+            if e4 != nil {
+                return e4
+            }
+            rep := r2 + 3
+            v := all[i - 1]
+            for rep > 0 && i < nlen + ndist {
+                all[i] = v
+                i = i + 1
+                rep = rep - 1
+            }
+            if rep > 0 {
+                return corrupt("length repeat overruns table")
+            }
+        } else if s == 17 {
+            [r3, e5] = d.take(3)
+            if e5 != nil {
+                return e5
+            }
+            rep := r3 + 3
+            for rep > 0 && i < nlen + ndist {
+                all[i] = 0
+                i = i + 1
+                rep = rep - 1
+            }
+            if rep > 0 {
+                return corrupt("zero repeat overruns table")
+            }
+        } else if s == 18 {
+            [r7, e6] = d.take(7)
+            if e6 != nil {
+                return e6
+            }
+            rep := r7 + 11
+            for rep > 0 && i < nlen + ndist {
+                all[i] = 0
+                i = i + 1
+                rep = rep - 1
+            }
+            if rep > 0 {
+                return corrupt("zero repeat overruns table")
+            }
+        } else {
+            return corrupt("invalid code-length symbol")
+        }
+    }
+    lh := construct(all[0:nlen], nlen)
+    if lh.left < 0 {
+        return corrupt("literal code over-subscribed")
+    }
+    if lh.left > 0 && nlen != lh.count[0] + lh.count[1] {
+        return corrupt("literal code incomplete")
+    }
+    dh := construct(all[nlen:nlen + ndist], ndist)
+    if dh.left < 0 {
+        return corrupt("distance code over-subscribed")
+    }
+    if dh.left > 0 && ndist != dh.count[0] + dh.count[1] {
+        return corrupt("distance code incomplete")
+    }
+    d.lit = lh
+    d.dt = dh
+    return nil
+}
+
+// nextblock reads a block header and arms the decoder for it.
+fn (d mut Reader) nextblock() -> err {
+    [bf, e] = d.take(1)
+    if e != nil {
+        return e
+    }
+    [bt, e2] = d.take(2)
+    if e2 != nil {
+        return e2
+    }
+    d.final = bf
+    if bt == 0 {
+        return d.storedblk()
+    }
+    if bt == 1 {
+        d.fixedtabs()
+        d.block_open = 1
+        return nil
+    }
+    if bt == 2 {
+        e3 := d.dyntabs()
+        if e3 != nil {
+            return e3
+        }
+        d.block_open = 1
+        return nil
+    }
+    return corrupt("invalid block type")
+}
+
+// huffsym decodes one symbol inside a Huffman block: a literal byte,
+// the end-of-block mark, or a length/distance back-reference copied
+// out of the emitted history byte by byte (overlaps copy in order).
+fn (d mut Reader) huffsym() -> err {
+    [sym, e] = d.decode(d.lit)
+    if e != nil {
+        return e
+    }
+    if sym < 256 {
+        d.out = push(d.out, sym)
+        return nil
+    }
+    if sym == 256 {
+        d.block_open = 0
+        return nil
+    }
+    if sym > 285 {
+        return corrupt("invalid literal/length code")
+    }
+    li := sym - 257
+    length := lbase_t[li]
+    le := lext_t[li]
+    if le > 0 {
+        [x, ex] = d.take(le)
+        if ex != nil {
+            return ex
+        }
+        length = length + x
+    }
+    [ds, e2] = d.decode(d.dt)
+    if e2 != nil {
+        return e2
+    }
+    if ds > 29 {
+        return corrupt("invalid distance code")
+    }
+    distance := dbase_t[ds]
+    dx := dext_t[ds]
+    if dx > 0 {
+        [x2, e3] = d.take(dx)
+        if e3 != nil {
+            return e3
+        }
+        distance = distance + x2
+    }
+    if distance > len(d.out) {
+        return corrupt("distance too far back")
+    }
+    i := 0
+    for i < length {
+        d.out = push(d.out, d.out[len(d.out) - distance])
+        i = i + 1
+    }
+    return nil
+}
+
+// step decodes until at least one byte is pending in out, the stream
+// ends cleanly (io.eof), or something fails. Block structure and
+// end-of-block markers consume input without emitting, so the loop
+// keeps going until output appears.
+fn (d mut Reader) step() -> err {
+    for len(d.out) - d.pos == 0 {
+        if d.final != 0 && d.block_open == 0 {
+            // byte-align the pump so drain() hands whole trailer
+            // bytes to zlib/gzip wrappers
+            d.align()
+            return io.eof()
+        }
+        d.compact()
+        if d.block_open != 0 {
+            e := d.huffsym()
+            if e != nil {
+                return e
+            }
+        } else {
+            e := d.nextblock()
+            if e != nil {
+                return e
+            }
+        }
+    }
+    return nil
+}
+
+/// read yields decompressed bytes; io.eof marks the end of the final
+/// block. Corrupt streams and truncated input report real errors.
+fn (d mut Reader) read(b: []byte) -> [int, err] {
+    if len(b) == 0 {
+        if d.derr != nil {
+            return 0, d.derr
+        }
+        return 0, nil
+    }
+    gave := 0
+    for gave < len(b) {
+        for gave < len(b) && d.pos < len(d.out) {
+            b[gave] = d.out[d.pos]
+            d.pos = d.pos + 1
+            gave = gave + 1
+        }
+        if gave == len(b) {
+            break
+        }
+        if d.derr != nil {
+            break
+        }
+        e := d.step()
+        if e != nil {
+            d.derr = e
+            break
+        }
+    }
+    if gave > 0 {
+        return gave, nil
+    }
+    if d.derr != nil {
+        return 0, d.derr
+    }
+    return 0, io.eof()
+}
+
+/// drain reads bytes positioned immediately after the compressed
+/// stream — first whatever the bit reader buffered, then the source.
+/// zlib's ADLER32 and gzip's trailer/next-member headers come through
+/// here; without it those bytes would be stranded inside the pump.
+/// Only meaningful once read() has reported io.eof, and only whole
+/// bytes — partial bits were already dropped by the align at stream
+/// end.
+fn (d mut Reader) drain(b: []byte) -> [int, err] {
+    n := 0
+    for n < len(b) && d.nbits >= 8 {
+        v := d.bitbuf % 256
+        d.bitbuf = d.bitbuf / 256
+        d.nbits = d.nbits - 8
+        b[n] = v
+        n = n + 1
+    }
+    for n < len(b) && d.si < d.sn {
+        b[n] = d.sbuf[d.si]
+        d.si = d.si + 1
+        n = n + 1
+    }
+    if n == len(b) {
+        return n, nil
+    }
+    if d.stuck != nil {
+        return n, d.stuck
+    }
+    [m, e] = d.src.read(b[n:])
+    return n + m, e
+}
+
+/// reset re-arms the decoder for another stream on the same pump —
+/// the gzip multi-member path. Buffered bytes are kept; decode state
+/// (block position, history, errors) is not.
+fn (d mut Reader) reset() {
+    d.final = 0
+    d.block_open = 0
+    d.out = mkslice(byte, 0)
+    d.pos = 0
+    d.derr = nil
+}
+
+/// asreader boxes a borrow of this Reader as an io.Reader — reads
+/// through the box drive the caller's decoder (`&d`).
+fn (d mut Reader) asreader() -> io.Reader {
+    return d
+}
+
+// slicereader is the minimal io.Reader over a []byte — the inflate()
+// source. (bytes.Buffer works too but pays for a write copy.)
+struct slicereader { b: []byte, i: int }
+
+fn (s mut slicereader) read(b: []byte) -> [int, err] {
+    if s.i >= len(s.b) {
+        return 0, io.eof()
+    }
+    n := len(s.b) - s.i
+    if n > len(b) {
+        n = len(b)
+    }
+    j := 0
+    for j < n {
+        b[j] = s.b[s.i + j]
+        j = j + 1
+    }
+    s.i = s.i + n
+    return n, nil
+}
+
+fn (s mut slicereader) asreader() -> io.Reader {
+    return s
+}
+
+/// inflate decompresses a whole deflate stream held in src.
+/// [contents, err] — nil contents on failure.
+fn inflate(src: []byte) -> [own []byte, err] {
+    sr := slicereader{b: src, i: 0}
+    d := newreader(sr.asreader())
+    [s, e] = io.readall(d.asreader())
+    if e != nil {
+        return nil, e
+    }
+    return new(s as []byte), nil
+}

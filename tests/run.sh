@@ -227,6 +227,32 @@ for t in test_echo test_closer test_refused test_lookup test_badip; do
     grep -q "$t ... ok" <<<"$out" || { echo "FAIL net: $out"; exit 1; }
 done
 
+echo "== oxl test: compress & archive =="
+out=$("$OXL" test tests/compress_flate.oxl)
+printf '%s
+' "$out" >&2
+for t in test_fixed test_stored test_dynamic test_multiblock test_empty test_truncated test_zlib test_zlib_stream test_zlib_badheader test_zlib_badadler; do
+    grep -q "$t ... ok" <<<"$out" || { echo "FAIL flate/zlib: $out"; exit 1; }
+done
+out=$("$OXL" test tests/compress_gzip.oxl)
+printf '%s
+' "$out" >&2
+for t in test_basic test_header_fields test_multimember test_badcrc test_badmagic test_truncated; do
+    grep -q "$t ... ok" <<<"$out" || { echo "FAIL gzip: $out"; exit 1; }
+done
+out=$("$OXL" test tests/archive_tar.oxl)
+printf '%s
+' "$out" >&2
+for t in test_roundtrip test_prefix_split test_pax_longname test_gnu_longname test_skip_payload; do
+    grep -q "$t ... ok" <<<"$out" || { echo "FAIL tar: $out"; exit 1; }
+done
+out=$("$OXL" test tests/archive_zip.oxl)
+printf '%s
+' "$out" >&2
+for t in test_read test_open test_lookup test_corrupt; do
+    grep -q "$t ... ok" <<<"$out" || { echo "FAIL zip: $out"; exit 1; }
+done
+
 echo "== oxl test: regexp (s5) =="
 out=$("$OXL" test tests/regexp_test.oxl)
 printf '%s

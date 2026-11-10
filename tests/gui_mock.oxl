@@ -22,6 +22,26 @@ fn app_main(events: chan own gui.Event) {
         return
     }
     gui.append(w, b)
+    // the remaining kinds, driven through the same mock dispatch
+    // (G4 gate: every kind constructible + drivable via mock)
+    [vb, e3] = gui.vbox()
+    [en, e4] = gui.entry("type here")
+    [sc, e5] = gui.scrolled()
+    [lb, e6] = gui.list()
+    if e3 != nil || e4 != nil || e5 != nil || e6 != nil {
+        println("kind create err")
+        return
+    }
+    gui.append(w, vb)
+    gui.append(vb, en)
+    gui.append(w, sc)
+    gui.append(sc, lb)
+    en.set_text("typed")
+    [t, te] = en.text()
+    if te != nil || t != "typed" {
+        println("entry text err")
+        return
+    }
     ev := new(gui.Event)
     ev.kind = gui.EventKind.clicked
     ev.target = b.handle()

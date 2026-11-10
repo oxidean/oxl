@@ -1095,7 +1095,7 @@ kill $srv_pid 2>/dev/null || true
 # files exist (same gate as the gui section below — headless compiles,
 # DISPLAY additionally selftests)
 if command -v pkg-config >/dev/null 2>&1 && pkg-config --exists gtk4 2>/dev/null; then
-    "$CC" -O2 $(pkg-config --cflags gtk4) -c examples/gui-todo/gui_shim.c -o "$cgen_dir/gui_shim.o"
+    "$CC" -O2 $(pkg-config --cflags gtk4) -c extra/gui/gtk/gtk_shim.c -o "$cgen_dir/gui_shim.o"
     "$OXL" run bootstrap/cmd/codegen -- examples/gui-todo/todo.oxl > "$cgen_dir/todo.c"
     todonet=""
     grep -qE 'rt_sock_|rt_bind_any|rt_set_(reuseaddr|rcvtimo|sndtimo)|rt_htons|rt_htonl' "$cgen_dir/todo.c" && todonet="-DOXL_NET"
@@ -1526,6 +1526,30 @@ rc=0
 out=$(with_timeout 30 "$scratch/gui_cancel$EXE") || rc=$?
 [ "$rc" -eq 0 ] && [ "$(tail -1 <<<"$out")" = "cancel ok" ] || {
     echo "FAIL gui_cancel: rc=$rc: $out"; exit 1; }
+# select-composability: `chan own gui.Event` must sit in one select next
+# to an app's own chan (spec G3 gate); both arms fire before gui.stop.
+out=$("$OXL" run tests/gui_select.oxl)
+grep -q "select ok" <<<"$out" && [ "$(tail -1 <<<"$out")" = "done" ] || {
+    echo "FAIL gui_select: $out"; exit 1; }
+# stress: 200 rounds of add/remove row churn through the mock mailbox +
+# dispatcher, List.rows() asserted live from a second task (spec G3/G5).
+# Build + run directly so a hang shows as with_timeout's 124.
+"$OXL" build tests/gui_stress.oxl -o "$scratch/gui_stress$EXE" || {
+    echo "FAIL gui_stress: compile failed"; exit 1; }
+rc=0
+out=$(with_timeout 60 "$scratch/gui_stress$EXE") || rc=$?
+[ "$rc" -eq 0 ] && grep -q "stress ok" <<<"$out" && \
+    [ "$(tail -1 <<<"$out")" = "done" ] || {
+    echo "FAIL gui_stress: rc=$rc: $out"; exit 1; }
+# overflow policy at cap 1 (spec G3): all-protected posts land whole,
+# close dedup through delivery + dismissal + re-arm, last eligible post
+# survives eviction, events_dropped() reads the stashed count post-run.
+"$OXL" build tests/gui_overflow.oxl -o "$scratch/gui_overflow$EXE" || {
+    echo "FAIL gui_overflow: compile failed"; exit 1; }
+rc=0
+out=$(with_timeout 30 "$scratch/gui_overflow$EXE") || rc=$?
+[ "$rc" -eq 0 ] && [ "$(tail -1 <<<"$out")" = "overflow ok" ] || {
+    echo "FAIL gui_overflow: rc=$rc: $out"; exit 1; }
 # parked select must unwedge on sibling trap — exits nonzero, not a hang.
 # 124 = with_timeout expiry = the hang this test exists to catch. Build
 # first so a compile error fails the check instead of passing as a

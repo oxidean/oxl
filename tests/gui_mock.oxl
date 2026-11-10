@@ -1,0 +1,72 @@
+package main
+
+import "github.com/oxidean/oxl/extra/gui"
+
+import "github.com/oxidean/oxl/extra/gui/mock"
+
+let g_m: mock.Mock = mock.backend()
+
+fn app(events: chan own gui.Event) {
+    spawn app_main(events)
+}
+
+fn app_main(events: chan own gui.Event) {
+    [w, e] = gui.window("hi")
+    if e != nil {
+        println("window err")
+        return
+    }
+    [b, e2] = gui.button("ok")
+    if e2 != nil {
+        println("button err")
+        return
+    }
+    gui.append(w, b)
+    // the remaining kinds, driven through the same mock dispatch
+    // (G4 gate: every kind constructible + drivable via mock)
+    [vb, e3] = gui.vbox()
+    [en, e4] = gui.entry("type here")
+    [sc, e5] = gui.scrolled()
+    [lb, e6] = gui.list()
+    if e3 != nil || e4 != nil || e5 != nil || e6 != nil {
+        println("kind create err")
+        return
+    }
+    gui.append(w, vb)
+    gui.append(vb, en)
+    gui.append(w, sc)
+    gui.append(sc, lb)
+    en.set_text("typed")
+    [t, te] = en.text()
+    if te != nil || t != "typed" {
+        println("entry text err")
+        return
+    }
+    ev := new(gui.Event)
+    ev.kind = gui.EventKind.clicked
+    ev.target = b.handle()
+    ev.data = gui.EventData.None
+    g_m.inject(ev)
+    for 1 == 1 {
+        ev := recv(events)
+        if ev == nil {
+            break
+        }
+        if ev.kind == gui.EventKind.clicked {
+            println("clicked")
+            gui.stop()
+        }
+    }
+}
+
+fn main() {
+    g_m = mock.backend()
+    e := gui.run(g_m, app)
+    if e != nil {
+        println("run err")
+        return
+    }
+    println("mock new count:")
+    println(g_m.count("new"))
+    println("done")
+}

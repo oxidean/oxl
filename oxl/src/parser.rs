@@ -400,7 +400,16 @@ impl<'a> Parser<'a> {
             return Some(TyRef { kind: TyKind::Mut(Box::new(inner)), span: sp });
         }
         if self.eat_kw(Kw::Chan) {
-            return Some(TyRef { kind: TyKind::Chan, span: sp });
+            // `chan` alone is the bare word channel; `chan own T` is the
+            // typed payload channel (send checks T, recv yields `own T`)
+            if self.cur().tok == Tok::Kw(Kw::Own) {
+                let payload = self.ty()?;
+                return Some(TyRef { kind: TyKind::Chan(Some(Box::new(payload))), span: sp });
+            }
+            return Some(TyRef { kind: TyKind::Chan(None), span: sp });
+        }
+        if self.eat_kw(Kw::Scope) {
+            return Some(TyRef { kind: TyKind::Scope, span: sp });
         }
         if self.eat_kw(Kw::Fn) {
             // fn(int, int) -> bool / fn(a: int) / fn() — named params
@@ -516,12 +525,23 @@ impl<'a> Parser<'a> {
             Tok::Kw(Kw::Spawn) | Tok::Kw(Kw::Go) => {
                 self.bump();
                 let call = self.expr(0, true)?;
-                Some(Stmt::Spawn { call, pinned: false, blocking: false, span: sp })
+                Some(Stmt::Spawn { call, scope: None, pinned: false, blocking: false, span: sp })
             }
             Tok::Kw(Kw::SpawnB) => {
                 self.bump();
                 let call = self.expr(0, true)?;
-                Some(Stmt::Spawn { call, pinned: false, blocking: true, span: sp })
+                Some(Stmt::Spawn { call, scope: None, pinned: false, blocking: true, span: sp })
+            }
+            // `goin(sc, f(args))` — spawn a susp call bound to the named
+            // scope `sc` (mkscope) instead of the caller's innermost one
+            Tok::Kw(Kw::GoIn) => {
+                self.bump();
+                self.expect_p(P::LParen, "`(`");
+                let scope = self.expr(0, false)?;
+                self.expect_p(P::Comma, "`,`");
+                let call = self.expr(0, true)?;
+                self.expect_p(P::RParen, "`)`");
+                Some(Stmt::Spawn { call, scope: Some(scope), pinned: false, blocking: false, span: sp })
             }
             Tok::Kw(Kw::Select) => self.select_stmt(sp),
             Tok::Kw(Kw::Unsafe) => {

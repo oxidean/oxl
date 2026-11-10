@@ -1,0 +1,168 @@
+package main
+
+import "github.com/oxidean/oxl/extra/gui"
+
+import "github.com/oxidean/oxl/extra/gui/mock"
+
+import "std/sync"
+
+import "std/time"
+
+let g_m: mock.Mock = mock.backend()
+
+let g_lb: gui.List = gui.List{h: 0}
+
+fn wait_rows(want: int) -> int {
+    i := 0
+    for i < 4000 {
+        [n, e] = g_lb.rows()
+        if e == nil && n == want {
+            return 1
+        }
+        time.sleep_ms(2)
+        i = i + 1
+    }
+    println("rows never reached want=" + itoa(want))
+    return 0
+}
+
+struct RN { del: int, box: int, next: own RN }
+
+let g_rows: own RN = nil
+
+let g_rows_mu: shared = sync.mutex()
+
+fn row_put(del: int, box: int) {
+    r := new(RN)
+    r.del = del
+    r.box = box
+    sync.mlock(g_rows_mu)
+    r.next = g_rows
+    g_rows = r
+    sync.munlock(g_rows_mu)
+}
+
+fn row_take(del: int) -> int {
+    let out: own RN = nil
+    found := 0
+    sync.mlock(g_rows_mu)
+    l := g_rows
+    g_rows = nil
+    for l != nil {
+        n := l.next
+        if l.del == del {
+            found = l.box
+            l.next = nil
+        } else {
+            l.next = out
+            out = l
+        }
+        l = n
+    }
+    g_rows = out
+    sync.munlock(g_rows_mu)
+    return found
+}
+
+fn add_row(lb: gui.List) -> int {
+    [row, e1] = gui.hbox()
+    [lab, e2] = gui.label("x")
+    [del, e3] = gui.button("x")
+    if e1 != nil || e2 != nil || e3 != nil {
+        println("row create failed")
+        return 0
+    }
+    gui.append(row, lab)
+    gui.append(row, del)
+    gui.append(lb, row)
+    row_put(del.handle(), row.handle())
+    return del.handle()
+}
+
+fn clk(t: int) -> own gui.Event {
+    ev := new(gui.Event)
+    ev.kind = gui.EventKind.clicked
+    ev.target = t
+    ev.data = gui.EventData.None
+    return ev
+}
+
+fn driver(add: gui.Button) {
+    add_row(g_lb)
+    if wait_rows(1) == 0 {
+        gui.stop()
+        return
+    }
+    add_row(g_lb)
+    if wait_rows(2) == 0 {
+        gui.stop()
+        return
+    }
+    d := add_row(g_lb)
+    if wait_rows(3) == 0 {
+        gui.stop()
+        return
+    }
+    g_m.inject(clk(d))
+    if wait_rows(2) == 0 {
+        gui.stop()
+        return
+    }
+    i := 0
+    for i < 200 {
+        dd := add_row(g_lb)
+        g_m.inject(clk(dd))
+        i = i + 1
+    }
+    if wait_rows(2) == 0 {
+        gui.stop()
+        return
+    }
+    println("stress ok")
+    gui.stop()
+}
+
+fn app(events: chan own gui.Event) {
+    spawn ui(events)
+}
+
+fn ui(events: chan own gui.Event) {
+    [w, e1] = gui.window("t")
+    [lb, e2] = gui.list()
+    [add, e3] = gui.button("add")
+    if e1 != nil || e2 != nil || e3 != nil {
+        println("ui create failed")
+        gui.stop()
+        return
+    }
+    g_lb = lb
+    gui.append(w, lb)
+    gui.append(w, add)
+    spawn driver(add)
+    for 1 == 1 {
+        ev := recv(events)
+        if ev == nil {
+            break
+        }
+        if ev.kind == gui.EventKind.clicked {
+            if ev.target == add.handle() {
+                add_row(lb)
+            } else {
+                rh := row_take(ev.target)
+                if rh != 0 {
+                    gui.remove(gui.HBox{h: rh})
+                }
+            }
+        }
+    }
+}
+
+fn main() {
+    g_m = mock.backend()
+    e := gui.run(g_m, app)
+    if e != nil {
+        println("run err")
+        return
+    }
+    println("done")
+}

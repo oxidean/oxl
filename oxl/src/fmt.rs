@@ -446,7 +446,9 @@ impl<'a> Fmt<'a> {
             TyKind::Own(i) => format!("own {}", self.ty(i)),
             TyKind::Ref(i) => format!("ref {}", self.ty(i)),
             TyKind::Mut(i) => format!("mut {}", self.ty(i)),
-            TyKind::Chan => "chan".into(),
+            TyKind::Chan(None) => "chan".into(),
+            TyKind::Chan(Some(p)) => format!("chan {}", self.ty(p)),
+            TyKind::Scope => "scope".into(),
             TyKind::Slice(i) => format!("[]{}", self.ty(i)),
             TyKind::Fn { params, ret } => {
                 let ps = params.iter().map(|p| self.ty(p)).collect::<Vec<_>>().join(", ");
@@ -550,12 +552,17 @@ impl<'a> Fmt<'a> {
                 self.out.push_str("unsafe {");
                 self.block(body, ind);
             }
-            Stmt::Spawn { call, blocking, .. } => {
+            Stmt::Spawn { call, scope, blocking, .. } => {
                 let c = self.expr(call, 0, ind);
-                self.out.push_str(&format!(
-                    "{} {c}",
-                    if *blocking { "spawnBlocking" } else { "spawn" }
-                ));
+                if let Some(sc) = scope {
+                    let sv = self.expr(sc, 0, ind);
+                    self.out.push_str(&format!("goin({sv}, {c})"));
+                } else {
+                    self.out.push_str(&format!(
+                        "{} {c}",
+                        if *blocking { "spawnBlocking" } else { "spawn" }
+                    ));
+                }
             }
             Stmt::Defer { call, .. } => {
                 let c = self.expr(call, 0, ind);

@@ -1,0 +1,617 @@
+package mock
+
+// extra/gui/mock — pure-oxl Backend for headless testing (milestone G).
+// Records every protocol call, keeps a prop store for `read` replies,
+// honours the reply contracts (try_send; destroyed-on-lost-reply), and
+// runs a scriptable pump that drains injected Events into the EventBuf.
+// All mutable state lives in package globals guarded by the Mock's
+// mutex cell, so the small Mock value stays freely copyable — a test
+// can keep a handle after boxing a copy into gui.Backend.
+import "github.com/oxidean/oxl/extra/gui"
+
+import "std/errors"
+
+import "std/sync"
+
+// root-task pump blocks on the rt sleep — a susp
+// `msleep` would need a task frame the vtable lacks
+extern fn rt_msleep(ms: int)
+
+extern fn rt_str_free(s: str)
+
+// ---- recorded protocol log ----
+struct LE { what: str, h: int, arg: int, next: own LE }
+
+// ---- prop store: (h, id) -> PropVal ----
+struct PE { h: int, id: int, v: gui.PropVal, next: own PE }
+
+// ---- live handle set ----
+struct AE { h: int, next: own AE }
+
+// ---- scripted event queue (FIFO via head-append + reverse on pop) ----
+struct QE { v: own gui.Event, next: own QE }
+
+struct Mock { mu: shared, stopf: shared, hnext: shared }
+
+let g_mu: shared = nil
+
+let g_log: own LE = nil
+
+let g_props: own PE = nil
+
+let g_alive: own AE = nil
+
+let g_script: own QE = nil
+
+let g_failed: shared = nil // inject a creation error when nonzero
+
+let g_delay: shared = nil // ms to sleep before replying (cancel tests)
+
+let g_viol: shared = nil // dead-target protocol violations recorded
+
+fn backend() -> Mock {
+    m := Mock{mu: sync.mutex(), stopf: mkshared(0), hnext: mkshared(0)}
+    g_mu = m.mu
+    g_log = nil
+    g_props = nil
+    g_alive = nil
+    g_script = nil
+    g_failed = mkshared(0)
+    g_delay = mkshared(0)
+    g_viol = mkshared(0)
+    return m
+}
+
+fn mlockg() {
+    sync.mlock(g_mu)
+}
+
+fn munlockg() {
+    sync.munlock(g_mu)
+}
+
+fn logit(what: str, h: int, arg: int) {
+    e := new(LE)
+    e.what = what
+    e.h = h
+    e.arg = arg
+    e.next = g_log
+    g_log = e
+}
+
+fn al_add(h: int) {
+    e := new(AE)
+    e.h = h
+    e.next = g_alive
+    g_alive = e
+}
+
+fn al_has(h: int) -> int {
+    l := g_alive
+    for l != nil {
+        if l.h == h {
+            return 1
+        }
+        l = l.next
+    }
+    return 0
+}
+
+fn al_del(h: int) {
+    let out: own AE = nil
+    l := g_alive
+    for l != nil {
+        n := l.next
+        if l.h == h {
+            l.next = nil
+        } else {
+            l.next = out
+            out = l
+        }
+        l = n
+    }
+    g_alive = out
+}
+
+fn prop_put(h: int, id: int, v: gui.PropVal) {
+    l := g_props
+    for l != nil {
+        if l.h == h && l.id == id {
+            l.v = v
+            return
+        }
+        l = l.next
+    }
+    e := new(PE)
+    e.h = h
+    e.id = id
+    e.v = v
+    e.next = g_props
+    g_props = e
+}
+
+// returns a copy of the stored PropVal, or nil
+fn prop_get(h: int, id: int) -> own gui.PropVal {
+    l := g_props
+    for l != nil {
+        if l.h == h && l.id == id {
+            match l.v {
+                gui.PropVal.Text(t) => {
+                    return new(gui.PropVal.Text(t))
+                }
+                gui.PropVal.Flag(f) => {
+                    return new(gui.PropVal.Flag(f))
+                }
+                gui.PropVal.Num(n) => {
+                    return new(gui.PropVal.Num(n))
+                }
+            }
+        }
+        l = l.next
+    }
+    return nil
+}
+
+// ---- child edges — backs the computed P_ROWS prop ----
+struct CE { parent: int, child: int, next: own CE }
+
+let g_edges: own CE = nil
+
+fn edge_count(parent: int) -> int {
+    n := 0
+    l := g_edges
+    for l != nil {
+        if l.parent == parent {
+            n = n + 1
+        }
+        l = l.next
+    }
+    return n
+}
+
+// caller holds the global lock
+fn edge_sync_rows(parent: int) {
+    prop_put(parent, gui.P_ROWS, gui.PropVal.Num(edge_count(parent)))
+}
+
+fn edge_add(parent: int, child: int) {
+    e := new(CE)
+    e.parent = parent
+    e.child = child
+    e.next = g_edges
+    g_edges = e
+    edge_sync_rows(parent)
+}
+
+fn edge_rm(parent: int, child: int) {
+    let out: own CE = nil
+    l := g_edges
+    for l != nil {
+        n := l.next
+        if l.parent == parent && l.child == child {
+            l.next = nil
+        } else {
+            l.next = out
+            out = l
+        }
+        l = n
+    }
+    g_edges = out
+    edge_sync_rows(parent)
+}
+
+// caller holds the global lock: detach h from its parent and drop the
+// subtree's edges — mirrors toolkit teardown (destroy removes a widget
+// from its parent and frees its children)
+fn edge_drop_all(h: int) {
+    let out: own CE = nil
+    l := g_edges
+    for l != nil {
+        n := l.next
+        if l.parent == h || l.child == h {
+            if l.child == h {
+                p := l.parent
+                l.next = nil
+                edge_sync_rows(p)
+            } else {
+                l.next = nil
+            }
+        } else {
+            l.next = out
+            out = l
+        }
+        l = n
+    }
+    g_edges = out
+}
+
+// ---- Backend impl ----
+fn (m Mock) new(kind: gui.WidgetKind, props: own []gui.Prop) -> [int, err] {
+    mlockg()
+    logit("new", kind_to_i(kind), 0)
+    if sget(g_failed) == 1 {
+        munlockg()
+        return 0, errors.new("mock: forced create failure")
+    }
+    sset(m.hnext, sget(m.hnext) + 1)
+    h := sget(m.hnext)
+    al_add(h)
+    if props != nil {
+        i := 0
+        for i < len(props) {
+            prop_put(h, props[i].id, props[i].val)
+            i = i + 1
+        }
+    }
+    munlockg()
+    return h, nil
+}
+
+fn (m Mock) set_prop(h: int, p: gui.Prop) {
+    mlockg()
+    if al_has(h) == 0 {
+        logit("setprop-dead", h, p.id)
+        sadd(g_viol, 1)
+    } else {
+        logit("set_prop", h, p.id)
+        prop_put(h, p.id, p.val)
+    }
+    munlockg()
+}
+
+fn (m Mock) attach(parent: int, child: int) {
+    mlockg()
+    if al_has(parent) == 0 || al_has(child) == 0 {
+        logit("attach-dead", parent, child)
+        sadd(g_viol, 1)
+    } else {
+        logit("attach", parent, child)
+        edge_add(parent, child)
+    }
+    munlockg()
+}
+
+fn (m Mock) detach(parent: int, child: int) {
+    mlockg()
+    if al_has(parent) == 0 || al_has(child) == 0 {
+        logit("detach-dead", parent, child)
+        sadd(g_viol, 1)
+    } else {
+        logit("detach", parent, child)
+        edge_rm(parent, child)
+    }
+    munlockg()
+}
+
+fn (m Mock) destroy(h: int) {
+    mlockg()
+    if al_has(h) == 1 {
+        al_del(h)
+        edge_drop_all(h)
+        logit("destroy", h, 0)
+    } else {
+        logit("destroy-dead", h, 0)
+        sadd(g_viol, 1)
+    }
+    munlockg()
+}
+
+// exec one Cmd on the pump task — mirrors the protocol reconcile rules:
+// dead parent resolves err_gone before create; a lost reply (try_send false)
+// destroys a just-created handle.
+fn (m Mock) exec(c: own gui.Cmd) {
+    if c.kind == gui.CmdKind.new_kind {
+        if c.target != 0 {
+            mlockg()
+            a := al_has(c.target)
+            munlockg()
+            if a == 0 {
+                r := new(gui.CmdResult)
+                r.e = gui.err_gone()
+                r.handle = 0
+                r.val = gui.PropVal.Num(0)
+                try_send(c.reply, r)
+                return
+            }
+        }
+        [h, e] = m.new(c.widget, c.props)
+        if e != nil {
+            r := new(gui.CmdResult)
+            r.e = e
+            r.handle = 0
+            r.val = gui.PropVal.Num(0)
+            try_send(c.reply, r)
+            return
+        }
+        if c.target != 0 {
+            m.attach(c.target, h)
+        }
+        r2 := new(gui.CmdResult)
+        r2.e = nil
+        r2.handle = h
+        r2.val = gui.PropVal.Num(0)
+        rt_msleep(sget(g_delay))
+        if !try_send(c.reply, r2) {
+            m.destroy(h)
+        }
+        return
+    }
+    if c.kind == gui.CmdKind.set_prop {
+        m.set_prop(c.target, c.prop)
+        return
+    }
+    if c.kind == gui.CmdKind.attach {
+        m.attach(c.target, c.arg)
+        return
+    }
+    if c.kind == gui.CmdKind.detach {
+        m.detach(c.target, c.arg)
+        return
+    }
+    if c.kind == gui.CmdKind.destroy {
+        m.destroy(c.target)
+        return
+    }
+    if c.kind == gui.CmdKind.dismiss_close {
+        mlockg()
+        if al_has(c.target) == 0 {
+            logit("dismiss-dead", c.target, 0)
+            sadd(g_viol, 1)
+        } else {
+            logit("dismiss_close", c.target, 0)
+        }
+        munlockg()
+        return
+    }
+    if c.kind == gui.CmdKind.read {
+        mlockg()
+        a := al_has(c.target)
+        munlockg()
+        if a == 0 {
+            r := new(gui.CmdResult)
+            r.e = gui.err_gone()
+            r.handle = 0
+            r.val = gui.PropVal.Num(0)
+            try_send(c.reply, r)
+            return
+        }
+        mlockg()
+        v := prop_get(c.target, c.prop.id)
+        munlockg()
+        if v == nil {
+            r := new(gui.CmdResult)
+            r.e = errors.new("mock: unset prop")
+            r.handle = 0
+            r.val = gui.PropVal.Num(0)
+            try_send(c.reply, r)
+            return
+        }
+        r2 := new(gui.CmdResult)
+        r2.e = nil
+        r2.handle = 0
+        s := ""
+        owned := 0
+        match v {
+            gui.PropVal.Text(t) => {
+                // reply strs are per-reply own copies — the store's
+                // backing stays with the store; read_prop frees this one
+                s = gui.str_own(t)
+                owned = 1
+                r2.val = gui.PropVal.Text(s)
+            }
+            gui.PropVal.Flag(f) => {
+                r2.val = gui.PropVal.Flag(f)
+            }
+            gui.PropVal.Num(n) => {
+                r2.val = gui.PropVal.Num(n)
+            }
+        }
+        // a lost reply drops the envelope but not the embedded str
+        // word's backing — release our copy ourselves
+        if !try_send(c.reply, r2) && owned == 1 {
+            rt_str_free(s)
+        }
+        return
+    }
+}
+
+fn (m Mock) pump(events: mut gui.EventBuf, cmds: mut gui.CmdBuf) {
+    mlockg()
+    logit("pump", 0, 0)
+    munlockg()
+    for 1 == 1 {
+        // drain injected events into the buf — never blocks
+        for 1 == 1 {
+            e := m.pop_script()
+            if e == nil {
+                break
+            }
+            events.post(e)
+        }
+        q := cmds.drain()
+        worked := 0
+        for q != nil {
+            c := q.v
+            r := q.next
+            q.next = nil
+            m.exec(c)
+            q = r
+            worked = 1
+        }
+        if sget(m.stopf) == 1 {
+            break
+        }
+        if worked == 0 {
+            rt_msleep(1)
+        }
+    }
+    m.sweep()
+}
+
+// live-handle sweep — pump does not return with live handles.
+fn (m Mock) sweep() {
+    for 1 == 1 {
+        mlockg()
+        l := g_alive
+        if l == nil {
+            munlockg()
+            return
+        }
+        h := l.h
+        al_del(h)
+        logit("destroy", h, 0)
+        munlockg()
+    }
+}
+
+fn (m Mock) stop() {
+    sset(m.stopf, 1)
+}
+
+fn (m Mock) wake() {}
+
+// ---- test scripting + inspection ----
+
+// queue an event the pump will post on its next iteration.
+fn (m Mock) inject(e: own gui.Event) {
+    mlockg()
+    q := new(QE)
+    q.v = e
+    q.next = g_script
+    g_script = q
+    munlockg()
+}
+
+fn (m Mock) pop_script() -> own gui.Event {
+    mlockg()
+    if g_script == nil {
+        munlockg()
+        return nil
+    }
+    // oldest-first: pop the tail of the head-appended list
+    rr := qe_rm_last(g_script)
+    g_script = rr.list
+    munlockg()
+    return rr.found.v
+}
+
+struct QER { list: own QE, found: own QE }
+
+fn qe_rm_last(l: own QE) -> QER {
+    r := QER{list: nil, found: nil}
+    if l == nil {
+        return r
+    }
+    if l.next == nil {
+        r.found = l
+        return r
+    }
+    rest := l.next
+    l.next = nil
+    rr := qe_rm_last(rest)
+    l.next = rr.list
+    r.list = l
+    r.found = rr.found
+    return r
+}
+
+// delay exec's success replies by ms — lets a canceller close the
+// reply chan mid-flight so the lost-reply destroy fires.
+fn (m Mock) delay(ms: int) {
+    sset(g_delay, ms)
+}
+
+// dead-target protocol calls recorded so far.
+fn (m Mock) violations() -> int {
+    return sget(g_viol)
+}
+
+// count recorded calls of a verb ("new", "set_prop", "attach", ...).
+fn (m Mock) count(what: str) -> int {
+    mlockg()
+    n := 0
+    l := g_log
+    for l != nil {
+        if l.what == what {
+            n = n + 1
+        }
+        l = l.next
+    }
+    munlockg()
+    return n
+}
+
+// count recorded calls matching verb + handle + arg.
+fn (m Mock) count3(what: str, h: int, arg: int) -> int {
+    mlockg()
+    n := 0
+    l := g_log
+    for l != nil {
+        if l.what == what && l.h == h && l.arg == arg {
+            n = n + 1
+        }
+        l = l.next
+    }
+    munlockg()
+    return n
+}
+
+// prop-store readback for assertions.
+fn (m Mock) text_of(h: int, id: int) -> [str, err] {
+    mlockg()
+    v := prop_get(h, id)
+    munlockg()
+    if v == nil {
+        return "", errors.new("mock: unset prop")
+    }
+    match v {
+        gui.PropVal.Text(t) => {
+            return t, nil
+        }
+        gui.PropVal.Flag(f) => {
+            return "", errors.new("mock: not text")
+        }
+        gui.PropVal.Num(n) => {
+            return "", errors.new("mock: not text")
+        }
+    }
+}
+
+// next forced create fails.
+fn (m Mock) fail_next() {
+    sset(g_failed, 1)
+}
+
+// is handle still live in the mock's table?
+fn (m Mock) alive(h: int) -> int {
+    mlockg()
+    r := al_has(h)
+    munlockg()
+    return r
+}
+
+// WidgetKind payloads are flat ints on the wire — record them as ints.
+fn kind_to_i(k: gui.WidgetKind) -> int {
+    if k == gui.WidgetKind.window {
+        return 1
+    }
+    if k == gui.WidgetKind.vbox {
+        return 2
+    }
+    if k == gui.WidgetKind.hbox {
+        return 3
+    }
+    if k == gui.WidgetKind.label {
+        return 4
+    }
+    if k == gui.WidgetKind.button {
+        return 5
+    }
+    if k == gui.WidgetKind.entry {
+        return 6
+    }
+    if k == gui.WidgetKind.list {
+        return 7
+    }
+    return 8
+}

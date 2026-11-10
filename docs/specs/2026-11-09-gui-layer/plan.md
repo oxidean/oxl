@@ -8,9 +8,9 @@ Automatic reviews are disabled repo-wide — request a pass manually
 with `@coderabbitai review` on each stage PR after pushing the head
 you want verdicted, and again after the last fix commit.
 
-- [in progress] **G0 — spec** — this directory, WI-0005 artifacts,
+- [done] **G0 — spec** — PR #56 — this directory, WI-0005 artifacts,
       ADR for the six spec-level forks. *(this PR)*
-- [not started] **G1 — `extra/gui` core + mock backend**
+- [done] **G1 — `extra/gui` core + mock backend** — the milestone-g PR
       `gui.oxl`: `Backend` iface, `WidgetKind`/`EventKind`,
       `Prop`/`PropVal`, `Event`/`EventData`, own-typed tree, typed
       kind wrappers, `gui.Widget` iface, `gui.append`/`gui.remove`,
@@ -30,7 +30,9 @@ you want verdicted, and again after the last fix commit.
       covering `chan own T` payloads too: `pump`'s reply publication
       must be non-suspending (iface methods can't suspend across a
       vtable), so `try_send` on `chan own CmdResult` is the legal
-      reply path — `true` moves the payload, `false` retains it.
+      reply path — `true` moves the payload, `false` drops an
+      `own` payload via the chan thunk (statically a move; the
+      caller reconciles rather than retries).
       Also here: the runtime marks the task `rt_run_root` is
       ENTERED for (`is_root` — `external` can't discriminate the
       root task from `rt_spawnb_task` tasks) so `gui.run`'s
@@ -42,8 +44,8 @@ you want verdicted, and again after the last fix commit.
       legitimately (their main IS their root task), so the mock
       suite keeps its `pump`-driving path.
       `mock/`: pure-oxl backend recording protocol calls
-      with a scriptable `pump`. `tests/gui_test.oxl` drives the
-      whole surface headless.
+      with a scriptable `pump`. `tests/gui_mock.oxl` +
+      friends drive the whole surface headless.
       Language additions land here so G2's app chan is typed from
       its first selftest (parser + both checkers + a small runtime
       element-drop hook — word representation unchanged): `chan own
@@ -65,7 +67,7 @@ you want verdicted, and again after the last fix commit.
       mock-driven dispatch asserted end-to-end and a cancellation
       test (`scope { gui.run(...) }` + cancel while `pump` waits →
       watcher fires `stop`, `run` returns, join completes).
-- [not started] **G2 — GTK4 backend** — `extra/gui/gtk` +
+- [done] **G2 — GTK4 backend** — the milestone-g PR — `extra/gui/gtk` +
       generalized `gtk_shim.c` from the pilot pattern; the GTK
       backend wires real toolkit signals into the G1 delivery path
       (`eb.post` → dispatcher → app chan — the chan is `chan own
@@ -76,7 +78,7 @@ you want verdicted, and again after the last fix commit.
       Gate: gtk4-gated build + `--selftest` parity (add/remove,
       churn RSS); copy-at-boundary verified; headless CI
       compile-only.
-- [not started] **G3 — chan event model** — extends `gui.run`'s
+- [done] **G3 — chan event model** — the milestone-g PR — extends `gui.run`'s
       event machinery (mailboxes + dispatcher land in G1/G2) with
       the full overflow policy: `eb.post` evicts drop-oldest among
       drop-eligible + counts drops + applies per-target
@@ -89,17 +91,17 @@ you want verdicted, and again after the last fix commit.
       dedup exercised from post through delivery and dismissal;
       `events_dropped()` reads the stashed count after `run`
       returns.
-- [not started] **G4 — widget tranche** — pilot parity: window,
+- [done] **G4 — widget tranche** — the milestone-g PR — pilot parity: window,
       vbox/hbox, label, button, entry, list, scrolled + whatever the
       reference app needs; per-kind Prop coverage table in
       `extra/gui/README.md`.
       Gate: every kind constructible + drivable via mock; GTK
       selftest exercises each kind's primary event.
-- [not started] **G5 — reference app** — multi-widget state example
+- [done] **G5 — reference app** — the milestone-g PR — multi-widget state example
       (list + form + live edit, nested layout, scope-managed
       teardown) beyond the pilot's shape.
       Gate: scripted selftest via mock AND gtk backend.
-- [not started] **G6 — second-backend evidence + docs** —
+- [done] **G6 — second-backend evidence + docs** — the milestone-g PR —
       `extra/gui/dom` protocol sketch or `docs/gui-backends.md`
       honest case; `docs/gui.md` user docs (tree/event model,
       UI-thread convention, copy-at-boundary, scope-capture rules);

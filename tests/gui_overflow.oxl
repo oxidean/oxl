@@ -1,0 +1,156 @@
+package main
+
+// gui_overflow — the G3 overflow-policy gate, driven on the mock
+// backend with set_event_buffer(1) so both the EventBuf and the
+// app-facing chan sit at the interesting edge.
+//
+// Asserts, in one gui.run session:
+//   · an all-protected buf lands whole — close_requested never
+//     evicts and never triggers eviction, so three closes post and
+//     deliver past cap 1
+//   · close_requested dedups per window from post through delivery:
+//     a second close for the same window is absorbed at post while
+//     its decision is pending, and dismiss_close re-arms so the next
+//     close posts again
+//   · drop-eligible posts evict the oldest eligible entry at cap —
+//     the final post always survives
+//   · events_dropped() still reads the stashed count after run
+//     returns (pull-based loss reporting outlives the session)
+import "github.com/oxidean/oxl/extra/gui"
+
+import "github.com/oxidean/oxl/extra/gui/mock"
+
+let g_m: mock.Mock = mock.backend()
+
+fn app(events: chan own gui.Event) {
+    spawn app_main(events)
+}
+
+fn ev_of(kind: gui.EventKind, target: int) -> own gui.Event {
+    e := new(gui.Event)
+    e.kind = kind
+    e.target = target
+    e.data = gui.EventData.None
+    return e
+}
+
+// bounded recv — a lost event reports and lets the run end instead
+// of hanging the suite
+fn next(events: chan own gui.Event) -> own gui.Event {
+    r := new(gui.Event)
+    r.target = -1
+    select {
+        e := recv(events) => {
+            return e
+        }
+        timeout(10000) => {
+            println("recv timeout")
+            return r
+        }
+    }
+}
+
+fn app_main(events: chan own gui.Event) {
+    // live windows — close protection needs wt registration
+    [w1, e1] = gui.window("a")
+    [w2, e2] = gui.window("b")
+    [w3, e3] = gui.window("c")
+    if e1 != nil || e2 != nil || e3 != nil {
+        println("window err")
+        gui.stop()
+        return
+    }
+
+    // all-protected at cap 1: three closes (w1's posted twice — the
+    // dup is absorbed at post while its decision pends); every one
+    // must deliver, none counts as dropped
+    g_m.inject(ev_of(gui.EventKind.close_requested, w1.handle()))
+    g_m.inject(ev_of(gui.EventKind.close_requested, w1.handle()))
+    g_m.inject(ev_of(gui.EventKind.close_requested, w2.handle()))
+    g_m.inject(ev_of(gui.EventKind.close_requested, w3.handle()))
+    got := 0
+    for got < 3 {
+        ev := next(events)
+        if ev == nil {
+            break
+        }
+        if ev.target == -1 {
+            break
+        }
+        if ev.kind == gui.EventKind.close_requested {
+            got = got + 1
+        }
+    }
+    assert(got == 3)
+    println("closes delivered")
+
+    // the decision is still pending after delivery — dedup lives in
+    // the wt flag, not the queue entry
+    assert(gui.close_pending(w1) == 1)
+    assert(gui.close_pending(w2) == 1)
+
+    // dismissal clears it (post-then-clear is synchronous core-side)
+    // and re-arms the next close for the same window
+    gui.dismiss_close(w1)
+    assert(gui.close_pending(w1) == 0)
+    assert(gui.close_pending(w2) == 1)
+    g_m.inject(ev_of(gui.EventKind.close_requested, w1.handle()))
+
+    // eligible phase: three clicked posts on bare targets at cap 1 —
+    // the oldest eligible evicts; the final post can never be
+    // evicted by anything after it
+    g_m.inject(ev_of(gui.EventKind.clicked, 901))
+    g_m.inject(ev_of(gui.EventKind.clicked, 902))
+    g_m.inject(ev_of(gui.EventKind.clicked, 903))
+    closed_again := 0
+    last_ok := 0
+    for closed_again == 0 || last_ok == 0 {
+        ev := next(events)
+        if ev == nil {
+            break
+        }
+        if ev.target == -1 {
+            break
+        }
+        if ev.kind == gui.EventKind.close_requested && ev.target == w1.handle() {
+            closed_again = 1
+        }
+        if ev.kind == gui.EventKind.clicked && ev.target == 903 {
+            last_ok = 1
+        }
+    }
+    assert(closed_again == 1)
+    assert(last_ok == 1)
+    println("re-arm + survivor delivered")
+
+    gui.stop()
+    for 1 == 1 {
+        ev := next(events)
+        if ev == nil {
+            break
+        }
+        if ev.target == -1 {
+            break
+        }
+    }
+    println("chan drained")
+}
+
+fn main() {
+    g_m = mock.backend()
+    gui.set_event_buffer(1)
+    e := gui.run(g_m, app)
+    if e != nil {
+        println("run err")
+        return
+    }
+    // pull-based: the stashed count survives session teardown; the
+    // cap-1 eligible phase guaranteed at least one eviction
+    d := gui.events_dropped()
+    println("dropped=" + itoa(d))
+    if d < 1 {
+        println("no drops recorded")
+        return
+    }
+    println("overflow ok")
+}

@@ -1095,7 +1095,7 @@ kill $srv_pid 2>/dev/null || true
 # files exist (same gate as the gui section below — headless compiles,
 # DISPLAY additionally selftests)
 if command -v pkg-config >/dev/null 2>&1 && pkg-config --exists gtk4 2>/dev/null; then
-    "$CC" -O2 $(pkg-config --cflags gtk4) -c examples/gui-todo/gui_shim.c -o "$cgen_dir/gui_shim.o"
+    "$CC" -O2 $(pkg-config --cflags gtk4) -c extra/gui/gtk/gtk_shim.c -o "$cgen_dir/gui_shim.o"
     "$OXL" run bootstrap/cmd/codegen -- examples/gui-todo/todo.oxl > "$cgen_dir/todo.c"
     todonet=""
     grep -qE 'rt_sock_|rt_bind_any|rt_set_(reuseaddr|rcvtimo|sndtimo)|rt_htons|rt_htonl' "$cgen_dir/todo.c" && todonet="-DOXL_NET"
@@ -1508,6 +1508,57 @@ out=$("$OXL" run tests/select_fair.oxl)
 grep -qE "^select fair ok a=[0-9]+$" <<<"$(tail -1 <<<"$out")" || { echo "FAIL select_fair: $out"; exit 1; }
 out=$("$OXL" run tests/select.oxl)
 [ "$(tail -1 <<<"$out")" = "select done" ] || { echo "FAIL select: $out"; exit 1; }
+
+echo "== g1 typed chans + named scopes =="
+out=$("$OXL" run tests/chan_own.oxl)
+[ "$(tail -1 <<<"$out")" = "chan_own done" ] || { echo "FAIL chan_own: $out"; exit 1; }
+
+echo "== g1 gui: mock backend + cancel gate =="
+out=$("$OXL" run tests/gui_mock.oxl)
+[ "$(tail -1 <<<"$out")" = "done" ] || { echo "FAIL gui_mock: $out"; exit 1; }
+# cancellation: `scope { gui.run(...) }` + scancel while `pump` waits —
+# the watcher's defer fires `b.stop()`, `run` returns, the canceller's
+# scope joins (spec G1 gate). Build + run directly so a hang shows as
+# with_timeout's 124 rather than a driver-side kill.
+"$OXL" build tests/gui_cancel.oxl -o "$scratch/gui_cancel$EXE" || {
+    echo "FAIL gui_cancel: compile failed"; exit 1; }
+rc=0
+out=$(with_timeout 30 "$scratch/gui_cancel$EXE") || rc=$?
+[ "$rc" -eq 0 ] && [ "$(tail -1 <<<"$out")" = "cancel ok" ] || {
+    echo "FAIL gui_cancel: rc=$rc: $out"; exit 1; }
+# select-composability: `chan own gui.Event` must sit in one select next
+# to an app's own chan (spec G3 gate); both arms fire before gui.stop.
+out=$("$OXL" run tests/gui_select.oxl)
+grep -q "select ok" <<<"$out" && [ "$(tail -1 <<<"$out")" = "done" ] || {
+    echo "FAIL gui_select: $out"; exit 1; }
+# stress: 200 rounds of add/remove row churn through the mock mailbox +
+# dispatcher, List.rows() asserted live from a second task (spec G3/G5).
+# Build + run directly so a hang shows as with_timeout's 124.
+"$OXL" build tests/gui_stress.oxl -o "$scratch/gui_stress$EXE" || {
+    echo "FAIL gui_stress: compile failed"; exit 1; }
+rc=0
+out=$(with_timeout 60 "$scratch/gui_stress$EXE") || rc=$?
+[ "$rc" -eq 0 ] && grep -q "stress ok" <<<"$out" && \
+    [ "$(tail -1 <<<"$out")" = "done" ] || {
+    echo "FAIL gui_stress: rc=$rc: $out"; exit 1; }
+# overflow policy at cap 1 (spec G3): all-protected posts land whole,
+# close dedup through delivery + dismissal + re-arm, last eligible post
+# survives eviction, events_dropped() reads the stashed count post-run.
+"$OXL" build tests/gui_overflow.oxl -o "$scratch/gui_overflow$EXE" || {
+    echo "FAIL gui_overflow: compile failed"; exit 1; }
+rc=0
+out=$(with_timeout 30 "$scratch/gui_overflow$EXE") || rc=$?
+[ "$rc" -eq 0 ] && [ "$(tail -1 <<<"$out")" = "overflow ok" ] || {
+    echo "FAIL gui_overflow: rc=$rc: $out"; exit 1; }
+# lifecycle contracts (spec G1/G3): cancel mid-create fires the
+# lost-reply destroy reconcile mid-run, dead-handle calls record
+# violations, and post-run mutators are accepted-and-dropped.
+"$OXL" build tests/gui_lifecycle.oxl -o "$scratch/gui_lifecycle$EXE" || {
+    echo "FAIL gui_lifecycle: compile failed"; exit 1; }
+rc=0
+out=$(with_timeout 30 "$scratch/gui_lifecycle$EXE") || rc=$?
+[ "$rc" -eq 0 ] && [ "$(tail -1 <<<"$out")" = "lifecycle ok" ] || {
+    echo "FAIL gui_lifecycle: rc=$rc: $out"; exit 1; }
 # parked select must unwedge on sibling trap — exits nonzero, not a hang.
 # 124 = with_timeout expiry = the hang this test exists to catch. Build
 # first so a compile error fails the check instead of passing as a

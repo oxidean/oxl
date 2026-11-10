@@ -126,10 +126,14 @@ carries a task frame and suspending is legal.
   `pump` is an iface method, and a suspendable method cannot be
   vtable-reachable (the checker rejects it — "vtable calls carry no
   task frame"), so every backend's `pump` MUST stay non-susp-capable
-  end to end. `try_send` is legal here because the reply chan is
-  freshly allocated per `Cmd` and receives exactly one send — the
-  `false` branch is unreachable by construction — and because it is
-  a non-suspending builtin.
+  end to end. `try_send` is legal here because it is
+  non-suspending and the reply chan takes exactly one send on the
+  live path. `false` stays reachable, though: reply chans are
+  pooled on the mailbox-owning scope (admitted only open and
+  drained), and a cancelled caller's scope teardown closes the
+  reply chan — `false` is then the caller-gone signal, and
+  `pump` reconciles by freeing the reply's owned fields
+  (`str_own` copies) rather than retrying.
   Before returning, `pump` releases every handle it still owns —
   see the live-handle sweep in *Shutdown* below.
 - `stop` — idempotent, safe from any task: asks `pump` to unwind
@@ -287,7 +291,12 @@ delivery mechanism. Reads
 (`entry.text()`) post a `read` Cmd carrying its reply chan and
 block-receive — the reply crosses the boundary as an owned `str`,
 satisfying the copy rule, and the app-side wait is an ordinary chan
-op (suspendable, cancellable). `new_kind` uses the same shape: the
+op (suspendable, cancellable). The transport copy's lifetime is the
+call's, not the session's: `read_prop` scope-copies the payload so
+the getter returns a caller-scope `str` like any other, then frees
+the transport copy — backends reply with their own `str_own` copy
+per read (never a pointer into their widget or prop stores), and
+neither side accumulates. `new_kind` uses the same shape: the
 caller block-receives `CmdResult{handle: h}` (or `e`) — handlers
 can create widgets too, and `attach` can name the returned handle.
 `gui.run` allocates both mailboxes — `CmdBuf`, `EventBuf`, their

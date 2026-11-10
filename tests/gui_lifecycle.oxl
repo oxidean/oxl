@@ -1,0 +1,89 @@
+package main
+
+// gui_lifecycle — reply-chan, dead-handle, and post-run contracts:
+//  * a caller cancelled mid-create closes its reply chan on unwind —
+//    the backend's lost-reply reconcile destroys the orphan (alive→0)
+//  * dead-handle reads resolve err_gone; mutations are recorded as
+//    violations by the mock
+//  * post-run mutator calls are accepted-and-dropped — the mailboxes
+//    stay live with closed set, so stale calls never nil-deref
+//  * create/read_prop post-run resolve err_stopped
+import "github.com/oxidean/oxl/extra/gui"
+
+import "github.com/oxidean/oxl/extra/gui/mock"
+
+import "std/time"
+
+let g_m: mock.Mock = mock.backend()
+
+// blocks in recv on the delayed reply; scancel unwinds it — the defer
+// closes the reply chan so exec's try_send lands on a closed chan.
+fn creator() {
+    [h, e] = gui.window("x")
+    println("creator returned")
+}
+
+// joins the cancelled scope, then watches the orphan die mid-run —
+// the reconcile must destroy it BEFORE pump's exit sweep would.
+fn checker(w: scope) {
+    sjoin(w)
+    i := 0
+    for i < 800 {
+        if g_m.alive(2) == 0 {
+            break
+        }
+        time.sleep_ms(1)
+        i = i + 1
+    }
+    assert(g_m.alive(2) == 0)
+    println("orphan destroyed by reconcile")
+    gui.stop()
+}
+
+// susp work lives on a spawned task — `app` itself is a plain fn value.
+fn orchestrator() {
+    [w0, e0] = gui.window("keep")
+    assert(e0 == nil)
+    assert(g_m.alive(w0.handle()) == 1)
+    // dead-handle surface: destroy, then mutate + read the stale h
+    gui.remove(w0)
+    gui.set_prop(w0.handle(), gui.P_TITLE, gui.PropVal.Text("z"))
+    [_, e2] = gui.read_prop(w0.handle(), gui.P_TITLE)
+    assert(e2 != nil)
+    // cancel-during-create: delay makes the reply window hittable
+    g_m.delay(200)
+    w := mkscope()
+    goin(w, creator())
+    spawn checker(w)
+    time.sleep_ms(50)
+    scancel(w)
+}
+
+fn app(events: chan own gui.Event) {
+    spawn orchestrator()
+}
+
+fn main() {
+    e := gui.run(g_m, app)
+    assert(e == nil)
+    // the dead-handle set_prop was recorded as a violation
+    assert(g_m.violations() >= 1)
+    assert(g_m.count("setprop-dead") >= 1)
+    println("dead-handle calls recorded")
+    // post-run: mutator calls land on closed mailboxes — silently
+    // dropped, never a nil deref
+    w0 := gui.Window{h: 1}
+    gui.remove(w0)
+    gui.dismiss_close(w0)
+    gui.set_prop(1, gui.P_TITLE, gui.PropVal.Text("post"))
+    gui.close_pending(w0)
+    gui.stop()
+    // post-run reply paths resolve err_stopped, not a crash
+    [_, e3] = gui.window("post")
+    assert(e3 != nil)
+    [_, e4] = gui.read_prop(1, gui.P_TITLE)
+    assert(e4 != nil)
+    assert(gui.events_dropped() >= 0)
+    println("post-run calls dropped cleanly")
+    println("lifecycle ok")
+}

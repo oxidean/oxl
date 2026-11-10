@@ -123,6 +123,11 @@ fn scan_refs(text: &str, defs: &HashMap<String, Vec<usize>>, out: &mut Vec<usize
 struct Gen<'a> {
     out: String,
     trampolines: String,
+    /// struct/enum names needing an o_drop_<n> chan-payload destructor
+    drop_tys: std::collections::BTreeSet<String>,
+    /// payload kinds that only need rt_free on the word (own str/prim)
+    drop_word: bool,
+    drop_slice: bool,
     inst_out: String,
     inst_protos: String,
     // B4: fn-value wrappers + closures
@@ -202,6 +207,9 @@ pub fn generate_mode(c: &Crate, test_mode: bool, susp: &HashSet<String>) -> Stri
     let mut g = Gen {
         out: String::new(),
         trampolines: String::new(),
+        drop_tys: std::collections::BTreeSet::new(),
+        drop_word: false,
+        drop_slice: false,
         inst_out: String::new(),
         inst_protos: String::new(),
         fnv_wraps: std::collections::BTreeSet::new(),
@@ -565,6 +573,27 @@ pub fn generate_mode(c: &Crate, test_mode: bool, susp: &HashSet<String>) -> Stri
     let main_unit = units.len();
     units.push(u);
 
+    // destructor defs get their own unit: every `o_drop_*` it defines
+    // is reachable only through the live use that spells it, so two
+    // units calling `mkchan(Ev)` share ONE def and a pruned unit can
+    // never take a needed def down. Pushed last — its head lands after
+    // every type-decl head and before every body, and its text spelling
+    // `o_s_*`/`o_en_*` pulls those decl units live in the same pass.
+    {
+        let mut du = Unit::default();
+        for n in g.drop_tys.iter() {
+            du.defs.push(format!("o_drop_{}", cname(n)));
+        }
+        if g.drop_word {
+            du.defs.push("o_drop_word".into());
+        }
+        if g.drop_slice {
+            du.defs.push("o_drop_slice".into());
+        }
+        du.head = g.drops_src();
+        units.push(du);
+    }
+
     // csym -> units defining it; a colliding symbol (say a struct named
     // like an enum variant's payload) marks every claimant — safe
     let mut defs: HashMap<String, Vec<usize>> = HashMap::new();
@@ -643,13 +672,25 @@ fn defer_caps(g: &Gen, call: &Expr) -> Vec<(String, Ty)> {
     fn walk(e: &Expr, g: &Gen, out: &mut Vec<(String, Ty)>) {
         match &e.kind {
             ExprKind::Ident(n) => {
-                if g.env.iter().skip(1).any(|s| s.contains_key(n))
-                    || g.fslots.iter().any(|s| s.contains_key(n))
-                {
-                    if !g.globals.contains_key(n)
-                        && !out.iter().any(|(m, _)| m == n)
+                // `b.stop` arrives flattened — the env binding is the
+                // longest bound prefix (`b`), not the whole name; a
+                // qualified global prefix needs no capture (it emits
+                // as `o_g_*` directly).
+                let mut m = n.as_str();
+                loop {
+                    if g.env.iter().skip(1).any(|s| s.contains_key(m))
+                        || g.fslots.iter().any(|s| s.contains_key(m))
                     {
-                        out.push((n.clone(), g.lookup(n)));
+                        if !g.globals.contains_key(m)
+                            && !out.iter().any(|(x, _)| x == m)
+                        {
+                            out.push((m.to_string(), g.lookup(m)));
+                        }
+                        break;
+                    }
+                    match m.rfind('.') {
+                        Some(i) => m = &m[..i],
+                        None => break,
                     }
                 }
             }
@@ -789,7 +830,10 @@ impl<'a> Gen<'a> {
             TyKind::Own(t) => Ty::Own(Box::new(self.ty_of_ref(t))),
             TyKind::Ref(t) => Ty::Ref(Box::new(self.ty_of_ref(t))),
             TyKind::Mut(t) => Ty::Mut(Box::new(self.ty_of_ref(t))),
-            TyKind::Chan => Ty::Chan,
+            TyKind::Chan(p) => {
+                Ty::Chan(p.as_ref().map(|t| Box::new(self.ty_of_ref(t))))
+            }
+            TyKind::Scope => Ty::Scope,
             TyKind::Slice(t) => Ty::Slice(Box::new(self.ty_of_ref(t))),
             TyKind::Fn { params, ret } => Ty::Fn(
                 params.iter().map(|p| self.ty_of_ref(p)).collect(),
@@ -807,7 +851,8 @@ impl<'a> Gen<'a> {
             Ty::Str => "OxlStr".into(),
             Ty::CStr => "const char*".into(),
             Ty::Void => "void".into(),
-            Ty::Chan => "RtChan*".into(),
+            Ty::Chan(_) => "RtChan*".into(),
+            Ty::Scope => "RtScope*".into(),
             Ty::Shared => "RtShared*".into(),
             Ty::Struct(n) => format!("struct o_s_{}", cname(n)),
             Ty::Enum(n) => format!("struct o_en_{}", cname(n)),
@@ -836,6 +881,152 @@ impl<'a> Gen<'a> {
 
     fn pty(&self, t: &Ty) -> String {
         self.cty(t)
+    }
+
+    /// type-name argument to mkchan/smkchan: `Event` -> own Event, or a
+    /// TyLit already carrying `own`. Returns the payload Ty (`own T`).
+    fn chan_payload_ty(&self, a: &Expr) -> Option<Ty> {
+        match &a.kind {
+            ExprKind::Ident(n) if self.structs.contains_key(n) || self.enums.contains_key(n) => {
+                Some(Ty::Own(Box::new(self.ty_of_ref(&TyRef {
+                    kind: TyKind::Named(n.clone()),
+                    span: a.span,
+                }))))
+            }
+            ExprKind::TyLit(tr) => {
+                let t = self.ty_of_ref(tr);
+                matches!(t, Ty::Own(_)).then_some(t)
+            }
+            _ => None,
+        }
+    }
+
+    /// destructor thunk symbol for a `chan own T` payload; registers the
+    /// underlying type (and every own field reachable from it) so
+    /// emit_drops writes each o_drop_<n> once. Non-struct payloads get the
+    /// shared rt_free shim.
+    fn drop_sym(&mut self, payload: &Ty) -> String {
+        let inner_of = |p: &Ty| match p {
+            Ty::Own(b) => Some((**b).clone()),
+            _ => None,
+        };
+        let mut stack = match inner_of(payload) {
+            Some(t) => vec![t],
+            None => return "0 /*no drop*/".into(),
+        };
+        while let Some(t) = stack.pop() {
+            match &t {
+                Ty::Struct(n) | Ty::Enum(n) => {
+                    if !self.drop_tys.insert(n.clone()) {
+                        continue;
+                    }
+                }
+                _ => { self.drop_word = true; }
+            }
+            // enqueue own fields/variant payloads of the type just seen
+            let fields: Vec<Ty> = match &t {
+                Ty::Struct(n) => self.structs.get(n).cloned().unwrap_or_default()
+                    .into_iter().map(|(_, ft)| ft).collect(),
+                Ty::Enum(n) => self.enums.get(n).cloned().unwrap_or_default()
+                    .into_iter()
+                    .flat_map(|vn| self.enum_fields.get(&format!("{n}.{vn}")).cloned().unwrap_or_default())
+                    .map(|(_, ft)| ft).collect(),
+                _ => Vec::new(),
+            };
+            for ft in fields {
+                if let Some(it) = inner_of(&ft) {
+                    stack.push(it);
+                } else if matches!(ft, Ty::Str) {
+                    self.drop_word = true; // borrowed str fields aren't owned
+                }
+            }
+        }
+        match inner_of(payload) {
+            Some(Ty::Struct(n)) | Some(Ty::Enum(n)) => format!("o_drop_{}", cname(&n)),
+            // an own-slice payload is a heap box over a heap backing —
+            // the shared word shim would free the box but leak ptr
+            Some(Ty::Slice(_)) => { self.drop_slice = true; "o_drop_slice".into() }
+            Some(_) => { self.drop_word = true; "o_drop_word".into() }
+            None => "0 /*no drop*/".into(),
+        }
+    }
+
+    /// write each registered o_drop_<n>: frees own fields recursively then
+    /// rt_free's the object. Bodies reference one another, so prototypes
+    /// go first; emission order is irrelevant. Registration accumulates
+    /// across every unit's codegen and this runs ONCE in the assembled
+    /// preamble — two units calling `mkchan(Ev)` must not each emit
+    /// `o_drop_Ev`, and a pruned unit can't take a live use's def with it.
+    fn drops_src(&mut self) -> String {
+        if self.drop_tys.is_empty() && !self.drop_word && !self.drop_slice {
+            return String::new();
+        }
+        let drop_tys = std::mem::take(&mut self.drop_tys);
+        let drop_word = std::mem::take(&mut self.drop_word);
+        let drop_slice = std::mem::take(&mut self.drop_slice);
+        let mut src = String::new();
+        if drop_word {
+            src.push_str("static void o_drop_word(int64_t _v) { rt_free((void*)_v); }\n");
+        }
+        if drop_slice {
+            src.push_str("static void o_drop_slice(int64_t _v) { RtSlice *s = (RtSlice *)_v; if (s) { rt_free(s->ptr); rt_free(s); } }\n");
+        }
+        for n in drop_tys.iter() {
+            let ct = self.cty(&match self.structs.contains_key(n) {
+                true => Ty::Struct(n.clone()),
+                false => Ty::Enum(n.clone()),
+            });
+            src.push_str(&format!("static void o_drop_{0}(int64_t _v);\n", cname(n)));
+            let _ = ct;
+        }
+        for n in drop_tys.iter() {
+            let cn = cname(n);
+            if self.structs.contains_key(n) {
+                let mut body = format!(
+                    "static void o_drop_{cn}(int64_t _v) {{ struct o_s_{cn} *p = (struct o_s_{cn} *)_v; if (!p) return;\n");
+                for (f, ft) in self.structs.get(n).cloned().unwrap_or_default() {
+                    body.push_str(&self.drop_field(&format!("p->f_{f}"), &ft));
+                }
+                body.push_str("    rt_free(p);\n}\n");
+                src.push_str(&body);
+            } else {
+                let mut body = format!(
+                    "static void o_drop_{cn}(int64_t _v) {{ struct o_en_{cn} *p = (struct o_en_{cn} *)_v; if (!p) return; switch (p->tag) {{\n");
+                // enum_fields is keyed per variant ("E.V") — walk the
+                // variant list so each case drops exactly its payload's
+                // own fields; a bare-name lookup finds nothing
+                for (i, vn) in self.enums.get(n).cloned().unwrap_or_default().iter().enumerate() {
+                    let key = format!("{n}.{vn}");
+                    let mut cases = String::new();
+                    for (f, ft) in self.enum_fields.get(&key).cloned().unwrap_or_default() {
+                        if matches!(ft, Ty::Own(_)) {
+                            cases.push_str(&self.drop_field(&format!("p->u.v{i}.f_{f}"), &ft));
+                        }
+                    }
+                    if !cases.is_empty() {
+                        body.push_str(&format!("    case {i}:\n{cases}        break;\n"));
+                    }
+                }
+                body.push_str("    }\n    rt_free(p);\n}\n");
+                src.push_str(&body);
+            }
+        }
+        src
+    }
+
+    /// one C stmt dropping an own field/payload word; borrowed fields are
+    /// untouched (they share the owner's lifetime, not the object's)
+    fn drop_field(&self, acc: &str, ft: &Ty) -> String {
+        match ft {
+            Ty::Own(b) => match &**b {
+                Ty::Struct(n) | Ty::Enum(n) =>
+                    format!("    o_drop_{}((int64_t){acc});\n", cname(n)),
+                Ty::Slice(_) =>
+                    format!("    if ({acc}) {{ rt_free(((RtSlice*){acc})->ptr); rt_free({acc}); }}\n"),
+                _ => format!("    rt_free((void*){acc});\n"),
+            },
+            _ => String::new(),
+        }
     }
 
     fn proto(&self, out: &mut String, f: &Fn, is_extern: bool) {
@@ -1003,6 +1194,8 @@ impl<'a> Gen<'a> {
         u.head.push_str(&std::mem::take(&mut self.frame_head));
         u.head.push_str(&std::mem::take(&mut self.inst_protos));
         u.head.push_str(&std::mem::take(&mut self.closure_protos));
+        // drop registrations accumulate — drops_src emits the union
+        // once between the head and body layers, never per unit
         u.body.push_str(&std::mem::take(&mut self.trampolines));
         u.body.push_str(&std::mem::take(&mut self.inst_out));
         u.body.push_str(&std::mem::take(&mut self.frame_out));
@@ -1118,7 +1311,10 @@ impl<'a> Gen<'a> {
                         };
                     }
                     match n.as_str() {
-                        "mkchan" => return Ty::Chan,
+                        "mkchan" | "smkchan" => {
+                            let payload = args.first().and_then(|a| self.chan_payload_ty(a));
+                            return Ty::Chan(payload.map(Box::new));
+                        }
                         "mkslice" => {
                             if let Some(a) = args.first() {
                                 match &a.kind {
@@ -1137,7 +1333,18 @@ impl<'a> Gen<'a> {
                             return Ty::Slice(Box::new(Ty::Unknown));
                         }
                         "push" => return self.expr_ty(&args[0]),
-                        "recv" | "argc" | "len" | "byteat" | "find" | "atoi" | "ftoi"
+                        "try_send" | "is_root" => return Ty::Bool,
+                        "mkscope" | "curscope" => return Ty::Scope,
+                        "sjoin" => return Ty::Int,
+                        "scancel" => return Ty::Void,
+                        "recv" => {
+                            let ct = args.first().map(|a| self.expr_ty(a)).unwrap_or(Ty::Unknown);
+                            return match ct {
+                                Ty::Chan(Some(p)) => (*p).clone(),
+                                _ => Ty::Int,
+                            };
+                        }
+                        "argc" | "len" | "byteat" | "find" | "atoi" | "ftoi"
                         | "htons" | "htonl" | "sqlite_exec" | "writefile" | "sget" | "scas"
                         | "sadd" | "now" | "now_ms" => {
                             return Ty::Int
@@ -1517,7 +1724,7 @@ impl<'a> Gen<'a> {
                 self.env.pop();
                 let _ = writeln!(self.out, "      rt_scope_leave(&_sc{id}); }}");
             }
-            Stmt::Spawn { call, blocking, .. } => self.spawn(call, *blocking),
+            Stmt::Spawn { call, scope, blocking, .. } => self.spawn(call, scope.as_ref(), *blocking),
             Stmt::Select { .. } => {
                 // select is only reachable inside suspendable fns (checker
                 // seeds the susp set) — those take the frame path (fstmt),
@@ -1535,10 +1742,19 @@ impl<'a> Gen<'a> {
         }
     }
 
-    fn spawn(&mut self, call: &Expr, blocking: bool) {
+    fn spawn(&mut self, call: &Expr, scope: Option<&Expr>, blocking: bool) {
         if let ExprKind::Call { f, args } = &call.kind {
             // spawn f() where f is a fn value — pack the fat pair as a0
             if let Ty::Fn(ps, r) = self.fn_callee_ty(f) {
+                if scope.is_some() {
+                    // the checker's goin gate rejects fn-valued callees —
+                    // a shadow that slipped through lands here; the
+                    // trampoline can't bind the named scope, so fail
+                    // loudly rather than spawn under the caller's
+                    let _ = writeln!(self.out,
+                        "    fprintf(stderr, \"goin on a fn value\\n\"); abort();");
+                    return;
+                }
                 let id = self.tmp();
                 let mut tr = format!("struct o_args_{id} {{ RtFnv a0;");
                 for (i, p) in ps.iter().enumerate() {
@@ -1595,9 +1811,17 @@ impl<'a> Gen<'a> {
                         .get(&cn)
                         .map(|af| all_params(af).iter().map(|p| p.name.clone()).collect())
                         .unwrap_or_default();
-                    let _ = writeln!(self.out,
-                        "    {{ struct o_frm_{} *_t = (struct o_frm_{} *)rt_task_new(o_poll_{}, (int64_t)sizeof(struct o_frm_{}));",
-                        cname(&mangled), cname(&mangled), cname(&mangled), cname(&mangled));
+                    let scope_v = scope.map(|e| self.expr(e)).unwrap_or_else(|| "0LL".into());
+                    let m2 = cname(&mangled);
+                    if scope.is_some() {
+                        let _ = writeln!(self.out,
+                            "    {{ struct o_frm_{0} *_t = (struct o_frm_{0} *)rt_task_new_in((void*){1}, o_poll_{0}, (int64_t)sizeof(struct o_frm_{0}));",
+                            m2, scope_v);
+                    } else {
+                        let _ = writeln!(self.out,
+                            "    {{ struct o_frm_{0} *_t = (struct o_frm_{0} *)rt_task_new(o_poll_{0}, (int64_t)sizeof(struct o_frm_{0}));",
+                            m2);
+                    }
                     let ptys = self.decl_param_tys(&cn, &eff);
                     for (i, arg) in eff.iter().enumerate() {
                         let v = match ptys.as_ref().and_then(|p| p.get(i)).cloned() {
@@ -1631,7 +1855,7 @@ impl<'a> Gen<'a> {
                 // type-dependent builtins can't expand here — trap visibly
                 "print" | "println" | "new" => "rt_trap(9);".into(),
                 "close" => {
-                    if self.expr_ty(&args[0]) == Ty::Chan {
+                    if matches!(self.expr_ty(&args[0]), Ty::Chan(_)) {
                         "rt_close(a->a0);".into()
                     } else {
                         "close(a->a0);".into()
@@ -1813,6 +2037,11 @@ impl<'a> Gen<'a> {
                     && self.dt(&lt) == Ty::Str
                 {
                     format!("(rt_str_cmp({lv}, {rv}) {cop} 0)")
+                } else if matches!(op, BinOp::Eq | BinOp::Ne) && matches!(lt, Ty::Enum(_)) {
+                    // unit enums: the tag is the whole value (payload
+                    // enums are rejected at check). The parens matter —
+                    // `.tag` on the compound-literal RHS needs them.
+                    format!("(({lv}).tag {cop} ({rv}).tag)")
                 } else if matches!(op, BinOp::Eq | BinOp::Ne)
                     && (matches!(self.dt(&lt), Ty::Iface(_))
                         || matches!(self.dt(&self.expr_ty(r)), Ty::Iface(_)))
@@ -2205,7 +2434,13 @@ impl<'a> Gen<'a> {
         Some(match name {
             "assert" => format!("(({}) ? (void)0 : (rt_trap(3)))", a0),
             "mkchan" => format!("rt_mkchan({})", if argvs.is_empty() { "0LL".into() } else { a0 }),
-            "send" => format!("rt_send({})", j(argvs)),
+            "send" => format!("rt_send({}, (int64_t)({}))", a0, argvs.get(1).cloned().unwrap_or_default()),
+            "try_send" => format!("rt_try_send({}, (int64_t)({}))", a0, argvs.get(1).cloned().unwrap_or_default()),
+            "is_root" => "rt_is_root()".into(),
+            "mkscope" => "rt_scope_named()".into(),
+            "curscope" => "rt_scope_current()".into(),
+            "scancel" => format!("rt_scope_cancel((void*){})", a0),
+            "sjoin" => format!("rt_scope_join_named((void*){})", a0),
             "recv" => format!("rt_recv({})", a0),
             "sleep" => format!("rt_sleep({})", a0),
             "msleep" => format!("rt_msleep({})", a0),
@@ -2409,7 +2644,7 @@ impl<'a> Gen<'a> {
             return CallPlan::Fn { q: name.clone(), recv: None };
         }
         if let Some((objp, mname)) = name.rsplit_once('.') {
-            if let Some(oe) = unflatten(objp, f.span) {
+            if let Some(oe) = self.obj_expr(objp, f.span) {
                 let ot = self.dt(&self.expr_ty(&oe));
                 if let Some(mt) = self.m_target(&ot, mname) {
                     return match mt {
@@ -2436,6 +2671,39 @@ impl<'a> Gen<'a> {
             Ty::Iface(w) => Some(w.clone()),
             Ty::Var(v) => self.subst.get(v).and_then(|t| self.iface_name(t)),
             _ => None,
+        }
+    }
+
+    /// `unflatten` that respects qualified decl names: a same-module
+    /// global's object path (`pkg.g` in `pkg.g.inc`) is ONE binding —
+    /// `Field{pkg, g}` would emit a literal `pkg.g`. Picks the longest
+    /// leading prefix bound as a frame slot, local, or global, then
+    /// Field-chains the rest; falls back to naive `unflatten`.
+    fn obj_expr(&self, path: &str, span: crate::diag::Span) -> Option<Expr> {
+        let mut cut = path.len();
+        loop {
+            let head = &path[..cut];
+            let bound = self.fslots.iter().rev().any(|s| s.contains_key(head))
+                || self.bind_env.borrow().iter().any(|s| s.contains_key(head))
+                || self.env.iter().any(|s| s.contains_key(head))
+                || self.globals.contains_key(head);
+            if bound {
+                let mut e = Expr { kind: ExprKind::Ident(head.to_string()), span };
+                let mut rest = &path[cut..];
+                while let Some(seg) = rest.strip_prefix('.') {
+                    let end = seg.find('.').unwrap_or(seg.len());
+                    e = Expr {
+                        kind: ExprKind::Field {
+                            obj: Box::new(e),
+                            name: seg[..end].to_string(),
+                        },
+                        span,
+                    };
+                    rest = &seg[end..];
+                }
+                return Some(e);
+            }
+            cut = path[..cut].rfind('.')?;
         }
     }
 
@@ -2729,12 +2997,46 @@ impl<'a> Gen<'a> {
                     return format!("rt_{name}_{sfx}({a})");
                 }
                 "close" => {
-                    return if self.expr_ty(&args[0]) == Ty::Chan {
+                    return if matches!(self.expr_ty(&args[0]), Ty::Chan(_)) {
                         format!("rt_close({})", argvs[0])
                     } else {
                         format!("close({})", argvs[0])
                     }
                 }
+                "mkchan" | "smkchan" => {
+                    let payload = args.first().and_then(|a| self.chan_payload_ty(a));
+                    let drop = payload.as_ref().map(|p| self.drop_sym(p))
+                        .unwrap_or_else(|| "0 /*no drop*/".into());
+                    let scoped = name == "smkchan";
+                    let (cap, sc) = if scoped {
+                        (args.get(1).map(|_| argvs[1].clone()).unwrap_or_else(|| "0LL".into()),
+                         args.get(2).map(|_| argvs[2].clone()).unwrap_or_else(|| "0LL".into()))
+                    } else {
+                        (args.get(1).map(|_| argvs[1].clone())
+                            .or_else(|| if payload.is_none() { argvs.first().cloned() } else { None })
+                            .unwrap_or_else(|| "0LL".into()),
+                         "0LL".into())
+                    };
+                    return format!("rt_mkchan_scoped((void*){sc}, {cap}, {drop})");
+                }
+                "send" => {
+                    return format!("rt_send({}, (int64_t)({}))", argvs[0], argvs[1]);
+                }
+                "try_send" => {
+                    return format!("rt_try_send({}, (int64_t)({}))", argvs[0], argvs[1]);
+                }
+                "recv" => {
+                    let ct = args.first().map(|a| self.expr_ty(a)).unwrap_or(Ty::Unknown);
+                    return match ct {
+                        Ty::Chan(Some(p)) => format!("(({})rt_recv({}))", self.cty(&p), argvs[0]),
+                        _ => format!("rt_recv({})", argvs[0]),
+                    };
+                }
+                "is_root" => return "rt_is_root()".into(),
+                "mkscope" => return "rt_scope_named()".into(),
+                "curscope" => return "rt_scope_current()".into(),
+                "scancel" => return format!("rt_scope_cancel((void*){})", argvs[0]),
+                "sjoin" => return format!("rt_scope_join_named((void*){})", argvs[0]),
                 "new" => {
                     if let ExprKind::Ident(sn) = &args[0].kind {
                         if self.structs.contains_key(sn.as_str()) {
@@ -2923,7 +3225,7 @@ impl<'a> Gen<'a> {
 
     /// is `n` a suspend point callee (susp fn or blocking builtin)?
     fn susp_name(&self, n: &str) -> bool {
-        self.susp.contains(n) || matches!(n, "recv" | "send" | "sleep" | "msleep")
+        self.susp.contains(n) || matches!(n, "recv" | "send" | "sleep" | "msleep" | "sjoin")
     }
 
     /// is this expr a call to a susp callee?
@@ -3300,12 +3602,14 @@ impl<'a> Gen<'a> {
                 self.env.pop();
                 out.push(Stmt::Unsafe { body: b2, span: *span });
             }
-            Stmt::Spawn { call, pinned, blocking, span } => {
+            Stmt::Spawn { call, scope, pinned, blocking, span } => {
                 let mut pre = Vec::new();
+                let s2 = scope.as_ref().map(|e| self.hoist_expr(e, &mut pre));
                 let c2 = self.hoist_call_args(call, &mut pre);
                 out.append(&mut pre);
                 out.push(Stmt::Spawn {
                     call: c2,
+                    scope: s2,
                     pinned: *pinned,
                     blocking: *blocking,
                     span: *span,
@@ -3478,29 +3782,66 @@ impl<'a> Gen<'a> {
         let k = self.state_ctr;
         self.state_ctr += 1;
         self.state_labels.push(k);
-        let _ = writeln!(self.out,
-            "    if (rt_cancelled()) {{ fr->cur_scope = tls_scope; tls_scope = saved; return RT_CANCEL; }}");
+        // sjoin's finish is the join's second half — a cancelled joiner
+        // still owes the named scope its teardown and the parent its
+        // hold release, so the join polls and finishes ahead of any
+        // cancel delivery (the cancel tree wakes joiners on drain).
+        if name != "sjoin" {
+            let _ = writeln!(self.out,
+                "    if (rt_cancelled()) {{ fr->cur_scope = tls_scope; tls_scope = saved; return RT_CANCEL; }}");
+        }
         let _ = writeln!(self.out, "    fr->state = {k};");
         let poll = match name {
             "recv" => format!("rt_recv_poll({}, task)", argvs[0]),
-            "send" => format!("rt_send_poll({}, {}, task)", argvs[0], argvs[1]),
+            "send" => format!("rt_send_poll({}, (int64_t)({}), task)", argvs[0], argvs[1]),
             "msleep" => format!("rt_msleep_poll({}, task)", argvs[0]),
+            "sjoin" => format!("rt_scope_join_poll((RtScope*){}, task)", argvs[0]),
             _ => format!("rt_sleep_poll({}, task)", argvs[0]),
         };
         let _ = writeln!(self.out,
             "    if ({poll} == RT_PENDING) {{ fr->cur_scope = tls_scope; tls_scope = saved; return RT_PENDING; }}");
         let _ = writeln!(self.out, "    s{k}: ;");
-        // a cancel-driven wake delivers no value — die at the resume point
-        let _ = writeln!(self.out,
-            "    if (rt_cancelled()) {{ fr->cur_scope = tls_scope; tls_scope = saved; return RT_CANCEL; }}");
+        let res = if name == "recv" {
+            match args.first().map(|a| self.expr_ty(a)) {
+                Some(Ty::Chan(Some(p))) => format!("({})rt_task_data(task)", self.cty(&p)),
+                _ => "rt_task_data(task)".into(),
+            }
+        } else if name == "sjoin" {
+            // join completed (that's what woke us) — run the teardown
+            // here on the joiner's thread; delivers the scope's trap code
+            format!("rt_scope_finish_named((void*){})", argvs[0])
+        } else {
+            "rt_task_data(task)".into()
+        };
+        if name == "sjoin" {
+            self.fsusp_dest(&dest, &res, name);
+            // scope finished — deliver a cancel that woke the join
+            let _ = writeln!(self.out,
+                "    if (rt_cancelled()) {{ fr->cur_scope = tls_scope; tls_scope = saved; return RT_CANCEL; }}");
+        } else {
+            // a cancel-driven wake delivers no value — die at the resume point
+            let _ = writeln!(self.out,
+                "    if (rt_cancelled()) {{ fr->cur_scope = tls_scope; tls_scope = saved; return RT_CANCEL; }}");
+            self.fsusp_dest(&dest, &res, name);
+        }
+    }
+
+    fn fsusp_dest(&mut self, dest: &FDest, res: &str, name: &str) {
         match dest {
             FDest::Field(fd) => {
-                let _ = writeln!(self.out, "    fr->{fd} = rt_task_data(task);");
+                let _ = writeln!(self.out, "    fr->{fd} = {res};");
             }
             FDest::Assign(tc) => {
-                let _ = writeln!(self.out, "    {tc} = rt_task_data(task);");
+                let _ = writeln!(self.out, "    {tc} = {res};");
             }
-            _ => {}
+            _ => {
+                // sjoin's finish is the join's second half — it must run
+                // even when the err result is discarded, or the named
+                // scope's parent hold leaks into the parent's join
+                if name == "sjoin" {
+                    let _ = writeln!(self.out, "    {res};");
+                }
+            }
         }
     }
 
@@ -3598,7 +3939,7 @@ impl<'a> Gen<'a> {
                     if let ExprKind::Call { f, args } = &init.kind {
                         if let ExprKind::Ident(n) = &f.kind {
                             let n = n.clone();
-                            if matches!(n.as_str(), "recv" | "send" | "sleep" | "msleep") {
+                            if matches!(n.as_str(), "recv" | "send" | "sleep" | "msleep" | "sjoin") {
                                 self.fsusp_leaf(&n, args, FDest::Field(fd));
                             } else if let Some((cn, recv)) = self.susp_call_plan(f, args) {
                                 self.fsusp_call(&cn, recv, args, FDest::Field(fd));
@@ -3705,7 +4046,7 @@ impl<'a> Gen<'a> {
                     if let ExprKind::Call { f, args } = &val.kind {
                         if let ExprKind::Ident(n) = &f.kind {
                             let n = n.clone();
-                            if matches!(n.as_str(), "recv" | "send" | "sleep" | "msleep") {
+                            if matches!(n.as_str(), "recv" | "send" | "sleep" | "msleep" | "sjoin") {
                                 self.fsusp_leaf(&n, args, FDest::Assign(tc));
                             } else if let Some((cn, recv)) = self.susp_call_plan(f, args) {
                                 self.fsusp_call(&cn, recv, args, FDest::Assign(tc));
@@ -3729,7 +4070,7 @@ impl<'a> Gen<'a> {
                     if let ExprKind::Call { f, args } = &e.kind {
                         if let ExprKind::Ident(n) = &f.kind {
                             let n = n.clone();
-                            if matches!(n.as_str(), "recv" | "send" | "sleep" | "msleep") {
+                            if matches!(n.as_str(), "recv" | "send" | "sleep" | "msleep" | "sjoin") {
                                 self.fsusp_leaf(&n, args, FDest::Void);
                             } else if let Some((cn, recv)) = self.susp_call_plan(f, args) {
                                 self.fsusp_call(&cn, recv, args, FDest::Void);
@@ -3784,7 +4125,7 @@ impl<'a> Gen<'a> {
                                     _ => "int64_t".to_string(),
                                 };
                                 let fd = self.fslot(&format!("_rv{n}"), &rt);
-                                if matches!(cn.as_str(), "recv" | "send" | "sleep" | "msleep") {
+                                if matches!(cn.as_str(), "recv" | "send" | "sleep" | "msleep" | "sjoin") {
                                     self.fsusp_leaf(&cn, args, FDest::Field(fd.clone()));
                                 } else {
                                     self.fsusp_call(&cn, crecv, args, FDest::Field(fd.clone()));
@@ -3897,7 +4238,7 @@ impl<'a> Gen<'a> {
                 self.fscope_stack.pop();
                 self.fscope_close(i);
             }
-            Stmt::Spawn { call, blocking, .. } => self.spawn(call, *blocking),
+            Stmt::Spawn { call, scope, blocking, .. } => self.spawn(call, scope.as_ref(), *blocking),
             Stmt::Select { arms, .. } => self.fselect(arms),
             Stmt::Unsafe { body, .. } => {
                 self.env.push(HashMap::new());
@@ -3978,10 +4319,14 @@ impl<'a> Gen<'a> {
         let _ = writeln!(self.out, "      default: goto {lend};\n    }}");
         for (i, arm) in arms.iter().enumerate() {
             let _ = writeln!(self.out, "    {}: ;", arm_labels[i]);
-            if let SelKind::Recv { bind: Some(name), .. } = &arm.kind {
-                let fd = self.fslot(name, "int64_t");
-                self.env.last_mut().unwrap().insert(name.clone(), Ty::Int);
-                let _ = writeln!(self.out, "    fr->{fd} = rt_task_data(task);");
+            if let SelKind::Recv { chan, bind: Some(name), .. } = &arm.kind {
+                let (ct, vt) = match self.expr_ty(chan) {
+                    Ty::Chan(Some(p)) => (self.cty(&p), (*p).clone()),
+                    _ => ("int64_t".into(), Ty::Int),
+                };
+                let fd = self.fslot(name, &ct);
+                self.env.last_mut().unwrap().insert(name.clone(), vt);
+                let _ = writeln!(self.out, "    fr->{fd} = ({ct})rt_task_data(task);");
             }
             self.env.push(HashMap::new());
             self.fslots.push(HashMap::new());

@@ -929,7 +929,12 @@ fn qualify_ty(
         ast::TyKind::Own(i) | ast::TyKind::Ref(i) | ast::TyKind::Mut(i) => {
             qualify_ty(i, renames, aliases, used)
         }
-        ast::TyKind::Chan => {}
+        ast::TyKind::Chan(p) => {
+            if let Some(t) = p.as_mut() {
+                qualify_ty(t.as_mut(), renames, aliases, used);
+            }
+        }
+        ast::TyKind::Scope => {}
         ast::TyKind::Slice(i) => qualify_ty(i, renames, aliases, used),
         ast::TyKind::Fn { params, ret } => {
             for p in params {
@@ -992,7 +997,14 @@ fn qualify_block(
             ast::Stmt::Scope { body, .. } | ast::Stmt::Unsafe { body, .. } => {
                 qualify_block(body, renames, aliases, locals, used)
             }
-            ast::Stmt::Spawn { call, .. } => qualify_expr(call, renames, aliases, locals, used),
+            ast::Stmt::Spawn { call, scope, .. } => {
+                qualify_expr(call, renames, aliases, locals, used);
+                // the `goin` scope expr names decls too — skipping it
+                // leaves imported scopes unqualified/misresolved
+                if let Some(s) = scope {
+                    qualify_expr(s, renames, aliases, locals, used);
+                }
+            }
             ast::Stmt::Defer { call, .. } => qualify_expr(call, renames, aliases, locals, used),
             ast::Stmt::Select { arms, .. } => {
                 for a in arms {

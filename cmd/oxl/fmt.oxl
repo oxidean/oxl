@@ -105,7 +105,7 @@ fn futf8_val(src: str, i: int) -> int {
 // the seed's keyword set — wider than lexlib's (defer/select/enum/match
 // are keywords there)
 fn fis_kw(w: str) -> bool {
-    return w == "fn" || w == "struct" || w == "extern" || w == "return" || w == "if" || w == "else" || w == "for" || w == "let" || w == "scope" || w == "spawn" || w == "go" || w == "own" || w == "ref" || w == "mut" || w == "unsafe" || w == "nil" || w == "true" || w == "false" || w == "import" || w == "package" || w == "chan" || w == "break" || w == "defer" || w == "continue" || w == "interface" || w == "spawnBlocking" || w == "select" || w == "enum" || w == "match"
+    return w == "fn" || w == "struct" || w == "extern" || w == "return" || w == "if" || w == "else" || w == "for" || w == "let" || w == "scope" || w == "spawn" || w == "go" || w == "own" || w == "ref" || w == "mut" || w == "unsafe" || w == "nil" || w == "true" || w == "false" || w == "import" || w == "package" || w == "chan" || w == "break" || w == "defer" || w == "continue" || w == "interface" || w == "spawnBlocking" || w == "select" || w == "enum" || w == "match" || w == "goin"
 }
 
 fn fstrip_us(s: str) -> str {
@@ -554,6 +554,7 @@ enum FSK {
     SScope { body: own FBlock },
     SUnsafe { body: own FBlock },
     SSpawn { call: own FX, blocking: int },
+    SGoIn { sc: own FX, call: own FX },
     SDefer { call: own FX },
     SSelect { arms: own SAL },
     SBreak,
@@ -853,6 +854,19 @@ fn fp_ty(p: mut FPar) -> own FTy {
         fbump(p)
         r := new(FTy)
         r.s = "chan"
+        if fat_kw(p, "own") {
+            inner := fp_ty(p)
+            if inner == nil {
+                return nil
+            }
+            r.s = "chan " + inner.s
+        }
+        return r
+    }
+    if fat_kw(p, "scope") {
+        fbump(p)
+        r := new(FTy)
+        r.s = "scope"
         return r
     }
     if fat_kw(p, "fn") {
@@ -1491,6 +1505,27 @@ fn fp_stmt(p: mut FPar) -> own FStmt {
                 return nil
             }
             return mkst(FSK.SSpawn{call: call, blocking: 1}, sp, 0, 0)
+        }
+        if t.txt == "goin" {
+            fbump(p)
+            if !fexpect_p(p, "(", "`(`") {
+                return nil
+            }
+            sc := fp_expr(p, 0, 0)
+            if sc == nil {
+                return nil
+            }
+            if !fexpect_p(p, ",", "`,`") {
+                return nil
+            }
+            call := fp_expr(p, 0, 1)
+            if call == nil {
+                return nil
+            }
+            if !fexpect_p(p, ")", "`)`") {
+                return nil
+            }
+            return mkst(FSK.SGoIn{sc: sc, call: call}, sp, 0, 0)
         }
         if t.txt == "select" {
             return fp_select(p, sp)
@@ -2859,6 +2894,9 @@ fn fstmt(f: mut Fmt2, st: own FStmt, ind: int) {
             } else {
                 fput(f, "spawn " + fexpr(f, call, ind))
             }
+        }
+        FSK.SGoIn{sc, call} => {
+            fput(f, "goin(" + fexpr(f, sc, ind) + ", " + fexpr(f, call, ind) + ")")
         }
         FSK.SDefer{call} => {
             fput(f, "defer " + fexpr(f, call, ind))

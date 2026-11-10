@@ -127,6 +127,10 @@ fn k_byte() -> int {
     return 19
 }
 
+fn k_scope() -> int {
+    return 20
+}
+
 // one pool record; i/r are ty handles (-1 unused), args an int list
 struct T { k: int, i: int, args: own IList, r: int, name: str }
 
@@ -438,6 +442,7 @@ struct Ck {
     retk: int, // current fn's return kind
     ret1: int,
     in_let2: int,
+    in_spawn: int, // inside `spawn`/`goin` callee — no calls edge (seed in_spawn)
     in_cl: int, // inside `{ |..| }` — ret feeds cl_ret
     cl_ret: int, // inferred closure return ty (-1 none)
     clcks: own ClChk, // deferred closure susp checks
@@ -832,7 +837,7 @@ fn ret_eq(ck: ref Ck, k1: int, r1: int, k2: int, r2: int) -> bool {
 fn op_ok(ck: ref Ck, op: str, t: int) -> bool {
     k := ck.tyv[t].k
     if op == "eq" {
-        return k == k_int() || k == k_bool() || k == k_str() || k == k_chan() || k == k_var() || k == k_float() || k == k_byte() || k == k_err()
+        return k == k_int() || k == k_bool() || k == k_str() || k == k_chan() || k == k_var() || k == k_float() || k == k_byte() || k == k_err() || k == k_scope()
     }
     if op == "ordered" {
         return k == k_int() || k == k_float() || k == k_byte() || k == k_str() || k == k_var()
@@ -1608,7 +1613,13 @@ fn ty_name(ck: ref Ck, t: int) -> str {
         return "byte"
     }
     if k == k_chan() {
+        if ck.tyv[t].i >= 0 {
+            return "chan " + ty_name(ck, ck.tyv[t].i)
+        }
         return "chan"
+    }
+    if k == k_scope() {
+        return "scope"
     }
     if k == k_shared() {
         return "shared"
@@ -1681,7 +1692,7 @@ fn assignable(ck: mut Ck, want: int, got: int) {
     }
     if !ok && gk == k_err() {
         // nil is the null pointer for owned/borrowed refs, chans, slices
-        ok = wk == k_own() || wk == k_ref() || wk == k_mut() || wk == k_chan() || wk == k_slice() || wk == k_shared()
+        ok = wk == k_own() || wk == k_ref() || wk == k_mut() || wk == k_chan() || wk == k_slice() || wk == k_shared() || wk == k_scope()
     }
     if !ok && wk == k_ref() {
         if gk == k_own() || gk == k_mut() || gk == k_ref() {
@@ -1715,7 +1726,7 @@ fn assignable(ck: mut Ck, want: int, got: int) {
 
 fn is_word(ck: ref Ck, t: int) -> bool {
     k := ck.tyv[t].k
-    return k == k_int() || k == k_bool() || k == k_chan() || k == k_own() || k == k_shared()
+    return k == k_int() || k == k_bool() || k == k_chan() || k == k_own() || k == k_shared() || k == k_scope()
 }
 
 // ---------- node helpers ----------
@@ -1742,6 +1753,7 @@ fn nk(n: ref parser.Node) -> int {
         parser.Node.Spawn{e} => 15
         parser.Node.SpawnBlocking{e} => 16
         parser.Node.Go{e} => 17
+        parser.Node.GoIn{sc} => 50
         parser.Node.Let2{names} => 18
         parser.Node.Bind{name} => 19
         parser.Node.ExprStmt{e} => 20
@@ -1975,6 +1987,12 @@ fn ty_parse(ck: mut Ck, s: str) -> int {
             return ti(ck, k_mut(), ty_parse(ck, rest))
         }
     }
+    if len(s) > 4 && substr(s, 0, 4) == "chan" && byteat(s, 4) == 32 {
+        return ti(ck, k_chan(), ty_parse(ck, strings.trim(substr(s, 5, len(s)))))
+    }
+    if s == "scope" {
+        return tk(ck, k_scope())
+    }
     if len(s) > 2 && substr(s, 0, 2) == "[]" {
         return ti(ck, k_slice(), ty_parse(ck, substr(s, 2, len(s))))
     }
@@ -2084,6 +2102,29 @@ fn ty_parse(ck: mut Ck, s: str) -> int {
 }
 
 // variant ctor lookup `E.V` — returns the enum-table idx or -1
+// `==` semantics gate: an enum with any payload-carrying variant
+// can't tag-compare (seed's BinOp::Eq check mirrors this).
+fn enum_has_payload(ck: ref Ck, t: int) -> bool {
+    if ck.tyv[t].k != k_enum() {
+        return false
+    }
+    if !collections.map_has(ck.enums, ck.tyv[t].name) {
+        return false
+    }
+    [ei, err] = collections.map_get(ck.enums, ck.tyv[t].name)
+    if err != nil {
+        return false
+    }
+    vl := ck.enumsv[ei].vars
+    for vl != nil {
+        if vl.v.fields != nil {
+            return true
+        }
+        vl = vl.next
+    }
+    return false
+}
+
 fn enum_variant(ck: ref Ck, path: str) -> int {
     ld := last_dot(path)
     if ld < 0 {
@@ -2594,11 +2635,11 @@ fn register(ck: mut Ck, its: []It) {
 
 // ---------- builtins ----------
 fn is_builtin(n: str) -> bool {
-    return n == "print" || n == "println" || n == "mkchan" || n == "send" || n == "recv" || n == "close" || n == "sleep" || n == "msleep" || n == "new" || n == "mkslice" || n == "push" || n == "assert" || n == "itoa" || n == "argc" || n == "argv" || n == "len" || n == "byteat" || n == "substr" || n == "find" || n == "atoi" || n == "mkbuf" || n == "bufstr" || n == "poke8" || n == "poke16" || n == "poke32" || n == "htons" || n == "htonl" || n == "cstr" || n == "sqlite_open" || n == "str" || n == "sqlite_exec" || n == "sqlite_exec_bind" || n == "set_rcvtimo" || n == "set_rcvtimo_ms" || n == "set_sndtimo" || n == "sqlite_query" || n == "sqlite_close" || n == "readfile" || n == "writefile" || n == "exit" || n == "mkshared" || n == "sget" || n == "sset" || n == "scas" || n == "sadd" || n == "now" || n == "now_ms" || n == "usleep" || n == "ftoi" || n == "itof" || n == "atof" || n == "ftoa"
+    return n == "print" || n == "println" || n == "mkchan" || n == "send" || n == "recv" || n == "close" || n == "sleep" || n == "msleep" || n == "new" || n == "mkslice" || n == "push" || n == "assert" || n == "itoa" || n == "argc" || n == "argv" || n == "len" || n == "byteat" || n == "substr" || n == "find" || n == "atoi" || n == "mkbuf" || n == "bufstr" || n == "poke8" || n == "poke16" || n == "poke32" || n == "htons" || n == "htonl" || n == "cstr" || n == "sqlite_open" || n == "str" || n == "sqlite_exec" || n == "sqlite_exec_bind" || n == "set_rcvtimo" || n == "set_rcvtimo_ms" || n == "set_sndtimo" || n == "sqlite_query" || n == "sqlite_close" || n == "readfile" || n == "writefile" || n == "exit" || n == "mkshared" || n == "sget" || n == "sset" || n == "scas" || n == "sadd" || n == "now" || n == "now_ms" || n == "usleep" || n == "ftoi" || n == "itof" || n == "atof" || n == "ftoa" || n == "smkchan" || n == "try_send" || n == "mkscope" || n == "sjoin" || n == "scancel" || n == "is_root" || n == "curscope"
 }
 
 fn is_susp_builtin(n: str) -> bool {
-    return n == "recv" || n == "send" || n == "sleep" || n == "msleep"
+    return n == "recv" || n == "send" || n == "sleep" || n == "msleep" || n == "sjoin"
 }
 
 // ---------- expressions ----------
@@ -2974,6 +3015,11 @@ fn bin_expr(ck: mut Ck, op: str, l: ref parser.Node, r: ref parser.Node, env: mu
             diag(ck, "type", "fn values aren't comparable (v0.2)")
         } else if lk == k_iface() && rk != k_err() || rk == k_iface() && lk != k_err() {
             diag(ck, "type", "iface values aren't comparable except against nil (v0.2)")
+        } else if lk == k_enum() && enum_has_payload(ck, lt) {
+            // `==` on a payload enum can't be a tag compare — it
+            // needs deep equality the language doesn't define.
+            // Unit enums compare fine (tag is the whole value).
+            diag(ck, "type", "`" + ty_name(ck, lt) + "` has payload variants — compare enums with `match`, not `==`")
         } else {
             assignable(ck, lt, rt)
         }
@@ -3418,7 +3464,10 @@ fn call(ck: mut Ck, f: ref parser.Node, args: ref parser.NList, env: mut Env) ->
                 }
             }
         }
-        if collections.map_has(ck.fns, qn) {
+        if collections.map_has(ck.fns, qn) && ck.in_spawn == 0 {
+            // no calls edge on the spawn callee: it runs on its own
+            // task, so its susp must not propagate to the caller —
+            // `goin`'s susp gate reads the callee's susp directly.
             add_edge(ck, qn)
         }
         // ---------- builtin table ----------
@@ -3434,28 +3483,103 @@ fn call(ck: mut Ck, f: ref parser.Node, args: ref parser.NList, env: mut Env) ->
             }
             return t_void(ck)
         }
-        if qn == "mkchan" {
-            if nl_len(args) > 1 {
-                diag(ck, "check", "`mkchan` takes at most one capacity arg")
+        if qn == "mkchan" || qn == "smkchan" {
+            // mkchan(cap?) — bare word chan
+            // mkchan(T, cap?) | mkchan(own T, cap?) — typed payload chan
+            // smkchan(T, cap, scope) — typed chan owned by a named scope
+            scoped := qn == "smkchan"
+            rest := args
+            payload := -1
+            if rest != nil {
+                pt := chan_payload_arg(ck, rest.v)
+                if pt >= 0 {
+                    payload = pt
+                    rest = rest.next
+                } else if scoped {
+                    diag(ck, "check", "`smkchan` takes a payload type — smkchan(Event, cap, sc)")
+                }
             }
-            if args != nil {
-                assignable(ck, t_int(ck), expr(ck, args.v, env))
+            cap_a := rest
+            let sc_a: ref parser.NList = nil
+            if scoped {
+                if nl_len(rest) < 2 {
+                    diag(ck, "check", "`smkchan` takes (T, cap, scope)")
+                }
+                if rest != nil {
+                    sc_a = rest.next
+                }
+            }
+            if cap_a != nil {
+                assignable(ck, t_int(ck), expr(ck, cap_a.v, env))
+            }
+            if sc_a != nil {
+                assignable(ck, tk(ck, k_scope()), expr(ck, sc_a.v, env))
+            }
+            want := 1
+            if scoped {
+                want = 2
+            }
+            if nl_len(rest) > want {
+                diag(ck, "check", "`" + qn + "` takes too many args")
+            }
+            if payload >= 0 {
+                return ti(ck, k_chan(), payload)
             }
             return tk(ck, k_chan())
         }
-        if qn == "send" {
+        if qn == "send" || qn == "try_send" {
             if nl_len(args) != 2 {
-                diag(ck, "check", "`send` takes (chan, value)")
+                diag(ck, "check", "`" + qn + "` takes (chan, value)")
             } else {
-                assignable(ck, tk(ck, k_chan()), expr(ck, args.v, env))
+                ct := expr(ck, args.v, env)
+                if ct >= 0 && ck.tyv[ct].k != k_chan() && ck.tyv[ct].k != k_unk() {
+                    diag(ck, "type", "expected `chan`, found `" + ty_name(ck, ct) + "`")
+                }
                 vt := expr(ck, args.next.v, env)
-                if !is_word(ck, vt) {
+                if ct >= 0 && ck.tyv[ct].k == k_chan() && ck.tyv[ct].i >= 0 {
+                    assignable(ck, ck.tyv[ct].i, vt)
+                } else if !is_word(ck, vt) {
                     diag(ck, "own", "channels carry word-sized owned values (v0), not `" + ty_name(ck, vt) + "`")
                 }
+                // try_send statically always moves — a `false` result
+                // drops the payload by disuse (v0 semantics)
+                move_own(ck, args.next.v, env)
+            }
+            if qn == "try_send" {
+                return t_bool(ck)
             }
             return t_void(ck)
         }
         if qn == "recv" {
+            if args != nil {
+                ct := expr(ck, args.v, env)
+                if ct >= 0 && ck.tyv[ct].k == k_chan() && ck.tyv[ct].i >= 0 {
+                    return ck.tyv[ct].i
+                }
+            }
+            return t_int(ck)
+        }
+        if qn == "mkscope" || qn == "curscope" {
+            if args != nil {
+                diag(ck, "check", "`" + qn + "` takes no arguments")
+            }
+            return tk(ck, k_scope())
+        }
+        if qn == "is_root" {
+            if args != nil {
+                diag(ck, "check", "`is_root` takes no arguments")
+            }
+            return t_bool(ck)
+        }
+        if qn == "scancel" || qn == "sjoin" {
+            if nl_len(args) != 1 {
+                diag(ck, "check", "`" + qn + "` takes (scope)")
+            } else {
+                assignable(ck, tk(ck, k_scope()), expr(ck, args.v, env))
+            }
+            if qn == "scancel" {
+                return t_void(ck)
+            }
             return t_int(ck)
         }
         if qn == "close" {
@@ -3796,7 +3920,10 @@ fn call(ck: mut Ck, f: ref parser.Node, args: ref parser.NList, env: mut Env) ->
         if recv != nil && wl != nil {
             // receiver slot: `*x`/`&x` adapt — `&` needs an lvalue
             want := subst_ty(ck, wl.v, bind)
+            sp := ck.in_spawn
+            ck.in_spawn = 0
             got := expr(ck, recv, env)
+            ck.in_spawn = sp
             wk2 := ck.tyv[want].k
             gk2 := ck.tyv[got].k
             if (wk2 == k_own() || wk2 == k_ref() || wk2 == k_mut()) && (gk2 == k_struct() || gk2 == k_enum()) && !is_lvalue(recv) {
@@ -3805,13 +3932,25 @@ fn call(ck: mut Ck, f: ref parser.Node, args: ref parser.NList, env: mut Env) ->
             got = recv_adapt_ty(ck, want, got)
             assignable(ck, want, got)
             move_for(ck, recv, want, env)
+            if sp != 0 && (wk2 == k_slice() || wk2 == k_ref() || wk2 == k_mut()) {
+                diag(ck, "check", "`spawn` arg of `[]T`/`ref`/`mut` escapes into the task — the backing dies with the scope; pass `own` or a value")
+            }
             wl = wl.next
         }
         for al != nil && wl != nil {
             want := subst_ty(ck, wl.v, bind)
+            sp := ck.in_spawn
+            ck.in_spawn = 0
             gt := expr(ck, al.v, env)
+            ck.in_spawn = sp
             assignable(ck, want, gt)
             move_for(ck, al.v, want, env)
+            if sp != 0 {
+                wk3 := ck.tyv[want].k
+                if wk3 == k_slice() || wk3 == k_ref() || wk3 == k_mut() {
+                    diag(ck, "check", "`spawn` arg of `[]T`/`ref`/`mut` escapes into the task — the backing dies with the scope; pass `own` or a value")
+                }
+            }
             wl = wl.next
             al = al.next
         }
@@ -3848,8 +3987,17 @@ fn call_fnvalue(ck: mut Ck, ps: ref IList, r: int, args: ref parser.NList, env: 
     wl := ps
     al := args
     for al != nil && wl != nil {
+        sp := ck.in_spawn
+        ck.in_spawn = 0
         gt := expr(ck, al.v, env)
+        ck.in_spawn = sp
         assignable(ck, wl.v, gt)
+        if sp != 0 {
+            wk4 := ck.tyv[wl.v].k
+            if wk4 == k_slice() || wk4 == k_ref() || wk4 == k_mut() {
+                diag(ck, "check", "`spawn` arg of `[]T`/`ref`/`mut` escapes into the task — the backing dies with the scope; pass `own` or a value")
+            }
+        }
         wl = wl.next
         al = al.next
     }
@@ -4083,6 +4231,9 @@ fn stmt(ck: mut Ck, s: ref parser.Node, env: mut Env) {
         parser.Node.Go{e} => {
             spawn_stmt(ck, e, env)
         }
+        parser.Node.GoIn{sc, e} => {
+            goin_stmt(ck, sc, e, env)
+        }
         parser.Node.Bind{name, init, lo, hi} => {
             t := expr(ck, init, env)
             env_set(env, name, t, lo, hi)
@@ -4107,20 +4258,67 @@ fn stmt(ck: mut Ck, s: ref parser.Node, env: mut Env) {
 
 fn spawn_stmt(ck: mut Ck, e: ref parser.Node, env: mut Env) {
     if e != nil && nk(e) == 8 {
+        // no calls edge: spawn doesn't suspend the caller, so the
+        // callee's susp must not propagate here — `goin`'s susp gate
+        // reads ck.susp directly in the post-pass scan.
+        ck.in_spawn = 1
+        expr(ck, e, env)
+        ck.in_spawn = 0
+        return
+    }
+    diag(ck, "check", "`spawn` requires a call")
+}
+
+// goin(sc, f(args)) — scope arg must be a named-scope handle; the call
+// gets the same edge+walk as spawn. The susp-callee gate runs in the
+// post-pass scan (susp isn't final at stmt time).
+fn goin_stmt(ck: mut Ck, sc: ref parser.Node, e: ref parser.Node, env: mut Env) {
+    assignable(ck, tk(ck, k_scope()), expr(ck, sc, env))
+    // a fn-valued local shadows the susp callee's name — the spawned
+    // task would bind the caller's scope, not sc. The post-pass gate
+    // only sees the resolved name, so the shadow check lives here.
+    if e != nil && nk(e) == 8 {
         match e {
-            parser.Node.Call{f, args} => {
+            parser.Node.Call{f} => {
                 n := callee_name(f)
-                if len(n) > 0 {
-                    add_edge(ck, resolve_named(ck, n))
+                lt := env_get(ck, env, n)
+                if len(n) > 0 && lt >= 0 && ck.tyv[lt].k == k_fn() {
+                    diag(ck, "check", "`goin` requires a susp fn call — `" + n + "` resolves to a local fn value")
                 }
             }
             _ => {
             }
         }
-        expr(ck, e, env)
-        return
     }
-    diag(ck, "check", "`spawn` requires a call")
+    spawn_stmt(ck, e, env)
+}
+
+// type-argument to mkchan/smkchan: `Event` (Ident/Field → own Event) or
+// a Ty literal already carrying `own`. Returns the payload ty (own T)
+// or -1 when the arg isn't a type literal.
+fn chan_payload_arg(ck: mut Ck, a: ref parser.Node) -> int {
+    if a == nil {
+        return -1
+    }
+    if nk(a) == 2 || nk(a) == 9 {
+        an := callee_name(a)
+        n := resolve_named(ck, an)
+        if collections.map_has(ck.structs, n) {
+            return ti(ck, k_own(), tn(ck, k_struct(), n))
+        }
+        if collections.map_has(ck.enums, n) {
+            return ti(ck, k_own(), tn(ck, k_enum(), n))
+        }
+        return -1
+    }
+    if nk(a) == 3 {
+        t := ty_parse(ck, ty_str(a))
+        if t >= 0 && ck.tyv[t].k == k_own() {
+            return t
+        }
+        diag(ck, "check", "chan payload must be an owned type — `own T`")
+    }
+    return -1
 }
 
 fn add_edge(ck: mut Ck, callee: str) {
@@ -4500,6 +4698,11 @@ fn cl_scan_stmt(ck: mut Ck, s: ref parser.Node, cc: mut ClChk) {
             cc.seeded = 1
             cl_scan_expr(ck, e, cc)
         }
+        parser.Node.GoIn{sc, e} => {
+            cc.seeded = 1
+            cl_scan_expr(ck, sc, cc)
+            cl_scan_expr(ck, e, cc)
+        }
         parser.Node.Select{arms} => {
             cc.seeded = 1
             a := arms
@@ -4564,10 +4767,17 @@ fn sel_stmt(ck: mut Ck, arms: ref parser.NList, env: mut Env) {
                     if ch == nil {
                         diag(ck, "check", "select arm must be `recv(ch)`, `timeout(ms)`, or `else`")
                     } else {
-                        assignable(ck, tk(ck, k_chan()), expr(ck, ch, env))
+                        ct := expr(ck, ch, env)
+                        if ct >= 0 && ck.tyv[ct].k != k_chan() && ck.tyv[ct].k != k_unk() {
+                            diag(ck, "type", "expected `chan`, found `" + ty_name(ck, ct) + "`")
+                        }
                         if len(bind) > 0 {
+                            bt := t_int(ck)
+                            if ct >= 0 && ck.tyv[ct].k == k_chan() && ck.tyv[ct].i >= 0 {
+                                bt = ck.tyv[ct].i
+                            }
                             blo := parser.nhi(ch) + 1
-                            env_set(env, bind, t_int(ck), blo, blo + len(bind))
+                            env_set(env, bind, bt, blo, blo + len(bind))
                         }
                     }
                 }
@@ -4634,6 +4844,7 @@ fn stmt_susp(ck: ref Ck, s: ref parser.Node) -> bool {
         parser.Node.Spawn{e} => expr_susp(ck, e)
         parser.Node.SpawnBlocking{e} => expr_susp(ck, e)
         parser.Node.Go{e} => expr_susp(ck, e)
+        parser.Node.GoIn{sc, e} => expr_susp(ck, sc) || expr_susp(ck, e)
         parser.Node.Defer{call} => expr_susp(ck, call)
         parser.Node.ExprStmt{e} => expr_susp(ck, e)
         parser.Node.Assign{val} => expr_susp(ck, val)
@@ -4847,6 +5058,7 @@ fn stmt_has_susp(ck: mut Ck, s: ref parser.Node) -> bool {
         parser.Node.Spawn{e} => expr_has_susp(ck, e)
         parser.Node.SpawnBlocking{e} => expr_has_susp(ck, e)
         parser.Node.Go{e} => expr_has_susp(ck, e)
+        parser.Node.GoIn{sc, e} => expr_has_susp(ck, sc) || expr_has_susp(ck, e)
         parser.Node.ExprStmt{e} => expr_has_susp(ck, e)
         parser.Node.Assign{val} => expr_has_susp(ck, val)
         parser.Node.Let{init} => expr_has_susp(ck, init)
@@ -5014,6 +5226,26 @@ fn walk_block(ck: mut Ck, items: ref parser.NList) {
                 scan_match(ck, e, false)
             }
             parser.Node.Go{e} => {
+                scan_match(ck, e, false)
+            }
+            parser.Node.GoIn{sc, e} => {
+                scan_match(ck, sc, false)
+                // goin binds the task's scope at frame creation — only the
+                // susp-callee path has a frame to bind
+                ok := false
+                if e != nil && nk(e) == 8 {
+                    match e {
+                        parser.Node.Call{f} => {
+                            n := resolve_named(ck, callee_name(f))
+                            ok = len(n) > 0 && sl_has(ck.susp, n)
+                        }
+                        _ => {
+                        }
+                    }
+                }
+                if !ok {
+                    diag(ck, "check", "`goin` requires a susp fn call — the scope binds at frame-task creation")
+                }
                 scan_match(ck, e, false)
             }
             parser.Node.Ret{vals} => {

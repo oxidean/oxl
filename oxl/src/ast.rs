@@ -162,7 +162,10 @@ pub enum TyKind {
     Own(Box<TyRef>),
     Ref(Box<TyRef>),
     Mut(Box<TyRef>),
-    Chan,
+    /// `chan` (bare word channel) | `chan own T` (typed payload channel)
+    Chan(Option<Box<TyRef>>),
+    /// `scope` — named child-scope handle (mkscope/goin/scancel/sjoin)
+    Scope,
     Slice(Box<TyRef>),
     /// `fn(int, int) -> bool` / `fn(a: int) -> int` — fn value type;
     /// ret None = void. `[T, err]` returns are not supported in v0.2.
@@ -176,7 +179,9 @@ pub fn ty_text(t: &TyRef) -> String {
         TyKind::Own(i) => format!("own {}", ty_text(i)),
         TyKind::Ref(i) => format!("ref {}", ty_text(i)),
         TyKind::Mut(i) => format!("mut {}", ty_text(i)),
-        TyKind::Chan => "chan".into(),
+        TyKind::Chan(None) => "chan".into(),
+        TyKind::Chan(Some(p)) => format!("chan {}", ty_text(p)),
+        TyKind::Scope => "scope".into(),
         TyKind::Slice(i) => format!("[]{}", ty_text(i)),
         TyKind::Fn { params, ret } => {
             let ps = params.iter().map(ty_text).collect::<Vec<_>>().join(", ");
@@ -240,7 +245,7 @@ pub enum Stmt {
     If { cond: Expr, then: Block, els: Option<Block>, span: Span },
     For { cond: Expr, body: Block, span: Span },
     Scope { body: Block, span: Span },
-    Spawn { call: Expr, pinned: bool, blocking: bool, span: Span },
+    Spawn { call: Expr, scope: Option<Expr>, pinned: bool, blocking: bool, span: Span },
     Select { arms: Vec<SelectArm>, span: Span },
     Defer { call: Expr, span: Span },
     Unsafe { body: Block, span: Span },

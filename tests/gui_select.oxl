@@ -1,0 +1,75 @@
+package main
+
+// gui_select — the G3 select-composability gate: a `chan own
+// gui.Event` must sit in one `select` next to an app's own
+// channels. A spawned ticker feeds a bare word chan; the app
+// asserts both arms fire before stopping the backend.
+import "github.com/oxidean/oxl/extra/gui"
+
+import "github.com/oxidean/oxl/extra/gui/mock"
+
+import "std/time"
+
+let g_m: mock.Mock = mock.backend()
+
+let g_tick: chan = nil
+
+fn ticker() {
+    time.sleep_ms(20)
+    send(g_tick, 1)
+}
+
+fn ui(events: chan own gui.Event) {
+    [w, e1] = gui.window("t")
+    [b, e2] = gui.button("b")
+    if e1 != nil || e2 != nil {
+        gui.stop()
+        return
+    }
+    gui.append(w, b)
+    ev := new(gui.Event)
+    ev.kind = gui.EventKind.clicked
+    ev.target = b.handle()
+    ev.data = gui.EventData.None
+    g_m.inject(ev)
+
+    got_ui := 0
+    got_tick := 0
+    for got_ui == 0 || got_tick == 0 {
+        select {
+            e := recv(events) => {
+                if e == nil {
+                    println("events closed early")
+                    got_ui = -1
+                } else if e.kind == gui.EventKind.clicked {
+                    got_ui = 1
+                }
+            }
+            t := recv(g_tick) => {
+                if t != 0 {
+                    got_tick = 1
+                }
+            }
+        }
+    }
+    if got_ui == 1 && got_tick == 1 {
+        println("select ok")
+    }
+    gui.stop()
+}
+
+fn app(events: chan own gui.Event) {
+    spawn ui(events)
+}
+
+fn main() {
+    g_m = mock.backend()
+    g_tick = mkchan(1)
+    spawn ticker()
+    e := gui.run(g_m, app)
+    if e != nil {
+        println("run err")
+        return
+    }
+    println("done")
+}

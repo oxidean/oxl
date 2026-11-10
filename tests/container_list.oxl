@@ -1,0 +1,146 @@
+package main
+
+// container/list — doubly-linked list: traversal both directions,
+// inserts around marks, removes returning payloads, in-place moves,
+// whole-list splices; removed handles go inert.
+//
+// `l.remove(l.front())`-style nesting is a borrow-aliasing trap
+// (the front() borrow is live for the whole remove() call), so mut
+// calls get their handles hoisted — same rule everywhere `own` args
+// meet ref/mut params.
+import "std/container/list"
+
+fn main() {
+    l := list.newlist()
+    assert(l.len() == 0)
+    assert(l.front() == -1 && l.back() == -1)
+
+    a := l.pushback(1)
+    b := l.pushback(3)
+    l.pushfront(0)
+    c := l.pushback(5)
+    // insert 2 before b, 4 after b -> [0,1,2,3,4,5]
+    [i2, e2] = l.insertbefore(2, b)
+    assert(e2 == nil)
+    [i4, e4] = l.insertafter(4, b)
+    assert(e4 == nil)
+    assert(l.len() == 6)
+    assert(l.val(l.front()) == 0)
+    assert(l.val(l.back()) == 5)
+
+    // forward walk
+    i := l.front()
+    want := 0
+    for i != -1 {
+        assert(l.val(i) == want)
+        want = want + 1
+        i = l.next(i)
+    }
+    assert(want == 6)
+
+    // backward walk
+    i = l.back()
+    want = 5
+    for i != -1 {
+        assert(l.val(i) == want)
+        want = want - 1
+        i = l.prev(i)
+    }
+    assert(want == -1)
+
+    // the walk ends past both ends, like Go's nil *Element
+    assert(l.prev(l.front()) == -1)
+    assert(l.next(l.back()) == -1)
+
+    // payload write/read through the handle
+    l.setval(i2, 20)
+    assert(l.val(i2) == 20)
+    l.setval(i2, 2)
+
+    // remove head, tail — returns payloads, len tracks
+    f := l.front()
+    [v0, e0] = l.remove(f)
+    assert(e0 == nil && v0 == 0)
+    [v5, e5] = l.remove(c)
+    assert(e5 == nil && v5 == 5)
+    assert(l.len() == 4)
+    // list now [1,2,3,4]
+    assert(l.val(l.front()) == 1)
+    assert(l.val(l.back()) == 4)
+
+    // a removed handle is dead: reads -1/0, re-remove errs
+    [_, e5b] = l.remove(c)
+    assert(e5b != nil)
+    assert(l.next(c) == -1)
+    assert(l.prev(c) == -1)
+    assert(l.val(c) == 0)
+    l.setval(c, 99) // no-op on a dead handle
+
+    // moveto* reorder in place — list is [1,2,3,4]
+    l.movetofront(i4) // [4,1,2,3]
+    assert(l.val(l.front()) == 4)
+    l.movetoback(i4) // [1,2,3,4]
+    assert(l.val(l.back()) == 4)
+    l.movebefore(i4, a) // [4,1,2,3]
+    assert(l.val(l.front()) == 4 && l.prev(a) == i4)
+    l.moveafter(i4, b) // [1,2,3,4]
+    assert(l.next(b) == i4 && l.val(l.back()) == 4)
+    l.moveafter(i4, i4) // self move is a no-op
+    assert(l.next(b) == i4)
+
+    // remove middle -> [1,3,4]
+    [v2, e2b] = l.remove(i2)
+    assert(e2b == nil && v2 == 2)
+    assert(l.next(a) == b)
+    assert(l.prev(b) == a)
+
+    // whole-list splices — PushBackList/PushFrontList
+    m := list.newlist()
+    m.pushback(10)
+    m.pushback(11)
+    l.pushbacklist(m) // [1,3,4,10,11]
+    assert(l.len() == 5)
+    assert(l.val(l.back()) == 11)
+    n := list.newlist()
+    n.pushback(-1)
+    n.pushback(-2)
+    l.pushfrontlist(n) // [-1,-2,1,3,4,10,11]
+    assert(l.len() == 7)
+    assert(l.val(l.front()) == -1)
+    assert(l.val(l.next(l.front())) == -2)
+
+    // drain everything off the head
+    for l.front() != -1 {
+        h := l.front()
+        [_, de] = l.remove(h)
+        assert(de == nil)
+    }
+    assert(l.len() == 0)
+    assert(l.front() == -1 && l.back() == -1)
+
+    // inserts at a dead mark err instead of corrupting
+    [_, ie] = l.insertbefore(9, i2)
+    assert(ie != nil)
+    [_, ie2] = l.insertafter(9, i2)
+    assert(ie2 != nil)
+
+    // churn reuses nodes: 2000 push/remove cycles keep the arena
+    // bounded at the high-water mark, not one slot per op
+    i = 0
+    for i < 2000 {
+        h2 := l.pushback(i)
+        if i % 3 == 0 {
+            [_, re] = l.remove(h2)
+            assert(re == nil)
+        }
+        i = i + 1
+    }
+    for l.front() != -1 {
+        h3 := l.front()
+        [_, de2] = l.remove(h3)
+        assert(de2 == nil)
+    }
+    assert(l.len() == 0)
+
+    println("list ok")
+}

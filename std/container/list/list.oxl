@@ -1,0 +1,273 @@
+package list
+
+// std/container/list — Go's container/list: a doubly-linked list.
+//
+// Element handles are ints, not *Element: `ref`/`mut` may not be
+// stored in heap objects, so prev/next are links into the list's
+// node arena and -1 plays nil. `remove` recycles nodes through a
+// freelist, bounding the arena at the high-water mark — the same
+// call std/collections made. A removed handle is dead: readers
+// return -1/0, mutators no-op or report err.
+//
+// Payloads are int only in v0 — rich values wait on payload
+// generics, like std/collections' map values.
+//
+//   l := list.newlist()
+//   a := l.pushback(1)
+//   l.pushback(2)
+//   i := l.front()
+//   for i != -1 {
+//       println(itoa(l.val(i)))
+//       i = l.next(i)
+//   }
+
+// Node is a link cell: v the payload, prev/next arena indices,
+// live marks the cell in the list (0 = on the freelist).
+struct Node { v: int, prev: int, next: int, live: int }
+
+/// List is a doubly-linked list; create with newlist.
+struct List { ns: []Node, head: int, tail: int, free: int, n: int }
+
+/// newlist returns an empty list — list.New.
+fn newlist() -> own List {
+    l := new(List)
+    l.ns = mkslice(Node, 0)
+    l.head = -1
+    l.tail = -1
+    l.free = -1
+    l.n = 0
+    return l
+}
+
+/// len returns the element count — List.Len.
+fn (l ref List) len() -> int {
+    return l.n
+}
+
+/// front returns the first element's handle, or -1 when empty —
+// List.Front.
+fn (l ref List) front() -> int {
+    return l.head
+}
+
+/// back returns the last element's handle, or -1 when empty —
+// List.Back.
+fn (l ref List) back() -> int {
+    return l.tail
+}
+
+// ok reports whether i names a live element of this list. A stale
+// handle fails here only until its slot is reused — recycling makes
+// old handles indistinguishable, same caveat as Go's removed
+// *Element.
+fn (l ref List) ok(i: int) -> bool {
+    return i >= 0 && i < len(l.ns) && l.ns[i].live == 1
+}
+
+/// next returns the handle after i, or -1 at the tail (or when i
+/// names no live element) — Element.Next.
+fn (l ref List) next(i: int) -> int {
+    if !l.ok(i) {
+        return -1
+    }
+    return l.ns[i].next
+}
+
+/// prev returns the handle before i, or -1 at the head —
+/// Element.Prev.
+fn (l ref List) prev(i: int) -> int {
+    if !l.ok(i) {
+        return -1
+    }
+    return l.ns[i].prev
+}
+
+/// val returns element i's payload — Element.Value. A dead handle
+/// reads 0.
+fn (l ref List) val(i: int) -> int {
+    if !l.ok(i) {
+        return 0
+    }
+    return l.ns[i].v
+}
+
+/// setval writes element i's payload; a dead handle is a no-op.
+fn (l mut List) setval(i: int, v: int) {
+    if !l.ok(i) {
+        return
+    }
+    l.ns[i].v = v
+}
+
+// alloc recycles a freelist node before growing the arena — churn
+// stays bounded at the high-water mark (see List.free).
+fn (l mut List) alloc(v: int) -> int {
+    i := l.free
+    if i != -1 {
+        l.free = l.ns[i].next
+    } else {
+        i = len(l.ns)
+        l.ns = push(l.ns, Node{v: 0, prev: -1, next: -1, live: 0})
+    }
+    l.ns[i].v = v
+    l.ns[i].prev = -1
+    l.ns[i].next = -1
+    l.ns[i].live = 1
+    return i
+}
+
+// splice links node i between a and b — the only pointer fixup in
+// the package, so every op below is one-liners on it.
+fn (l mut List) splice(i: int, a: int, b: int) {
+    l.ns[i].prev = a
+    l.ns[i].next = b
+    if a != -1 {
+        l.ns[a].next = i
+    } else {
+        l.head = i
+    }
+    if b != -1 {
+        l.ns[b].prev = i
+    } else {
+        l.tail = i
+    }
+}
+
+// unlink detaches node i, fixing head/tail. The caller handles the
+// freelist push — this only cuts links.
+fn (l mut List) unlink(i: int) {
+    a := l.ns[i].prev
+    b := l.ns[i].next
+    if a != -1 {
+        l.ns[a].next = b
+    } else {
+        l.head = b
+    }
+    if b != -1 {
+        l.ns[b].prev = a
+    } else {
+        l.tail = a
+    }
+    l.ns[i].prev = -1
+    l.ns[i].next = -1
+}
+
+/// pushfront inserts v at the head and returns its handle —
+/// List.PushFront.
+fn (l mut List) pushfront(v: int) -> int {
+    i := l.alloc(v)
+    l.splice(i, -1, l.head)
+    l.n = l.n + 1
+    return i
+}
+
+/// pushback inserts v at the tail and returns its handle —
+/// List.PushBack.
+fn (l mut List) pushback(v: int) -> int {
+    i := l.alloc(v)
+    l.splice(i, l.tail, -1)
+    l.n = l.n + 1
+    return i
+}
+
+/// insertbefore inserts v immediately before mark — List.InsertBefore.
+/// err when mark names no live element.
+fn (l mut List) insertbefore(v: int, mark: int) -> [int, err] {
+    if !l.ok(mark) {
+        return -1, 1
+    }
+    i := l.alloc(v)
+    l.splice(i, l.ns[mark].prev, mark)
+    l.n = l.n + 1
+    return i, nil
+}
+
+/// insertafter inserts v immediately after mark — List.InsertAfter.
+/// err when mark names no live element.
+fn (l mut List) insertafter(v: int, mark: int) -> [int, err] {
+    if !l.ok(mark) {
+        return -1, 1
+    }
+    i := l.alloc(v)
+    l.splice(i, mark, l.ns[mark].next)
+    l.n = l.n + 1
+    return i, nil
+}
+
+/// remove cuts element i out of the list and returns its payload —
+/// List.Remove. err when i names no live element.
+fn (l mut List) remove(i: int) -> [int, err] {
+    if !l.ok(i) {
+        return 0, 1
+    }
+    l.unlink(i)
+    v := l.ns[i].v
+    l.ns[i].live = 0
+    l.ns[i].next = l.free
+    l.free = i
+    l.n = l.n - 1
+    return v, nil
+}
+
+/// movetofront moves element i to the head — List.MoveToFront.
+/// A dead handle is a no-op; moving the head itself is free.
+fn (l mut List) movetofront(i: int) {
+    if !l.ok(i) || l.head == i {
+        return
+    }
+    l.unlink(i)
+    l.splice(i, -1, l.head)
+}
+
+/// movetoback moves element i to the tail — List.MoveToBack.
+fn (l mut List) movetoback(i: int) {
+    if !l.ok(i) || l.tail == i {
+        return
+    }
+    l.unlink(i)
+    l.splice(i, l.tail, -1)
+}
+
+/// movebefore moves element i immediately before mark —
+/// List.MoveBefore. No-op when either handle is dead or i == mark.
+fn (l mut List) movebefore(i: int, mark: int) {
+    if !l.ok(i) || !l.ok(mark) || i == mark {
+        return
+    }
+    l.unlink(i)
+    l.splice(i, l.ns[mark].prev, mark)
+}
+
+/// moveafter moves element i immediately after mark —
+/// List.MoveAfter.
+fn (l mut List) moveafter(i: int, mark: int) {
+    if !l.ok(i) || !l.ok(mark) || i == mark {
+        return
+    }
+    l.unlink(i)
+    l.splice(i, mark, l.ns[mark].next)
+}
+
+/// pushbacklist appends other's elements, in order, at the tail —
+/// List.PushBackList. `other` is consumed: `own` moves it in and
+//  its arena dies with the handle; its handles are dead after.
+fn (l mut List) pushbacklist(other: own List) {
+    i := other.head
+    for i != -1 {
+        nx := other.ns[i].next
+        l.pushback(other.ns[i].v)
+        i = nx
+    }
+}
+
+/// pushfrontlist inserts other's elements, in order, at the head —
+/// List.PushFrontList (front-most of other lands at head).
+/// `other` is consumed like in pushbacklist.
+fn (l mut List) pushfrontlist(other: own List) {
+    i := other.tail
+    for i != -1 {
+        pv := other.ns[i].prev
+        l.pushfront(other.ns[i].v)
+        i = pv
+    }
+}

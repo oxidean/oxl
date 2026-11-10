@@ -1,0 +1,136 @@
+package main
+
+// container/ring — circular list: walking both directions, move,
+// link splices a consumed ring in, unlink lifts a subring back out,
+// do visits every element. ref-vs-mut nesting borrows alias-trap
+// like container/list, so mut calls get their handles hoisted.
+import "std/container/ring"
+
+let walkacc = 0
+
+let walkn = 0
+
+// acc folds each visited payload into walkacc — do() callbacks are
+// plain fns, so a package global is the accumulator.
+fn acc(v: int) {
+    walkacc = walkacc * 10 + v
+    walkn = walkn + 1
+}
+
+fn main() {
+    // newring(n <= 0) is nil, like ring.New
+    z := ring.newring(0)
+    assert(z == nil)
+    assert(ring.newring(-3) == nil)
+
+    r := ring.newring(4)
+    assert(r != nil)
+    assert(r.len() == 4)
+
+    // set 10,20,30,40 around the cycle, then walk it
+    i := r.head()
+    v := 10
+    k := 0
+    for k < 4 {
+        r.setval(i, v)
+        v = v + 10
+        i = r.next(i)
+        k = k + 1
+    }
+    assert(i == r.head()) // the walk wrapped exactly once
+    i = r.head()
+    assert(r.val(i) == 10)
+    i = r.next(i)
+    assert(r.val(i) == 20)
+    // prev walks backward over the same boundary
+    p := r.prev(r.head())
+    assert(r.val(p) == 40)
+    // move forward, backward, and wrapping
+    assert(r.val(r.move(r.head(), 2)) == 30)
+    assert(r.val(r.move(r.head(), -1)) == 40)
+    assert(r.val(r.move(r.head(), 5)) == 20)
+
+    // do visits every element in order
+    r.do(r.head(), acc)
+    assert(walkacc == 12340 && walkn == 4)
+
+    // link splices s in right after head: [10,1,2,20,30,40]
+    s := ring.newring(2)
+    si := s.head()
+    s.setval(si, 1)
+    s2 := s.next(si)
+    s.setval(s2, 2)
+    hd := r.head()
+    bd := r.link(hd, s)
+    assert(r.len() == 6)
+    assert(r.val(r.next(r.head())) == 1)
+    assert(r.val(bd) == 20) // link returns the element behind the splice
+    assert(r.val(r.prev(bd)) == 2)
+
+    // link(nil) is a no-op returning i.next — z is already nil
+    nx := r.next(r.head())
+    nxl := r.link(hd, z)
+    assert(nxl == nx)
+    assert(r.len() == 6)
+
+    // unlink lifts the [1,2] block back out, ring closes back up
+    out := r.unlink(hd, 2)
+    assert(out != nil)
+    assert(out.len() == 2)
+    assert(r.len() == 4)
+    assert(out.val(out.head()) == 1)
+    assert(out.val(out.next(out.head())) == 2)
+    assert(r.val(r.next(r.head())) == 20)
+
+    // unlink wraps across the head boundary: r=[10,20,30,40] head@10,
+    // anchoring at prev(head)=40 removes [10,20] — head moves to 40
+    pv := r.prev(r.head())
+    out2 := r.unlink(pv, 2)
+    assert(out2 != nil && out2.len() == 2)
+    assert(out2.val(out2.head()) == 10)
+    assert(r.len() == 2)
+    assert(r.val(r.head()) == 40)
+    assert(r.val(r.next(r.head())) == 30)
+
+    // removing nothing yields nil and leaves the ring alone
+    hh := r.head()
+    assert(r.unlink(hh, 2) == nil) // n == len removes none
+    assert(r.len() == 2)
+    assert(r.unlink(hh, 0) == nil)
+    assert(r.unlink(hh, -1) == nil)
+
+    // unlink down to a single element leaves a self-loop
+    one := r.unlink(hh, 1)
+    assert(one != nil)
+    assert(r.len() == 1)
+    assert(r.next(r.head()) == r.head())
+    assert(r.prev(r.head()) == r.head())
+
+    // freelist reuse across churn: unlink 5 of 8 then link them back
+    big := ring.newring(8)
+    j := big.head()
+    k = 0
+    for k < 8 {
+        big.setval(j, k)
+        j = big.next(j)
+        k = k + 1
+    }
+    bh := big.head()
+    out3 := big.unlink(bh, 5)
+    assert(out3 != nil && out3.len() == 5)
+    assert(out3.val(out3.head()) == 1)
+    assert(big.len() == 3)
+    assert(big.val(big.head()) == 0)
+    big.link(bh, out3) // [0,1,2,3,4,5,6,7] again
+    assert(big.len() == 8)
+    walkacc = 0
+    walkn = 0
+    big.do(big.head(), acc)
+    assert(walkacc == 1234567 && walkn == 8)
+
+    // dead handles go inert — one of the nodes unlink recycled
+    assert(big.next(999) == -1)
+    assert(big.val(999) == 0)
+
+    println("ring ok")
+}

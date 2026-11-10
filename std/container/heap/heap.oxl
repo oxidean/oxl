@@ -1,0 +1,143 @@
+package heap
+
+// std/container/heap — Go's container/heap: a min-heap over any
+// user type carrying Interface. The impl owns its storage and
+// ordering; the package drives the sift-up/down machinery behind
+// init/push/pop/remove/fix.
+//
+// v0 payloads are int only — `any`-typed elements wait on payload
+// generics (the same call std/collections made); an int covers
+// values, priorities, and indices into the caller's records.
+//
+// An impl hands its handle in once — Go's implicit `&h` aliasing
+// has no equivalent here: either move an `own` cell into the
+// interface once and drive everything through it, or give the impl
+// a mut-borrowing helper (the bufio asreader() shape) that boxes
+// `&h` per call so the plain struct stays usable:
+//
+//   struct IntHeap { v: []int }
+//   fn (h mut IntHeap) Len() -> int { return len(h.v) }
+//   fn (h mut IntHeap) Less(i: int, j: int) -> bool { return h.v[i] < h.v[j] }
+//   fn (h mut IntHeap) Swap(i: int, j: int) { t := h.v[i]; h.v[i] = h.v[j]; h.v[j] = t }
+//   fn (h mut IntHeap) Push(x: int) { h.v = push(h.v, x) }
+//   fn (h mut IntHeap) Pop() -> int {
+//       n := len(h.v)
+//       x := h.v[n - 1]
+//       h.v = h.v[:n - 1]
+//       return x
+//   }
+//   fn (h mut IntHeap) asheap() -> heap.Interface { return h }
+//
+//   h := IntHeap{v: mkslice(int, 0)}
+//   heap.push(h.asheap(), 5)
+//   v := heap.pop(h.asheap())
+//
+// or, through one interface handle:
+//
+//   let ih: heap.Interface = new(IntHeap)
+//   heap.push(ih, 5)
+//   v := heap.pop(ih)
+
+/// Interface is the heap contract — heap.Interface: sort.Interface's
+/// index-based ordering plus the storage ops. Less(i, j) orders the
+/// elements at positions i and j; Push appends x as element Len()
+/// (before the sift), Pop removes and returns element Len()-1 (after
+/// the sift) — the package calls them at the sift boundaries only.
+/// The methods are capitalized like Go's: an Interface impl has to
+/// declare them, and decls named `len`/`push` collide with builtins
+/// when the impl lives in package main.
+interface Interface {
+    Len() -> int,
+    Less(i: int, j: int) -> bool,
+    Swap(i: int, j: int),
+    Push(x: int),
+    Pop() -> int,
+}
+
+/// init establishes the heap invariant over the impl's current
+/// elements — heap.Init, O(n).
+fn init(h: Interface) {
+    n := h.Len()
+    i := n / 2 - 1
+    for i >= 0 {
+        down(h, i, n)
+        i = i - 1
+    }
+}
+
+/// push adds x and restores the invariant — heap.Push, O(log n).
+fn push(h: Interface, x: int) {
+    h.Push(x)
+    up(h, h.Len() - 1)
+}
+
+/// pop removes and returns the minimum — heap.Pop, O(log n).
+/// Calling pop on an empty heap is a programming error; the impl's
+/// pop() traps on the underflow the same way indexing an empty
+/// slice does.
+fn pop(h: Interface) -> int {
+    n := h.Len() - 1
+    h.Swap(0, n)
+    down(h, 0, n)
+    return h.Pop()
+}
+
+/// remove removes the element at index i and returns it —
+/// heap.Remove, O(log n).
+fn remove(h: Interface, i: int) -> int {
+    n := h.Len() - 1
+    if n != i {
+        h.Swap(i, n)
+        if !down(h, i, n) {
+            up(h, i)
+        }
+    }
+    return h.Pop()
+}
+
+/// fix restores the invariant after the element at index i changed
+/// its ordering — heap.Fix, O(log n); cheaper than init.
+fn fix(h: Interface, i: int) {
+    if !down(h, i, h.Len()) {
+        up(h, i)
+    }
+}
+
+// up sifts element j toward the root while it orders before its
+// parent. (j-1)/2 for j==0 truncates to 0 — i == j ends the walk.
+fn up(h: Interface, j0: int) {
+    j := j0
+    for true {
+        i := (j - 1) / 2
+        if i == j || !h.Less(j, i) {
+            break
+        }
+        h.Swap(i, j)
+        j = i
+    }
+}
+
+// down sifts element i0 toward the leaves over v[0:n], picking the
+// smaller child. Returns whether the element moved — remove/fix use
+// it to skip the compensating up-sift.
+fn down(h: Interface, i0: int, n: int) -> bool {
+    i := i0
+    for true {
+        j1 := 2 * i + 1
+        // j1 < 0 is the int-overflow guard Go keeps
+        if j1 >= n || j1 < 0 {
+            break
+        }
+        j := j1 // left child
+        j2 := j1 + 1
+        if j2 < n && h.Less(j2, j1) {
+            j = j2 // right child orders first
+        }
+        if !h.Less(j, i) {
+            break
+        }
+        h.Swap(i, j)
+        i = j
+    }
+    return i > i0
+}

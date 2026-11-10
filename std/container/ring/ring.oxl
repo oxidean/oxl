@@ -1,0 +1,238 @@
+package ring
+
+// std/container/ring — Go's container/ring: a circular list.
+//
+// A Ring owns an arena of nodes; element handles are ints into it
+// (ref/mut can't sit in heap objects, so a cycle of pointers can't
+// form — indices are the v0 equivalent) and -1 plays nil. Handles
+// double as cursors: Go's `r.Next()` returns the neighboring
+// *Ring, ours returns the neighboring handle.
+//
+// link/unlink move elements between arenas rather than aliasing
+// them — Go's shared-cycle pointer semantics have no `own`
+// equivalent, so the moved elements' values splice across and the
+// consumed ring dies with its handle. Removed nodes recycle
+// through a freelist like std/container/list's.
+//
+// Payloads are int only in v0 (see std/collections for the same call).
+//
+//   r := ring.newring(3)
+//   i := r.head()
+//   k := 0
+//   for k < r.len() {
+//       r.setval(i, k)
+//       i = r.next(i)
+//       k = k + 1
+//   }
+
+// RNode is a ring cell: v the payload, prev/next arena indices,
+// live marks the cell linked (0 = on the freelist).
+struct RNode { v: int, prev: int, next: int, live: int }
+
+/// Ring is a circular list; create with newring. `root` is any one
+/// live element kept as the entry point (link/unlink maintain it);
+//  -1 only on a ring nothing was ever linked into.
+struct Ring { ns: []RNode, root: int, free: int, n: int }
+
+/// newring creates a ring of n elements — ring.New. nil for n <= 0.
+fn newring(n: int) -> own Ring {
+    if n <= 0 {
+        return nil
+    }
+    r := new(Ring)
+    r.ns = mkslice(RNode, n)
+    i := 0
+    for i < n {
+        r.ns[i].v = 0
+        r.ns[i].live = 1
+        r.ns[i].prev = (i + n - 1) % n
+        r.ns[i].next = (i + 1) % n
+        i = i + 1
+    }
+    r.root = 0
+    r.free = -1
+    r.n = n
+    return r
+}
+
+/// len returns the element count — Ring.Len. Note this is O(1)
+/// here; Go's walks the cycle.
+fn (r ref Ring) len() -> int {
+    return r.n
+}
+
+/// head returns the ring's entry handle — where newring/link/unlink
+/// leave a cursor so callers don't have to remember one. -1 only
+/// when the ring holds nothing (impossible once newring ran).
+fn (r ref Ring) head() -> int {
+    return r.root
+}
+
+// ok reports whether i names a live element of this ring.
+fn (r ref Ring) ok(i: int) -> bool {
+    return i >= 0 && i < len(r.ns) && r.ns[i].live == 1
+}
+
+/// next returns the handle after i in the cycle — Ring.Next.
+/// A dead handle reads -1.
+fn (r ref Ring) next(i: int) -> int {
+    if !r.ok(i) {
+        return -1
+    }
+    return r.ns[i].next
+}
+
+/// prev returns the handle before i in the cycle — Ring.Prev.
+fn (r ref Ring) prev(i: int) -> int {
+    if !r.ok(i) {
+        return -1
+    }
+    return r.ns[i].prev
+}
+
+/// move returns the handle n positions forward from i — Ring.Move.
+/// n < 0 walks backward; the step count wraps modulo len.
+fn (r ref Ring) move(i: int, n: int) -> int {
+    if !r.ok(i) || r.n == 0 {
+        return -1
+    }
+    p := i
+    if n < 0 {
+        k := (0 - n) % r.n
+        for k > 0 {
+            p = r.ns[p].prev
+            k = k - 1
+        }
+    } else {
+        k := n % r.n
+        for k > 0 {
+            p = r.ns[p].next
+            k = k - 1
+        }
+    }
+    return p
+}
+
+/// val returns element i's payload — Ring.Value. A dead handle
+/// reads 0.
+fn (r ref Ring) val(i: int) -> int {
+    if !r.ok(i) {
+        return 0
+    }
+    return r.ns[i].v
+}
+
+/// setval writes element i's payload; a dead handle is a no-op.
+fn (r mut Ring) setval(i: int, v: int) {
+    if !r.ok(i) {
+        return
+    }
+    r.ns[i].v = v
+}
+
+// alloc recycles a freelist node before growing the arena.
+fn (r mut Ring) alloc(v: int) -> int {
+    i := r.free
+    if i != -1 {
+        r.free = r.ns[i].next
+    } else {
+        i = len(r.ns)
+        r.ns = push(r.ns, RNode{v: 0, prev: -1, next: -1, live: 0})
+    }
+    r.ns[i].v = v
+    r.ns[i].prev = -1
+    r.ns[i].next = -1
+    r.ns[i].live = 1
+    return i
+}
+
+/// link splices all of ring s into this ring right after element i
+/// — Ring.Link. s is consumed (`own` moves it in); its elements
+/// migrate into r's arena in order. Returns i's original next — the
+/// element now behind the inserted block, so it heads the remainder
+/// just like Go's result. link(i, nil) is a no-op returning i.next.
+fn (r mut Ring) link(i: int, s: own Ring) -> int {
+    if !r.ok(i) {
+        return -1
+    }
+    if s == nil || s.n == 0 {
+        return r.ns[i].next
+    }
+    n := r.ns[i].next
+    // splice s's cycle, walking it once from s.root
+    p := s.root
+    k := 0
+    for k < s.n {
+        j := r.alloc(s.ns[p].v)
+        // slot j between the splice point and n — n's prev is the
+        // last element inserted so far (i itself on the first pass),
+        // so consecutive inserts keep s's order
+        r.ns[j].prev = r.ns[n].prev
+        r.ns[j].next = n
+        r.ns[r.ns[n].prev].next = j
+        r.ns[n].prev = j
+        p = s.ns[p].next
+        k = k + 1
+    }
+    r.n = r.n + s.n
+    return n
+}
+
+/// unlink removes the n elements starting at i.next — Ring.Unlink —
+/// and returns them as a new ring whose head is the first removed
+/// element. Removing nothing yields nil: n <= 0 or n % len == 0.
+fn (r mut Ring) unlink(i: int, n: int) -> own Ring {
+    if !r.ok(i) || r.n == 0 || n <= 0 {
+        return nil
+    }
+    k := n % r.n
+    if k == 0 {
+        return nil
+    }
+    out := newring(k)
+    // copy the removed range's values out in order — p ends on the
+    // survivor after the range
+    p := r.ns[i].next
+    first := p
+    j := 0
+    for j < k {
+        out.ns[j].v = r.ns[p].v
+        p = r.ns[p].next
+        j = j + 1
+    }
+    // cut the range out of the cycle
+    r.ns[i].next = p
+    r.ns[p].prev = i
+    // recycle the removed nodes onto the freelist
+    j = 0
+    for j < k {
+        nx := r.ns[first].next
+        r.ns[first].live = 0
+        r.ns[first].prev = -1
+        r.ns[first].next = r.free
+        r.free = first
+        first = nx
+        j = j + 1
+    }
+    r.n = r.n - k
+    if !r.ok(r.root) {
+        r.root = i
+    }
+    return out
+}
+
+/// do calls f on each element's payload in forward order starting
+/// at i — Ring.Do. f must not mutate the ring (Go's caveat too).
+fn (r ref Ring) do(i: int, f: fn(int)) {
+    if !r.ok(i) {
+        return
+    }
+    p := i
+    for true {
+        f(r.ns[p].v)
+        p = r.ns[p].next
+        if p == i {
+            break
+        }
+    }
+}

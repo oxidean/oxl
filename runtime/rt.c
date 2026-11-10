@@ -234,6 +234,9 @@ struct RtTask {
      * a waker swaps PARKED->WAKE_REQ or plants WAKE_REQ for the driver
      * to self-enqueue when it actually leaves the C stack */
     volatile int wstate;
+    volatile int started;   /* the body/poll ran at least once — defers
+        may be registered; the cancel-before-start skip is only safe
+        once this is set (never-run tasks carry no defers to drain) */
     struct RtDefer *defers;  /* fn-scope defer stack (LIFO) */
     /* one hold per still-open inner scope + one self-hold taken while
      * settling — the frame frees when the last hold drops, so children
@@ -728,6 +731,7 @@ static void run_task(RtTask *t) {
     volatile int trapped = 0;
     if (t->is_frame) {
         t->wstate = WS_ONSTACK;
+        t->started = 1;
         if (setjmp(tls_jb) == 0) {
             if (t->poll(t->frame, t) == RT_PENDING) {
                 /* leaving the C stack: a waker that already fired
@@ -745,6 +749,7 @@ static void run_task(RtTask *t) {
         }
         /* READY / CANCEL / trapped(longjmp) all land here */
     } else {
+        t->started = 1;
         if (setjmp(tls_jb) == 0) t->fn(t->arg);
         else trapped = 1;
         /* cancel-unwound (task_unwind) lands here */
@@ -811,7 +816,7 @@ static void *worker(void *_p) {
         pool.head = t->next;
         if (!pool.head) pool.tail = NULL;
         oxl_mu_unlock(&pool.mu);
-        if (!t->scope || !t->scope->cancel) run_task(t);
+        if (!t->scope || !t->scope->cancel || !t->started) run_task(t);
         else {
             /* cancelled before it ran: earlier poll rounds may still
              * have registered defers — drain them under a live setjmp
@@ -907,10 +912,12 @@ static void *task_wrap_frame(void *p) {
     volatile int trapped = 0;
     if (setjmp(tls_jb) == 0) {
         while (1) {
-            /* cancelled before it ran: settle like the pool worker
-             * instead of re-polling into a dead scope */
-            if (t->scope && t->scope->cancel) break;
+            /* cancelled after it started: settle like the pool worker.
+             * A never-started task still polls once — its body must run
+             * far enough to register the defers the unwind drains. */
+            if (t->scope && t->scope->cancel && t->started) break;
             t->wstate = WS_ONSTACK;
+            t->started = 1;
             if (t->poll(t->frame, t) != RT_PENDING) break;
             if (__sync_lock_test_and_set(&t->wstate, WS_PARKED) == WS_WAKEREQ)
                 continue; /* wake already landed */
@@ -1049,10 +1056,11 @@ int rt_run_root(RtFrame *fr) {
     volatile int trapped = 0;
     if (setjmp(tls_jb) == 0) {
         while (1) {
-            /* same cancel gate as the pool worker: a cancel-woken task
-             * settles instead of re-polling into a dead scope */
-            if (t->scope && t->scope->cancel) break;
+            /* same cancel gate as the pool worker — gated on started so
+             * a never-run task still reaches its body (and its defers) */
+            if (t->scope && t->scope->cancel && t->started) break;
             t->wstate = WS_ONSTACK;
+            t->started = 1;
             if (t->poll(fr, t) != RT_PENDING) break;
             if (__sync_lock_test_and_set(&t->wstate, WS_PARKED) == WS_WAKEREQ)
                 continue;

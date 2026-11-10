@@ -1,0 +1,38 @@
+# items/dom-backend.md — the `extra/gui/dom` backend contract
+
+W6's deliverable: a `Backend` implementation rendering to the
+DOM. The iface is fixed (`docs/gui-backends.md`): `new`,
+`set_prop`, `attach`, `detach`, `destroy`, `pump`, `stop`,
+`wake` — the same eight methods, no schema changes.
+
+## Mapping
+
+| gui concept | DOM |
+|---|---|
+| widget handle (monotonic int) | entry in a `{h: Element}` table — ints stay ints, elements stay opaque refs |
+| `window` | a backend-owned child `<div>` created inside the configured root (`document.body` default, a given `#id` for embeds) — `destroy` removes the owned child, never the host element: unmapping a window must not remove the host page's body or an embedder's root |
+| `hbox`/`vbox`/`scrolled` | `<div>` + flex/overflow CSS classes |
+| `label` | `<span>` |
+| `button` | `<button>` |
+| `entry` | `<input>` |
+| `list` | `<ul>`/`role=listbox`; rows render through `attach`/`detach` as `<li>` children; `P_ROWS` is read-only — a `read` returns the current child count, a `set_prop` is a contract violation (v1: eager render; virtual-list extension parked per `gui-backends.md`) |
+| `Prop`/`PropVal` | `text`→`textContent` — except `entry`, where `P_TEXT` reads/writes the `<input>`'s `.value`; `placeholder`→property; `enabled`→`disabled`; style props→`element.style` |
+| `Event` kinds | `clicked`→`click`; `text_changed`→`input`; `activated`→Enter (`keydown`/form `submit`) on `<input>` — never `change`: blur-after-edit fires `change` and would submit without an Enter action (and double-activate after a real Enter); `row_activated`→`click` on `<li>` rows, row index in `EventData.Index`; `close_requested`→host-defined (a custom `oxl-close` event the page or a window manager fires). No `selected` kind exists — row activation is `row_activated` |
+| `pump` | a susp frame task: parks on `stop`/`wake` edges and drains CmdBuf → DOM calls between event deliveries; `wake()` = `queueMicrotask` nudge. It returns only after `stop` — `gui.run` begins shutdown on return, so an immediate or drain-and-exit pump would end the session |
+| `stop`/`wake` | allowed off "root task" trivially — everything is the main thread |
+| copy-at-boundary | `PropVal.Text` arrives as `OxlStr` → decoded to JS string at `set_prop` (the §7 boundary rule) |
+
+## Test surface
+
+`dom` ships `dom.Backend` + a `dom.Headless` variant: a tiny
+in-rt.mjs DOM stub (createElement/appendChild/dispatch on a
+JS object tree) so `tests/gui_*` can drive the backend under
+node without a browser — the same ledger/inject pattern the
+mock proved. Real-browser verification is `examples/web-todo`
++ the `--html` scaffold.
+
+## Deferred
+
+- Virtual list for large `P_ROWS` (spec watch item from
+  `gui-backends.md`, unchanged)
+- IME/a11y/canvas — out of scope per shape.md

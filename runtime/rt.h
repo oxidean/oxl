@@ -316,6 +316,7 @@ OxlStr rt_itoa(int64_t v);
 OxlStr rt_str(const char *s);
 OxlStr rt_str_own(OxlStr s); /* deep-copy backing into own heap (escaping captures) */
 void rt_str_free(OxlStr s);     /* release an rt_str_own copy's backing */
+OxlStr rt_str_scope(OxlStr s); /* copy backing into scope-lived storage (gui read replies) */
 int64_t rt_chan_is_closed(RtChan *ch); /* closed-state probe under ch->mu */
 void rt_print_str(OxlStr s);
 void rt_print_i64(int64_t v);

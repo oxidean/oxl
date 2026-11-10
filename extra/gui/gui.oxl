@@ -18,6 +18,7 @@ import "std/sync"
 // session — a queued payload never aliases storage that can die
 // underneath it (poster arenas, shim ring buffers)
 extern fn rt_str_own(s: str) -> str
+extern fn rt_str_scope(s: str) -> str
 
 extern fn rt_str_free(s: str)
 
@@ -628,8 +629,9 @@ fn reply_done(rc: chan own CmdResult, settled: shared) {
     close(rc)
 }
 
-// owned-string copy for payload boundaries a buf can't reach — read
-// replies. The returned str is own-heap; session-lifetime in v0.
+// owned-string copy for payload boundaries a buf can't reach —
+// backends build read replies with this; read_prop scope-copies the
+// payload for the caller and frees this one
 fn str_own(s: str) -> str {
     return rt_str_own(s)
 }
@@ -1258,6 +1260,13 @@ fn read_prop(h: int, id: int) -> [PropVal, err] {
     sset(settled, 1)
     if r.e != nil {
         return PropVal.Num(0), r.e
+    }
+    match r.val {
+        PropVal.Text(t) => {
+            r.val = PropVal.Text(rt_str_scope(t))
+            rt_str_free(t)
+        }
+        _ => {}
     }
     return r.val, nil
 }

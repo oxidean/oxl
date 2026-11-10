@@ -2377,8 +2377,20 @@ OxlStr rt_str_own(OxlStr s) {
 OxlStr rt_str(const char *s) { return (OxlStr){ s, (int64_t)strlen(s) }; }
 
 /* release the backing of an rt_str_own copy — the interned-by-mailbox
- * strings in extra/gui use this at session teardown */
+ * strings in extra/gui use this at session teardown, and the gui read
+ * path frees each reply copy after scope-copying it for the caller */
 void rt_str_free(OxlStr s) { if (s.p) rt_free((void *)s.p); }
+
+/* copy s's backing into scope-lived storage — the gui read path hands
+ * replies to callers as plain str, so the bytes get the caller's
+ * normal str lifetime (freed with the caller's scope) instead of
+ * own-heap storage nothing would release */
+OxlStr rt_str_scope(OxlStr s) {
+    char *p = rt_alloc(s.n + 1);
+    memcpy(p, s.p, (size_t)s.n);
+    p[s.n] = 0;
+    return (OxlStr){ p, s.n };
+}
 
 /* state probe for the gui reply-chan lifecycle — pool admission and
  * post-close short-circuits read this under their own locking */

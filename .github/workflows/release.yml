@@ -254,6 +254,8 @@ jobs:
           mkdir -p dist/oxl-toolchain/runtime
           cp runtime/rt.h runtime/rt.c dist/oxl-toolchain/runtime/
           cp LICENSE dist/oxl-toolchain/
+          # the version manager + `oxl version` read this file for the tag
+          echo "${{ needs.version.outputs.tag }}" > dist/oxl-toolchain/RELEASE
           # the repo README documents building from oxl/ and other paths
           # the archive doesn't ship — give it release-specific steps
           cat > dist/oxl-toolchain/README.md <<'EOF2'
@@ -269,6 +271,7 @@ jobs:
           `import "std/x"` resolves against `std/` next to the binary.
           EOF2
           cd dist && tar czf oxl-toolchain-linux-x86_64.tar.gz oxl-toolchain
+          sha256sum oxl-toolchain-linux-x86_64.tar.gz > oxl-toolchain-linux-x86_64.tar.gz.sha256
       # tag creation happens AFTER the suite gate so a failed gate never burns
       # a version; pushed via API because GITHUB_TOKEN tag pushes do not
       # retrigger on:push:tags — publish runs in this same run
@@ -304,7 +307,9 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.version.outputs.tag }}
-          files: dist/oxl-toolchain-linux-x86_64.tar.gz
+          files: |
+            dist/oxl-toolchain-linux-x86_64.tar.gz
+            dist/oxl-toolchain-linux-x86_64.tar.gz.sha256
           generate_release_notes: true
 
 

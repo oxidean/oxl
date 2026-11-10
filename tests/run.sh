@@ -1736,16 +1736,16 @@ if command -v node >/dev/null 2>&1; then
     # gui_* joined the lane in W5 — the susp-pump contract lets the
     # mock's cooperative pump drive the same gates single-threaded
     for f in conc_ping conc_scale select select_fair chan_own chanbuf chanbuf_close scope_exit orphan_join defer_order pairfwd match methods fnval d5_qual stdmods_test gui_mock gui_lifecycle gui_overflow gui_select gui_stress gui_cancel gui_dom; do
-        out=$(timeout 60 "$SELFOXL" run --target js "tests/$f.oxl" 2>&1) || { echo "FAIL js lane $f: $out"; exit 1; }
+        out=$(with_timeout 60 "$SELFOXL" run --target js "tests/$f.oxl" 2>&1) || { echo "FAIL js lane $f: $out"; exit 1; }
     done
     for f in enc_test hash_test regexp_test float_test util_test stdlib_test collections_test enum_test defer_test os_test exec_test net_test flaglog_test extra_testutil; do
-        out=$(timeout 60 "$SELFOXL" test --target js "tests/$f.oxl" 2>&1) || { echo "FAIL js lane test $f: $out"; exit 1; }
+        out=$(with_timeout 60 "$SELFOXL" test --target js "tests/$f.oxl" 2>&1) || { echo "FAIL js lane test $f: $out"; exit 1; }
         grep -q 'FAIL' <<<"$out" && { echo "FAIL js lane test $f: $out"; exit 1; }
     done
     for f in select_cancel cancel_join; do
         "$SELFOXL" build --target js "tests/$f.oxl" -o "$scratch/$f.mjs" || { echo "FAIL js lane $f: emit"; exit 1; }
         rc=0
-        out=$(timeout 30 node "$scratch/$f.mjs" 2>&1) || rc=$?
+        out=$(with_timeout 30 node "$scratch/$f.mjs" 2>&1) || rc=$?
         [ "$rc" -ne 0 ] || { echo "FAIL js lane $f: expected trap exit"; exit 1; }
         grep -q 'escaped top scope' <<<"$out" || { echo "FAIL js lane $f: trap line: $out"; exit 1; }
     done
@@ -1765,7 +1765,7 @@ if command -v node >/dev/null 2>&1; then
     done
     grep -q 'type="module"' "$scratch/web-todo.mjs.html" || {
         echo "FAIL web-todo html scaffold"; exit 1; }
-    out=$(cd "$scratch" && timeout 60 node -e "process.argv[1]='web-todo.mjs'; process.argv[2]='--selftest'; import('./web-todo.mjs')" 2>&1) || {
+    out=$(cd "$scratch" && with_timeout 60 node -e "process.argv[1]='web-todo.mjs'; process.argv[2]='--selftest'; import('./web-todo.mjs')" 2>&1) || {
         echo "FAIL web-todo selftest: $out"; exit 1; }
     grep -q 'selftest rows=2 churn=200 ok' <<<"$out" || {
         echo "FAIL web-todo selftest line: $out"; exit 1; }

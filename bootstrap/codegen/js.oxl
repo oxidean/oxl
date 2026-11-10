@@ -397,6 +397,10 @@ fn jxas(g: mut G, inner: ref parser.Node, ty: ref parser.Node) -> str {
         }
     }
     iv := jx(g, inner)
+    if bt != ot {
+        // own box — the carried value sits at .v
+        iv = iv + ".v"
+    }
     wt := gty(g, ty)
     bok := tyk(g, bt)
     wk := tyk(g, wt)
@@ -879,10 +883,16 @@ fn jclosure(g: mut G, params: ref parser.NList, body: ref parser.Node) -> str {
         cp0 = cp0.next
     }
     sv := g.defers
+    sretk := g.retk
+    scret := g.cret
     g.defers = nil
+    g.retk = 0
+    g.cret = xclret(g, body)
     jblk(g, body)
     jdefers(g)
     g.defers = sv
+    g.retk = sretk
+    g.cret = scret
     wln(g, "}")
     wpop(g)
     btxt := wjoin(g.wlast)
@@ -994,6 +1004,13 @@ fn jbuiltin(g: mut G, name: str, args: ref parser.NList, argvs: ref GAv) -> str 
     if name == "argv" {
         return "rt.rt_argv(" + a0 + ")"
     }
+    if name == "len" && args != nil {
+        at := xty(g, args.v)
+        if tyk(g, at) == check.k_own() && tyk(g, gdt(g, at)) == check.k_slice() {
+            return "rt.rt_len(" + a0 + ".v)"
+        }
+        return "rt.rt_len(" + a0 + ")"
+    }
     if name == "len" {
         return "rt.rt_len(" + a0 + ")"
     }
@@ -1050,14 +1067,12 @@ fn jffi_arg(g: mut G, e: ref parser.Node, v: str, pt: int) -> str {
     return v
 }
 
+// extern returns already sit in oxl reps — the ffi boundary is
+// oxl-domain end to end (rt-node/rt-browser fill __oxl_ffi with
+// {u8,off,len} strs, {a,off,len,cap} slices, BigInt ints; js_of_s /
+// s_of_js are the shim-side decoders). A JS-domain re-wrap here
+// would double-encode — the boundary mapping is the shims' job.
 fn jffi_ret(g: mut G, expr: str, rt1: int) -> str {
-    k := tyk(g, rt1)
-    if k == check.k_str() {
-        return "rt.rt_str(" + expr + ")"
-    }
-    if k == check.k_slice() && tyk(g, tyi(g, rt1)) == check.k_byte() {
-        return "((_b) => ({a: _b, off: 0, len: _b ? _b.length : 0, cap: _b ? _b.length : 0}))(" + expr + ")"
-    }
     return expr
 }
 
@@ -1244,6 +1259,10 @@ fn jcall(g: mut G, f: ref parser.Node, args: ref parser.NList) -> str {
         return "rt.rt_slice_push(" + sv + ", " + v + ")"
     }
     if qn == "len" && args != nil {
+        at := xty(g, args.v)
+        if tyk(g, at) == check.k_own() && tyk(g, gdt(g, at)) == check.k_slice() {
+            return "rt.rt_len(" + argvs.v + ".v)"
+        }
         return "rt.rt_len(" + argvs.v + ")"
     }
     b := jbuiltin(g, qn, args, argvs)
@@ -1575,6 +1594,7 @@ fn js(g: mut G, s: ref parser.Node) {
                         return
                     }
                 }
+                v = jconv_v(g, vals.v, v, g.cret)
                 wln(g, "    return " + v + ";")
             }
         }
@@ -3386,6 +3406,60 @@ fn emit_js(r: own check.CkRes, testm: int) -> str {
 
 // ---------- expr dispatcher ----------
 
+// str literal decode — the token text carries source escapes;
+// JS needs the decoded bytes before base64. Mirrors the seed
+// lexer: \n \t \r \0 decode, \\ \" covered by the
+// pass-through, unknown \x drops the backslash (x survives).
+fn ju8w(b0: int) -> int {
+    if b0 >= 240 {
+        return 4
+    }
+    if b0 >= 224 {
+        return 3
+    }
+    if b0 >= 192 {
+        return 2
+    }
+    return 1
+}
+
+fn junesc(s: str) -> own []byte {
+    out := mkslice(byte, 0)
+    i := 0
+    for i < len(s) {
+        c := byteat(s, i)
+        if c == 92 && i + 1 < len(s) {
+            x := byteat(s, i + 1)
+            if x == 110 {
+                out = push(out, 10)
+            } else if x == 116 {
+                out = push(out, 9)
+            } else if x == 114 {
+                out = push(out, 13)
+            } else if x == 48 {
+                out = push(out, 0)
+            } else {
+                n := ju8w(x)
+                k := 0
+                for k < n && i + 1 + k < len(s) {
+                    out = push(out, byteat(s, i + 1 + k))
+                    k = k + 1
+                }
+            }
+            i = i + 2
+            continue
+        }
+        n := ju8w(c)
+        k := 0
+        for k < n && i + k < len(s) {
+            out = push(out, byteat(s, i + k))
+            k = k + 1
+        }
+        i = i + n
+    }
+    return new(out)
+}
+
 fn jx(g: mut G, e: ref parser.Node) -> str {
     if e == nil {
         return "null"
@@ -3408,7 +3482,7 @@ fn jx(g: mut G, e: ref parser.Node) -> str {
     out := match e {
         parser.Node.JInt(v) => itoa(v) + "n",
         parser.Node.JFloat(v) => v,
-        parser.Node.JStr(v) => "rt.rt_str_lit(\"" + base64.encode(v as []byte) + "\")",
+        parser.Node.JStr(v) => "rt.rt_str_lit(\"" + base64.encode(junesc(v)) + "\")",
         parser.Node.Name{n} => jxname(g, n),
         parser.Node.Call{f, args} => jcall(g, f, args),
         parser.Node.Field{obj, name} => jxfield(g, obj, name),

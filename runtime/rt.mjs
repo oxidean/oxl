@@ -1367,8 +1367,12 @@ export function rt_select_poll(chs, n, tmo_ms, has_else, t) {
         return RT_READY
       }
     }
-    t.sel_arm = RT_SEL_ELSE
-    return RT_READY
+    /* a miss parks a single scheduler turn rather than reporting
+     * else synchronously: native threads preempt, but under the
+     * cooperative scheduler a synchronous else-poll never yields and
+     * starves spawned peers forever. The waiters stay armed during
+     * the turn, so a send that lands on it claims an arm through the
+     * normal winner path — else only reports on a still-empty set. */
   }
   /* park: one SelW node per arm */
   const s = {
@@ -1378,6 +1382,7 @@ export function rt_select_poll(chs, n, tmo_ms, has_else, t) {
     t,
     w: [],
     timer: null,
+    is_else: has_else ? 1 : 0,
   }
   t.sel = s
   if (park_add_scoped(t, s, WK_SEL)) {
@@ -1391,17 +1396,20 @@ export function rt_select_poll(chs, n, tmo_ms, has_else, t) {
     s.w.push(w)
     chs[i].selq = w
   }
-  if (BigInt(tmo_ms) >= 0n) {
+  if (BigInt(tmo_ms) >= 0n || s.is_else) {
     const tm = setTimeout(() => {
       if (s.winner === -1) {
         s.winner = -2
         if (park_claim(t)) {
-          t.sel_arm = RT_SEL_TMO
+          t.sel_arm = s.is_else ? RT_SEL_ELSE : RT_SEL_TMO
           rt_task_wake(t)
         }
       }
-    }, Number(tmo_ms))
+    }, s.is_else ? 0 : Number(tmo_ms))
     s.timer = tm
+    /* like rt_sleep's: a parked select must not pin the loop past a
+     * settled root — unref where the env allows */
+    if (tm && tm.unref) tm.unref()
   }
   return RT_PENDING
 }
@@ -1632,11 +1640,12 @@ export function rt_atoi(s) {
   }
 }
 export function rt_atof(s) {
+  /* strtod parity: inf/infinity/nan literals parse, overflow gives
+   * Inf (not 0), only a non-numeric head yields 0 */
   const js = rt_str_cstr(s)
-  const m = js.match(/^[\s]*([+-]?(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?)/)
+  const m = js.match(/^[\s]*([+-]?(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?|[+-]?(?:inf(?:inity)?|nan))/i)
   if (!m) return 0
-  const v = parseFloat(m[1])
-  return Number.isFinite(v) ? v : 0
+  return parseFloat(m[1])
 }
 
 /* %.15g / %.*g emulation — g = shortest of fixed/exponential at the
@@ -1701,14 +1710,17 @@ export function rt_slice_push(s, v) {
 }
 
 export function rt_slice_push_b(s, v) {
+  /* int-domain byte narrows to Number before the Uint8Array store —
+   * a bare & would mix BigInt with a Number literal */
+  const b = typeof v === 'bigint' ? Number(v & 0xffn) : v & 0xff
   if (s.len < s.cap) {
-    s.a[s.off + s.len] = v & 0xff
+    s.a[s.off + s.len] = b
     return { a: s.a, off: s.off, len: s.len + 1, cap: s.cap }
   }
   const ncap = s.cap > 0 ? s.cap * 2 : 4
   const nb = new Uint8Array(ncap)
   nb.set(s.a.subarray(s.off, s.off + s.len))
-  nb[s.len] = v & 0xff
+  nb[s.len] = b
   return { a: nb, off: 0, len: s.len + 1, cap: ncap }
 }
 
@@ -1722,11 +1734,20 @@ export function rt_slice_own(s) {
 export function rt_sidx(s, i) {
   i = BigInt(i)
   if (i < 0n || i >= BigInt(s.len)) rt_trap(10n)
-  return s.a[s.off + Number(i)]
+  const v = s.a[s.off + Number(i)]
+  /* byte-slice backings are Uint8Array — the Number element widens
+   * to the int domain's BigInt (mirror of rt_sidx_set's narrow) */
+  return s.a instanceof Uint8Array ? BigInt(v) : v
 }
 export function rt_sidx_set(s, i, v) {
   i = BigInt(i)
   if (i < 0n || i >= BigInt(s.len)) rt_trap(10n)
+  /* byte-slice backings are Uint8Array — a BigInt (int domain) value
+   * narrows to the byte's masked Number rather than throwing */
+  if (s.a instanceof Uint8Array && typeof v === 'bigint') {
+    s.a[s.off + Number(i)] = Number(v & 0xffn)
+    return
+  }
   s.a[s.off + Number(i)] = v
 }
 
@@ -1939,12 +1960,14 @@ export function rt_err_wrap(msg, cause) {
 }
 
 export function rt_err_cause(code) {
+  if (code == null) return 0n
   const i = Number(BigInt(code) - BigInt(RT_ERR_BASE))
   if (i < 0) return 0n
   return i < err_tab.length ? err_tab[i].cause : 0n
 }
 
 export function rt_err_msg(code) {
+  if (code == null) return rt_str('')
   const i = Number(BigInt(code) - BigInt(RT_ERR_BASE))
   if (i < 0 || i >= err_tab.length) return rt_str('')
   return err_tab[i].msg
@@ -2124,11 +2147,26 @@ export async function __oxl_boot(main_entry) {
   }
   const base = scope_make()
   rt_scope_enter(base)
-  const trapped = await main_entry()
-  const code = env.exitCodeOf ? env.exitCodeOf() : 0
-  rt_scope_leave(base)
-  if (isNode) env.setExitCode(code)
-  return trapped ? 1 : 0
+  try {
+    const trapped = await main_entry()
+    const code = env.exitCodeOf ? env.exitCodeOf() : 0
+    rt_scope_leave(base)
+    if (isNode) env.setExitCode(code)
+    return trapped ? 1 : 0
+  } catch (e) {
+    /* a fatal that escaped the scope tree mirrors native's abort:
+     * the message lands on stderr, the run exits nonzero. Without
+     * the boundary the throw surfaces as an unhandled rejection —
+     * node's crash banner, not the trap line native prints. */
+    if (e && e.__oxl_fatal) {
+      const m = te.encode(String(e.__oxl_fatal))
+      env.write(2, m, 0, m.length)
+      env.write(2, NL8, 0, 1)
+      env.setExitCode(1)
+      return 1
+    }
+    throw e // genuine JS fault — propagate loudly
+  }
 }
 
 /* passed to the env module's install(): lets it wire writers, argv,

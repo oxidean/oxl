@@ -188,9 +188,11 @@ Directives: `module` (this module's path), `oxl` (minimum toolchain
 version), `require` (a dependency at a version, also in a parenthesized
 block), `replace` (pin a dependency to a local directory), and
 `toolchain` (toolchain pin — parsed by the language, consumed by the
-version-manager shim). The
-toolchain walks up from the entry file to the nearest `oxl.mod`;
-without one, only `std/` imports resolve.
+version-manager shim). The two lookups root differently: the language
+walks up from the entry file to the nearest `oxl.mod` (without one,
+only `std/` imports resolve), while the version-manager shim picks the
+pin walking up from the current working directory — invoking `oxl` from
+outside the project tree can resolve a different pin or the default.
 
 Import resolution runs one longest-prefix competition across every
 candidate tree: `std/...` (the toolchain's shipped standard library),

@@ -79,9 +79,11 @@ supported). The v0.4 line ships 36 packages:
 
 Packages are directories of `.oxl` files that share a `package` clause;
 `package main` marks an executable. A project opts into module mode by
-placing an `oxl.mod` manifest at its root; the toolchain walks up from
+placing an `oxl.mod` manifest at its root; the language walks up from
 the entry file to the nearest one, and without it only `std/` imports
-resolve:
+resolve (the version-manager shim looks the pin up from the current
+working directory instead — a build run from outside the project tree
+can resolve a different pin or the default):
 
 ```text title="oxl.mod"
 module github.com/me/app

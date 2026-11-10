@@ -128,15 +128,23 @@ rt.__oxl_boot(oxl_main)   // entry: installs run queue, runs root
   float/byte, `false` bool, `null`/zero-views for refs — matching
   `rt_mkslice`'s memset; a bare `new Array(n)` leaves holes that
   read `undefined`, so `fill` (or a sized `Uint8Array`) is
-  required.
+  required. For struct/named element types each element is a
+  *fresh* zero-valued object — `fill` with one shared object
+  aliases every slot (a field write through `s[0]` would show in
+  `s[1]`), while native zeroes each element's storage separately;
+  use `Array.from({length:n}, () => mkZero(T))` or a per-element
+  loop.
 - `s[i]`: `rt_trap(10)` if `i<0 || i>=s.len`, else
   `a[off+rt_to_num(i)]`.
 - `s[i:j]`: bounds-trap on i,j; `{a, off+i, len:j-i, cap:cap-i}`
   — **aliasing**: writes through the sub-view hit the parent.
 - `push(s, v)`: if `len<cap` → `a[off+len]=v`, `len++` in place;
-  else reallocate — `new Array(2*cap)` for general slices,
-  `new Uint8Array(2*cap)` for `[]byte` so the §4 typed-backing
-  contract survives a grow — copy, `cap=2*cap`. Slice value is a
+  else reallocate — growth matches native's
+  `ncap = cap > 0 ? 2*cap : 4` (a zero-capacity slice gets cap 4,
+  so the first push after `mkslice(T, 0)` can store): `new
+  Array(ncap)` for general slices, `new Uint8Array(ncap)` for
+  `[]byte` so the §4 typed-backing contract survives a grow —
+  copy, `cap=ncap`. Slice value is a
   *struct copy* — push
   returns/assigns like native (callers already treat `push`
   as a builtin that may re-seat).

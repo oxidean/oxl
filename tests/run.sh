@@ -1838,4 +1838,94 @@ out=$(OXL_HOME="$tch" "$SHIM" toolchain uninstall "v0.1.0/../../../$scratch/keep
     echo "FAIL uninstall-traversal: rc=$rc $out"; exit 1; }
 [ -d "$tch/versions/v0.1.0" ] || { echo "FAIL uninstall-traversal removed real dir"; exit 1; }
 
+echo "== i60 install pipeline — file:// release fixture =="
+# end-to-end: download -> sha256 verify -> stage -> atomic mv -> verbs.
+# OXL_RELEASE_BASE takes file:// so the whole pipeline runs offline.
+reldir="$scratch/relfix"; mkdir -p "$reldir/download/v9.9.9" "$reldir/download/v9.9.8"
+case "$(uname -s)" in Linux) tch_os=linux ;; Darwin) tch_os=macos ;; *) tch_os=linux ;; esac
+case "$(uname -m)" in x86_64) tch_arch=x86_64 ;; arm64|aarch64) tch_arch=arm64 ;; *) tch_arch=x86_64 ;; esac
+tch_asset="oxl-toolchain-$tch_os-$tch_arch.tar.gz"
+mkdir -p "$reldir/work/oxl-toolchain"
+printf '#!/bin/sh\necho "FAKE 9.9.9 $@"\n' > "$reldir/work/oxl-toolchain/oxl"
+chmod +x "$reldir/work/oxl-toolchain/oxl"
+tar czf "$reldir/download/v9.9.9/$tch_asset" -C "$reldir/work" oxl-toolchain
+if have_sum=$(command -v sha256sum 2>/dev/null); then
+    (cd "$reldir/download/v9.9.9" && sha256sum "$tch_asset" > "$tch_asset.sha256")
+elif command -v shasum >/dev/null 2>&1; then
+    (cd "$reldir/download/v9.9.9" && shasum -a 256 "$tch_asset" > "$tch_asset.sha256")
+fi
+# tampered tarball for the verify-or-die path (wrong payload, real sum)
+mkdir -p "$reldir/work2/oxl-toolchain"
+printf '#!/bin/sh\necho tampered\n' > "$reldir/work2/oxl-toolchain/oxl"
+chmod +x "$reldir/work2/oxl-toolchain/oxl"
+tar czf "$reldir/download/v9.9.8/$tch_asset" -C "$reldir/work2" oxl-toolchain
+printf '%s  %s\n' "0000000000000000000000000000000000000000000000000000000000000000" "$tch_asset" \
+    > "$reldir/download/v9.9.8/$tch_asset.sha256"
+# atom feed so `latest` resolves offline — newest-first, toolchain
+# tag. $reldir/latest must exist for curl's file:// HEAD to succeed;
+# its url_effective then falls through to the atom scan.
+printf '<feed><entry>releases/tag/v9.9.9</entry></feed>\n' > "$reldir.atom"
+printf 'latest\n' > "$reldir/latest"
+
+tch2="$scratch/tchome2"
+OXL_HOME="$tch2" OXL_RELEASE_BASE="file://$reldir" \
+    sh scripts/install.sh v9.9.9 >"$scratch/i60-install.log" 2>&1 || {
+    echo "FAIL install pipeline:"; cat "$scratch/i60-install.log"; exit 1; }
+[ -x "$tch2/versions/v9.9.9/oxl-toolchain/oxl" ] || { echo "FAIL install: no toolchain dir"; exit 1; }
+[ "$(cat "$tch2/default-version")" = "v9.9.9" ] || { echo "FAIL install: default-version"; cat "$tch2/default-version"; exit 1; }
+! ls -d "$tch2/versions"/.stage.* >/dev/null 2>&1 || { echo "FAIL install: stage dir leaked"; exit 1; }
+SHIM2="$tch2/bin/oxl"
+# dispatch goes through the shim to the installed toolchain
+out=$(cd "$tcw" && OXL_HOME="$tch2" "$SHIM2" run --help)
+[ "$out" = "FAKE 9.9.9 run --help" ] || { echo "FAIL pipeline dispatch: $out"; exit 1; }
+# verbs: list marks default, default echoes the tag, current names source
+out=$(OXL_HOME="$tch2" "$SHIM2" toolchain list)
+[ "$out" = "v9.9.9 (default)" ] || { echo "FAIL pipeline list: $out"; exit 1; }
+out=$(OXL_HOME="$tch2" "$SHIM2" toolchain default)
+[ "$out" = "v9.9.9" ] || { echo "FAIL pipeline default: $out"; exit 1; }
+out=$(cd "$tcw" && OXL_HOME="$tch2" "$SHIM2" toolchain current)
+case "$out" in v9.9.9*default-version*installed*) ;; *)
+    echo "FAIL pipeline current: $out"; exit 1 ;; esac
+# `latest` resolves through the atom-feed fallback on file://
+out=$(OXL_HOME="$tch2" OXL_RELEASE_BASE="file://$reldir" \
+    "$SHIM2" toolchain install latest 2>&1)
+grep -q "already installed" <<<"$out" || { echo "FAIL pipeline latest: $out"; exit 1; }
+# --default forces the pin even when a default exists
+echo v9.9.8 > "$tch2/default-version"
+OXL_HOME="$tch2" OXL_RELEASE_BASE="file://$reldir" \
+    sh scripts/install.sh --default v9.9.9 >>"$scratch/i60-install.log" 2>&1 || {
+    echo "FAIL --default install:"; cat "$scratch/i60-install.log"; exit 1; }
+[ "$(cat "$tch2/default-version")" = "v9.9.9" ] || { echo "FAIL --default pin"; cat "$tch2/default-version"; exit 1; }
+# --shim-only rejects a positional tag instead of silently ignoring it
+rc=0
+out=$(OXL_HOME="$tch2" sh scripts/install.sh --shim-only v1.2.3 2>&1) || rc=$?
+[ "$rc" = 2 ] && grep -q "no effect with --shim-only" <<<"$out" || {
+    echo "FAIL shim-only positional guard: rc=$rc $out"; exit 1; }
+# OXL_TOOLCHAIN with stray whitespace trims instead of dying
+out=$(cd "$tcw" && OXL_HOME="$tch2" OXL_TOOLCHAIN=" v9.9.9 " "$SHIM2" version)
+[ "$out" = "FAKE 9.9.9 version" ] || { echo "FAIL env trim: $out"; exit 1; }
+# a tampered payload must die at the checksum gate, never install
+rc=0
+out=$(OXL_HOME="$tch2" OXL_RELEASE_BASE="file://$reldir" \
+    "$SHIM2" toolchain install v9.9.8 2>&1) || rc=$?
+[ "$rc" != 0 ] && grep -q "sha256 mismatch" <<<"$out" \
+    && [ ! -d "$tch2/versions/v9.9.8" ] || {
+    echo "FAIL sha256 gate: rc=$rc $out"; ls "$tch2/versions"; exit 1; }
+# uninstall guards the default; --force removes it
+rc=0
+out=$(OXL_HOME="$tch2" "$SHIM2" toolchain uninstall v9.9.9 2>&1) || rc=$?
+[ "$rc" != 0 ] && grep -q "is the default" <<<"$out" || {
+    echo "FAIL uninstall default-guard: rc=$rc $out"; exit 1; }
+out=$(OXL_HOME="$tch2" "$SHIM2" toolchain uninstall v9.9.9 --force 2>&1)
+grep -q "removed v9.9.9" <<<"$out" && [ ! -d "$tch2/versions/v9.9.9" ] || {
+    echo "FAIL uninstall --force: $out"; exit 1; }
+# a non-directory parked at the version path dies before the stage work
+mkdir -p "$tch2/versions"; echo x > "$tch2/versions/v9.9.9"
+rc=0
+out=$(OXL_HOME="$tch2" OXL_RELEASE_BASE="file://$reldir" \
+    "$SHIM2" toolchain install v9.9.9 2>&1) || rc=$?
+[ "$rc" != 0 ] && grep -q "not a directory" <<<"$out" || {
+    echo "FAIL nondir guard: rc=$rc $out"; exit 1; }
+rm "$tch2/versions/v9.9.9"
+
 echo "ALL TESTS PASSED"

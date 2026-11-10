@@ -53,6 +53,8 @@ done
 [ "$seen_tag" = 0 ] && [ "${OXL_VERSION:-}" ] && want="$OXL_VERSION" || true
 [ "$shim_only" = 1 ] && [ "$set_default" = 1 ] \
     && { echo "install.sh: --default has no effect with --shim-only" >&2; exit 2; }
+[ "$shim_only" = 1 ] && [ "$seen_tag" = 1 ] \
+    && { echo "install.sh: a version tag has no effect with --shim-only" >&2; exit 2; }
 [ "$want" != latest ] && case "$want" in v*) : ;; *) want="v$want" ;; esac
 
 # ---------- the shim (single source — also serves `oxl toolchain`) ----------
@@ -126,7 +128,7 @@ have() { command -v "$1" >/dev/null 2>&1; }
 
 fetch() { # url out  — download url to file out
     have curl || die "curl is required for toolchain install"
-    curl -fsSL "$1" -o "$2"
+    curl -fsSL --connect-timeout 15 --max-time 300 "$1" -o "$2"
 }
 
 latest_tag() {
@@ -136,7 +138,7 @@ latest_tag() {
     # GitHub's "latest" and basename extraction would strip `extra/`
     # and resolve an unrelated toolchain tag.
     have curl || die "curl is required for toolchain install"
-    url=$(curl -fsIL -o /dev/null -w '%{url_effective}' "$BASE/latest") \
+    url=$(curl -fsIL --connect-timeout 15 --max-time 60 -o /dev/null -w '%{url_effective}' "$BASE/latest") \
         || die "cannot resolve latest release at $BASE/latest"
     case "$url" in
         */releases/tag/*) lt="${url##*/releases/tag/}" ;;
@@ -146,9 +148,14 @@ latest_tag() {
         v[0-9]*) ;;
         *) # an extras-lane tag (extra/vX.Y.Z) can hold "latest" — scan the
            # release feed for the newest toolchain tag instead of failing
+           # walk candidates newest-first until one validates — a
+           # malformed v-shaped tag must be skipped, not picked
            lt=$(curl -fsSL "$BASE.atom" 2>/dev/null \
-                | grep -o 'releases/tag/v[0-9][^"<]*' | head -n1)
-           lt=${lt#releases/tag/} ;;
+                | grep -o 'releases/tag/v[0-9][^"<]*' \
+                | while IFS= read -r m; do
+                      c=${m#releases/tag/}
+                      vtag "$c" >/dev/null 2>&1 && { printf '%s\n' "$c"; break; }
+                  done) ;;
     esac
     [ -n "$lt" ] \
         || die "no toolchain release tag found — pass one: oxl toolchain install vX.Y.Z"
@@ -158,10 +165,11 @@ latest_tag() {
 
 resolve() { # echoes "tag<TAB>source" or nothing
     if [ "${OXL_TOOLCHAIN:-}" ]; then
-        v=$(vtag "$OXL_TOOLCHAIN") || die "invalid OXL_TOOLCHAIN: $OXL_TOOLCHAIN"
+        oc=$(printf '%s' "$OXL_TOOLCHAIN" | tr -d '\r\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        v=$(vtag "$oc") || die "invalid OXL_TOOLCHAIN: $OXL_TOOLCHAIN"
         printf '%s\t%s\n' "$v" "env OXL_TOOLCHAIN"; return
     fi
-    d=$(pwd -P)
+    d=$(pwd -P) || die "cannot resolve the working directory"
     while :; do
         if [ -f "$d/.oxl-version" ]; then
             [ -r "$d/.oxl-version" ] || die "cannot read $d/.oxl-version"
@@ -172,7 +180,7 @@ resolve() { # echoes "tag<TAB>source" or nothing
         [ "$d" = / ] && break
         d=$(dirname "$d")
     done
-    d=$(pwd -P)
+    d=$(pwd -P) || die "cannot resolve the working directory"
     while :; do
         if [ -f "$d/oxl.mod" ]; then
             # manifest-parser parity: `//` comments (line start or
@@ -223,6 +231,9 @@ exe_for() { echo "$VERS/$1/oxl-toolchain/oxl"; }
 tc_install() { # tag|latest
     tag="$1"; [ "$tag" = latest ] && tag=$(latest_tag)
     tag=$(vtag "$tag") || die "invalid toolchain tag: $1"
+    if [ -e "$VERS/$tag" ] && [ ! -d "$VERS/$tag" ]; then
+        die "$VERS/$tag exists and is not a directory — remove it and retry"
+    fi
     if [ -d "$VERS/$tag" ] && [ ! -x "$(exe_for "$tag")" ]; then
         echo "oxl: clearing partial install at $VERS/$tag" >&2
         rm -rf "$VERS/$tag"
@@ -283,7 +294,11 @@ tc_install() { # tag|latest
         || die "$tag install raced — a same-tag dir appeared; retry"
     rm -rf "$tmp"; trap - EXIT
     echo "oxl: installed $tag -> $VERS/$tag"
-    [ -f "$OXL_HOME/default-version" ] || echo "$tag" > "$OXL_HOME/default-version"
+    # tmp+rename — a concurrent `resolve` must never read a torn file
+    [ -f "$OXL_HOME/default-version" ] || {
+        df="$OXL_HOME/.default-version.$$"
+        echo "$tag" > "$df" && mv "$df" "$OXL_HOME/default-version"
+    }
 }
 
 tc_uninstall() {
@@ -297,6 +312,7 @@ tc_uninstall() {
     tag=$(vtag "$raw") || die "invalid toolchain tag: $raw"
     [ -d "$VERS/$tag" ] || die "$tag is not installed"
     if [ -f "$OXL_HOME/default-version" ] && [ "$force" = 0 ]; then
+        [ -r "$OXL_HOME/default-version" ] || die "cannot read $OXL_HOME/default-version"
         def=$(head -n1 "$OXL_HOME/default-version" | tr -d '\r\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
         [ "$(vtag "$def" 2>/dev/null || printf '%s' "$def")" = "$tag" ] \
             && die "$tag is the default — \`oxl toolchain uninstall $tag --force\` to remove anyway"
@@ -316,10 +332,12 @@ tc_use() {
     tag=$(vtag "$raw") || die "invalid toolchain tag: $raw"
     [ -d "$VERS/$tag" ] || die "$tag is not installed — \`oxl toolchain install $tag\` first"
     if [ "$local_tag" ]; then
-        echo "$tag" > .oxl-version
+        df="./.oxl-version.$$"
+        echo "$tag" > "$df" && mv "$df" .oxl-version
         echo "oxl: pinned $tag in ./.oxl-version"
     else
-        echo "$tag" > "$OXL_HOME/default-version"
+        df="$OXL_HOME/.default-version.$$"
+        echo "$tag" > "$df" && mv "$df" "$OXL_HOME/default-version"
         echo "oxl: default toolchain -> $tag"
     fi
 }
@@ -389,8 +407,14 @@ out=$("$OXL_HOME/bin/oxl" toolchain install "$want") || exit $?
 printf '%s\n' "$out"
 tag=$(printf '%s\n' "$out" | sed -n 's/^oxl: installed \(v[^ ]*\).*/\1/p;s/^oxl: \(v[^ ]*\) already installed/\1/p')
 tag=${tag:-$want}
+case "$tag" in
+    v[0-9]*.*.*) ;;
+    *) echo "install.sh: install succeeded but no tag resolved (got \`$tag\`)" \
+        "— set the default manually: oxl toolchain use <tag>" >&2; exit 1 ;;
+esac
 if [ ! -f "$OXL_HOME/default-version" ] || [ "$set_default" = 1 ]; then
-    echo "$tag" > "$OXL_HOME/default-version"
+    df="$OXL_HOME/.default-version.$$"
+    echo "$tag" > "$df" && mv "$df" "$OXL_HOME/default-version"
 fi
 
 cat <<EOF

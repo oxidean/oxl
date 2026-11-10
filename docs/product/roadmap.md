@@ -44,6 +44,10 @@ Milestone map: [docs/specs/2026-11-07-phase-2-plan/](../specs/2026-11-07-phase-2
 - **G — portable GUI layer** in the language (charter path) as
   `extra/gui` + `extra/gui/gtk` — spec:
   `docs/specs/2026-11-09-gui-layer/`
+- **R — runtime type descriptors + reflection**: compiler-emitted
+  `TypeDesc` table, `std/reflect` lite, `fmt %v` (#28), typed
+  `errors.As` (#27), then `gob`/`xml`/`template`/`sql` — spec:
+  `docs/specs/2026-11-11-type-descriptors/`
 - Parked on triggers: LLVM backend (behind the `interfaces.md`
   codegen seam), web compilation target (JS/HTML/CSS — guardrail in
   `docs/specs/2026-11-04-0132-v0-2-forward/items/parked-web.md`), D4 shape-generics, parked-stdlib list

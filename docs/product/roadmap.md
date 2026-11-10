@@ -47,10 +47,26 @@ Milestone map: [docs/specs/2026-11-07-phase-2-plan/](../specs/2026-11-07-phase-2
 - **W — web compilation target**: shipped — `--target js` emit
   (node + browser flavors), `extra/gui/dom` backend, `web-todo`
   reference app; spec: `docs/specs/2026-11-10-web-target/`
-- Parked on triggers: LLVM backend (behind the `interfaces.md`
-  codegen seam), D4 shape-generics, reflection-class stdlib
-  (runtime type descriptors), TLS/x509, `pin` primitive,
-  parked-stdlib list
+- Parked on triggers (each unparks when its trigger fires, then
+  takes the normal spec → work-item → PR loop):
+  - LLVM backend — trigger: the C emit lane hits a wall the
+    `interfaces.md` codegen seam can't route around (optimization
+    ceiling, platform reach) or a second backend consumer arrives
+    to prove the seam.
+  - D4 shape-generics — spec item exists
+    (`docs/specs/2026-11-04-0132-v0-2-forward/items/d4-shape-generics.md`);
+    trigger: generic-heavy builds show measurable bloat or compile-
+    time pain — pure backend optimization, semantics unchanged.
+  - reflection-class stdlib (runtime type descriptors) — trigger:
+    a stdlib surface needs runtime type introspection (generic
+    fmt, serialization, plugin dispatch).
+  - TLS/x509 — trigger: first consumer needing authenticated or
+    encrypted transport beyond cleartext `net`; spec must cover
+    the x509 trust story, not just a wrapping API.
+  - `pin` primitive — trigger: FFI or IO needs address-stable
+    values (OS async handles, self-referential own graphs).
+  - parked-stdlib list — per module, trigger: a real consumer
+    demands it; files one work item each.
 
 (The compiler already compiles itself — see `docs/self-hosting.md`;
 "T" retires the Rust seed driver, not the compiler.)

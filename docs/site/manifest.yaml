@@ -8,6 +8,8 @@ version: "0.8.2"
 pages:
   - label: oxl
     link: /
+  - label: Install
+    link: /install/
   - label: Getting started
     link: /getting-started/
   - label: Language

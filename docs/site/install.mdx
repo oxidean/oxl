@@ -1,0 +1,75 @@
+---
+title: Install
+description: Install the oxl toolchain with the version manager, pin releases per project, or build from source.
+---
+
+import { Aside, Steps } from "@astrojs/starlight/components";
+
+**Requires:** a C compiler (`cc`) and pthreads; `oxl build`/`run` emit C and
+link through it. Prebuilt tarballs ship for Linux (x86_64) — macOS (aarch64)
+and Windows (x86_64, via MinGW gcc or LLVM clang) build from source.
+
+<Steps>
+1. Run the installer:
+
+   ```bash
+   curl -fsSL https://raw.githubusercontent.com/oxidean/oxl/main/scripts/install.sh | sh
+   ```
+
+   Pin a specific release with `sh -s -- v0.9.0` appended.
+
+2. Put the shim on `PATH` — the installer prints this line:
+
+   ```bash
+   export PATH="$HOME/.oxl/bin:$PATH"
+   ```
+
+3. Verify:
+
+   ```bash
+   oxl version     # → oxl v0.9.0 (language 0.3)
+   ```
+</Steps>
+
+## The version manager
+
+The `oxl` on `PATH` is a dispatch shim — multiple toolchains live side by
+side under `~/.oxl/versions/`, and the shim picks one per command, first
+hit wins:
+
+1. `$OXL_TOOLCHAIN` — explicit one-command override
+2. `.oxl-version` — a dotfile pin (walking up from the cwd)
+3. `toolchain vX.Y.Z` in the nearest `oxl.mod` — the project's pin
+4. `~/.oxl/default-version` — the fallback
+
+```bash
+oxl toolchain install v0.9.0     # download + verify + unpack
+oxl toolchain list               # installed versions
+oxl toolchain use v0.9.0         # set the default
+oxl toolchain use --local v0.9.0 # pin a directory (.oxl-version)
+oxl toolchain current            # resolved tag + its source
+```
+
+A resolved-but-missing toolchain exits with the install command that
+fixes it — nothing is auto-downloaded mid-build.
+
+<Aside type="note">
+The `oxl` directive in `oxl.mod` is a **language** floor enforced by the
+toolchain itself — it does not select a release. `toolchain vX.Y.Z` is
+the dispatch pin.
+</Aside>
+
+## Building from source
+
+For development work on oxl itself, or platforms without a prebuilt
+tarball:
+
+```bash
+git clone https://github.com/oxidean/oxl && cd oxl
+cd oxl && cargo build --release && cd ..
+export PATH="$PWD/oxl/target/release:$PATH"
+```
+
+A source-built binary reports `oxl dev (language 0.3)`. The version
+manager only manages release installs; keep a dev build earlier on
+`PATH` when you want it to win.

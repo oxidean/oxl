@@ -33,7 +33,37 @@ emitter are written in oxl and compile themselves (see
 - `docs/prototype/report.md` — de-risking benchmarks (state-machine
   frames ~96 B/task; ownership checks ≈ free)
 
-## Building the toolchain
+## Installing the toolchain
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/oxidean/oxl/main/scripts/install.sh | sh
+```
+
+The installer drops a dispatch shim at `~/.oxl/bin/oxl` and the latest
+toolchain under `~/.oxl/versions/<tag>/`. Put the shim on PATH
+(the installer prints the line):
+
+```sh
+export PATH="$HOME/.oxl/bin:$PATH"
+oxl version     # → oxl vX.Y.Z (language 0.3)
+```
+
+The shim manages multiple toolchains side by side and auto-detects the
+one a project needs — `toolchain vX.Y.Z` in `oxl.mod`, a `.oxl-version`
+file, `$OXL_TOOLCHAIN`, else the default:
+
+```sh
+oxl toolchain list                  # installed versions
+oxl toolchain install v0.9.0        # fetch another release
+oxl toolchain use v0.9.0            # set the default
+oxl toolchain use --local v0.9.0    # pin a directory (.oxl-version)
+```
+
+Full details: [`docs/install.md`](docs/install.md). Prebuilt tarballs
+currently ship for Linux x86_64; other supported platforms build from
+source below.
+
+## Building from source
 
 Requires: a Rust toolchain (cargo) for the seed compiler, a C compiler
 (`cc`), and pthreads. Programs that use the sqlite3 shims also need

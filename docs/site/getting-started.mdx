@@ -13,23 +13,23 @@ build from source. See the
 [README](https://github.com/oxidean/oxl/blob/main/README.md#building-the-toolchain).
 
 <Steps>
-1. Download and extract the latest toolchain release:
+1. Install the toolchain and put it on `PATH` (see
+   [Install](/install/) for releases and the version manager):
 
    ```bash
-   curl -LO https://github.com/oxidean/oxl/releases/latest/download/oxl-toolchain-linux-x86_64.tar.gz
-   tar xzf oxl-toolchain-linux-x86_64.tar.gz && cd oxl-toolchain
+   curl -fsSL https://raw.githubusercontent.com/oxidean/oxl/main/scripts/install.sh | sh
+   export PATH="$HOME/.oxl/bin:$PATH"
    ```
 
-2. The tarball bundles the compiler, `std/`, and `examples/`. Try the
-   bundled hello world:
+2. Try the bundled hello world — installed toolchains carry `std/` and
+   `examples/` under `~/.oxl/versions/<tag>/oxl-toolchain/`:
 
    ```bash
-   ./oxl run examples/hello.oxl    # compile + run (needs cc on PATH)
+   oxl run ~/.oxl/versions/*/oxl-toolchain/examples/hello.oxl
    ```
 
-3. Put the toolchain on `PATH`, then write and run your own program.
-   Keep `std/` next to the `oxl` binary: that is where
-   `import "std/x"` resolves. Every file starts with a `package` clause,
+3. Write and run your own program. `import "std/x"` resolves against
+   `std/` next to the binary. Every file starts with a `package` clause,
    and `package main` marks an executable:
 
    ```text title="hello.oxl"
@@ -41,7 +41,6 @@ build from source. See the
    ```
 
    ```bash
-   export PATH="$PWD:$PATH"
    oxl run hello.oxl      # compile + run
    oxl build hello.oxl    # → native binary
    ```

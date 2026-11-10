@@ -217,7 +217,17 @@ fn parse_manifest(
                 if toolchain.is_some() {
                     return Err(err("duplicate directive \"toolchain\"".into()));
                 }
-                if toks.len() != 2 || semver::parse(toks[1]).is_none() {
+                if toks.len() != 2 {
+                    return Err(err("expected `vX.Y.Z`".into()));
+                }
+                // `v` prefix optional — validate a normalized copy; the
+                // pin is stored as written
+                let pin = if toks[1].starts_with('v') {
+                    toks[1].to_string()
+                } else {
+                    format!("v{}", toks[1])
+                };
+                if semver::parse(&pin).is_none() {
                     return Err(err("expected `vX.Y.Z`".into()));
                 }
                 toolchain = Some(toks[1].to_string());

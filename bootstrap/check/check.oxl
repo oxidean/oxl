@@ -6208,11 +6208,23 @@ fn parse_manifest_to(root: str, text: str) -> own ManRes {
                 out.errt = mstr(lineno, "duplicate directive \"toolchain\"")
                 return out
             }
-            if n != 2 || sver_parse(sl_at(toks, 1)).ok == 0 {
+            if n != 2 {
                 out.errt = mstr(lineno, "expected `vX.Y.Z`")
                 return out
             }
-            out.toolchain = sl_at(toks, 1)
+            // `v` is optional on toolchain pins — validate a normalized
+            // copy so sver_parse keeps its v-required contract for other
+            // callers; the pin is stored as written
+            tv := sl_at(toks, 1)
+            tvn := tv
+            if strings.startswith(tvn, "v") == false {
+                tvn = "v" + tvn
+            }
+            if sver_parse(tvn).ok == 0 {
+                out.errt = mstr(lineno, "expected `vX.Y.Z`")
+                return out
+            }
+            out.toolchain = tv
         } else if kw == "require" || kw == "replace" {
             if n == 2 && sl_at(toks, 1) == "(" {
                 block = kw

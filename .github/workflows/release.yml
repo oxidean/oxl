@@ -241,6 +241,8 @@ jobs:
       - name: test suite (gate)
         run: bash tests/run.sh ./oxl/target/release/oxl
       - name: package toolchain
+        env:
+          RELEASE_TAG: ${{ needs.version.outputs.tag }}
         run: |
           mkdir -p dist/oxl-toolchain
           # the suite gate above built and validated the product driver
@@ -255,7 +257,7 @@ jobs:
           cp runtime/rt.h runtime/rt.c dist/oxl-toolchain/runtime/
           cp LICENSE dist/oxl-toolchain/
           # the version manager + `oxl version` read this file for the tag
-          echo "${{ needs.version.outputs.tag }}" > dist/oxl-toolchain/RELEASE
+          echo "$RELEASE_TAG" > dist/oxl-toolchain/RELEASE
           # the repo README documents building from oxl/ and other paths
           # the archive doesn't ship — give it release-specific steps
           cat > dist/oxl-toolchain/README.md <<'EOF2'

@@ -113,13 +113,14 @@ in E's stage E6. Filed items:
 
 ## Parked
 
-See `parked.md` — LLVM backend, web target, D4 shape-generics,
-parked-stdlib list. Each has an explicit reopen trigger; none is
-scheduled.
+See `parked.md` — LLVM backend, D4 shape-generics, parked-stdlib
+list. Each has an explicit reopen trigger; none is scheduled. (The
+web target's trigger fired when G shipped — it is milestone W now,
+WI-0007, spec `docs/specs/2026-11-10-web-target/`.)
 
 ## Sequence
 
 ```
-T (shipped) ──► E ──► G        (R, P absorbed into E)
-└── LLVM, web, D4, stdlib-list: parked on triggers
+T (shipped) ──► E ──► G ──► W  (R, P absorbed into E)
+└── LLVM, D4, stdlib-list: parked on triggers
 ```

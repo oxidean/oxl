@@ -1786,4 +1786,38 @@ rm "$tcw/proj/inner/main.oxl"
 grep -q '^toolchain v0.9.0$' "$tcw/proj/inner/oxl.mod" || {
     echo "FAIL tidy preserves toolchain"; cat "$tcw/proj/inner/oxl.mod"; exit 1; }
 
+# unprefixed `toolchain 0.9.0` pins resolve and parse on both drivers
+printf 'module example.com/tc2\n\noxl 0.3\ntoolchain 0.2.0\n' > "$tcw/oxl.mod"
+rm -f "$tcw/proj/inner/oxl.mod"
+out=$(cd "$tcw/proj" && OXL_HOME="$tch" "$SHIM" build)
+[ "$out" = "FAKE v0.2.0 build" ] || { echo "FAIL shim unprefixed-directive: $out"; exit 1; }
+printf 'module example.com/tc3\n\noxl 0.3\ntoolchain 0.9.0\n' > "$tcw/proj/inner/oxl.mod"
+printf 'package main\n\nfn main() { println("tc3") }\n' > "$tcw/proj/inner/main.oxl"
+out=$("$OXL" run "$tcw/proj/inner" 2>&1)
+[ "$out" = "tc3" ] || { echo "FAIL self unprefixed-toolchain: $out"; exit 1; }
+out=$("$SEEDOXL" run "$tcw/proj/inner" 2>&1)
+[ "$out" = "tc3" ] || { echo "FAIL seed unprefixed-toolchain: $out"; exit 1; }
+rm "$tcw/proj/inner/main.oxl"
+(cd "$tcw/proj/inner" && "$OXL" mod tidy >/dev/null 2>&1)
+grep -q '^toolchain 0.9.0$' "$tcw/proj/inner/oxl.mod" || {
+    echo "FAIL tidy preserves unprefixed pin"; cat "$tcw/proj/inner/oxl.mod"; exit 1; }
+# invalid directive is rejected, not silently selected
+printf 'module example.com/tc4\n\noxl 0.3\ntoolchain vfoo\n' > "$tcw/oxl.mod"
+rc=0
+out=$(cd "$tcw/proj" && OXL_HOME="$tch" "$SHIM" build 2>&1) || rc=$?
+[ "$rc" != 0 ] && grep -q "invalid toolchain directive" <<<"$out" || {
+    echo "FAIL shim bad-directive: rc=$rc $out"; exit 1; }
+printf 'module example.com/m\n\noxl 0.3\ntoolchain v0.1.0\n' > "$tcw/oxl.mod"
+# invalid pins die loudly rather than traversing paths
+rc=0
+out=$(OXL_HOME="$tch" OXL_TOOLCHAIN="../v0.1.0" "$SHIM" build 2>&1) || rc=$?
+[ "$rc" != 0 ] && grep -q "invalid OXL_TOOLCHAIN" <<<"$out" || {
+    echo "FAIL shim env-traversal: rc=$rc $out"; exit 1; }
+mkdir -p "$scratch/keepme"
+rc=0
+out=$(OXL_HOME="$tch" "$SHIM" toolchain uninstall "v0.1.0/../../../$scratch/keepme" 2>&1) || rc=$?
+[ "$rc" != 0 ] && grep -q "invalid toolchain tag" <<<"$out"     && [ -d "$scratch/keepme" ] || {
+    echo "FAIL uninstall-traversal: rc=$rc $out"; exit 1; }
+[ -d "$tch/versions/v0.1.0" ] || { echo "FAIL uninstall-traversal removed real dir"; exit 1; }
+
 echo "ALL TESTS PASSED"

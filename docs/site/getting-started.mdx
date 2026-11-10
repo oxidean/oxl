@@ -22,10 +22,13 @@ build from source. See the
    ```
 
 2. Try the bundled hello world — installed toolchains carry `std/` and
-   `examples/` under `~/.oxl/versions/<tag>/oxl-toolchain/`:
+   `examples/` under `~/.oxl/versions/<tag>/oxl-toolchain/`. Resolve
+   the active tag first (the shim's default), then run the example out
+   of that one toolchain:
 
    ```bash
-   oxl run ~/.oxl/versions/*/oxl-toolchain/examples/hello.oxl
+   tag=$(cat ~/.oxl/default-version)
+   oxl run ~/.oxl/versions/$tag/oxl-toolchain/examples/hello.oxl
    ```
 
 3. Write and run your own program. `import "std/x"` resolves against

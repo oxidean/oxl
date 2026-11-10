@@ -30,7 +30,7 @@ export PATH="$HOME/.oxl/bin:$PATH"
 ```
 
 The installer verifies the release's `.sha256` when one is published
-(releases from v0.9.0 onward ship it; older releases warn and skip).
+(new releases ship the sidecar; releases cut before it warn and skip).
 It never runs the toolchain — only unpacks it.
 
 Prebuilt tarballs ship for **Linux x86_64**. On any other platform the

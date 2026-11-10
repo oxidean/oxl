@@ -74,6 +74,16 @@ die() {
 
 norm() { case "$1" in v*) echo "$1" ;; *) echo "v$1" ;; esac; }
 
+# strict tag validation — a tag lands in $VERS/$tag paths (install dir,
+# rm -rf on uninstall), so reject anything that is not vX.Y.Z(+suffix):
+# blocks `..`/separator traversal and junk directives alike
+vtag() { # raw -> normalized tag on stdout; nonzero exit if invalid
+    t=$(norm "$1")
+    echo "$t" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+([-+][A-Za-z0-9._-]+)?$' \
+        || return 1
+    echo "$t"
+}
+
 # platform asset suffix, e.g. linux-x86_64
 asset_os_arch() {
     os=$(uname -s | tr '[:upper:]' '[:lower:]')
@@ -103,13 +113,15 @@ latest_tag() {
 
 resolve() { # echoes "tag<TAB>source" or nothing
     if [ "${OXL_TOOLCHAIN:-}" ]; then
-        echo "$(norm "$OXL_TOOLCHAIN")	env OXL_TOOLCHAIN"; return
+        v=$(vtag "$OXL_TOOLCHAIN") || die "invalid OXL_TOOLCHAIN: $OXL_TOOLCHAIN"
+        echo "$v	env OXL_TOOLCHAIN"; return
     fi
     d=$(pwd -P)
     while :; do
         if [ -f "$d/.oxl-version" ]; then
             t=$(head -n1 "$d/.oxl-version" | tr -d '[:space:]')
-            [ -n "$t" ] && { echo "$(norm "$t")	$d/.oxl-version"; return; }
+            [ -n "$t" ] && { v=$(vtag "$t") || die "invalid version in $d/.oxl-version: $t"
+                echo "$v	$d/.oxl-version"; return; }
         fi
         [ "$d" = / ] && break
         d=$(dirname "$d")
@@ -117,9 +129,11 @@ resolve() { # echoes "tag<TAB>source" or nothing
     d=$(pwd -P)
     while :; do
         if [ -f "$d/oxl.mod" ]; then
-            t=$(sed -n 's/^[[:space:]]*toolchain[[:space:]][[:space:]]*\(v[^[:space:]]*\).*/\1/p' \
+            t=$(sed -n 's/^[[:space:]]*toolchain[[:space:]][[:space:]]*\([^[:space:]]*\).*/\1/p' \
                 "$d/oxl.mod" | head -n1)
-            [ -n "$t" ] && { echo "$t	$d/oxl.mod toolchain directive"; return; }
+            [ -n "$t" ] && { v=$(vtag "$t") \
+                || die "invalid toolchain directive in $d/oxl.mod: $t"
+                echo "$v	$d/oxl.mod toolchain directive"; return; }
             break   # nearest oxl.mod wins even without a pin — do not climb past it
         fi
         [ "$d" = / ] && break
@@ -127,7 +141,8 @@ resolve() { # echoes "tag<TAB>source" or nothing
     done
     if [ -f "$OXL_HOME/default-version" ]; then
         t=$(head -n1 "$OXL_HOME/default-version" | tr -d '[:space:]')
-        [ -n "$t" ] && { echo "$(norm "$t")	default-version"; return; }
+        [ -n "$t" ] && { v=$(vtag "$t") || die "invalid version in default-version: $t"
+            echo "$v	default-version"; return; }
     fi
     return 0
 }
@@ -135,7 +150,8 @@ resolve() { # echoes "tag<TAB>source" or nothing
 exe_for() { echo "$VERS/$1/oxl-toolchain/oxl"; }
 
 tc_install() { # tag|latest
-    tag="$1"; [ "$tag" = latest ] && tag=$(latest_tag); tag=$(norm "$tag")
+    tag="$1"; [ "$tag" = latest ] && tag=$(latest_tag)
+    tag=$(vtag "$tag") || die "invalid toolchain tag: $1"
     [ -d "$VERS/$tag" ] && { echo "oxl: $tag already installed"; return 0; }
     suf=$(asset_os_arch)
     asset="oxl-toolchain-$suf.tar.gz"
@@ -166,7 +182,7 @@ tc_uninstall() {
         case "$a" in --force) force=1 ;; *) tag="$a" ;; esac
     done
     [ -n "$tag" ] || { echo "usage: oxl toolchain uninstall <tag> [--force]" >&2; exit 2; }
-    tag=$(norm "$tag")
+    raw=$tag; tag=$(vtag "$raw") || die "invalid toolchain tag: $raw"
     [ -d "$VERS/$tag" ] || die "$tag is not installed"
     if [ -f "$OXL_HOME/default-version" ] \
         && [ "$(cat "$OXL_HOME/default-version")" = "$tag" ] && [ "$force" = 0 ]; then
@@ -181,7 +197,7 @@ tc_use() {
     for a in "$@"; do
         case "$a" in --local) local_tag=1 ;; *) tag="$a" ;; esac
     done
-    tag=$(norm "$tag")
+    raw=$tag; tag=$(vtag "$raw") || die "invalid toolchain tag: $raw"
     [ -d "$VERS/$tag" ] || die "$tag is not installed — \`oxl toolchain install $tag\` first"
     if [ "$local_tag" ]; then
         echo "$tag" > .oxl-version

@@ -2,9 +2,9 @@
   "schema_version": 1,
   "id": "WI-0005",
   "title": "milestone G spec: portable GUI layer as extra/gui + extra/gui/gtk",
-  "state": "verifying",
+  "state": "archived",
   "profile": "normal",
   "current_stage": "verification",
   "created_at": "2026-11-09T09:57:36Z",
-  "updated_at": "2026-11-09T10:05:26Z"
+  "updated_at": "2026-11-10T00:35:04Z"
 }

@@ -55,6 +55,7 @@ and both just work:
 oxl toolchain install v0.9.0    # download + verify + unpack a release
 oxl toolchain list              # installed versions ((default) marked)
 oxl toolchain use v0.9.0        # set the default
+oxl toolchain default            # print the default tag
 oxl toolchain use --local v0.9.0   # pin this directory (.oxl-version)
 oxl toolchain current           # resolved tag + where it came from
 oxl toolchain uninstall v0.8.0  # remove (refuses the default; --force)

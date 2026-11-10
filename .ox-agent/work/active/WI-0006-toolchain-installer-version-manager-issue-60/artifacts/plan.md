@@ -43,10 +43,10 @@ Single-PR delivery, staged commits. Each stage lands suite-green.
 
 ## S4 — tests
 
-- `tests/toolchain/shim_test.sh`: fake `versions/` fixture, assert
+- Inline `tests/run.sh` i60 section: fake `versions/` fixture, assert
   resolution order (env > dotfile > directive > default), missing-
-  version exit 127 + hint, all verbs offline. Wired into run.sh.
-- `tests/mod/toolchain_directive/` fixture: manifest with `toolchain`
+  version exit 127 + hint, all verbs offline.
+- Inline `tests/run.sh` directive cases: manifest with `toolchain`
   checks clean on both drivers; `mod tidy` preserves the line.
 
 ## S5 — docs + un-park sweep

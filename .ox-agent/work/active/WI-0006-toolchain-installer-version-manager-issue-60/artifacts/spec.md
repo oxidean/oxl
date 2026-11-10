@@ -65,7 +65,7 @@ $OXL_HOME/                    (default ~/.oxl)
   `./.oxl-version`), `toolchain uninstall <tag>` (refuses when the tag
   is the default unless `--force`), `toolchain current` (resolved
   version + source), `toolchain default`.
-- `oxl version` (real binary): `oxl <release|dev> (language <X.Y.Z>)`.
+- `oxl version` (real binary): `oxl <release|dev> (language <X.Y>)`.
 
 ## Acceptance criteria
 

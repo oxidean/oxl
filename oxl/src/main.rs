@@ -148,9 +148,6 @@ fn modcache_dir() -> PathBuf {
     modcache::cache_dir()
 }
 
-/// parse oxl.mod text -> (module path, `oxl` floor as written,
-/// requires, replaces). Errors come back ready to print:
-/// `oxl.mod:<line>: <msg>` — display stays hermetic (the manifest is
 /// manifest comment rule: `//` opens a comment only at line start or
 /// after whitespace — a `//` glued inside a token (`file://`, `https://`)
 /// is part of the path, the same constraint the modfile lexer applies
@@ -167,7 +164,11 @@ fn strip_comment(raw: &str) -> &str {
     raw
 }
 
-/// always AT the module root, so the bare name locates it).
+/// parse oxl.mod text -> (module path, `oxl` floor as written,
+/// toolchain pin, requires, replaces). Errors come back ready to
+/// print: `oxl.mod:<line>: <msg>` — display stays hermetic (the
+/// manifest is always AT the module root, so the bare name locates
+/// it).
 fn parse_manifest(
     src: &str,
 ) -> Result<

@@ -72,7 +72,7 @@ die() {
     echo "oxl: $*" >&2; exit "$code"
 }
 
-norm() { case "$1" in v*) echo "$1" ;; *) echo "v$1" ;; esac; }
+norm() { case "$1" in v*) printf '%s\n' "$1" ;; *) printf 'v%s\n' "${1#v}" ;; esac; }
 
 # strict tag validation — a tag lands in $VERS/$tag paths (install dir,
 # rm -rf on uninstall), so reject anything that is not vX.Y.Z(+suffix):
@@ -83,11 +83,17 @@ vtag() { # raw -> normalized tag on stdout; nonzero exit if invalid
     # would pass on its first line and traverse $VERS paths downstream
     [ "$(printf '%s' "$t" | tr -d '[:space:]')" = "$t" ] || return 1
     # semver.rs parity: numeric fields reject leading zeros, idents are
-    # alnum+'-' dot-separated. Residual gap: numeric pre idents with
-    # leading zeros (v1.2.3-01) pass here — ERE can't express it.
-    echo "$t" | grep -qE '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$' \
+    # alnum+'-' dot-separated.
+    printf '%s\n' "$t" | grep -qE '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$' \
         || return 1
-    echo "$t"
+    # numeric prerelease idents reject leading zeros (v1.2.3-01) on both
+    # drivers — the ERE above can't express it, so a second pass covers it
+    case "$t" in
+        *-*) pre=${t#*-}; pre=${pre%%+*}
+             printf '%s\n' "$pre" | grep -qE '(^|\.)0[0-9]+(\.|$)' \
+                 && return 1 ;;
+    esac
+    printf '%s\n' "$t"
 }
 
 # platform asset suffix, e.g. linux-x86_64
@@ -149,7 +155,7 @@ resolve() { # echoes "tag<TAB>source" or nothing
             # appear at most once — a duplicate, extra-token, or bare
             # form is an error, not a silent skip
             pa=$(awk '
-                { sub(/(^|[ \t])\/\/.*/, "") }
+                { sub(/(^|[[:space:]])\/\/.*/, "") }
                 /^[ \t]*(require|replace)[ \t]*\(/ { depth++ }
                 /^[ \t]*\)/ { if (depth > 0) depth-- }
                 depth == 0 && /^[ \t]*toolchain([ \t]|$)/ {
@@ -224,6 +230,12 @@ tc_install() { # tag|latest
     [ -e "$VERS/$tag" ] && die "$tag appeared during install — retry"
     chmod 755 "$stage"
     mv "$stage" "$VERS/$tag"
+    # a same-tag dir materializing between the check and mv nests the
+    # stage inside it ($VERS/$tag/.stage.*) — clean the orphan and fail
+    if ls -d "$VERS/$tag"/.stage.* >/dev/null 2>&1; then
+        rm -rf "$VERS/$tag"/.stage.*
+        die "$tag install raced — a same-tag dir appeared; retry"
+    fi
     [ -x "$VERS/$tag/oxl-toolchain/oxl" ] \
         || die "$tag install raced — a same-tag dir appeared; retry"
     rm -rf "$tmp"; trap - EXIT
@@ -280,7 +292,8 @@ tc_list() {
 if [ "${1:-}" = toolchain ]; then
     shift
     case "${1:-}" in
-        install)   tc_install "${2:?usage: oxl toolchain install <tag|latest>}" ;;
+        install)   [ -z "${3:-}" ] || die "usage: oxl toolchain install <tag|latest>"
+                   tc_install "${2:?usage: oxl toolchain install <tag|latest>}" ;;
         uninstall) shift; tc_uninstall "$@" ;;
         use)       shift; tc_use "$@" ;;
         list|ls)   tc_list ;;

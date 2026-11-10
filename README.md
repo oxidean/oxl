@@ -49,8 +49,8 @@ oxl version     # → oxl vX.Y.Z (language 0.3)
 ```
 
 The shim manages multiple toolchains side by side and auto-detects the
-one a project needs — `toolchain vX.Y.Z` in `oxl.mod`, a `.oxl-version`
-file, `$OXL_TOOLCHAIN`, else the default:
+one a project needs — `$OXL_TOOLCHAIN`, a `.oxl-version` file,
+`toolchain vX.Y.Z` in the nearest `oxl.mod`, else the default:
 
 ```sh
 oxl toolchain list                  # installed versions

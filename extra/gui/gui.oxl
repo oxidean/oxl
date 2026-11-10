@@ -530,6 +530,16 @@ interface Backend {
     detach(parent: int, child: int),
     destroy(h: int),
     pump(events: mut EventBuf, cmds: mut CmdBuf),
+    // cooperative-scheduler driving: a backend that answers 1 cannot
+    // own a blocking loop (the js lane has no blocking waits inside a
+    // vtable call) — run drives one bounded pump_iter per pass on its
+    // own susp frame and parks on pump_edge between passes. stop,
+    // wake and event injection must all post an edge there.
+    susp_pump() -> int,
+    pump_iter(events: mut EventBuf, cmds: mut CmdBuf) -> int,
+    pump_edge() -> chan,
+    stopped() -> int,
+    pump_fin(),
     stop(),
     wake(),
 }
@@ -836,6 +846,29 @@ fn watcher(b: Backend, rt: chan) {
     recv(rt)
 }
 
+// susp-frame pump driver: same "only returns after stop" contract a
+// blocking pump has, expressed as bounded passes plus an edge park.
+// A miss parks one bounded select — the wake latch covers posts that
+// beat the park, and the timeout stays defensive-only: every edge
+// (cmd post -> wake -> nudge, inject -> nudge, stop -> nudge) lands on
+// the backend's chan.
+fn pump_task(b: Backend, events: mut EventBuf, cmds: mut CmdBuf) {
+    edge := b.pump_edge()
+    for 1 == 1 {
+        worked := b.pump_iter(events, cmds)
+        if b.stopped() == 1 {
+            break
+        }
+        if worked == 0 && cmds.take_wake() == 0 {
+            select {
+                recv(edge) => {}
+                timeout(50) => {}
+            }
+        }
+    }
+    b.pump_fin()
+}
+
 // ---- run ----
 
 // run-side teardown accounting: every still-unsent entry is counted
@@ -958,7 +991,11 @@ fn run(b: Backend, app: fn(chan own Event)) -> err {
         g_sess.disp = disp
         goin(disp, dispatch_loop())
         app(ev)
-        g_sess.b.pump(g_eb, g_cb)
+        if g_sess.b.susp_pump() == 1 {
+            pump_task(g_sess.b, g_eb, g_cb)
+        } else {
+            g_sess.b.pump(g_eb, g_cb)
+        }
         close(g_sess.retire)
         cb_shutdown()
         sync.mlock(g_eb.mu)

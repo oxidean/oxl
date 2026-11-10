@@ -1787,6 +1787,11 @@ grep -q '^toolchain v0.9.0$' "$tcw/proj/inner/oxl.mod" || {
     echo "FAIL tidy preserves toolchain"; cat "$tcw/proj/inner/oxl.mod"; exit 1; }
 
 # unprefixed `toolchain 0.9.0` pins resolve and parse on both drivers
+rm -f "$tcw/proj/.oxl-version"
+# the --force uninstall above removed v0.2.0 — restore the fake install
+mkdir -p "$tch/versions/v0.2.0/oxl-toolchain"
+printf '#!/bin/sh\necho "FAKE v0.2.0 $@"\n' > "$tch/versions/v0.2.0/oxl-toolchain/oxl"
+chmod +x "$tch/versions/v0.2.0/oxl-toolchain/oxl"
 printf 'module example.com/tc2\n\noxl 0.3\ntoolchain 0.2.0\n' > "$tcw/oxl.mod"
 rm -f "$tcw/proj/inner/oxl.mod"
 out=$(cd "$tcw/proj" && OXL_HOME="$tch" "$SHIM" build)

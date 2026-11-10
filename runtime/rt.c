@@ -124,24 +124,8 @@ void rt_free(void *obj) {
     /* arena blocks free with their scope */
 }
 
-void rt_borrow_read(void *obj) {
-    if (!obj) return;
-    ObjHdr *h = hdr_of(obj);
-    if (h->poisoned || h->borrow == 2) rt_trap(2); /* aliasing */
-    h->borrow = 1;
-}
+/* borrow tracking lives below RtTask — it is per-task */
 
-void rt_borrow_mut(void *obj) {
-    if (!obj) return;
-    ObjHdr *h = hdr_of(obj);
-    if (h->poisoned || h->borrow != 0) rt_trap(2); /* aliasing */
-    h->borrow = 2;
-}
-
-void rt_unborrow(void *obj) {
-    if (!obj) return;
-    hdr_of(obj)->borrow = 0;
-}
 
 /* ---------------- scopes, tasks, traps ---------------- */
 
@@ -207,7 +191,21 @@ typedef struct RtWake {
  * while its poll is on the C stack, so the target can live in TLS */
 static _Thread_local jmp_buf tls_jb;
 
+/* one live lexical borrow: an `own` value passed `mut`/`ref` is borrowed
+ * for the call's duration. Borrow state is per-task, not on the object —
+ * two tasks may borrow one object legitimately when their calls are
+ * serialized by a mutex; an object-global flag lives outside whatever
+ * synchronization the callers arranged, so it aliased lexical regions
+ * across tasks and trapped correctly-synchronized code. */
+typedef struct BorrowEnt {
+    struct BorrowEnt *next;
+    ObjHdr *h;
+    int mode; /* 1 read, 2 mut */
+} BorrowEnt;
+
 struct RtTask {
+    BorrowEnt *borrows;     /* live borrows, innermost first */
+    BorrowEnt *borrow_pool; /* recycled entries */
     RtPoll poll;          /* frame tasks: driver fn */
     RtFrame *frame;       /* == (RtFrame *)(t + 1) for rt_task_new blocks */
     void *(*fn)(void *);  /* thread tasks: plain fn */
@@ -259,7 +257,73 @@ struct RtTask {
  * memory across claim+wake; the last dropper frees task+frame. */
 static void task_ref(RtTask *t) { __sync_add_and_fetch(&t->holds, 1); }
 static void task_unref(RtTask *t) {
-    if (__sync_sub_and_fetch(&t->holds, 1) == 0) free(t);
+    if (__sync_sub_and_fetch(&t->holds, 1) == 0) {
+        for (BorrowEnt *e = t->borrows, *n; e; e = n) {
+            n = e->next;
+            e->h->borrow = 0;
+            free(e);
+        }
+        for (BorrowEnt *e = t->borrow_pool, *n; e; e = n) {
+            n = e->next;
+            free(e);
+        }
+        free(t);
+    }
+}
+
+/* ---------------- per-task borrow tracking ----------------
+ * Same-task conflicts trap: mut over any live borrow of mine, read over
+ * my mut borrow. Cross-task overlap is the mutex/chan model's concern —
+ * the flag check never saw it reliably anyway (flag set outside every
+ * caller's serialization). Foreign threads (no tls_task) get a
+ * per-thread list. */
+
+static BorrowEnt **borrow_list(void) {
+    static _Thread_local BorrowEnt *fb;
+    RtTask *t = tls_task;
+    return t ? &t->borrows : &fb;
+}
+
+static BorrowEnt **borrow_pool(void) {
+    static _Thread_local BorrowEnt *fp;
+    RtTask *t = tls_task;
+    return t ? &t->borrow_pool : &fp;
+}
+
+static void borrow_push(void *obj, int mode) {
+    ObjHdr *h = hdr_of(obj);
+    if (h->poisoned) rt_trap(2); /* moved-from */
+    BorrowEnt **lp = borrow_list();
+    for (BorrowEnt *e = *lp; e; e = e->next)
+        if (e->h == h && (mode == 2 || e->mode == 2)) rt_trap(2); /* aliasing */
+    BorrowEnt **pp = borrow_pool();
+    BorrowEnt *e = *pp;
+    if (e) *pp = e->next; else e = xmalloc(sizeof *e);
+    e->h = h;
+    e->mode = mode;
+    e->next = *lp;
+    *lp = e;
+    h->borrow = mode; /* advisory only — see BorrowEnt comment */
+}
+
+void rt_borrow_read(void *obj) { if (obj) borrow_push(obj, 1); }
+void rt_borrow_mut(void *obj)  { if (obj) borrow_push(obj, 2); }
+
+void rt_unborrow(void *obj) {
+    if (!obj) return;
+    ObjHdr *h = hdr_of(obj);
+    BorrowEnt **lp = borrow_list();
+    for (BorrowEnt **pp = lp; *pp; pp = &(*pp)->next) {
+        if ((*pp)->h == h) {
+            BorrowEnt *e = *pp;
+            *pp = e->next;
+            BorrowEnt **pl = borrow_pool();
+            e->next = *pl;
+            *pl = e;
+            h->borrow = 0;
+            return;
+        }
+    }
 }
 
 /* register `t` as parked on `obj` in scope `s` — callers hold the wait

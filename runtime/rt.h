@@ -110,7 +110,9 @@ typedef struct {
 typedef struct RtScope RtScope;
 typedef struct ObjHdr {
     uint32_t gen;
-    uint8_t borrow; /* 0 free, 1 read-held, 2 mut-held */
+    uint8_t borrow; /* advisory last-seen mode — the borrow
+                           * rules themselves are per-task lists on
+                           * RtTask (rt_borrow_* in rt.c) */
     uint8_t arena;
     uint8_t poisoned;
     uint8_t _pad;

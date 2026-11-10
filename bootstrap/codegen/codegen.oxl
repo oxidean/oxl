@@ -2934,6 +2934,20 @@ fn gcall(g: mut G, f: ref parser.Node, args: ref parser.NList) -> str {
             parser.Node.Field{obj} => {
                 c := new(GAv)
                 c.v = gadapt_v(g, obj, gx(g, obj), pt)
+                // own receiver to a mut/ref method borrows for the
+                // call — the same wrap garg_c puts on own args
+                raw := gsub(g, xty(g, obj))
+                if tyk(g, raw) == check.k_own() {
+                    pk := tyk(g, pt)
+                    if pk == check.k_mut() {
+                        pre = pre + "rt_borrow_mut(" + c.v + "); "
+                        post = "rt_unborrow(" + c.v + "); " + post
+                    }
+                    if pk == check.k_ref() {
+                        pre = pre + "rt_borrow_read(" + c.v + "); "
+                        post = "rt_unborrow(" + c.v + "); " + post
+                    }
+                }
                 coerced = c
                 ctail = c
             }

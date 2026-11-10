@@ -40,12 +40,22 @@ reliable. `new(expr)` heap-boxes a *value*: `new(E.V(...))` yields
 ## Borrow rules (dynamic)
 
 1. While a `mut T` borrow is live: no other `mut` or `ref` borrow of the
-   same object may activate. Violation → `TrapAliasing`. A call's `own`
-   argument borrow is live for the whole call — `f(x, g(x))` where `x`
-   is `own` and both params take `mut`/`ref` traps; hoist the inner
-   call to a `let`/`:=` so the borrows sequence.
+   same object may activate **on the same task**. Violation →
+   `TrapAliasing`. A call's `own` argument borrow is live for the whole
+   call — `f(x, g(x))` where `x` is `own` and both params take
+   `mut`/`ref` traps; hoist the inner call to a `let`/`:=` so the
+   borrows sequence.
    (Passing a `mut`/`ref` *reference* on is a reborrow — no runtime op —
    only `own` arguments start a fresh borrow.)
+
+   Borrows are tracked **per task**: two tasks may hold live borrows of
+   one object in overlapping call windows when the calls are serialized
+   by a mutex — `sync.mlock(mu); obj.method(); sync.munlock(mu)` from
+   many tasks is the supported shape for mutex-guarded shared state.
+   Borrow flags live outside whatever synchronization the callers
+   arrange, so an object-global flag could not tell a mutex-serialized
+   access from a real race; cross-task aliasing is the
+   `sync`/chan model's concern, not this check's.
 2. Any access through a dead handle (moved `own`, outlived arena
    reference, freed generation) → `TrapDangling`.
 3. Channel `send` transfers ownership: the sent handle dies at the
@@ -60,7 +70,9 @@ Each checked heap object carries a header:
 ```c
 typedef struct ObjHdr {
     uint32_t gen;            // generation tag — dangling detection
-    uint8_t  borrow;         // 0 = free, 1 = shared-readers>0, 2 = mut-held
+    uint8_t  borrow;         // advisory last-seen mode — the borrow
+                             // rules live on the borrowing task's
+                             // BorrowEnt list (per-task state)
     uint8_t  arena;          // arena-owned flag
     uint8_t  poisoned;       // owner trapped mid-mutation — next access traps
     uint8_t  _pad;

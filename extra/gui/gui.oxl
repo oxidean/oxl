@@ -21,6 +21,8 @@ extern fn rt_str_own(s: str) -> str
 
 extern fn rt_str_free(s: str)
 
+extern fn rt_chan_is_closed(c: chan own CmdResult) -> int
+
 // ---- public protocol types ----
 enum WidgetKind { window, vbox, hbox, label, button, entry, list, scrolled, }
 
@@ -553,14 +555,77 @@ fn last_dropped_cell() {
     }
 }
 
-// ---- reply chans ----
-// One cap-1 chan per round trip, bound to the mailbox-owning scope
-// (g_sess.mscope) — the caller's own scope can die mid-recv without
-// the reply chan dying under a queued Cmd. Callers close it on every
-// exit path (defer) so a backend's try_send observes the loss and its
-// reconcile runs; the scope's teardown reclaims the chans themselves.
+// ---- reply-chan pool ----
+// A small pool bound to the mailbox-owning scope (g_sess.mscope) so a
+// long session does not accumulate a chan object per round trip. A
+// wrapper re-pools its chan only when its recv resolved normally —
+// the reply is consumed, the chan is still open, and no queued Cmd
+// still names it (pump's try_send landed before the recv resolved,
+// so that Cmd is done). Every other exit path closes the chan
+// instead: close is terminal, so a cancelled caller's chan is NEVER
+// pooled — pump's try_send then observes false and its reconcile
+// runs. The scope's teardown reclaims chans either way.
+struct PN { c: chan own CmdResult, next: own PN }
+
+let g_rp: own PN = nil
+let g_rp_n: int = 0
+let g_rp_mu: shared = nil
+
+// a cap-1 chan per round trip — drawn from the pool when one is
+// available, else smkchan'd fresh against the mailbox scope
 fn reply_chan() -> chan own CmdResult {
+    if g_rp_mu != nil {
+        sync.mlock(g_rp_mu)
+        n := g_rp
+        if n != nil {
+            g_rp = n.next
+            g_rp_n = g_rp_n - 1
+        }
+        sync.munlock(g_rp_mu)
+        if n != nil {
+            return n.c
+        }
+    }
     return smkchan(CmdResult, 1, g_sess.mscope)
+}
+
+// admit an open+drained chan back to the pool; anything else — a chan
+// that died between borrow and re-pool (is_closed is the admission
+// probe), or one over the small bound — is closed and left for the
+// mailbox scope's teardown rather than recycled
+fn reply_pool_put(rc: chan own CmdResult) {
+    if rt_chan_is_closed(rc) != 0 {
+        return
+    }
+    if g_rp_mu == nil {
+        close(rc)
+        return
+    }
+    sync.mlock(g_rp_mu)
+    if g_rp_n >= 8 {
+        sync.munlock(g_rp_mu)
+        close(rc)
+        return
+    }
+    n := new(PN)
+    n.c = rc
+    n.next = g_rp
+    g_rp = n
+    g_rp_n = g_rp_n + 1
+    sync.munlock(g_rp_mu)
+}
+
+// defer target on every reply borrow: a recv that resolved normally
+// leaves the chan open+drained — eligible for the pool; any other
+// exit (a cancel mid-recv, an early error before the reply landed)
+// closes it, which is terminal — the chan is never pooled — and
+// flips the backend's try_send to false so its reconcile runs
+fn reply_done(rc: chan own CmdResult, settled: shared) {
+    if sget(settled) != 0 {
+        reply_pool_put(rc)
+        return
+    }
+    close(rc)
 }
 
 // owned-string copy for payload boundaries a buf can't reach — read
@@ -827,6 +892,10 @@ fn run(b: Backend, app: fn(chan own Event)) -> err {
     g_sess.retire = mkchan(1)
     g_sess.mscope = curscope()
 
+    g_rp = nil
+    g_rp_n = 0
+    g_rp_mu = sync.mutex()
+
     spawn watcher(b, g_sess.retire)
     scope {
         disp := mkscope()
@@ -995,9 +1064,12 @@ fn create(kind: WidgetKind, parent: int, props: own []Prop) -> [int, err] {
         return 0, err_stopped()
     }
     rc := reply_chan()
-    // close on every exit — a cancel mid-recv or an early error return
-    // must flip the backend's try_send to false so its reconcile runs
-    defer close(rc)
+    // close on every exit that never saw a reply resolve — a cancel
+    // mid-recv or an early error flips the backend's try_send to false
+    // so its reconcile runs; a resolved recv re-pools the open+drained
+    // chan instead (see reply_done)
+    settled := mkshared(0)
+    defer reply_done(rc, settled)
     c := mk_cmd(CmdKind.new_kind, parent, 0)
     c.widget = kind
     c.props = props
@@ -1010,6 +1082,7 @@ fn create(kind: WidgetKind, parent: int, props: own []Prop) -> [int, err] {
     if r == nil {
         return 0, err_stopped()
     }
+    sset(settled, 1)
     if r.e != nil {
         return 0, r.e
     }
@@ -1100,7 +1173,13 @@ fn append(parent: Widget, child: Widget) {
     post_ff(mk_cmd(CmdKind.attach, parent.handle(), child.handle()))
 }
 
-// detach + destroy — destroy is the single release op.
+// detach + destroy — destroy is the single release op. The settle
+// Cmds post BEFORE the core table marks the handle dead: a poster
+// parked on a full CmdBuf and then cancelled leaves the widget live
+// in the table, which is the correct state — the destroy never
+// landed, so neither did the close decision. Marking first would let
+// a later OS close_requested resolve dead, post drop-eligible, and
+// be evicted under load — a lost close is a wedged app.
 fn remove(w: Widget) {
     if g_eb == nil {
         return
@@ -1108,12 +1187,14 @@ fn remove(w: Widget) {
     h := w.handle()
     sync.mlock(g_eb.mu)
     wt := wt_get(g_eb.wt, h)
-    eb_mark_dead(g_eb, h)
     sync.munlock(g_eb.mu)
     if wt.parent != 0 {
         post_ff(mk_cmd(CmdKind.detach, wt.parent, h))
     }
     post_ff(mk_cmd(CmdKind.destroy, h, 0))
+    sync.mlock(g_eb.mu)
+    eb_mark_dead(g_eb, h)
+    sync.munlock(g_eb.mu)
 }
 
 // keep the window: resolves the pending close decision and re-arms the
@@ -1161,7 +1242,8 @@ fn read_prop(h: int, id: int) -> [PropVal, err] {
         return PropVal.Num(0), err_stopped()
     }
     rc := reply_chan()
-    defer close(rc)
+    settled := mkshared(0)
+    defer reply_done(rc, settled)
     c := mk_cmd(CmdKind.read, h, 0)
     c.prop = Prop{id: id, val: PropVal.Num(0)}
     c.reply = rc
@@ -1173,6 +1255,7 @@ fn read_prop(h: int, id: int) -> [PropVal, err] {
     if r == nil {
         return PropVal.Num(0), err_stopped()
     }
+    sset(settled, 1)
     if r.e != nil {
         return PropVal.Num(0), r.e
     }

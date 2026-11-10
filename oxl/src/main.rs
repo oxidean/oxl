@@ -997,7 +997,14 @@ fn qualify_block(
             ast::Stmt::Scope { body, .. } | ast::Stmt::Unsafe { body, .. } => {
                 qualify_block(body, renames, aliases, locals, used)
             }
-            ast::Stmt::Spawn { call, .. } => qualify_expr(call, renames, aliases, locals, used),
+            ast::Stmt::Spawn { call, scope, .. } => {
+                qualify_expr(call, renames, aliases, locals, used);
+                // the `goin` scope expr names decls too — skipping it
+                // leaves imported scopes unqualified/misresolved
+                if let Some(s) = scope {
+                    qualify_expr(s, renames, aliases, locals, used);
+                }
+            }
             ast::Stmt::Defer { call, .. } => qualify_expr(call, renames, aliases, locals, used),
             ast::Stmt::Select { arms, .. } => {
                 for a in arms {

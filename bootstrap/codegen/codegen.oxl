@@ -183,6 +183,7 @@ struct G {
     subst: own collections.Map, // tyvar -> tyid for the inst being emitted (nil = off)
     drop_tys: []str, // struct/enum names needing an o_drop_<n> chan-payload destructor
     drop_word: int, // payload kinds that only need rt_free on the word
+    drop_slice: int, // own-slice payloads needing the two-free thunk
     insts: own GInst, // pending instantiation queue (LIFO)
     inst_done: own collections.Map, // mangled inst name -> 1
     vtabs: own GVU, // materialized (iface, impl) pairs, newest first
@@ -3115,6 +3116,12 @@ fn drop_sym(g: mut G, payload: int) -> str {
     if ik == check.k_struct() || ik == check.k_enum() {
         return "o_drop_" + cname(g.ck.tyv[inner].name)
     }
+    // an own-slice payload is a heap box over a heap backing — the
+    // shared word shim would free the box but leak ptr
+    if ik == check.k_slice() {
+        g.drop_slice = 1
+        return "o_drop_slice"
+    }
     g.drop_word = 1
     return "o_drop_word"
 }
@@ -3151,12 +3158,15 @@ fn drop_field(g: mut G, acc: str, ft: int) -> str {
 // section — emitted once, `static`, scanned by the mark like any other
 // referenced symbol
 fn gemit_drops(g: mut G, ru: int) {
-    if len(g.drop_tys) == 0 && g.drop_word == 0 {
+    if len(g.drop_tys) == 0 && g.drop_word == 0 && g.drop_slice == 0 {
         return
     }
     src := ""
     if g.drop_word == 1 {
         src = src + "static void o_drop_word(int64_t _v) { rt_free((void*)_v); }\n"
+    }
+    if g.drop_slice == 1 {
+        src = src + "static void o_drop_slice(int64_t _v) { RtSlice *s = (RtSlice *)_v; if (s) { rt_free(s->ptr); rt_free(s); } }\n"
     }
     i := 0
     for i < len(g.drop_tys) {
@@ -4063,7 +4073,13 @@ fn gfsusp_leaf(g: mut G, name: str, args: ref parser.NList, dk: int, da: str, db
     k := g.staten
     g.staten = g.staten + 1
     g.states = push(g.states, k)
-    wln(g, "    if (rt_cancelled()) { fr->cur_scope = tls_scope; tls_scope = saved; return RT_CANCEL; }")
+    // sjoin's finish is the join's second half — a cancelled joiner
+    // still owes the named scope its teardown and the parent its
+    // hold release, so the join polls and finishes ahead of any
+    // cancel delivery (Rust fsusp_leaf parity).
+    if name != "sjoin" {
+        wln(g, "    if (rt_cancelled()) { fr->cur_scope = tls_scope; tls_scope = saved; return RT_CANCEL; }")
+    }
     wln(g, "    fr->state = " + itoa(k) + ";")
     poll := ""
     if name == "recv" {
@@ -4083,7 +4099,6 @@ fn gfsusp_leaf(g: mut G, name: str, args: ref parser.NList, dk: int, da: str, db
     }
     wln(g, "    if (" + poll + " == RT_PENDING) { fr->cur_scope = tls_scope; tls_scope = saved; return RT_PENDING; }")
     wln(g, "    s" + itoa(k) + ": ;")
-    wln(g, "    if (rt_cancelled()) { fr->cur_scope = tls_scope; tls_scope = saved; return RT_CANCEL; }")
     res := "rt_task_data(task)"
     if name == "recv" && args != nil {
         ct := xty(g, args.v)
@@ -4096,16 +4111,31 @@ fn gfsusp_leaf(g: mut G, name: str, args: ref parser.NList, dk: int, da: str, db
         // joiner's thread and delivers the scope's trap code
         res = "rt_scope_finish_named((void*)" + gav_at(argvs, 0) + ")"
     }
-    if dk == 1 {
-        wln(g, "    fr->" + da + " = " + res + ";")
-    }
-    if dk == 2 {
-        wln(g, "    " + da + " = " + res + ";")
-    }
-    if dk != 1 && dk != 2 && name == "sjoin" {
-        // the finish is the join's second half — it must run even when
-        // the err result is discarded or the parent hold leaks
-        wln(g, "    " + res + ";")
+    if name == "sjoin" {
+        // the finish is the join's second half — it must run before any
+        // cancel delivery, even when the err result is discarded, or the
+        // named scope's teardown and the parent's hold release leak
+        // into join_scope
+        if dk == 1 {
+            wln(g, "    fr->" + da + " = " + res + ";")
+        }
+        if dk == 2 {
+            wln(g, "    " + da + " = " + res + ";")
+        }
+        if dk != 1 && dk != 2 {
+            wln(g, "    " + res + ";")
+        }
+        // scope finished — deliver a cancel that woke the join
+        wln(g, "    if (rt_cancelled()) { fr->cur_scope = tls_scope; tls_scope = saved; return RT_CANCEL; }")
+    } else {
+        // a cancel-driven wake delivers no value — die at the resume point
+        wln(g, "    if (rt_cancelled()) { fr->cur_scope = tls_scope; tls_scope = saved; return RT_CANCEL; }")
+        if dk == 1 {
+            wln(g, "    fr->" + da + " = " + res + ";")
+        }
+        if dk == 2 {
+            wln(g, "    " + da + " = " + res + ";")
+        }
     }
 }
 

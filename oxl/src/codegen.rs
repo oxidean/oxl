@@ -127,6 +127,7 @@ struct Gen<'a> {
     drop_tys: std::collections::BTreeSet<String>,
     /// payload kinds that only need rt_free on the word (own str/prim)
     drop_word: bool,
+    drop_slice: bool,
     inst_out: String,
     inst_protos: String,
     // B4: fn-value wrappers + closures
@@ -208,6 +209,7 @@ pub fn generate_mode(c: &Crate, test_mode: bool, susp: &HashSet<String>) -> Stri
         trampolines: String::new(),
         drop_tys: std::collections::BTreeSet::new(),
         drop_word: false,
+        drop_slice: false,
         inst_out: String::new(),
         inst_protos: String::new(),
         fnv_wraps: std::collections::BTreeSet::new(),
@@ -585,6 +587,9 @@ pub fn generate_mode(c: &Crate, test_mode: bool, susp: &HashSet<String>) -> Stri
         if g.drop_word {
             du.defs.push("o_drop_word".into());
         }
+        if g.drop_slice {
+            du.defs.push("o_drop_slice".into());
+        }
         du.head = g.drops_src();
         units.push(du);
     }
@@ -901,8 +906,7 @@ impl<'a> Gen<'a> {
     /// emit_drops writes each o_drop_<n> once. Non-struct payloads get the
     /// shared rt_free shim.
     fn drop_sym(&mut self, payload: &Ty) -> String {
-        let mut need = Vec::new();
-        let mut inner_of = |p: &Ty| match p {
+        let inner_of = |p: &Ty| match p {
             Ty::Own(b) => Some((**b).clone()),
             _ => None,
         };
@@ -913,9 +917,7 @@ impl<'a> Gen<'a> {
         while let Some(t) = stack.pop() {
             match &t {
                 Ty::Struct(n) | Ty::Enum(n) => {
-                    if self.drop_tys.insert(n.clone()) {
-                        need.push(n.clone());
-                    }
+                    self.drop_tys.insert(n.clone());
                 }
                 _ => { self.drop_word = true; }
             }
@@ -937,9 +939,11 @@ impl<'a> Gen<'a> {
                 }
             }
         }
-        let _ = &mut need; let _ = &mut inner_of;
         match inner_of(payload) {
             Some(Ty::Struct(n)) | Some(Ty::Enum(n)) => format!("o_drop_{}", cname(&n)),
+            // an own-slice payload is a heap box over a heap backing —
+            // the shared word shim would free the box but leak ptr
+            Some(Ty::Slice(_)) => { self.drop_slice = true; "o_drop_slice".into() }
             Some(_) => { self.drop_word = true; "o_drop_word".into() }
             None => "0 /*no drop*/".into(),
         }
@@ -952,14 +956,18 @@ impl<'a> Gen<'a> {
     /// preamble — two units calling `mkchan(Ev)` must not each emit
     /// `o_drop_Ev`, and a pruned unit can't take a live use's def with it.
     fn drops_src(&mut self) -> String {
-        if self.drop_tys.is_empty() && !self.drop_word {
+        if self.drop_tys.is_empty() && !self.drop_word && !self.drop_slice {
             return String::new();
         }
         let drop_tys = std::mem::take(&mut self.drop_tys);
         let drop_word = std::mem::take(&mut self.drop_word);
+        let drop_slice = std::mem::take(&mut self.drop_slice);
         let mut src = String::new();
         if drop_word {
             src.push_str("static void o_drop_word(int64_t _v) { rt_free((void*)_v); }\n");
+        }
+        if drop_slice {
+            src.push_str("static void o_drop_slice(int64_t _v) { RtSlice *s = (RtSlice *)_v; if (s) { rt_free(s->ptr); rt_free(s); } }\n");
         }
         for n in drop_tys.iter() {
             let ct = self.cty(&match self.structs.contains_key(n) {

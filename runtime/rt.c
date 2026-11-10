@@ -2382,7 +2382,7 @@ void rt_str_free(OxlStr s) { if (s.p) rt_free((void *)s.p); }
 
 /* state probe for the gui reply-chan lifecycle — pool admission and
  * post-close short-circuits read this under their own locking */
-int rt_chan_is_closed(RtChan *ch) {
+int64_t rt_chan_is_closed(RtChan *ch) {
     oxl_mu_lock(&ch->mu);
     int c = ch->closed;
     oxl_mu_unlock(&ch->mu);

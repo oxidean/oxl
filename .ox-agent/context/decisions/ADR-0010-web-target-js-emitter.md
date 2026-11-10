@@ -6,8 +6,8 @@ Status: accepted (WI-0007) — 2026-11-10
 
 Milestone W adds a JavaScript compilation target: a sibling
 `.oxl` emitter (`bootstrap/codegen/js/`) over the same
-`check.CkRes`, a `runtime/rt.js` semantic runtime, env-flavor
-extern shims (`rt-node.js`/`rt-browser.js`), a `oxl --target js`
+`check.CkRes`, a `runtime/rt.mjs` semantic runtime, env-flavor
+extern shims (`rt-node.mjs`/`rt-browser.mjs`), a `oxl --target js`
 driver lane, a node-gated test section, and `extra/gui/dom` as
 the DOM backend that justified un-parking.
 
@@ -32,21 +32,27 @@ Forks resolved (brainstorm detail in WI-0007 artifacts):
    Worker/SAB emulation is parked (needs COOP/COEP headers).
 4. **Externs bind via `globalThis.__oxl_ffi`** — emitted calls
    `__oxl_ffi.<name>(mapped…)`; `[T,err]` externs take
-   `{val,err}` returns. `rt-node.js` wires std shims to Node
+   `{val,err}` returns. `rt-node.mjs` wires std shims to Node
    builtins when `typeof process !== "undefined"`;
-   `rt-browser.js` fills the same names with `err`-stubs. A
+   `rt-browser.mjs` fills the same names with `err`-stubs. A
    missing name is a contract violation, not a `TypeError`.
 5. **Emit `out.mjs` + runtime siblings** — module output
-   importing `./rt.js`; the driver copies the rt files beside
-   it (the `rt.c`-copy model verbatim). `oxl run --target js`
-   execs node; `--html` writes a module-script host page.
-6. **own/borrow machinery erases under GC** — `rt_alloc`→`new`,
-   borrow calls→no-ops, `rt_free`→no-op. Nothing observable is
-   lost: borrow checks gate call-arg aliasing, not heap
-   lifetime; move rules remain compile-time.
+   importing `./rt.mjs`; the driver copies the rt files beside
+   it (the `rt.c`-copy model verbatim). `.mjs` sidecars keep
+   the files ESM under any ambient `package.json` `type`
+   setting. `oxl run --target js` execs node; `--html` writes
+   a module-script host page.
+6. **own/borrow heap machinery erases under GC** — `rt_alloc`
+   →`new`, `rt_free`→no-op, arenas absent. Dynamic borrow
+   *checks* do not erase: overlapping same-task `mut`/`ref`
+   borrows are observable (`TrapAliasing`), so `rt_borrow_*`
+   port as a per-task ledger keyed on object identity in
+   rt.mjs. Move rules remain compile-time.
 7. **Slices `{a,off,len,cap}`** — one view type preserving
    `push`-into-cap growth and aliasing sub-slice semantics;
-   `[]byte` may share `Uint8Array` storage with `str`.
+   `[]byte` is always `Uint8Array`-backed so extern writes
+   land in caller storage, and `str`↔`[]byte` follows the
+   native copy/view directions.
 8. **No Rust-seed JS emitter** — `--target js` is OXL-driver
    only; the seed's role is bootstrap. Dual-driver parity
    covers shared commands; the js flag is not shared.
@@ -60,7 +66,7 @@ Forks resolved (brainstorm detail in WI-0007 artifacts):
 
 ## Consequences
 
-- `rt.js` re-expresses ~65% of `rt.c` (scopes/traps/defers,
+- `rt.mjs` re-expresses ~65% of `rt.c` (scopes/traps/defers,
   chans/select, named scopes, err registry, slice/str traps)
   while ~35% (arenas, ObjHdr, mutex/CV/thread veneer) evaporates
   under GC — the contract doc pins which claims carry over.
@@ -68,7 +74,7 @@ Forks resolved (brainstorm detail in WI-0007 artifacts):
   exercise typed chans + named scopes + cancel + select
   end-to-end, so `gui_*`/`conc_*` green under node is the
   semantic-parity gate.
-- The `chan own T` drop-thunk field survives in `rt.js` as a
+- The `chan own T` drop-thunk field survives in `rt.mjs` as a
   no-op so emitter shape stays mechanical — documented, not a
   leak.
 - Select keeps uniform-random arm pick (semantic, via

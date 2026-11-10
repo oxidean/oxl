@@ -2,7 +2,7 @@
 
 The load-bearing contract for milestone W. It pins what emitted
 JavaScript *means*: every representation choice a reader can
-observe, every runtime obligation `rt.js` owes, and every place
+observe, every runtime obligation `rt.mjs` owes, and every place
 the JS target deliberately diverges from native. Divergences are
 named so a program that hits one fails loudly, not silently.
 
@@ -31,7 +31,7 @@ named so a program that hits one fails loudly, not silently.
 | nil | `null` (handles) / `{a:null,off:0,len:0,cap:0}` (slices) | |
 
 `main` returns `int` → process exit code conversion happens in
-`rt.js`'s entry (`node: process.exitCode`, browser: ignored).
+`rt.mjs`'s entry (`node: process.exitCode`, browser: ignored).
 
 ### The `int`/`Number` firewall
 
@@ -57,7 +57,7 @@ domain *before* narrowing.
 `emit(r, testm) -> str` returns one ES-module text:
 
 ```js
-import * as rt from './rt.js'
+import * as rt from './rt.mjs'
 // … emitted declarations …
 export function oxl_main() { … }
 rt.__oxl_boot(oxl_main)   // entry: installs run queue, runs root
@@ -66,11 +66,14 @@ rt.__oxl_boot(oxl_main)   // entry: installs run queue, runs root
 - `out.mjs` so `node out.mjs` works unconditionally; browsers
   load it via `<script type="module">`.
 - `oxl run --target js` → `node <scratch>/out.mjs`; the sibling
-  copies `rt.js` + `rt-node.js`/`rt-browser.js` come from the
-  `runtime/` dir via the existing `runtime_dir()` probe.
-- `rt.js` self-selects env: `typeof process !== "undefined"` →
-  dynamic `import('./rt-node.js')` wiring before `oxl_main`;
-  else `rt-browser.js` stubs. Selection happens inside
+  copies `rt.mjs` + `rt-node.mjs`/`rt-browser.mjs` come from the
+  `runtime/` dir via the existing `runtime_dir()` probe. The
+  `.mjs` extension is load-bearing: under a `package.json` with
+  `"type": "commonjs"` node would treat a `.js` sidecar as CJS
+  and the import would fail — `.mjs` is unconditional ESM.
+- `rt.mjs` self-selects env: `typeof process !== "undefined"` →
+  dynamic `import('./rt-node.mjs')` wiring before `oxl_main`;
+  else `rt-browser.mjs` stubs. Selection happens inside
   `__oxl_boot` — `import` of the env file is the only
   conditional import in the system.
 - testm=1 emits the same `test_*` wrapper pattern as C emit
@@ -83,28 +86,42 @@ rt.__oxl_boot(oxl_main)   // entry: installs run queue, runs root
 - Literals: emitted as base64/`TextEncoder` init — `rt_str_lit`
   decodes once at module init into a shared backing buffer;
   views reference `(u8, off, len)`.
-- `len(s)` → `s.len` (BigInt at surface). `byteat`/`s[i]` →
-  `u8[off+i]` + `rt_trap(10)` bounds. `substr`/`s[i:j]` → new
-  view on the same `u8` — O(1), aliasing like rt.c.
-- `str as []byte` → `{a: s.u8-as-array-or-same-buffer, off,
-  len, cap: len}` — byte-level identity preserved; `[]byte as
-  str` → `{u8, off, len}` view. Mutation through the slice is
-  visible through the str (same as native).
+- `len(s)` → `s.len` (BigInt at surface). `s[i]` → `u8[off+i]`
+  + `rt_trap(10)` bounds; `byteat` keeps the native result —
+  `-1` out of range, no trap. `substr`/`s[i:j]` → clamped copy
+  of the selected bytes into a fresh `u8` — `rt_substr` clamps
+  and copies on native, so the result is not a view and is
+  unaffected by later mutation of the source.
+- `str as []byte` → copy of the string bytes (`rt_bytes_str`
+  copies on native) — slice mutation can never write back into
+  the str. `[]byte as str` → `{u8, off, len}` view — native
+  keeps the view semantics in this direction, so mutation
+  through the slice is visible through the str.
 - `strcat`/`+` → concat into fresh `Uint8Array`.
 - `streq` → `rt_streq` byte-compare (`u8` range compare, not
   `===` — views may differ in `off`).
 - **`cstr`/edge decode**: `rt_str_cstr(s)` → `TextDecoder`
-  utf-8 → JS string (used by `rt_print_str`, `rt_eprint_str`,
-  `__oxl_ffi` str args, DOM set_prop). Encode back:
-  `TextEncoder`. These two fns are the *only* legal UTF-16
+  utf-8 → JS string (used by `__oxl_ffi` str args and DOM
+  set_prop — places that genuinely need a JS string). Encode
+  back: `TextEncoder`. These two fns are the *only* legal UTF-16
   crossings — std code never sees a JS string.
-- `println`/`print`/`eprintln` use `rt_print_str` → Node:
-  `process.stdout.write(decoded)`; browser: `console.log`.
+- `println`/`print`/`eprintln` use `rt_print_str`, which writes
+  the raw bytes `u8[off..off+len]` — a str can carry arbitrary
+  bytes via `[]byte as str`, so decoding would corrupt non-UTF-8
+  payloads where native writes them verbatim. Node:
+  `process.stdout.write(Buffer.from(u8.buffer, off, len))`;
+  browser: byte-accurate console write or documented
+  replacement-char divergence. The same rule holds for
+  byte-oriented file output: `rt_fd_write`/file ops pass the
+  `Uint8Array` range to `fs` directly, no TextDecoder.
 
 ## 4. Slices — `{a, off, len, cap}`
 
-- `a` is a JS `Array` (any elem) — or `Uint8Array` when the
-  slice shares `str` storage (`[]byte` only).
+- `a` is a JS `Array` (any elem) — except `[]byte`, which is
+  always `Uint8Array`-backed: externs like `rt_fd_read` write
+  into the caller's slice, so the backing must be a shared
+  typed-array view — a plain `Array` (or a copy at the boundary)
+  would silently drop callee writes.
 - `mkslice`/`[]T{…}` literals: fresh array, `off=0`, `cap=len`
   (literal) or `cap≥len` (`mkslice`).
 - `s[i]`: `rt_trap(10)` if `i<0 || i>=s.len`, else
@@ -164,11 +181,22 @@ chan = {
 ## 6. Scopes, tasks, defers, traps
 
 - **Run queue**: `rq = []` drained by `queueMicrotask` (browser)
-  or `setImmediate` (node) — each drained task polls once.
+  or `setImmediate` (node) — each drained task polls once. The
+  drain is bounded: after a fixed number of polls (or when the
+  queue stays non-empty across a drain) the scheduler reschedules
+  itself through a task-level source (`setTimeout(0)` /
+  `MessageChannel` port.postMessage / node `setImmediate`) so
+  browser input, timers, and rendering interleave — an unbounded
+  microtask drain would starve them.
   `rt_run_root` drives the root frame until READY; when the
   queue empties with live parked tasks, the loop waits on
-  timer/wake sources (node: natural event loop; it exits when
-  nothing is pending — same termination rule as native).
+  timer/wake sources. Node must not exit while the root task is
+  merely parked: the scheduler holds a keepalive (`setInterval`
+  kept `ref()`d while parked waiters exist, or an explicit
+  deadlock check that traps) — native `rt_run_root` waits for a
+  wake rather than reporting completion, and the JS lane matches
+  that: it either wakes or fails as a deadlock, never silently
+  reports success with work outstanding.
 - **Task**: `{poll, state, scope, wakes, defer_top}`; `go f()` /
   `spawn f()` / `goin(sc, f())` all emit frame tasks — *every*
   spawned call is a poll frame (there are no thread tasks).
@@ -179,17 +207,23 @@ chan = {
 - **Cancel**: `scancel` → subtree cancel wake — parked waiters
   claim-cancel (same order invariants as `scope_cancel_wake` in
   rt.c), defer stacks drain, `err` propagates to joiner.
-- **defers**: per-scope LIFO thunk list, drained at scope leave
-  and on cancel — same semantics, minus env-struct capture cost
-  (closures capture directly).
-- **`is_root()`** → always `true` on this target (every task is
-  the main thread) — emitted as `rt_is_root` returning true.
+- **defers**: LIFO thunk list marked at *function* entry and
+  drained at *function* return — a defer registered inside a
+  `scope {}` block does not run at block exit, matching the
+  native emitter — plus drain on cancel unwind, same semantics
+  minus env-struct capture cost (closures capture directly).
+- **`is_root()`** → the scheduler tracks the root task identity:
+  `rt_run_root` records its task and `rt_is_root` returns true
+  only for it — spawned frame tasks read false even though they
+  run on the same thread (a spawn-fallback frame intentionally
+  still passes per the G contract: mark lands only on outermost
+  `rt_run_root` entry).
 - **Traps**: `rt_trap(code)` → `throw {__oxl_trap: code}`;
   caught at the task's spawn-scope boundary → cancels siblings,
   propagates `err` to joiner — the rt.c propagation, minus
   arena unwinding. `rt_scope_try` → try/catch wrapper. Codes
   are the rt.c set plus `21` = blocking surface unsupported.
-- **No arenas, no ObjHdr, no borrow flags** (§9).
+- **No arenas, no ObjHdr**; borrow *checks* port as a per-task ledger (§9).
 
 ## 7. Externs — `__oxl_ffi`
 
@@ -199,7 +233,7 @@ Emitted: `extern fn name(args) -> [ret, err]` calls
 - plain return → the mapped ret value
 - `[T, err]` → `{val, err}` (err: BigInt code or `0n`)
 
-`__oxl_ffi` is `globalThis.__oxl_ffi` — `rt-node.js`/`rt-browser.js`
+`__oxl_ffi` is `globalThis.__oxl_ffi` — `rt-node.mjs`/`rt-browser.mjs`
 pre-fill the std set before `oxl_main` runs; user shims assign or
 extend the same object.
 
@@ -213,7 +247,7 @@ Arg mapping (mirrors the checker FFI whitelist
 | `bool` | `boolean` |
 | `str` | JS `string` (decoded via `rt_str_cstr`) |
 | `cstr` | JS `string` |
-| `[]byte` | `Uint8Array` view |
+| `[]byte` | `Uint8Array` view (shared — callee writes land in caller storage) |
 | `[]T` other | `{a,off,len,cap}` (shims must respect views) |
 | `own/ref/mut` | raw ref |
 | `chan`/`shared`/scope/fn/iface | raw object |
@@ -221,12 +255,12 @@ Arg mapping (mirrors the checker FFI whitelist
 
 Return mapping inverts the table; `{val, err}` for pair fns.
 
-- **Node flavor** (`rt-node.js`): `rt_open_write`→`fs.openSync`,
+- **Node flavor** (`rt-node.mjs`): `rt_open_write`→`fs.openSync`,
   `rt_readfile`→`fs.readFileSync`, `rt_proc_*`→`child_process`,
   `rt_sock_*`→`net`+`dns` (lookup → shared cell callback),
   `rt_getenv`/`rt_argv`/`rt_exepath`/`rt_exit`→`process.*`,
   `rt_now*`→`Date.now`/`performance.now`, `rt_errstr`→string.
-- **Browser flavor** (`rt-browser.js`): every name present as
+- **Browser flavor** (`rt-browser.mjs`): every name present as
   a stub — `err` returns where the contract allows, else
   `rt_trap(21)`. No unbound names: a missing shim is a contract
   violation, not a `TypeError`.
@@ -248,11 +282,15 @@ These emit `rt_trap(21)` on this target:
 
 - `rt_alloc`/`rt_alloc_own` → `new`/`{}` (GC)
 - `rt_free` → no-op
-- `rt_borrow_read`/`rt_borrow_mut`/`rt_unborrow` → no-ops —
-  borrow checks gate *call-arg aliasing*; under GC there is no
-  scope-arena lifetime to protect. Move/consume rules stay
-  compile-time (check unchanged).
-- `ObjHdr`/per-task borrow lists → absent
+- `rt_borrow_read`/`rt_borrow_mut`/`rt_unborrow` → a per-task
+  ledger keyed on object identity (`Map`/`WeakMap` on the ref) —
+  the checks gate *call-arg aliasing*, which is observable
+  behavior independent of GC: overlapping same-task `mut`/`ref`
+  borrows must still `rt_trap(TrapAliasing)`. Only the
+  heap-lifetime side erases: `rt_free`, scope arenas. Move/
+  consume rules stay compile-time (check unchanged).
+- `ObjHdr` → absent (borrow state lives in the ledger, not on
+  the object)
 - `rt_alloc` failure traps → absent (GC throws OOM → uncaught,
   same as native abort)
 

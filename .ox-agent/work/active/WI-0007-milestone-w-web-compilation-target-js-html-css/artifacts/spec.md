@@ -48,37 +48,43 @@ the DOM story that justifies it.
   plain hosting doesn't send.
 - **Externs bind through `globalThis.__oxl_ffi`.** Emitted calls
   `__oxl_ffi.<name>(args…)`; pair-returns use `{val, err}`. The
-  runtime ships env flavors: `rt-node.js` (fs/proc/net via Node
+  runtime ships env flavors: `rt-node.mjs` (fs/proc/net via Node
   builtins) auto-wires when `typeof process !== "undefined"`;
-  `rt-browser.js` fills the same names with `err`-returning stubs.
+  `rt-browser.mjs` fills the same names with `err`-returning stubs.
 - **Emit form: `out.mjs` + runtime siblings.** `emit` returns the
-  program text; the driver writes `out.mjs` importing `./rt.js`,
-  and copies `runtime/{rt.js,rt-node.js,rt-browser.js}` beside it —
+  program text; the driver writes `out.mjs` importing `./rt.mjs`,
+  and copies `runtime/{rt.mjs,rt-node.mjs,rt-browser.mjs}` beside it —
   the `rt.c`-copy model verbatim. `oxl run --target js` execs
   `node out.mjs`. `--html` additionally writes a module-script
   `index.html` host page.
-- **own/borrow machinery erases under GC.** `rt_alloc`→`new`,
-  borrow calls→no-ops, `rt_free`→no-op, `chan own T` drop thunks
-  retained but empty. Move rules remain compile-time; documented in
-  the target doc — no behavioral parity is lost because borrow
-  checks gate call args, not heap lifetime.
+- **own/borrow heap machinery erases under GC.** `rt_alloc`→`new`,
+  `rt_free`→no-op, `chan own T` drop thunks retained but empty.
+  Dynamic borrow *checks* do not erase — `rt_borrow_*` port as a
+  per-task ledger (overlap → `TrapAliasing`), since call-arg
+  aliasing is observable independent of GC. Move rules remain
+  compile-time.
 - **HTML/CSS scope = the GUI layer.** `extra/gui/dom` is a backend
   inside the existing `Backend` iface (WidgetKind→elements,
-  Prop→attrs/props, Event→listeners, `pump`→microtask drain; the
-  root-task rule is trivially satisfied). CSS is user assets beside
-  `index.html`. Static-site/templating emit is a parked non-goal.
+  Prop→attrs/props, Event→listeners). `pump` is a susp frame task
+  parking on `stop`/`wake` edges — `gui.run` starts shutdown the
+  moment it returns, so it must not return before `stop`; a
+  microtask drain that exits would end the session and a
+  synchronous wait would starve the single-threaded loop. The
+  same contract applies to the mock under the JS lane. CSS is
+  user assets beside `index.html`. Static-site/templating emit
+  is a parked non-goal.
 
 ## Scope
 
-- `runtime/rt.js`: run queue + poll scheduler; scope trees +
+- `runtime/rt.mjs`: run queue + poll scheduler; scope trees +
   cancellation + trap propagation; defer stacks; channels
   (unbuffered + buffered + `chan own T`), `select` with
   random-pick + timeout/`else`; named scopes (`mkscope`/`sjoin`/
-  `scancel`/`smkchan`/`curscope`); `try_send`; `is_root`; `shared`
+  `scancel`/`smkchan`/`curscope`); `try_send`; `is_root` (scheduler-tracked root task); `shared`
   cells; err registry; slice/str ops + traps; `{val,err}` pairs.
-- `runtime/rt-node.js`: `rt_*` extern impls over node:fs/process/
+- `runtime/rt-node.mjs`: `rt_*` extern impls over node:fs/process/
   child_process/net/dns (os, exec, net, filepath, log shims).
-- `runtime/rt-browser.js`: same names as stubs — `err` returns or
+- `runtime/rt-browser.mjs`: same names as stubs — `err` returns or
   `rt_trap` per call contract.
 - `bootstrap/codegen/js/`: the emitter — expressions, fns
   (incl. susp poll frames), generics, structs/enums/match,
@@ -88,8 +94,12 @@ the DOM story that justifies it.
 - Driver: `--target js` on `build`/`run`/`test`; emit layout;
   node exec for `run`/`test`; `--html` scaffold.
 - std: pure-oxl set ports unchanged (they compile through the new
-  emitter); `os`/`exec`/`net`/`http`/`filepath`/`flag`/`log` work
-  under Node via rt-node shims; browser env gets stubs.
+  emitter); `os`/`exec`/`net`/`filepath`/`flag`/`log` and the
+  `http` client paths work under Node via rt-node shims;
+  `http.serve` is excluded from the node claim — its
+  `spawnBlocking` accept/handler model traps under the §8
+  blocking list pending a specified non-blocking serve path;
+  browser env gets stubs.
 - `extra/gui` + `extra/gui/mock` port unchanged (the conformance
   suite); `extra/gui/dom` new backend + `examples/web-todo`.
 - Test lane: `command -v node`-gated section in `tests/run.sh`

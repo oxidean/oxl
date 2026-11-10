@@ -1812,6 +1812,16 @@ rc=0
 out=$(cd "$tcw/proj" && OXL_HOME="$tch" "$SHIM" build 2>&1) || rc=$?
 [ "$rc" != 0 ] && grep -q "invalid toolchain directive" <<<"$out" || {
     echo "FAIL shim bad-directive: rc=$rc $out"; exit 1; }
+# `//` is the manifest comment — a trailing note does not break the pin
+printf 'module example.com/m\n\noxl 0.3\ntoolchain v0.2.0 // pinned\n' > "$tcw/oxl.mod"
+out=$(cd "$tcw/proj" && OXL_HOME="$tch" "$SHIM" build)
+[ "$out" = "FAKE v0.2.0 build" ] || { echo "FAIL shim comment-directive: $out"; exit 1; }
+# `#` is NOT a manifest comment — trailing tokens make the directive invalid
+printf 'module example.com/m\n\noxl 0.3\ntoolchain v0.2.0 # note\n' > "$tcw/oxl.mod"
+rc=0
+out=$(cd "$tcw/proj" && OXL_HOME="$tch" "$SHIM" build 2>&1) || rc=$?
+[ "$rc" != 0 ] && grep -q "invalid toolchain directive" <<<"$out" || {
+    echo "FAIL shim hash-directive: rc=$rc $out"; exit 1; }
 printf 'module example.com/m\n\noxl 0.3\ntoolchain v0.1.0\n' > "$tcw/oxl.mod"
 # invalid pins die loudly rather than traversing paths
 rc=0

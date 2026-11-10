@@ -132,12 +132,13 @@ resolve() { # echoes "tag<TAB>source" or nothing
     d=$(pwd -P)
     while :; do
         if [ -f "$d/oxl.mod" ]; then
-            # manifest-parser parity: `#` comments are stripped, the
-            # directive must be exactly `toolchain <tag>` and appear at
-            # most once — a duplicate, extra-token, or bare form is an
-            # error, not a silent skip
+            # manifest-parser parity: `//` comments (line start or
+            # after whitespace) are stripped — `#` is not a comment.
+            # The directive must be exactly `toolchain <tag>` and
+            # appear at most once — a duplicate, extra-token, or bare
+            # form is an error, not a silent skip
             pa=$(awk '
-                { sub(/#.*/, "") }
+                { sub(/(^|[ \t])\/\/.*/, "") }
                 /^[ \t]*toolchain([ \t]|$)/ {
                     n++
                     r = $0
@@ -178,7 +179,9 @@ tc_install() { # tag|latest
     [ -d "$VERS/$tag" ] && { echo "oxl: $tag already installed"; return 0; }
     suf=$(asset_os_arch)
     asset="oxl-toolchain-$suf.tar.gz"
-    tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+    mkdir -p "$VERS"
+    tmp=$(mktemp -d); stage=$(mktemp -d "$VERS/.stage.XXXXXX")
+    trap 'rm -rf "$tmp" "$stage"' EXIT
     echo "oxl: downloading $tag ($asset)"
     fetch "$BASE/download/$tag/$asset" "$tmp/$asset" \
         || die "no toolchain asset for $suf at $tag — build from source instead:
@@ -191,9 +194,15 @@ tc_install() { # tag|latest
     else
         echo "oxl: warning: $tag ships no .sha256 — skipping integrity check" >&2
     fi
-    mkdir -p "$VERS/$tag"
-    tar xzf "$tmp/$asset" -C "$VERS/$tag" \
+    tar xzf "$tmp/$asset" -C "$stage" \
         || die "corrupt tarball for $tag"
+    [ -x "$stage/oxl-toolchain/oxl" ] \
+        || die "tarball for $tag has no oxl-toolchain/oxl"
+    # same-filesystem rename — a partial extract can never read as
+    # installed; .stage.* is hidden so `tc_list`'s "$VERS"/*/ glob skips it
+    [ -e "$VERS/$tag" ] && die "$tag appeared during install — retry"
+    chmod 755 "$stage"
+    mv "$stage" "$VERS/$tag"
     rm -rf "$tmp"; trap - EXIT
     echo "oxl: installed $tag -> $VERS/$tag"
     [ -f "$OXL_HOME/default-version" ] || echo "$tag" > "$OXL_HOME/default-version"

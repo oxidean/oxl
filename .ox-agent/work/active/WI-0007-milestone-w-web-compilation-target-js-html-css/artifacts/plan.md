@@ -5,7 +5,7 @@ js-semantics + items/dom-backend), ADR-0010.
 
 Stages per `docs/specs/2026-11-10-web-target/plan.md`:
 
-- W1 `runtime/rt.js` core — run queue, frame scheduler, scopes/
+- W1 `runtime/rt.mjs` core — run queue, frame scheduler, scopes/
   traps/defers, err registry, str/slice ops, shared cells,
   `__oxl_ffi` shell
 - W2 `bootstrap/codegen/js` — non-concurrency emit surface,

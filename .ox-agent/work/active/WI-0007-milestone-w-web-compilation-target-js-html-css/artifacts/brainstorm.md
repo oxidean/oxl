@@ -4,7 +4,7 @@ Context: the trigger fired when G landed — the widget tree proved
 DOM-mappable (`docs/gui-backends.md`). Recon
 (`context/references/web-target-recon.md`) mapped the seams: a JS
 backend is a sibling emitter over the same `check.CkRes`, plus a
-`rt.js` runtime shim, a driver `--target` flag, and a node-gated
+`rt.mjs` runtime shim, a driver `--target` flag, and a node-gated
 test lane. These are the forks inside that shape.
 
 ## Fork W-a — `int` representation: BigInt vs Number
@@ -68,8 +68,8 @@ emitted calls need a binding convention.
 | B. ESM `import` from `./ffi.js` | emitted code imports a sibling the user writes | real module graph but *requires* a bundler/module-loader context — breaks `node out.js` single-file runs; missing file = parse error not runtime err |
 | C. Generated registration table | emit `register_ffi({…})` call user fills | same as A with extra emit surface |
 
-Recommendation: **A** — registry with env pre-fill. `rt.js`
-detects Node (`typeof process`) and wires `rt-node.js` shims;
+Recommendation: **A** — registry with env pre-fill. `rt.mjs`
+detects Node (`typeof process`) and wires `rt-node.mjs` shims;
 browser gets stub-fns returning `err`/`rt_trap` per call contract.
 Extern *pair-return* fns keep the `o_ret_*` shape: `__oxl_ffi.f`
 returns `{val, err}`.
@@ -78,14 +78,14 @@ returns `{val, err}`.
 
 | option | shape | tradeoff |
 |---|---|---|
-| **A. `out.js` + `rt.js` siblings** | emit writes program JS; driver copies `runtime/rt.js` (+ `rt-node.js`, `rt-browser.js`) beside it; `out.js` does `import './rt.js'` then calls `rt_run_root` | mirrors the `rt.c`-copy model verbatim; runtime diffable/versionable separately; `node out.js` needs ESM (`import` → `.mjs`/package.json or ESM syntax in `.js` under `--experimental` — actually node ≥20 runs `.js` ESM only inside a `"type":"module"` package) |
-| B. Single concatenated `out.js` | `emit` returns `rt.js_text + program_text` like the `#include "rt.h"` prepend | one artifact, `node out.js` works CJS-style; runtime not separately inspectable; embeds a *copy* of rt.js text in the binary (self-hosted driver reads `runtime/rt.js` at build time — needs it shipped beside the driver like rt.c already is) |
+| **A. `out.js` + `rt.mjs` siblings** | emit writes program JS; driver copies `runtime/rt.mjs` (+ `rt-node.mjs`, `rt-browser.mjs`) beside it; `out.js` does `import './rt.mjs'` then calls `rt_run_root` | mirrors the `rt.c`-copy model verbatim; runtime diffable/versionable separately; `node out.js` needs ESM (`import` → `.mjs`/package.json or ESM syntax in `.js` under `--experimental` — actually node ≥20 runs `.js` ESM only inside a `"type":"module"` package) |
+| B. Single concatenated `out.js` | `emit` returns `rt.mjs_text + program_text` like the `#include "rt.h"` prepend | one artifact, `node out.mjs` works CJS-style; runtime not separately inspectable; embeds a *copy* of rt.mjs text in the binary (self-hosted driver reads `runtime/rt.mjs` at build time — needs it shipped beside the driver like rt.c already is) |
 | **C. A, with `.mjs` + host flag** | as A but emit `out.mjs` (ESM) + optional `--html` emitting a bare `index.html` host | ESM is the DOM story's native form (script type=module); node runs `.mjs` unconditionally; the html scaffold is a template, not codegen |
 
-Recommendation: **C** — `out.mjs` + copied `rt.js`/`rt-node.js`/
-`rt-browser.js` siblings under a scratch or `-o` dir; `oxl run
+Recommendation: **C** — `out.mjs` + copied `rt.mjs`/`rt-node.mjs`/
+`rt-browser.mjs` siblings under a scratch or `-o` dir; `oxl run
 --target js` execs `node out.mjs`; `--html` (opt-in) also writes a
-module-script `index.html`. Program text references `rt.js` via a
+module-script `index.html`. Program text references `rt.mjs` via a
 static `import` — real module resolution, no bundler needed.
 
 ## Fork W-f — HTML/CSS scope
@@ -121,7 +121,7 @@ traps. JS GC removes the memory need entirely.
 
 | option | shape | tradeoff |
 |---|---|---|
-| **A. Erase** | `rt_alloc`→`new`/GC; borrow calls → no-ops; `rt_free`→no-op; move rules stay compile-time | smallest rt.js; no runtime aliasing traps — but native doesn't trap on shared-state races either (borrow checks gate *call args*, not heap lifetime) |
+| **A. Erase** | `rt_alloc`→`new`/GC; borrow calls → no-ops; `rt_free`→no-op; move rules stay compile-time | smallest rt.mjs; no runtime aliasing traps — but native doesn't trap on shared-state races either (borrow checks gate *call args*, not heap lifetime) |
 | B. Dev-mode borrow flags | keep rt_borrow_* as debug instrumentation | behavioral parity nobody's testing; double the flag surface |
 
 Recommendation: **A** — erase. `chan own T`'s `drop_elem` thunks

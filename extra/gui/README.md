@@ -34,7 +34,8 @@ Backends shipped here:
     }
 
 `gui.run` must be called from the root task and runs one session at
-a time; it returns `err_not_root()`/`err_stopped()` on violation.
+a time; it returns `err_not_root()` off the root task and a
+"gui: already running" error while another session is live.
 See `docs/gui.md` for the full model and `docs/gui-backends.md` for
 the backend-authoring notes.
 

@@ -51,6 +51,9 @@
 #define P_PLACEHOLDER 3
 #define P_ROWS        4 /* read-only: list row count */
 
+/* dev stats — incremented across the shim, dumped only under GX_STATS */
+static long g_n_invoke, g_n_emitcb, g_n_evpush, g_n_hedead;
+
 /* ---- handle table ---- */
 typedef struct HE {
     int64_t h;
@@ -62,14 +65,25 @@ typedef struct HE {
 static HE *handles;
 static int64_t hnext;
 
-/* widget finalized by any path marks its handle dead — cascade
- * kills (window teardown frees children, a removed list row frees
- * its child) can never leave the table pointing at freed memory */
+/* entries die with the widget — a dead handle has no entry at all, so
+ * the table stays bounded under churn (handles are never reissued) */
+static void he_unlink(HE *e) {
+    HE **pp = &handles;
+    while (*pp && *pp != e)
+        pp = &(*pp)->next;
+    if (*pp) {
+        *pp = e->next;
+        free(e);
+    }
+}
+
+/* widget finalized by any path drops its handle — cascade kills
+ * (window teardown frees children, a removed list row frees its
+ * child) can never leave the table pointing at freed memory */
 static void he_notify(gpointer data, GObject *old) {
     (void)old;
-    HE *e = data;
-    e->dead = 1;
-    e->w = NULL;
+    g_n_hedead++;
+    he_unlink((HE *)data);
 }
 
 static HE *he_find(int64_t h) {
@@ -87,6 +101,9 @@ static int64_t he_add(GtkWidget *w, int kind) {
     e->dead = 0;
     e->next = handles;
     handles = e;
+    /* signal trampolines read the handle straight off the widget —
+     * no table scan per event */
+    g_object_set_data(G_OBJECT(w), "oxl_h", (gpointer)(intptr_t)e->h);
     g_object_weak_ref(G_OBJECT(w), he_notify, e);
     return e->h;
 }
@@ -102,7 +119,6 @@ static Ev cur;
  * A full ring drops the oldest entry; the core EventBuf's own
  * overflow accounting is the app's loss signal, so a silently
  * overwritten ring slot is acceptable and bounded. */
-static long g_n_invoke, g_n_emitcb, g_n_evpush, g_n_hedead;
 static void dump_stats(void) {
     char b[160];
     int n = snprintf(b, sizeof b, "[shim] invoke=%ld emitcb=%ld evpush=%ld hedead=%ld\n",
@@ -111,6 +127,7 @@ static void dump_stats(void) {
 }
 static void stats_sig(int sig) { (void)sig; dump_stats(); _exit(1); }
 __attribute__((constructor)) static void reg_stats(void) {
+    if (!getenv("GX_STATS")) return; /* dev aid — opt-in, not per-app noise */
     atexit(dump_stats);
     signal(SIGTERM, stats_sig);
     signal(SIGINT, stats_sig);
@@ -138,33 +155,36 @@ int64_t gx_ev_kind(void) { return cur.kind; }
 int64_t gx_ev_aux(void) { return cur.aux; }
 
 /* ---- signal trampolines ---- */
+static int64_t w_handle(GtkWidget *w) {
+    return (int64_t)(intptr_t)g_object_get_data(G_OBJECT(w), "oxl_h");
+}
 static void t_clicked(GtkWidget *w, gpointer data) {
     (void)data;
-    for (HE *e = handles; e; e = e->next)
-        if (e->w == w) { ev_push(e->h, E_CLICKED, 0); return; }
+    int64_t h = w_handle(w);
+    if (h) ev_push(h, E_CLICKED, 0);
 }
 static void t_activate(GtkWidget *w, gpointer data) {
     (void)data;
-    for (HE *e = handles; e; e = e->next)
-        if (e->w == w) { ev_push(e->h, E_ACTIVATED, 0); return; }
+    int64_t h = w_handle(w);
+    if (h) ev_push(h, E_ACTIVATED, 0);
 }
 static void t_changed(GtkWidget *w, gpointer data) {
     (void)data;
-    for (HE *e = handles; e; e = e->next)
-        if (e->w == w) { ev_push(e->h, E_TEXT_CHANGED, 0); return; }
+    int64_t h = w_handle(w);
+    if (h) ev_push(h, E_TEXT_CHANGED, 0);
 }
 static void t_row_activated(GtkListBox *lb, GtkListBoxRow *row, gpointer data) {
     (void)data;
     int64_t idx = row ? gtk_list_box_row_get_index(row) : -1;
-    for (HE *e = handles; e; e = e->next)
-        if (e->w == GTK_WIDGET(lb)) { ev_push(e->h, E_ROW_ACTIVATED, idx); return; }
+    int64_t h = w_handle(GTK_WIDGET(lb));
+    if (h) ev_push(h, E_ROW_ACTIVATED, idx);
 }
 /* close-request is veto-backed: the event posts and the window
  * survives — the app answers with gui.remove (destroy) or keeps it */
 static gboolean t_close_req(GtkWindow *w, gpointer data) {
     (void)data;
-    for (HE *e = handles; e; e = e->next)
-        if (e->w == GTK_WIDGET(w)) { ev_push(e->h, E_CLOSE_REQUESTED, 0); break; }
+    int64_t h = w_handle(GTK_WIDGET(w));
+    if (h) ev_push(h, E_CLOSE_REQUESTED, 0);
     return TRUE;
 }
 
@@ -217,11 +237,13 @@ void gx_destroy(int64_t h) {
     HE *e = he_find(h);
     if (!e || e->dead)
         return;
-    e->dead = 1;
     GtkWidget *w = e->w;
-    e->w = NULL;
+    int kind = e->kind;
+    /* drop our notify first so the entry can be freed here — the
+     * table then holds only live widgets */
     g_object_weak_unref(G_OBJECT(w), he_notify, e);
-    if (e->kind == K_WINDOW) {
+    he_unlink(e);
+    if (kind == K_WINDOW) {
         gtk_window_destroy(GTK_WINDOW(w));
         return;
     }
@@ -249,6 +271,13 @@ void gx_destroy(int64_t h) {
     /* unattached (never parented, or detached with a held ref): the
      * outstanding ref is ours — drop it */
     g_object_unref(w);
+}
+
+/* liveness for the backend's reconcile checks — a finalized widget's
+ * entry is already unlinked, so this is "is the handle still managed" */
+int64_t gx_alive(int64_t h) {
+    HE *e = he_find(h);
+    return e != NULL && !e->dead;
 }
 
 /* ---- props ---- */

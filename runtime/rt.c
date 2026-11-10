@@ -260,7 +260,8 @@ static void task_unref(RtTask *t) {
     if (__sync_sub_and_fetch(&t->holds, 1) == 0) {
         for (BorrowEnt *e = t->borrows, *n; e; e = n) {
             n = e->next;
-            e->h->borrow = 0;
+            /* the flag is advisory and h may already be freed (defers or
+             * a chan drop_elem ran first) — never write through it here */
             free(e);
         }
         for (BorrowEnt *e = t->borrow_pool, *n; e; e = n) {
@@ -1035,6 +1036,11 @@ int rt_run_root(RtFrame *fr) {
     } else {
         trapped = 1;
     }
+    /* same post-trap fixup run_task needs: a longjmp may have left
+     * tls_task NULL and tls_scope on a torn-down inner scope — defers
+     * must run in the task's spawn scope */
+    tls_task = t;
+    tls_scope = t->scope;
     task_defers_drain(t);
     memcpy(tls_jb, prev_jb, sizeof prev_jb);
     tls_task = prev;
@@ -1582,7 +1588,7 @@ RtChan *rt_mkchan_scoped(void *sv, int64_t cap, void (*drop)(int64_t)) {
  * select waiter, then ring space; nothing is ever deposited or parked. */
 int rt_try_send(RtChan *ch, int64_t v) {
     oxl_mu_lock(&ch->mu);
-    if (ch->closed) { oxl_mu_unlock(&ch->mu); return 0; }
+    if (ch->closed) { oxl_mu_unlock(&ch->mu); goto fail; }
     RtTask *r = chan_pop_recv(ch);
     if (r) {
         r->chan_res = v;
@@ -1599,7 +1605,21 @@ int rt_try_send(RtChan *ch, int64_t v) {
         oxl_mu_unlock(&ch->mu);
         return 1;
     }
+    /* a parked thread receiver consumes `has` inside cv_wait — same
+     * last-resort deposit rt_send makes before it would park */
+    if (ch->trecv > 0 && !ch->has) {
+        ch->val = v;
+        ch->has = 1;
+        ch->slot_owner = NULL;
+        oxl_cv_broadcast(&ch->cv_recv);
+        oxl_mu_unlock(&ch->mu);
+        return 1;
+    }
     oxl_mu_unlock(&ch->mu);
+fail:
+    /* statically a move either way: an undelivered own payload is
+     * dropped by the chan's thunk, not left to leak */
+    if (ch->drop_elem) ch->drop_elem(v);
     return 0;
 }
 
@@ -1642,7 +1662,11 @@ void rt_send(RtChan *ch, int64_t v) {
         if (rt_cancelled()) {
             /* retract our own unclaimed slot only — a 1 here could be
              * another thread sender's fresh deposit */
-            if (ch->has && ch->slot_owner == me) { ch->has = 0; ch->val = 0; ch->slot_owner = NULL; }
+            if (ch->has && ch->slot_owner == me) {
+                int64_t rv = ch->val;
+                ch->has = 0; ch->val = 0; ch->slot_owner = NULL;
+                if (ch->drop_elem) ch->drop_elem(rv); /* retracted, never delivered */
+            }
             goto cancelled;
         }
         /* consumed or closed mid-wait: the send is complete either way
@@ -1810,6 +1834,7 @@ void rt_close(RtChan *ch) {
     for (SelW *w = sw; w; w = w->next)
         __sync_add_and_fetch(&w->sel->refs, 1);
     int64_t val = ch->has ? ch->val : 0;
+    int had = ch->has, delivered = 0;
     ch->has = 0;
     ch->val = 0;
     oxl_mu_unlock(&ch->mu);
@@ -1817,7 +1842,10 @@ void rt_close(RtChan *ch) {
         RtTask *n = r->next;
         if (park_claim(r)) {
             park_del(r);
-            r->chan_res = val;
+            /* the deposited slot satisfies exactly one waiter — handing
+             * it to every parked receiver would double-own the value */
+            r->chan_res = delivered ? 0 : val;
+            delivered = 1;
             rt_task_wake(r);
         }
         task_unref(r); /* recvq node ref */
@@ -1827,6 +1855,7 @@ void rt_close(RtChan *ch) {
         SendReq *n = sq->next;
         if (park_claim(sq->t)) {
             park_del(sq->t);
+            if (ch->drop_elem) ch->drop_elem(sq->v); /* never delivered */
             rt_task_wake(sq->t);
         }
         task_unref(sq->t); /* sendq node ref */
@@ -1840,7 +1869,8 @@ void rt_close(RtChan *ch) {
          * claim; the RtSel ref (taken under ch->mu) keeps s itself */
         if (park_claim(s->t)) {
             s->winner = sw->slot;
-            s->t->chan_res = val;
+            s->t->chan_res = delivered ? 0 : val;
+            delivered = 1;
             s->t->sel_arm = sw->slot;
             rt_task_wake(s->t);
         }
@@ -1848,6 +1878,7 @@ void rt_close(RtChan *ch) {
         sel_unref(s);
         sw = n;
     }
+    if (had && !delivered && ch->drop_elem) ch->drop_elem(val);
 }
 
 /* scope-teardown chan close: everything rt_close does for waiters, plus
@@ -2275,6 +2306,9 @@ static void scope_cancel_wake(RtScope *s) {
                     if ((*pp)->t == t) {
                         SendReq *d = *pp;
                         *pp = d->next;
+                        /* send is statically a move: the parked payload was
+                         * never delivered, so the chan thunk reclaims it */
+                        if (ch->drop_elem) ch->drop_elem(d->v);
                         free(d);
                         unlinked = 1;
                         break;
@@ -2341,6 +2375,19 @@ OxlStr rt_str_own(OxlStr s) {
 }
 
 OxlStr rt_str(const char *s) { return (OxlStr){ s, (int64_t)strlen(s) }; }
+
+/* release the backing of an rt_str_own copy — the interned-by-mailbox
+ * strings in extra/gui use this at session teardown */
+void rt_str_free(OxlStr s) { if (s.p) rt_free((void *)s.p); }
+
+/* state probe for the gui reply-chan lifecycle — pool admission and
+ * post-close short-circuits read this under their own locking */
+int rt_chan_is_closed(RtChan *ch) {
+    oxl_mu_lock(&ch->mu);
+    int c = ch->closed;
+    oxl_mu_unlock(&ch->mu);
+    return c;
+}
 OxlStr rt_str_lit(const char *s) { return rt_str(s); }
 
 OxlStr rt_strcat(OxlStr a, OxlStr b) {

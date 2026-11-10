@@ -13,6 +13,14 @@ import "std/errors"
 
 import "std/sync"
 
+// owned-string copies for the mailbox boundary: every str entering a
+// mailbox is deep-copied into own heap and interned on the buf for the
+// session — a queued payload never aliases storage that can die
+// underneath it (poster arenas, shim ring buffers)
+extern fn rt_str_own(s: str) -> str
+
+extern fn rt_str_free(s: str)
+
 // ---- public protocol types ----
 enum WidgetKind { window, vbox, hbox, label, button, entry, list, scrolled, }
 
@@ -138,7 +146,12 @@ struct EventBuf {
     elig: int,
     q: own EN,
     wt: own WN,
+    strs: own SN,
 }
+
+// interned string node — copies live until the buf's free_strs at
+// session teardown, so a delivered payload stays valid all session
+struct SN { s: str, next: own SN }
 
 fn en_cons(v: own Event, elig: int, next: own EN) -> own EN {
     c := new(EN)
@@ -313,6 +326,12 @@ fn (b mut EventBuf) post(e: own Event) -> int {
             return 1
         }
     }
+    match e.data {
+        EventData.Text(t) => {
+            e.data = EventData.Text(eb_intern_l(b, t))
+        }
+        _ => {}
+    }
     elig := ev_eligible(b, e)
     if elig == 1 && b.elig >= b.cap {
         rr := en_rm_last_elig(b.q)
@@ -363,6 +382,15 @@ fn (b mut EventBuf) add_dropped(n: int) {
     sync.munlock(b.mu)
 }
 
+// marker-cancel credit: the events were already counted into dropped
+// at eviction — a lost marker re-pends the report without double-
+// counting the loss itself
+fn (b mut EventBuf) add_dp(n: int) {
+    sync.mlock(b.mu)
+    sset(b.dp, sget(b.dp) + n)
+    sync.munlock(b.mu)
+}
+
 fn (b mut EventBuf) closed_empty() -> int {
     sync.mlock(b.mu)
     r := 0
@@ -373,12 +401,27 @@ fn (b mut EventBuf) closed_empty() -> int {
     return r
 }
 
-// dead-handle bookkeeping: clear liveness + pending close, flip any
-// queued close_requests for h to drop-eligible. Called with mu held.
+// drop a widget-table node outright — handles are never reused, so a
+// dead widget's entry has no readers left once queued closes flip
+fn wt_del(l: own WN, h: int) -> own WN {
+    if l == nil {
+        return nil
+    }
+    if l.h == h {
+        return l.next
+    }
+    rest := l.next
+    l.next = wt_del(rest, h)
+    return l
+}
+
+// dead-handle bookkeeping: flip any queued close_requests for h to
+// drop-eligible, then prune the node — lookups on the dead handle
+// resolve as never-alive, which is the same dead-handle answer.
+// Called with mu held.
 fn eb_mark_dead(b: mut EventBuf, h: int) {
-    b.wt = wt_set(b.wt, h, 1, 0)
-    b.wt = wt_set(b.wt, h, 2, 0)
     b.q = en_flip_close(b, b.q, h)
+    b.wt = wt_del(b.wt, h)
 }
 
 // ---- CmdBuf ----
@@ -386,8 +429,6 @@ fn eb_mark_dead(b: mut EventBuf, h: int) {
 // while full — bounded admission IS the mutator backpressure; commands
 // are never silently dropped while the buf is open.
 struct CN { v: own Cmd, next: own CN }
-
-struct PN { ch: chan own CmdResult, next: own PN }
 
 struct CNR { list: own CN, found: own CN }
 
@@ -398,8 +439,8 @@ struct CmdBuf {
     cap: int,
     len: int,
     q: own CN,
-    pool: own PN,
-    pool_n: int,
+    strs: own SN,
+    wakep: shared,
 }
 
 fn cn_cons(v: own Cmd, next: own CN) -> own CN {
@@ -438,6 +479,8 @@ fn (b mut CmdBuf) drain() -> own CN {
 }
 
 // post — returns 1 enqueued, 0 closed. Parks on `room` only while full.
+// Every str inside the Cmd is interned before enqueue: the queued
+// command can never alias the poster's dying arena storage.
 fn (b mut CmdBuf) post(c: own Cmd) -> int {
     for 1 == 1 {
         sync.mlock(b.mu)
@@ -446,10 +489,28 @@ fn (b mut CmdBuf) post(c: own Cmd) -> int {
             return 0
         }
         if b.len < b.cap {
+            match c.prop.val {
+                PropVal.Text(t) => {
+                    c.prop.val = PropVal.Text(cb_intern_l(b, t))
+                }
+                _ => {}
+            }
+            if c.props != nil {
+                i := 0
+                for i < len(c.props) {
+                    match c.props[i].val {
+                        PropVal.Text(t) => {
+                            c.props[i].val = PropVal.Text(cb_intern_l(b, t))
+                        }
+                        _ => {}
+                    }
+                    i = i + 1
+                }
+            }
             b.q = cn_cons(c, b.q)
             b.len = b.len + 1
+            sset(b.wakep, 1)
             sync.munlock(b.mu)
-            try_send(b.room, 1)
             return 1
         }
         sync.munlock(b.mu)
@@ -492,30 +553,70 @@ fn last_dropped_cell() {
     }
 }
 
-// ---- reply chans (pool bound to the mailbox scope) ----
+// ---- reply chans ----
+// One cap-1 chan per round trip, bound to the mailbox-owning scope
+// (g_sess.mscope) — the caller's own scope can die mid-recv without
+// the reply chan dying under a queued Cmd. Callers close it on every
+// exit path (defer) so a backend's try_send observes the loss and its
+// reconcile runs; the scope's teardown reclaims the chans themselves.
 fn reply_chan() -> chan own CmdResult {
-    sync.mlock(g_cb.mu)
-    p := g_cb.pool
-    if p != nil {
-        g_cb.pool = p.next
-        g_cb.pool_n = g_cb.pool_n - 1
-        sync.munlock(g_cb.mu)
-        return p.ch
-    }
-    sync.munlock(g_cb.mu)
     return smkchan(CmdResult, 1, g_sess.mscope)
 }
 
-fn reply_free(c: chan own CmdResult) {
-    sync.mlock(g_cb.mu)
-    if g_cb.pool_n < 8 {
-        p := new(PN)
-        p.ch = c
-        p.next = g_cb.pool
-        g_cb.pool = p
-        g_cb.pool_n = g_cb.pool_n + 1
+// owned-string copy for payload boundaries a buf can't reach — read
+// replies. The returned str is own-heap; session-lifetime in v0.
+fn str_own(s: str) -> str {
+    return rt_str_own(s)
+}
+
+// intern s on b — caller must hold b.mu
+fn cb_intern_l(b: mut CmdBuf, s: str) -> str {
+    n := new(SN)
+    n.s = rt_str_own(s)
+    n.next = b.strs
+    r := n.s
+    b.strs = n
+    return r
+}
+
+// intern s on b — caller must hold b.mu
+fn eb_intern_l(b: mut EventBuf, s: str) -> str {
+    n := new(SN)
+    n.s = rt_str_own(s)
+    n.next = b.strs
+    r := n.s
+    b.strs = n
+    return r
+}
+
+fn sn_free_all(l: own SN) {
+    for l != nil {
+        rt_str_free(l.s)
+        l = l.next
     }
-    sync.munlock(g_cb.mu)
+}
+
+// release every interned string — session teardown calls this once
+// the buf is drained, so no consumer can still hold a copied str
+fn (b mut CmdBuf) free_strs() {
+    sn_free_all(b.strs)
+    b.strs = nil
+}
+
+fn (b mut EventBuf) free_strs() {
+    sn_free_all(b.strs)
+    b.strs = nil
+}
+
+// core-owned wake latch: set under mu on every accepted post, consumed
+// by a backend's wait decision so a post landing between drain and
+// park can never be slept through
+fn (b mut CmdBuf) take_wake() -> int {
+    sync.mlock(b.mu)
+    w := sget(b.wakep)
+    sset(b.wakep, 0)
+    sync.munlock(b.mu)
+    return w
 }
 
 // ---- cmd posting ----
@@ -566,10 +667,16 @@ fn credit_unless(sent: shared, n: int) {
     }
 }
 
+fn credit_marker(sent: shared, n: int) {
+    if sget(sent) == 0 {
+        g_eb.add_dp(n)
+    }
+}
+
 // blocking send of the overflow marker; a cancelled send credits n back.
 fn send_marked(n: int) {
     sent := mkshared(0)
-    defer credit_unless(sent, n)
+    defer credit_marker(sent, n)
     m := new(Event)
     m.kind = EventKind.overflow
     m.target = 0
@@ -671,6 +778,9 @@ fn events_dropped() -> int {
 
 // is a close decision currently pending for this handle? (core table)
 fn close_pending(w: Widget) -> int {
+    if g_eb == nil {
+        return 0
+    }
     sync.mlock(g_eb.mu)
     w2 := wt_get(g_eb.wt, w.handle())
     sync.munlock(g_eb.mu)
@@ -697,6 +807,7 @@ fn run(b: Backend, app: fn(chan own Event)) -> err {
     g_eb.elig = 0
     g_eb.q = nil
     g_eb.wt = nil
+    g_eb.strs = nil
 
     g_cb = new(CmdBuf)
     g_cb.mu = sync.mutex()
@@ -705,8 +816,8 @@ fn run(b: Backend, app: fn(chan own Event)) -> err {
     g_cb.cap = g_cmd_cap
     g_cb.len = 0
     g_cb.q = nil
-    g_cb.pool = nil
-    g_cb.pool_n = 0
+    g_cb.strs = nil
+    g_cb.wakep = mkshared(0)
 
     ev := smkchan(Event, g_event_cap, curscope())
     g_sess = new(Session)
@@ -749,11 +860,43 @@ fn run(b: Backend, app: fn(chan own Event)) -> err {
         close(ev)
     }
     sset(g_last_dropped, sget(g_eb.dropped))
-    g_sess = nil
-    g_eb = nil
-    g_cb = nil
+    g_cb.free_strs()
+    g_eb.free_strs()
+    // the mailboxes stay live: they are bound to the enclosing scope and
+    // both closed flags are set, so a post-run mutator call always hits
+    // the accepted-and-dropped rule instead of dangling on a nil global
     g_running = 0
     return nil
+}
+
+fn kind_i(k: WidgetKind) -> int {
+    match k {
+        WidgetKind.window => { return 0 }
+        WidgetKind.vbox => { return 1 }
+        WidgetKind.hbox => { return 2 }
+        WidgetKind.label => { return 3 }
+        WidgetKind.button => { return 4 }
+        WidgetKind.entry => { return 5 }
+        WidgetKind.list => { return 6 }
+        WidgetKind.scrolled => { return 7 }
+    }
+}
+
+// ---- dev gate: protocol diagnostics off unless enabled ----
+let g_dbg: shared = nil
+
+fn debug_protocol(on: int) {
+    if g_dbg == nil {
+        g_dbg = mkshared(0)
+    }
+    sset(g_dbg, on)
+}
+
+fn dbg() -> int {
+    if g_dbg == nil {
+        return 0
+    }
+    return sget(g_dbg)
 }
 
 // ---- widget iface + typed wrappers ----
@@ -852,6 +995,9 @@ fn create(kind: WidgetKind, parent: int, props: own []Prop) -> [int, err] {
         return 0, err_stopped()
     }
     rc := reply_chan()
+    // close on every exit — a cancel mid-recv or an early error return
+    // must flip the backend's try_send to false so its reconcile runs
+    defer close(rc)
     c := mk_cmd(CmdKind.new_kind, parent, 0)
     c.widget = kind
     c.props = props
@@ -861,13 +1007,15 @@ fn create(kind: WidgetKind, parent: int, props: own []Prop) -> [int, err] {
         return 0, e
     }
     r := recv(rc)
-    reply_free(rc)
+    if r == nil {
+        return 0, err_stopped()
+    }
     if r.e != nil {
         return 0, r.e
     }
     h := r.handle
     sync.mlock(g_eb.mu)
-    g_eb.wt = wt_put(g_eb.wt, h, 1)
+    g_eb.wt = wt_put(g_eb.wt, h, kind_i(kind))
     if parent != 0 {
         g_eb.wt = wt_set(g_eb.wt, h, 3, parent)
     }
@@ -943,6 +1091,9 @@ fn scrolled() -> [Scrolled, err] {
 
 // attach child under parent; records the edge for remove's detach.
 fn append(parent: Widget, child: Widget) {
+    if g_eb == nil {
+        return
+    }
     sync.mlock(g_eb.mu)
     g_eb.wt = wt_set(g_eb.wt, child.handle(), 3, parent.handle())
     sync.munlock(g_eb.mu)
@@ -969,6 +1120,9 @@ fn remove(w: Widget) {
 // next user close. The flag clears only after the settle Cmd enqueues —
 // a cancelled poster leaves it set, which is the correct state.
 fn dismiss_close(w: Widget) {
+    if g_cb == nil {
+        return
+    }
     c := mk_cmd(CmdKind.dismiss_close, w.handle(), 0)
     if g_cb.post(c) == 1 {
         g_sess.b.wake()
@@ -1007,6 +1161,7 @@ fn read_prop(h: int, id: int) -> [PropVal, err] {
         return PropVal.Num(0), err_stopped()
     }
     rc := reply_chan()
+    defer close(rc)
     c := mk_cmd(CmdKind.read, h, 0)
     c.prop = Prop{id: id, val: PropVal.Num(0)}
     c.reply = rc
@@ -1015,7 +1170,9 @@ fn read_prop(h: int, id: int) -> [PropVal, err] {
         return PropVal.Num(0), e
     }
     r := recv(rc)
-    reply_free(rc)
+    if r == nil {
+        return PropVal.Num(0), err_stopped()
+    }
     if r.e != nil {
         return PropVal.Num(0), r.e
     }

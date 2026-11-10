@@ -42,8 +42,8 @@ you want verdicted, and again after the last fix commit.
       legitimately (their main IS their root task), so the mock
       suite keeps its `pump`-driving path.
       `mock/`: pure-oxl backend recording protocol calls
-      with a scriptable `pump`. `tests/gui_test.oxl` drives the
-      whole surface headless.
+      with a scriptable `pump`. `tests/gui_mock.oxl` +
+      friends drive the whole surface headless.
       Language additions land here so G2's app chan is typed from
       its first selftest (parser + both checkers + a small runtime
       element-drop hook — word representation unchanged): `chan own

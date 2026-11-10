@@ -887,13 +887,22 @@ impl<'a> Checker<'a> {
             Stmt::Scope { body, .. } => self.block(body, env),
             Stmt::Spawn { call, scope, span, .. } => {
                 match &call.kind {
-                    ExprKind::Call { .. } => {
+                    ExprKind::Call { f, .. } => {
                         // no calls edge: spawn doesn't suspend the caller,
                         // so the callee's susp must not propagate here —
                         // `goin`'s susp gate reads `suspend` directly.
                         if let Some(se) = scope {
                             let st = self.expr(se, env);
                             self.assignable(&Ty::Scope, &st, se.span);
+                            // a fn-valued local shadows the susp callee's
+                            // name — codegen would bind the caller's
+                            // scope, not `sc`
+                            if let ExprKind::Ident(n) = &f.kind {
+                                if matches!(env.get(n), Some(Ty::Fn(..))) {
+                                    self.diags.push(Diag::err(*span, "check",
+                                        format!("`goin` requires a susp fn call — `{n}` resolves to a local fn value")));
+                                }
+                            }
                         }
                         self.in_spawn = true;
                         self.expr(call, env);
@@ -2186,20 +2195,30 @@ impl<'a> Checker<'a> {
                         _ => Ty::Int,
                     };
                 }
-                "mkscope" => return Ty::Scope,
-                "curscope" => return Ty::Scope,
-                "is_root" => return Ty::Bool,
-                "scancel" => {
-                    if let Some(a) = args.first() {
-                        let t = self.expr(a, env);
-                        self.assignable(&Ty::Scope, &t, a.span);
+                "mkscope" | "curscope" => {
+                    if !args.is_empty() {
+                        self.diags.push(Diag::err(sp, "check",
+                            &format!("`{name}` takes no arguments")));
                     }
-                    return Ty::Void;
+                    return Ty::Scope;
                 }
-                "sjoin" => {
-                    if let Some(a) = args.first() {
-                        let t = self.expr(a, env);
-                        self.assignable(&Ty::Scope, &t, a.span);
+                "is_root" => {
+                    if !args.is_empty() {
+                        self.diags.push(Diag::err(sp, "check",
+                            "`is_root` takes no arguments"));
+                    }
+                    return Ty::Bool;
+                }
+                "scancel" | "sjoin" => {
+                    if args.len() != 1 {
+                        self.diags.push(Diag::err(sp, "check",
+                            &format!("`{name}` takes (scope)")));
+                    } else {
+                        let t = self.expr(&args[0], env);
+                        self.assignable(&Ty::Scope, &t, args[0].span);
+                    }
+                    if name == "scancel" {
+                        return Ty::Void;
                     }
                     return Ty::Int; // the joined scope's trap code (0 = clean)
                 }

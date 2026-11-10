@@ -1550,6 +1550,15 @@ rc=0
 out=$(with_timeout 30 "$scratch/gui_overflow$EXE") || rc=$?
 [ "$rc" -eq 0 ] && [ "$(tail -1 <<<"$out")" = "overflow ok" ] || {
     echo "FAIL gui_overflow: rc=$rc: $out"; exit 1; }
+# lifecycle contracts (spec G1/G3): cancel mid-create fires the
+# lost-reply destroy reconcile mid-run, dead-handle calls record
+# violations, and post-run mutators are accepted-and-dropped.
+"$OXL" build tests/gui_lifecycle.oxl -o "$scratch/gui_lifecycle$EXE" || {
+    echo "FAIL gui_lifecycle: compile failed"; exit 1; }
+rc=0
+out=$(with_timeout 30 "$scratch/gui_lifecycle$EXE") || rc=$?
+[ "$rc" -eq 0 ] && [ "$(tail -1 <<<"$out")" = "lifecycle ok" ] || {
+    echo "FAIL gui_lifecycle: rc=$rc: $out"; exit 1; }
 # parked select must unwedge on sibling trap — exits nonzero, not a hang.
 # 124 = with_timeout expiry = the hang this test exists to catch. Build
 # first so a compile error fails the check instead of passing as a

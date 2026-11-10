@@ -1618,6 +1618,9 @@ fn ty_name(ck: ref Ck, t: int) -> str {
         }
         return "chan"
     }
+    if k == k_scope() {
+        return "scope"
+    }
     if k == k_shared() {
         return "shared"
     }
@@ -3557,20 +3560,25 @@ fn call(ck: mut Ck, f: ref parser.Node, args: ref parser.NList, env: mut Env) ->
             return t_int(ck)
         }
         if qn == "mkscope" || qn == "curscope" {
+            if args != nil {
+                diag(ck, "check", "`" + qn + "` takes no arguments")
+            }
             return tk(ck, k_scope())
         }
         if qn == "is_root" {
+            if args != nil {
+                diag(ck, "check", "`is_root` takes no arguments")
+            }
             return t_bool(ck)
         }
-        if qn == "scancel" {
-            if args != nil {
+        if qn == "scancel" || qn == "sjoin" {
+            if nl_len(args) != 1 {
+                diag(ck, "check", "`" + qn + "` takes (scope)")
+            } else {
                 assignable(ck, tk(ck, k_scope()), expr(ck, args.v, env))
             }
-            return t_void(ck)
-        }
-        if qn == "sjoin" {
-            if args != nil {
-                assignable(ck, tk(ck, k_scope()), expr(ck, args.v, env))
+            if qn == "scancel" {
+                return t_void(ck)
             }
             return t_int(ck)
         }
@@ -4266,6 +4274,22 @@ fn spawn_stmt(ck: mut Ck, e: ref parser.Node, env: mut Env) {
 // post-pass scan (susp isn't final at stmt time).
 fn goin_stmt(ck: mut Ck, sc: ref parser.Node, e: ref parser.Node, env: mut Env) {
     assignable(ck, tk(ck, k_scope()), expr(ck, sc, env))
+    // a fn-valued local shadows the susp callee's name — the spawned
+    // task would bind the caller's scope, not sc. The post-pass gate
+    // only sees the resolved name, so the shadow check lives here.
+    if e != nil && nk(e) == 8 {
+        match e {
+            parser.Node.Call{f} => {
+                n := callee_name(f)
+                lt := env_get(ck, env, n)
+                if len(n) > 0 && lt >= 0 && ck.tyv[lt].k == k_fn() {
+                    diag(ck, "check", "`goin` requires a susp fn call — `" + n + "` resolves to a local fn value")
+                }
+            }
+            _ => {
+            }
+        }
+    }
     spawn_stmt(ck, e, env)
 }
 

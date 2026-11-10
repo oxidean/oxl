@@ -23,6 +23,8 @@ extern fn gx_create(kind: int) -> int
 
 extern fn gx_destroy(h: int)
 
+extern fn gx_alive(h: int) -> int
+
 extern fn gx_set_text(h: int, id: int, s: str)
 
 extern fn gx_read_str(h: int, id: int) -> cstr
@@ -103,6 +105,13 @@ fn al_add(h: int) {
 }
 
 fn al_has(h: int) -> int {
+    // shim liveness is authoritative: GTK can finalize a widget without
+    // a destroy Cmd (row churn, window teardown). A stale record drops
+    // here so reads and new-kind parents resolve err_gone, not a hit.
+    if gx_alive(h) == 0 {
+        al_del(h)
+        return 0
+    }
     l := g_alive
     for l != nil {
         if l.h == h {
@@ -141,7 +150,7 @@ fn backend() -> Gtk {
 // means a caller reached the iface directly. Reported, not fatal —
 // protocol violations are development aids per backend-protocol.md.
 fn aff_check(what: str) {
-    if !is_root() {
+    if gui.dbg() == 1 && !is_root() {
         println("gui/gtk: " + what + " off the root task — call through gui.run only")
     }
 }
@@ -282,7 +291,7 @@ fn (g Gtk) exec(c: own gui.Cmd) {
             r2.val = gui.PropVal.Num(0)
         } else {
             r2.e = nil
-            r2.val = gui.PropVal.Text(str(gx_read_str(c.target, c.prop.id)))
+            r2.val = gui.PropVal.Text(gui.str_own(str(gx_read_str(c.target, c.prop.id))))
         }
         try_send(c.reply, r2)
         return
@@ -344,7 +353,7 @@ fn (g Gtk) pump(events: mut gui.EventBuf, cmds: mut gui.CmdBuf) {
         if sget(g.stopf) == 1 {
             break
         }
-        gx_iter(1 - worked)
+        gx_iter((1 - worked) * (1 - cmds.take_wake()))
     }
     g.sweep()
 }

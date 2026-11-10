@@ -571,6 +571,24 @@ pub fn generate_mode(c: &Crate, test_mode: bool, susp: &HashSet<String>) -> Stri
     let main_unit = units.len();
     units.push(u);
 
+    // destructor defs get their own unit: every `o_drop_*` it defines
+    // is reachable only through the live use that spells it, so two
+    // units calling `mkchan(Ev)` share ONE def and a pruned unit can
+    // never take a needed def down. Pushed last — its head lands after
+    // every type-decl head and before every body, and its text spelling
+    // `o_s_*`/`o_en_*` pulls those decl units live in the same pass.
+    {
+        let mut du = Unit::default();
+        for n in g.drop_tys.iter() {
+            du.defs.push(format!("o_drop_{}", cname(n)));
+        }
+        if g.drop_word {
+            du.defs.push("o_drop_word".into());
+        }
+        du.head = g.drops_src();
+        units.push(du);
+    }
+
     // csym -> units defining it; a colliding symbol (say a struct named
     // like an enum variant's payload) marks every claimant — safe
     let mut defs: HashMap<String, Vec<usize>> = HashMap::new();
@@ -905,8 +923,10 @@ impl<'a> Gen<'a> {
             let fields: Vec<Ty> = match &t {
                 Ty::Struct(n) => self.structs.get(n).cloned().unwrap_or_default()
                     .into_iter().map(|(_, ft)| ft).collect(),
-                Ty::Enum(n) => self.enum_fields.get(n).cloned().unwrap_or_default()
-                    .into_iter().map(|(_, ft)| ft).collect(),
+                Ty::Enum(n) => self.enums.get(n).cloned().unwrap_or_default()
+                    .into_iter()
+                    .flat_map(|vn| self.enum_fields.get(&format!("{n}.{vn}")).cloned().unwrap_or_default())
+                    .map(|(_, ft)| ft).collect(),
                 _ => Vec::new(),
             };
             for ft in fields {
@@ -927,12 +947,13 @@ impl<'a> Gen<'a> {
 
     /// write each registered o_drop_<n>: frees own fields recursively then
     /// rt_free's the object. Bodies reference one another, so prototypes
-    /// go first; emission order is irrelevant. The sets drain on emit —
-    /// `drain` runs per unit, so without clearing every unit would
-    /// re-emit all previously-registered defs (duplicate `static`s).
-    fn emit_drops(&mut self) {
+    /// go first; emission order is irrelevant. Registration accumulates
+    /// across every unit's codegen and this runs ONCE in the assembled
+    /// preamble — two units calling `mkchan(Ev)` must not each emit
+    /// `o_drop_Ev`, and a pruned unit can't take a live use's def with it.
+    fn drops_src(&mut self) -> String {
         if self.drop_tys.is_empty() && !self.drop_word {
-            return;
+            return String::new();
         }
         let drop_tys = std::mem::take(&mut self.drop_tys);
         let drop_word = std::mem::take(&mut self.drop_word);
@@ -961,17 +982,26 @@ impl<'a> Gen<'a> {
             } else {
                 let mut body = format!(
                     "static void o_drop_{cn}(int64_t _v) {{ struct o_en_{cn} *p = (struct o_en_{cn} *)_v; if (!p) return; switch (p->tag) {{\n");
-                for (i, (_vn, ft)) in self.enum_fields.get(n).cloned().unwrap_or_default().iter().enumerate() {
-                    if matches!(ft, Ty::Own(_)) {
-                        body.push_str(&format!("    case {i}: {}break;\n",
-                            self.drop_field(&format!("p->u.v{i}"), ft)));
+                // enum_fields is keyed per variant ("E.V") — walk the
+                // variant list so each case drops exactly its payload's
+                // own fields; a bare-name lookup finds nothing
+                for (i, vn) in self.enums.get(n).cloned().unwrap_or_default().iter().enumerate() {
+                    let key = format!("{n}.{vn}");
+                    let mut cases = String::new();
+                    for (f, ft) in self.enum_fields.get(&key).cloned().unwrap_or_default() {
+                        if matches!(ft, Ty::Own(_)) {
+                            cases.push_str(&self.drop_field(&format!("p->u.v{i}.f_{f}"), &ft));
+                        }
+                    }
+                    if !cases.is_empty() {
+                        body.push_str(&format!("    case {i}:\n{cases}        break;\n"));
                     }
                 }
                 body.push_str("    }\n    rt_free(p);\n}\n");
                 src.push_str(&body);
             }
         }
-        self.trampolines.push_str(&src);
+        src
     }
 
     /// one C stmt dropping an own field/payload word; borrowed fields are
@@ -1154,7 +1184,8 @@ impl<'a> Gen<'a> {
         u.head.push_str(&std::mem::take(&mut self.frame_head));
         u.head.push_str(&std::mem::take(&mut self.inst_protos));
         u.head.push_str(&std::mem::take(&mut self.closure_protos));
-        self.emit_drops();
+        // drop registrations accumulate — drops_src emits the union
+        // once between the head and body layers, never per unit
         u.body.push_str(&std::mem::take(&mut self.trampolines));
         u.body.push_str(&std::mem::take(&mut self.inst_out));
         u.body.push_str(&std::mem::take(&mut self.frame_out));
@@ -1705,6 +1736,15 @@ impl<'a> Gen<'a> {
         if let ExprKind::Call { f, args } = &call.kind {
             // spawn f() where f is a fn value — pack the fat pair as a0
             if let Ty::Fn(ps, r) = self.fn_callee_ty(f) {
+                if scope.is_some() {
+                    // the checker's goin gate rejects fn-valued callees —
+                    // a shadow that slipped through lands here; the
+                    // trampoline can't bind the named scope, so fail
+                    // loudly rather than spawn under the caller's
+                    let _ = writeln!(self.out,
+                        "    fprintf(stderr, \"goin on a fn value\\n\"); abort();");
+                    return;
+                }
                 let id = self.tmp();
                 let mut tr = format!("struct o_args_{id} {{ RtFnv a0;");
                 for (i, p) in ps.iter().enumerate() {
@@ -2634,6 +2674,7 @@ impl<'a> Gen<'a> {
         loop {
             let head = &path[..cut];
             let bound = self.fslots.iter().rev().any(|s| s.contains_key(head))
+                || self.bind_env.borrow().iter().any(|s| s.contains_key(head))
                 || self.env.iter().any(|s| s.contains_key(head))
                 || self.globals.contains_key(head);
             if bound {
@@ -3731,8 +3772,14 @@ impl<'a> Gen<'a> {
         let k = self.state_ctr;
         self.state_ctr += 1;
         self.state_labels.push(k);
-        let _ = writeln!(self.out,
-            "    if (rt_cancelled()) {{ fr->cur_scope = tls_scope; tls_scope = saved; return RT_CANCEL; }}");
+        // sjoin's finish is the join's second half — a cancelled joiner
+        // still owes the named scope its teardown and the parent its
+        // hold release, so the join polls and finishes ahead of any
+        // cancel delivery (the cancel tree wakes joiners on drain).
+        if name != "sjoin" {
+            let _ = writeln!(self.out,
+                "    if (rt_cancelled()) {{ fr->cur_scope = tls_scope; tls_scope = saved; return RT_CANCEL; }}");
+        }
         let _ = writeln!(self.out, "    fr->state = {k};");
         let poll = match name {
             "recv" => format!("rt_recv_poll({}, task)", argvs[0]),
@@ -3744,9 +3791,6 @@ impl<'a> Gen<'a> {
         let _ = writeln!(self.out,
             "    if ({poll} == RT_PENDING) {{ fr->cur_scope = tls_scope; tls_scope = saved; return RT_PENDING; }}");
         let _ = writeln!(self.out, "    s{k}: ;");
-        // a cancel-driven wake delivers no value — die at the resume point
-        let _ = writeln!(self.out,
-            "    if (rt_cancelled()) {{ fr->cur_scope = tls_scope; tls_scope = saved; return RT_CANCEL; }}");
         let res = if name == "recv" {
             match args.first().map(|a| self.expr_ty(a)) {
                 Some(Ty::Chan(Some(p))) => format!("({})rt_task_data(task)", self.cty(&p)),
@@ -3759,6 +3803,20 @@ impl<'a> Gen<'a> {
         } else {
             "rt_task_data(task)".into()
         };
+        if name == "sjoin" {
+            self.fsusp_dest(&dest, &res, name);
+            // scope finished — deliver a cancel that woke the join
+            let _ = writeln!(self.out,
+                "    if (rt_cancelled()) {{ fr->cur_scope = tls_scope; tls_scope = saved; return RT_CANCEL; }}");
+        } else {
+            // a cancel-driven wake delivers no value — die at the resume point
+            let _ = writeln!(self.out,
+                "    if (rt_cancelled()) {{ fr->cur_scope = tls_scope; tls_scope = saved; return RT_CANCEL; }}");
+            self.fsusp_dest(&dest, &res, name);
+        }
+    }
+
+    fn fsusp_dest(&mut self, dest: &FDest, res: &str, name: &str) {
         match dest {
             FDest::Field(fd) => {
                 let _ = writeln!(self.out, "    fr->{fd} = {res};");

@@ -408,7 +408,9 @@ export function rt_scope_finish_named(sv) {
   const s = sv
   if (!s) return 0n
   const p = s.parent
+  const save = tls_scope
   const e = rt_scope_finish(s)
+  tls_scope = save
   if (p) scope_done(p)
   return e
 }
@@ -524,6 +526,7 @@ function task_make(poll, scope) {
     started: 0,
     defers: null,
     settled: false,
+    trapped_result: 0,
     _resolve: null,
   }
 }
@@ -637,6 +640,7 @@ function task_release_frame(t, trapped) {
     }
   }
   t.settled = true
+  t.trapped_result = trapped
   if (t._resolve) t._resolve()
 }
 

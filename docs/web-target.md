@@ -15,8 +15,9 @@ oxl test  <pkg|file.oxl> --target js        # test_* fns, same `… ok` lines
 
 - `--target js` selects the JS emitter (`bootstrap/codegen/js.oxl`).
   Anything else is the native lane.
-- `-o` names the emitted module (default `<pkg>.mjs` beside the
-  source). The runtime files land next to it, not inlined.
+- `-o` names the emitted module (default `a.mjs` in the working
+  directory — the js lane's `a.out`). The runtime files land next
+  to it, not inlined.
 - `--html` also writes `out.mjs.html`: a minimal page —
   `<div id="app"></div>` + `<script type="module">` — the DOM
   backend mounts on `#app` when present, `<body>` otherwise.
@@ -40,9 +41,10 @@ real vs headless by `typeof document`. Programs that never touch
 
 ## Env flavors
 
-- **node**: `os`/`os/exec`/`net`/`filepath`/`log`/`flag` work —
-  files via `fs`, argv via `process.argv`, exec via
-  `child_process`, net/dns through the shared-cell callback.
+- **node**: `os`/`os/exec`/`filepath`/`log`/`flag` work — files
+  via `fs`, argv via `process.argv`, exec via `child_process`.
+  `net` binds are present but trap code 21 — socket i/o has no
+  cooperative-fiber mapping yet.
 - **browser**: every env name is bound — file/proc/net calls
   return `err` codes where the contract permits and trap code 21
   where it does not. Nothing is unbound; a missing shim is a
@@ -85,6 +87,7 @@ extern calls. These trap rather than silently mis-behave:
 The DOM backend renders `extra/gui` apps to real elements —
 `window`→owned `<div>` under `#app`/`<body>`, containers→`<div>`,
 `label`→`<span>`, `button`→`<button>`, `entry`→`<input>`,
-`list`→`<ul>` rows as `<li>`; events map `click`/`input`/
-Enter-keydown/li-click/`oxl-close` onto the core `EventKind`s.
+`list`→`<ul>` with each attached row kept as its own widget tag;
+events map `click`/`input`/Enter-keydown/row-click/`oxl-close`
+onto the core `EventKind`s.
 See `docs/gui-backends.md` and `examples/web-todo`.

@@ -62,12 +62,12 @@ signals never enter oxl directly). It proved:
 (milestone W): `window`→an owned `<div>` under the configured root
 (`#app` else `<body>` — `destroy` removes only the owned child,
 never the host), containers→`<div>`, `label`→`<span>`,
-`button`→`<button>`, `entry`→`<input>`, `list`→`<ul>` with rows as
-`<li>`, `scrolled`→`<div>` + overflow CSS. `PropVal.Text` →
+`button`→`<button>`, `entry`→`<input>`, `list`→`<ul>` — each attached row keeps its own widget
+tag (row index rides the event's aux), `scrolled`→`<div>` + overflow CSS. `PropVal.Text` →
 `textContent` (`entry` reads/writes `.value`),
 `P_PLACEHOLDER`→placeholder, `P_ROWS`→live child count (read-only;
 a `set_prop` is a contract violation). Events map `click`→clicked,
-`input`→text_changed, Enter-keydown→activated, li-`click`→
+`input`→text_changed, Enter-keydown→activated, row-`click`→
 row_activated with the row index in `EventData.Index`, and a
 custom `oxl-close` event→close_requested — `change` is never used
 (blur-after-edit would submit without an Enter action).

@@ -52,9 +52,12 @@ const P_TEXT = 1n, P_TITLE = 2n, P_PLACEHOLDER = 3n, P_ROWS = 4n
 /* text-bearing prop field per element: <input> uses value for
  * P_TEXT, everything else uses textContent; P_PLACEHOLDER maps to
  * the input placeholder property. */
+function tagOf(el) {
+  return REAL ? el.tagName.toLowerCase() : el.tag
+}
 function propField(el, id) {
   if (id === P_PLACEHOLDER) return 'placeholder'
-  if (id === P_TEXT && el.tag === 'input') return 'value'
+  if (id === P_TEXT && tagOf(el) === 'input') return 'value'
   if (id === P_TEXT || id === P_TITLE) return 'textContent'
   return null
 }
@@ -148,7 +151,7 @@ export function install(api) {
     const el = get(h)
     if (!el) return -1n
     if (BigInt(id) === P_ROWS) {
-      return BigInt(REAL ? el.children.length : el.children.length)
+      return BigInt(el.children.length)
     }
     return -1n
   }
@@ -160,31 +163,31 @@ export function install(api) {
     const k = BigInt(kind)
     if (k === D_CLICK) {
       const f = () => pushEv(el, D_CLICK, 0n)
-      REAL ? el.addEventListener('click', f) : el.addEventListener('click', f)
+      el.addEventListener('click', f)
       return
     }
     if (k === D_INPUT) {
       const f = () => pushEv(el, D_INPUT, 0n)
-      REAL ? el.addEventListener('input', f) : el.addEventListener('input', f)
+      el.addEventListener('input', f)
       return
     }
     if (k === D_ENTER) {
       const f = (e) => { if ((e && e.key) === 'Enter') pushEv(el, D_ENTER, 0n) }
-      REAL ? el.addEventListener('keydown', f) : el.addEventListener('keydown', f)
+      el.addEventListener('keydown', f)
       return
     }
     if (k === D_ROWCLICK) {
       const f = () => {
-        const p = el.parent ? el.parent : (REAL ? el.parentNode : el.parent)
-        const idx = p ? p.children.indexOf(el) : -1
+        const p = REAL ? el.parentNode : el.parent
+        const idx = p ? Array.prototype.indexOf.call(p.children, el) : -1
         pushEv(el, D_ROWCLICK, BigInt(idx < 0 ? 0 : idx))
       }
-      REAL ? el.addEventListener('click', f) : el.addEventListener('click', f)
+      el.addEventListener('click', f)
       return
     }
     if (k === D_CLOSE) {
       const f = () => pushEv(el, D_CLOSE, 0n)
-      REAL ? el.addEventListener('oxl-close', f) : el.addEventListener('oxl-close', f)
+      el.addEventListener('oxl-close', f)
       return
     }
   }
@@ -210,7 +213,7 @@ export function install(api) {
   /* headless inspection — tests read the tree the backend built */
   F.oxl_dom_tag = (h) => {
     const el = get(h)
-    return el ? el.tag : ''
+    return el ? tagOf(el) : ''
   }
   F.oxl_dom_kids = (h) => {
     const el = get(h)

@@ -528,6 +528,7 @@ void *rt_scope_named(void) {
  * named scope isn't the frame the joiner is leaving. */
 int64_t rt_scope_join_named(void *sv) {
     RtScope *s = sv;
+    if (!s) return 0;
     RtScope *p = s->parent;   /* unlink inside join_scope clears it */
     RtScope *save = tls_scope;
     int64_t e = join_scope(s);
@@ -541,6 +542,7 @@ int64_t rt_scope_join_named(void *sv) {
  * parent's pending hold drop from mkscope. */
 int64_t rt_scope_finish_named(void *sv) {
     RtScope *s = sv;
+    if (!s) return 0;
     RtScope *p = s->parent;
     RtScope *save = tls_scope;
     int64_t e = rt_scope_finish(s);
@@ -593,6 +595,7 @@ static void scope_cancel_tree(RtScope *s) {
  * alone: their mutex may already be destroyed. */
 void rt_scope_cancel(void *sv) {
     RtScope *s = sv;
+    if (!s) return;
     oxl_mu_lock(&s->mu);
     if (s->dead) { oxl_mu_unlock(&s->mu); return; }
     s->cancel = 1;
@@ -1110,6 +1113,7 @@ static int join_scope(RtScope *s) {
 
 /* frame-task join: register as the scope's joiner, or READY if drained */
 int rt_scope_join_poll(RtScope *s, RtTask *t) {
+    if (!s) return RT_READY; /* nothing to join — park_add would deref s */
     park_add(t, t->scope, s, WK_JOIN);
     oxl_mu_lock(&s->mu);
     if (s->pending > 0) {
@@ -1159,7 +1163,7 @@ void rt_scope_leave(RtScope *s) {
     if (err) rt_scope_propagate(tls_scope, err);
 }
 
-int rt_scope_try(RtScope *s) { return join_scope(s); }
+int rt_scope_try(RtScope *s) { return s ? join_scope(s) : 0; }
 
 void rt_trap(int64_t code) {
     /* don't lose buffered prints (test FAILED lines) on trap — but a
@@ -1542,7 +1546,13 @@ static SendReq *chan_pop_send(RtChan *ch) {
     while (ch->sendq) {
         SendReq *r = ch->sendq;
         ch->sendq = r->next;
-        if (!park_claim(r->t)) { task_unref(r->t); free(r); continue; }
+        /* claim lost: the cancel pass owns the wake, but we already
+         * unlinked the node — its walk can't find it, so the payload
+         * is ours to drop */
+        if (!park_claim(r->t)) {
+            if (ch->drop_elem) ch->drop_elem(r->v);
+            task_unref(r->t); free(r); continue;
+        }
         park_del(r->t);
         return r; /* r->t's node ref rides out — caller drops post-wake */
     }
@@ -1635,7 +1645,12 @@ void rt_send(RtChan *ch, int64_t v) {
          * under-lock test that cancel is lost and we cond_wait forever */
         while (ch->has && !ch->closed && !rt_cancelled())
             oxl_cv_wait(&ch->cv_send, &ch->mu);
-        if (ch->closed) break;
+        if (ch->closed) {
+            /* send on closed completes silently — but an own payload
+             * was never deposited; the chan thunk reclaims it */
+            if (ch->drop_elem) ch->drop_elem(v);
+            break;
+        }
         if (rt_cancelled()) goto cancelled; /* cancel-wake must not re-wait */
         RtTask *r = chan_pop_recv(ch);
         if (r) { /* hand directly to a parked frame receiver */
@@ -1790,6 +1805,9 @@ int rt_send_poll(RtChan *ch, int64_t v, RtTask *t) {
     }
     if (ch->closed) {
         oxl_mu_unlock(&ch->mu);
+        /* silent completion still consumed the send — reclaim an
+         * undelivered own payload through the chan thunk */
+        if (ch->drop_elem) ch->drop_elem(v);
         return RT_READY; /* send on closed completes silently (v0 rule) */
     }
     /* a thread receiver is committed inside cv_wait — but only plant
@@ -1855,9 +1873,12 @@ void rt_close(RtChan *ch) {
         SendReq *n = sq->next;
         if (park_claim(sq->t)) {
             park_del(sq->t);
-            if (ch->drop_elem) ch->drop_elem(sq->v); /* never delivered */
             rt_task_wake(sq->t);
         }
+        /* the payload was never delivered on either claim path — a
+         * lost claim means cancel owns the wake but the detached node
+         * is still ours */
+        if (ch->drop_elem) ch->drop_elem(sq->v);
         task_unref(sq->t); /* sendq node ref */
         free(sq);
         sq = n;

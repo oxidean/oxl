@@ -1708,6 +1708,7 @@ echo "== w1 js runtime smoke =="
 # skips cleanly where node is absent
 if command -v node >/dev/null 2>&1; then
     node tests/js/rt-core-smoke.mjs || { echo "FAIL rt-core-smoke"; exit 1; }
+    node tests/js/rt-browser-stub.mjs || { echo "FAIL rt-browser-stub"; exit 1; }
 else
     echo "  (skipped: node not installed)"
 fi
@@ -1718,10 +1719,12 @@ echo "== w4 js driver lane =="
 # `--target js` lane — the W4 conformance gate. Lane skips cleanly
 # where node is absent.
 if command -v node >/dev/null 2>&1; then
-    for f in conc_ping conc_scale select select_fair chan_own chanbuf chanbuf_close scope_exit orphan_join defer_order pairfwd match methods fnval d5_qual stdmods_test; do
+    # gui_* joined the lane in W5 — the susp-pump contract lets the
+    # mock's cooperative pump drive the same gates single-threaded
+    for f in conc_ping conc_scale select select_fair chan_own chanbuf chanbuf_close scope_exit orphan_join defer_order pairfwd match methods fnval d5_qual stdmods_test gui_mock gui_lifecycle gui_overflow gui_select gui_stress gui_cancel gui_dom; do
         out=$(timeout 60 "$SELFOXL" run --target js "tests/$f.oxl" 2>&1) || { echo "FAIL js lane $f: $out"; exit 1; }
     done
-    for f in enc_test hash_test regexp_test float_test util_test stdlib_test collections_test enum_test defer_test; do
+    for f in enc_test hash_test regexp_test float_test util_test stdlib_test collections_test enum_test defer_test os_test exec_test net_test flaglog_test extra_testutil; do
         out=$(timeout 60 "$SELFOXL" test --target js "tests/$f.oxl" 2>&1) || { echo "FAIL js lane test $f: $out"; exit 1; }
         grep -q 'FAIL' <<<"$out" && { echo "FAIL js lane test $f: $out"; exit 1; }
     done
@@ -1732,6 +1735,26 @@ if command -v node >/dev/null 2>&1; then
         [ "$rc" -ne 0 ] || { echo "FAIL js lane $f: expected trap exit"; exit 1; }
         grep -q 'escaped top scope' <<<"$out" || { echo "FAIL js lane $f: trap line: $out"; exit 1; }
     done
+else
+    echo "  (skipped: node not installed)"
+fi
+
+echo "== w6 dom backend + web bundle =="
+# node-gated: the reference app's emitted bundle structure plus its
+# headless-DOM selftest — the same rows=2 churn=200 gate the gtk
+# pilot asserts, driven through the dom backend's listener path.
+if command -v node >/dev/null 2>&1; then
+    "$SELFOXL" build --target js --html examples/web-todo -o "$scratch/web-todo.mjs" || {
+        echo "FAIL web-todo emit"; exit 1; }
+    for r in rt.mjs rt-node.mjs rt-browser.mjs rt-dom.mjs web-todo.mjs web-todo.mjs.html; do
+        [ -f "$scratch/$r" ] || { echo "FAIL web-todo bundle missing $r"; exit 1; }
+    done
+    grep -q 'type="module"' "$scratch/web-todo.mjs.html" || {
+        echo "FAIL web-todo html scaffold"; exit 1; }
+    out=$(cd "$scratch" && timeout 60 node -e "process.argv[1]='web-todo.mjs'; process.argv[2]='--selftest'; import('./web-todo.mjs')" 2>&1) || {
+        echo "FAIL web-todo selftest: $out"; exit 1; }
+    grep -q 'selftest rows=2 churn=200 ok' <<<"$out" || {
+        echo "FAIL web-todo selftest line: $out"; exit 1; }
 else
     echo "  (skipped: node not installed)"
 fi

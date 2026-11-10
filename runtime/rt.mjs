@@ -740,6 +740,7 @@ export function rt_run_root(fr) {
   t.external = 1
   const prev = tls_task
   t.is_root = prev === null ? 1 : 0
+  if (t.is_root && root_task === null) root_task = t
   const prev_scope = tls_scope
   tls_task = t
   tls_scope = t.scope
@@ -768,6 +769,14 @@ export function rt_is_root() {
 /* the caller's innermost live scope as an opaque handle (curscope()) */
 export function rt_scope_current() {
   return tls_scope
+}
+
+/* poll-driver prologue/epilogue: `rt_scope_set(fr.cur_scope)` on
+ * frame entry restores the innermost scope the frame last saved;
+ * `fr.cur_scope = rt_scope_current()` before each suspend return.
+ * Plain assignment — no relinking (rt_scope_enter re-parents). */
+export function rt_scope_set(s) {
+  tls_scope = s
 }
 
 export function rt_task_data(t) {
@@ -1392,7 +1401,6 @@ export function rt_select_poll(chs, n, tmo_ms, has_else, t) {
         }
       }
     }, Number(tmo_ms))
-    if (tm && tm.unref) tm.unref()
     s.timer = tm
   }
   return RT_PENDING

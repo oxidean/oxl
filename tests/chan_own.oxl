@@ -8,6 +8,9 @@ import "std/time"
 
 struct Ev { kind: int, x: int }
 
+// recursive own payload — drop_sym's worklist must terminate on it
+struct Node { next: own Node }
+
 fn producer(c: chan own Ev) {
     e := new(Ev)
     e.kind = 7
@@ -98,6 +101,16 @@ fn main() {
         }
         i = i + 1
     }
+
+    // recursive payload: send + buffered teardown exercise the drop
+    // thunk that drop_sym used to hang registering
+    nc := smkchan(Node, 2, curscope())
+    nd := new(Node)
+    nd.next = new(Node)
+    send(nc, nd)
+    send(nc, new(Node))
+    rn := recv(nc)
+    assert(rn.next != nil)
 
     println("chan_own done")
 }

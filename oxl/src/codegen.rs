@@ -917,7 +917,9 @@ impl<'a> Gen<'a> {
         while let Some(t) = stack.pop() {
             match &t {
                 Ty::Struct(n) | Ty::Enum(n) => {
-                    self.drop_tys.insert(n.clone());
+                    if !self.drop_tys.insert(n.clone()) {
+                        continue;
+                    }
                 }
                 _ => { self.drop_word = true; }
             }

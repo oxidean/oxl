@@ -3071,9 +3071,10 @@ fn drop_sym(g: mut G, payload: int) -> str {
         tk := tyk(g, t)
         if tk == check.k_struct() || tk == check.k_enum() {
             n := g.ck.tyv[t].name
-            if !sl_has_str(g.drop_tys, n) {
-                g.drop_tys = push(g.drop_tys, n)
+            if sl_has_str(g.drop_tys, n) {
+                continue
             }
+            g.drop_tys = push(g.drop_tys, n)
         } else {
             g.drop_word = 1
         }

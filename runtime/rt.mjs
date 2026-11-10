@@ -1987,7 +1987,7 @@ export function rt_timestr() {
   const p = (n, w = 2) => String(n).padStart(w, '0')
   return rt_str(
     `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ` +
-      `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}.${p(d.getMilliseconds(), 3)}`
+      `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
   )
 }
 

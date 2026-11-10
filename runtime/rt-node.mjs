@@ -8,7 +8,7 @@
 
 import fs from 'node:fs'
 import path from 'node:path'
-import { execSync, execFileSync } from 'node:child_process'
+import { execFileSync, spawnSync } from 'node:child_process'
 import os from 'node:os'
 
 let S = null // {u8,off,len} helpers from rt.mjs
@@ -177,19 +177,14 @@ export function install(api) {
     rt_strlen: (s) => BigInt(typeof s === 'string' ? s.length : 0),
 
     /* ---------- process spawn (sync surface) ---------- */
+    // env is an override list merged onto the inherited environment —
+    // `env_merge` parity: KEY=VALUE sets, a bare KEY strips the
+    // inherited entry (never appended). An empty list means inherit.
     rt_proc_run: (argv, envv) => {
       try {
-        const av = []
-        for (let i = 0; i < argv.len; i++) av.push(js_of_s(argv.a[argv.off + i]))
-        const envmap = {}
-        if (envv && envv.len > 0)
-          for (let i = 0; i < envv.len; i++) {
-            const kv = js_of_s(envv.a[envv.off + i])
-            const eq = kv.indexOf('=')
-            if (eq > 0) envmap[kv.slice(0, eq)] = kv.slice(eq + 1)
-          }
+        const av = argv_exec(argv)
         const r = execFileSync(av[0], av.slice(1), {
-          env: Object.keys(envmap).length ? envmap : process.env,
+          env: env_merge(envv),
           stdio: 'inherit',
         })
         return 0n
@@ -198,20 +193,22 @@ export function install(api) {
       }
     },
     rt_proc_output: (argv, envv, outp, errp) => {
-      // returns {status, out:[]byte, err:[]byte} per the std call shape —
-      // std wraps the raw signature; fill via return object if the
-      // checker maps it, else the slice-out convention
+      // mut []byte params arrive boxed ({v: slice}) — reseat .v with
+      // the captured streams and return the status, mirroring the
+      // native RtSlice* writes; a negative return is the spawn/capture
+      // err contract, nonzero exit is just status.
       try {
-        const av = []
-        for (let i = 0; i < argv.len; i++) av.push(js_of_s(argv.a[argv.off + i]))
-        const r = execFileSync(av[0], av.slice(1), { encoding: 'buffer', stdio: ['ignore', 'pipe', 'pipe'] })
-        return { status: 0n, out: slice_of_u8(new Uint8Array(r)), err: slice_of_u8(new Uint8Array(0)) }
+        const av = argv_exec(argv)
+        const r = spawnSync(av[0], av.slice(1), {
+          env: env_merge(envv),
+          encoding: 'buffer',
+        })
+        if (r.error) return ok_int(-(r.error.errno || 1))
+        if (outp) outp.v = slice_of_u8(new Uint8Array(r.stdout || []))
+        if (errp) errp.v = slice_of_u8(new Uint8Array(r.stderr || []))
+        return ok_int(r.status == null ? (r.signal ? 128 : 1) : r.status)
       } catch (e) {
-        return {
-          status: ok_int(typeof e.status === 'number' ? e.status : 1),
-          out: slice_of_u8(new Uint8Array(e.stdout || [])),
-          err: slice_of_u8(new Uint8Array(e.stderr || [])),
-        }
+        return ok_int(-(e.errno || 1))
       }
     },
 
@@ -234,4 +231,32 @@ export function install(api) {
     rt_lookup_release: () => 0n,
   }
   for (const k in I) F[k] = I[k]
+}
+
+// argv -> exec argv. argv(0) is the script path under node, which is
+// not directly executable — a self-respawn (exec of argv(0)) is the
+// program's own convention, so rewrite it to `node <script>` through
+// process.execPath. Anything else executes verbatim.
+function argv_exec(argv) {
+  const av = []
+  for (let i = 0; i < argv.len; i++) av.push(js_of_s(argv.a[argv.off + i]))
+  const self = process.argv[1]
+  if (av.length > 0 && self && path.resolve(av[0]) === path.resolve(self))
+    return [process.execPath, self, ...av.slice(1)]
+  return av
+}
+
+// merge an oxl []str override list onto the inherited environment —
+// `env_merge` parity: KEY=VALUE sets/replaces, a bare KEY (no '=')
+// strips the inherited entry rather than appending.
+function env_merge(envv) {
+  const merged = { ...process.env }
+  if (!envv || envv.len <= 0) return merged
+  for (let i = 0; i < envv.len; i++) {
+    const kv = js_of_s(envv.a[envv.off + i])
+    const eq = kv.indexOf('=')
+    if (eq > 0) merged[kv.slice(0, eq)] = kv.slice(eq + 1)
+    else delete merged[kv]
+  }
+  return merged
 }

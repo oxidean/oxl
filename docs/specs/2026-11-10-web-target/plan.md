@@ -94,8 +94,14 @@ skips cleanly where node is absent.
 ## W5 — std/env shims
 
 `runtime/rt-node.mjs`: `os` (fs/env/argv/exit), `os/exec`
-(child_process), `net` (net/dns → shared cell), `filepath`
-(path), `log` (timestr via Date), `testutil` reachable.
+(child_process → spawnSync + env-merge parity + argv(0)
+self-respawn via `process.execPath`), `filepath` (path),
+`log` (timestr via Date — 19-char contract), `testutil`
+reachable. Sockets stay `trap21`: a blocking TCP primitive
+has no honest single-thread analog under node (async-only
+`net.Socket`); `net_test` in the lane covers the socket-free
+err paths, real socket tests run native-only in
+`net_sock_test.oxl`. A net→shared-cell lane can reopen this.
 `runtime/rt-browser.mjs`: same names → `err` stubs. `extra/gui`
 + `extra/gui/mock` verified ported (they're pure oxl over the
 concurrency surface). One specified change rides this stage:

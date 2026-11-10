@@ -223,8 +223,17 @@ done
 out=$("$OXL" test tests/net_test.oxl)
 printf '%s
 ' "$out" >&2
-for t in test_echo test_closer test_refused test_lookup test_badip; do
+for t in test_refused test_lookup test_badip; do
     grep -q "$t ... ok" <<<"$out" || { echo "FAIL net: $out"; exit 1; }
+done
+# socket-dependent half — the js lane's socket natives are trap21
+# stubs, so this file stays native-only (the w4 lane runs net_test's
+# socket-free tests)
+out=$("$OXL" test tests/net_sock_test.oxl)
+printf '%s
+' "$out" >&2
+for t in test_echo test_closer; do
+    grep -q "$t ... ok" <<<"$out" || { echo "FAIL net-sock: $out"; exit 1; }
 done
 
 echo "== oxl test: regexp (s5) =="

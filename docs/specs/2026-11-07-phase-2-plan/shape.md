@@ -33,7 +33,7 @@ retires it.
 
 Parked: LLVM backend, D4 shape-generics, the parked-stdlib list —
 see `parked.md`. (The web target's guardrail fired when G shipped:
-it moved into the map as milestone W — WI-0007, spec
+it moved into the map as milestone W — WI-0007, spec proposed at
 `docs/specs/2026-11-10-web-target/`.)
 
 ## Sequencing rationale

@@ -79,6 +79,9 @@ norm() { case "$1" in v*) echo "$1" ;; *) echo "v$1" ;; esac; }
 # blocks `..`/separator traversal and junk directives alike
 vtag() { # raw -> normalized tag on stdout; nonzero exit if invalid
     t=$(norm "$1")
+    # single line only — grep -q matches ANY line, so a multiline tag
+    # would pass on its first line and traverse $VERS paths downstream
+    [ "$(printf '%s' "$t" | tr -d '[:space:]')" = "$t" ] || return 1
     echo "$t" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+([-+][A-Za-z0-9._-]+)?$' \
         || return 1
     echo "$t"
@@ -129,11 +132,31 @@ resolve() { # echoes "tag<TAB>source" or nothing
     d=$(pwd -P)
     while :; do
         if [ -f "$d/oxl.mod" ]; then
-            t=$(sed -n 's/^[[:space:]]*toolchain[[:space:]][[:space:]]*\([^[:space:]]*\).*/\1/p' \
-                "$d/oxl.mod" | head -n1)
-            [ -n "$t" ] && { v=$(vtag "$t") \
-                || die "invalid toolchain directive in $d/oxl.mod: $t"
-                echo "$v	$d/oxl.mod toolchain directive"; return; }
+            # manifest-parser parity: `#` comments are stripped, the
+            # directive must be exactly `toolchain <tag>` and appear at
+            # most once — a duplicate, extra-token, or bare form is an
+            # error, not a silent skip
+            pa=$(awk '
+                { sub(/#.*/, "") }
+                /^[ \t]*toolchain([ \t]|$)/ {
+                    n++
+                    r = $0
+                    sub(/^[ \t]*toolchain[ \t]*/, "", r)
+                    gsub(/^[ \t]+|[ \t]+$/, "", r)
+                    if (n == 1) first = r
+                }
+                END { print n+0; if (n == 1) print first }' "$d/oxl.mod")
+            case "$(printf '%s\n' "$pa" | sed -n '1p')" in
+                0) ;;
+                1) t=$(printf '%s\n' "$pa" | sed -n '2p')
+                   [ -n "$t" ] || die "toolchain directive in $d/oxl.mod requires a tag"
+                   case $t in *[[:space:]]*)
+                       die "invalid toolchain directive in $d/oxl.mod: $t" ;; esac
+                   v=$(vtag "$t") \
+                       || die "invalid toolchain directive in $d/oxl.mod: $t"
+                   echo "$v	$d/oxl.mod toolchain directive"; return ;;
+                *) die "duplicate toolchain directive in $d/oxl.mod" ;;
+            esac
             break   # nearest oxl.mod wins even without a pin — do not climb past it
         fi
         [ "$d" = / ] && break

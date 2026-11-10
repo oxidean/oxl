@@ -48,7 +48,7 @@ end, cargo is out of the build path.
 [`docs/specs/2026-11-07-toolchain-in-oxl/`](../2026-11-07-toolchain-in-oxl/spec.md)
 (WI-0003).
 
-## E — monorepo: `extra/` + workspace + git-index + polish
+## E — monorepo: `extra/` + workspace + git-index + polish — SHIPPED
 
 *Added 2026-11-08 — absorbs R (rescoped to a git-backed index) and P
 (issues placed in a stage). Spec: `../2026-11-08-monorepo-oxl-extra/`.*
@@ -66,7 +66,11 @@ suite; `extra/testutil` published and consumed on workspace and
 cache paths; #26/#27/#29/#30 closed, #28 parked; first `extra/v*`
 release.
 
-## G — portable GUI layer
+**Shipped as:** E0–E6 merged (WI-0004); `oxl.work` workspaces,
+subdir-module fetch, the git-backed index, the `extra/v*` lane,
+and `extra/testutil` are on main (PRs #50–#53).
+
+## G — portable GUI layer — SHIPPED
 
 Widget layer in the language on top of the GTK4 FFI pilot
 (`examples/gui-todo`).
@@ -85,6 +89,33 @@ E's monorepo machinery.
 **Exit:** a reference app with real widgets (beyond the pilot's
 raw FFI calls); a second backend sketched or an honest written case
 for why the abstraction doesn't foreclose one.
+
+**Shipped as:** G0–G6 merged (WI-0005); `extra/gui` core + mock +
+GTK4 backends, the widget kinds, and `examples/gui-todo` are on
+main (PRs #56, #59).
+
+## W — web compilation target
+
+*Added 2026-11-10 — the web target's parked-trigger fired when G
+shipped. WI-0007; spec proposed at
+`docs/specs/2026-11-10-web-target/` (lands with its own spec PR).*
+
+**Scope sketch:** a JavaScript emit target — `runtime/rt.js`
+semantic runtime; a `bootstrap/codegen/js` emitter (the value
+surface first, then `susp` fns as poll state-machines); the full
+concurrency surface (chans/select/named scopes over a microtask
+run queue); a `--target js` emit lane with a node-gated suite
+section; `rt-node`/`rt-browser` env shims; and `extra/gui/dom` —
+the DOM backend the G widget-tree abstraction was shaped to keep
+open — plus `examples/web-todo`.
+
+**Entry:** G shipped (done — its DOM-mappable tree was the
+guardrail); stages W0→W6 run sequentially, each a PR.
+
+**Exit:** the conformance claim — `conc_*` + `gui_*` (mock) suite
+files emit to JS and run under `node` with identical output; the
+web-todo reference app runs on `extra/gui/dom`; a jsdom-class
+smoke covers the DOM backend paths the mock's ledger cannot.
 
 ## R — package registry — FOLDED INTO E
 
@@ -116,11 +147,11 @@ in E's stage E6. Filed items:
 See `parked.md` — LLVM backend, D4 shape-generics, parked-stdlib
 list. Each has an explicit reopen trigger; none is scheduled. (The
 web target's trigger fired when G shipped — it is milestone W now,
-WI-0007, spec `docs/specs/2026-11-10-web-target/`.)
+WI-0007, spec proposed at `docs/specs/2026-11-10-web-target/`.)
 
 ## Sequence
 
 ```
-T (shipped) ──► E ──► G ──► W  (R, P absorbed into E)
+T, E, G (shipped) ──► W  (R, P absorbed into E)
 └── LLVM, D4, stdlib-list: parked on triggers
 ```

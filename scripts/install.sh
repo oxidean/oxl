@@ -139,7 +139,7 @@ resolve() { # echoes "tag<TAB>source" or nothing
     d=$(pwd -P)
     while :; do
         if [ -f "$d/.oxl-version" ]; then
-            t=$(head -n1 "$d/.oxl-version" | tr -d '\r\n' | sed 's/^[ \t]*//;s/[ \t]*$//')
+            t=$(head -n1 "$d/.oxl-version" | tr -d '\r\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
             [ -n "$t" ] && { v=$(vtag "$t") || die "invalid version in $d/.oxl-version: $t"
                 echo "$v	$d/.oxl-version"; return; }
         fi
@@ -184,7 +184,7 @@ resolve() { # echoes "tag<TAB>source" or nothing
         d=$(dirname "$d")
     done
     if [ -f "$OXL_HOME/default-version" ]; then
-        t=$(head -n1 "$OXL_HOME/default-version" | tr -d '\r\n' | sed 's/^[ \t]*//;s/[ \t]*$//')
+        t=$(head -n1 "$OXL_HOME/default-version" | tr -d '\r\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
         [ -n "$t" ] && { v=$(vtag "$t") || die "invalid version in default-version: $t"
             echo "$v	default-version"; return; }
     fi
@@ -252,7 +252,7 @@ tc_uninstall() {
     raw=$tag; tag=$(vtag "$raw") || die "invalid toolchain tag: $raw"
     [ -d "$VERS/$tag" ] || die "$tag is not installed"
     if [ -f "$OXL_HOME/default-version" ] && [ "$force" = 0 ]; then
-        def=$(head -n1 "$OXL_HOME/default-version" | tr -d '\r\n' | sed 's/^[ \t]*//;s/[ \t]*$//')
+        def=$(head -n1 "$OXL_HOME/default-version" | tr -d '\r\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
         [ "$(vtag "$def" 2>/dev/null || printf '%s' "$def")" = "$tag" ] \
             && die "$tag is the default — \`oxl toolchain uninstall $tag --force\` to remove anyway"
     fi
@@ -299,7 +299,7 @@ if [ "${1:-}" = toolchain ]; then
         list|ls)   tc_list ;;
         default)   { [ -f "$OXL_HOME/default-version" ] && [ -s "$OXL_HOME/default-version" ]; } \
                        || die "no default — \`oxl toolchain use <tag>\`"
-                   def=$(head -n1 "$OXL_HOME/default-version" | tr -d '\r\n' | sed 's/^[ \t]*//;s/[ \t]*$//')
+                   def=$(head -n1 "$OXL_HOME/default-version" | tr -d '\r\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
                    vtag "$def" || die "invalid version in default-version: $def" ;;
         current)
             r=$(resolve); [ -n "$r" ] || die "no version resolved — set one with \`oxl toolchain use <tag>\`"

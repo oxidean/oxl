@@ -31,10 +31,8 @@ retires it.
 | **R** | package registry | central index + `oxl publish`/`oxl get` against it |
 | **P** | polish | small tracked debt, pulled opportunistically |
 
-Parked: LLVM backend, D4 shape-generics, the parked-stdlib list —
-see `parked.md`. (The web target's guardrail fired when G shipped:
-it moved into the map as milestone W — WI-0007, spec proposed at
-`docs/specs/2026-11-10-web-target/`.)
+Parked: LLVM backend, web target, D4 shape-generics, the parked-stdlib
+list — see `parked.md`.
 
 ## Sequencing rationale
 

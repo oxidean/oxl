@@ -12,26 +12,20 @@ firing moves the item into the milestone map via a new work item.
   time or runtime) or a platform target requires it (e.g. wasm via
   LLVM).
 
-## Web compilation target (JS/HTML/CSS) — UN-PARKED
+## Web compilation target (JS/HTML/CSS)
 
-- **Trigger fired 2026-11-10:** milestone G merged (PR #59); the
-  guardrail held — `docs/gui-backends.md` proves the backend protocol
-  ports to a DOM mapping with no GTK-shaped assumptions beyond a
-  main-loop thread, which holds in the DOM world.
-- Moved into the milestone map as **milestone W** (WI-0007) —
-  see `docs/product/roadmap.md`.
+- **Why parked:** design doc defers it; shipping a JS target without a
+  DOM-shaped UI layer produces a second-class target.
+- **Reopen trigger:** milestone G lands and the widget tree is
+  DOM-mappable as required.
+- **Guardrail (active):** the GUI abstraction must not foreclose a DOM
+  backend — reviewed at G's spec time.
 
 ## D4 shape-based generics
 
 - **Why parked:** deferred with a real measurement in the v0.2 spec —
   3 generic fns in the entire corpus, zero shared-shape groups; type-
   dictionary passing is pure complexity at that scale.
-- **Re-measured 2026-11-10:** the corpus grew ~7x (201 `.oxl` files —
-  std, extra/, gui, the whole self-hosted chain) and still shows ~zero
-  shared-shape monomorphization: 23 generic fn decls, 21 distinct
-  instantiation sites, no two instantiations sharing a shape. The mono
-  cost remains unmeasurable because there is nothing to measure —
-  stays parked.
 - **Reopen trigger:** the corpus grows enough generic code that two
   or more instantiations share a shape and the mono cost is measured.
 

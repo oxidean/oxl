@@ -1712,4 +1712,28 @@ else
     echo "  (skipped: node not installed)"
 fi
 
+echo "== w4 js driver lane =="
+# node-gated: the whitelisted corpus (W3 concurrency suite + W2
+# pure-stdlib corpus) through the self-built product driver's
+# `--target js` lane — the W4 conformance gate. Lane skips cleanly
+# where node is absent.
+if command -v node >/dev/null 2>&1; then
+    for f in conc_ping conc_scale select select_fair chan_own chanbuf chanbuf_close scope_exit orphan_join defer_order pairfwd match methods fnval d5_qual stdmods_test; do
+        out=$(timeout 60 "$SELFOXL" run --target js "tests/$f.oxl" 2>&1) || { echo "FAIL js lane $f: $out"; exit 1; }
+    done
+    for f in enc_test hash_test regexp_test float_test util_test stdlib_test collections_test enum_test defer_test; do
+        out=$(timeout 60 "$SELFOXL" test --target js "tests/$f.oxl" 2>&1) || { echo "FAIL js lane test $f: $out"; exit 1; }
+        grep -q 'FAIL' <<<"$out" && { echo "FAIL js lane test $f: $out"; exit 1; }
+    done
+    for f in select_cancel cancel_join; do
+        "$SELFOXL" build --target js "tests/$f.oxl" -o "$scratch/$f.mjs" || { echo "FAIL js lane $f: emit"; exit 1; }
+        rc=0
+        out=$(timeout 30 node "$scratch/$f.mjs" 2>&1) || rc=$?
+        [ "$rc" -ne 0 ] || { echo "FAIL js lane $f: expected trap exit"; exit 1; }
+        grep -q 'escaped top scope' <<<"$out" || { echo "FAIL js lane $f: trap line: $out"; exit 1; }
+    done
+else
+    echo "  (skipped: node not installed)"
+fi
+
 echo "ALL TESTS PASSED"

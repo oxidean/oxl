@@ -2145,6 +2145,10 @@ export async function __oxl_boot(main_entry) {
   } else {
     await import('./rt-browser.mjs').then((m) => m.install(rt_exports_api()))
   }
+  /* the dom provider self-selects real-document vs headless tree at
+   * import; programs that never link extra/gui/dom pay one tiny
+   * module load for a table nobody reads. */
+  await import('./rt-dom.mjs').then((m) => m.install(rt_exports_api()))
   const base = scope_make()
   rt_scope_enter(base)
   try {

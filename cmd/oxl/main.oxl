@@ -544,6 +544,7 @@ fn emit_and_js(jssrc: str, out: str, entry: str) -> int {
     names = push(names, "rt.mjs")
     names = push(names, "rt-node.mjs")
     names = push(names, "rt-browser.mjs")
+    names = push(names, "rt-dom.mjs")
     i := 0
     for i < len(names) {
         we = write_text(od + "/" + names[i], readfile(rt + "/runtime/" + names[i]))

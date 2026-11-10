@@ -201,7 +201,7 @@ tc_list() {
         mark=""; [ "$t" = "$def" ] && mark=" (default)"
         echo "$t$mark"
     done
-    [ "$found" = 0 ] && echo "(none installed)"
+    if [ "$found" = 0 ]; then echo "(none installed)"; fi
 }
 
 if [ "${1:-}" = toolchain ]; then

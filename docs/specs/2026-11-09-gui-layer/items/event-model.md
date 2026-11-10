@@ -304,11 +304,14 @@ its first selftest):
   effects rather than retrying the value. (The originally
   considered conditional-move — `false` returning ownership —
   needed a checker special-case on the builtin; v0 keeps the
-  single move rule, matching the cancelled-send revert below.) For the `reply`
-  use the `false` branch is unreachable by construction: each
-  cap-1 reply chan is allocated fresh per `Cmd` and receives
-  exactly one send. A non-`own` `false` branch is unambiguous for
-  the same reason — nothing was moved.
+  single move rule, matching the cancelled-send drop below.)
+  For the `reply` use the `false` branch stays reachable: reply
+  chans are pooled on the mailbox-owning scope rather than
+  allocated per `Cmd`, and a cancelled caller's scope teardown
+  closes its reply chan — `false` is then the caller-gone
+  signal `pump` reconciles by freeing the reply's owned fields,
+  as `items/backend-protocol.md` pins. A non-`own` `false`
+  branch is unambiguous — nothing was owned to drop.
 - **Scoped cancellation surface** — the drain-grace abort needs a
   first-class way to cancel a named scope: today only `rt_trap`
   cancels and only its own task's chain (`scope_cancel_tree` is a
@@ -338,16 +341,19 @@ its first selftest):
 **Cancelled-send ownership contract.** Channel teardown and
 cancellation must account for owned payloads exactly once:
 
-- a `send` that is cancelled before its value lands reverts
-  ownership to the sender — the word is either delivered or
-  returned, never silently consumed. The mechanism: a parked send
-  leaves its `SendReq` node in the chan's send queue; on
-  cancel-resume the runtime unlinks that node under the chan mutex
-  (still queued = the payload was never consumed, ownership
-  reverts; already gone = it was delivered) and the checker
-  un-moves the binding. The dispatcher's unwind path
-  then destroys the `own Event` it still holds (struct + `own`
-  payloads) as an ordinary drop.
+- a `send` cancelled before its value lands loses the payload
+  to the runtime, not back to the sender — the send is
+  statically a move, so a moved `own` payload is dropped once
+  and never returned. The mechanism: a parked send leaves its
+  `SendReq` node in the chan's send queue; the cancel pass
+  unlinks that node under the chan mutex and runs the chan's
+  `drop_elem` on the payload (still queued = never delivered;
+  already unlinked = a waker claimed it). A sender parked on
+  the single deposit slot retracts only its own slot under the
+  same drop rule. The checker keeps the binding moved — an
+  unwind path that also destroyed the payload would free it
+  twice. Plain-word payloads own nothing, so the drop is a
+  no-op there.
 - `close`d channel contents still drain before `recv` observes
   closed (documented runtime semantics); `EventBuf` teardown drops
   undelivered entries — each buffered `own Event` freed once by

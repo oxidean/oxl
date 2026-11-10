@@ -126,10 +126,14 @@ carries a task frame and suspending is legal.
   `pump` is an iface method, and a suspendable method cannot be
   vtable-reachable (the checker rejects it — "vtable calls carry no
   task frame"), so every backend's `pump` MUST stay non-susp-capable
-  end to end. `try_send` is legal here because the reply chan is
-  freshly allocated per `Cmd` and receives exactly one send — the
-  `false` branch is unreachable by construction — and because it is
-  a non-suspending builtin.
+  end to end. `try_send` is legal here because it is
+  non-suspending and the reply chan takes exactly one send on the
+  live path. `false` stays reachable, though: reply chans are
+  pooled on the mailbox-owning scope (admitted only open and
+  drained), and a cancelled caller's scope teardown closes the
+  reply chan — `false` is then the caller-gone signal, and
+  `pump` reconciles by freeing the reply's owned fields
+  (`str_own` copies) rather than retrying.
   Before returning, `pump` releases every handle it still owns —
   see the live-handle sweep in *Shutdown* below.
 - `stop` — idempotent, safe from any task: asks `pump` to unwind

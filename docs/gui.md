@@ -86,8 +86,10 @@ a pending unhandled close — use it to debounce close handlers.
 
 Read replies cross the boundary as owned copies; the getter
 scope-copies the payload so the returned `str` has the caller's
-normal `str` lifetime and frees the transport copy — repeated reads
-can't accumulate heap. No borrowed `cstr` aliases cross
+normal `str` lifetime and frees the transport copy — each copy
+then lives until the caller's scope ends, so repeated reads in
+a long-lived scope accumulate scoped allocations the way any
+other scoped value does. No borrowed `cstr` aliases cross
 the public API — the GTK shim's borrowed buffers are copied at the
 `gx_read_str` boundary inside the backend.
 

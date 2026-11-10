@@ -1,0 +1,2252 @@
+package codegen
+
+// bootstrap/codegen/js.oxl — the JS (.mjs) emitter, milestone W.
+// Parallel backend to codegen.oxl: consumes the same check.CkRes and
+// emits one ES module targeting runtime/rt.mjs. Representation is
+// pinned by docs/specs/2026-11-10-web-target/js-semantics.md — oxl
+// `int` is always a BigInt; `Number` appears only inside runtime
+// internals. Emitted symbol names keep codegen.oxl's `o_*` scheme so
+// the G1 reachability machinery (gubegin/gudrain/gdef/gscan) is
+// reused verbatim — its token scan is language-agnostic.
+//
+// Concurrency surface (susp frames, chans/select in emitted code,
+// spawn/go) lands in W3; v1 emits rt_trap(21) there.
+import "oxl/bootstrap/check"
+
+import "std/collections"
+import "std/encoding/base64"
+
+// ---------- zero values (the JS gcty analog) ----------
+
+// ty -> zero literal text. Used for `let x: T` defaults, mkslice
+// fills, frame field inits, and global decls.
+fn jzero(g: mut G, t: int) -> str {
+    t = gsub(g, t)
+    k := tyk(g, t)
+    if k == check.k_int() || k == check.k_err() {
+        return "0n"
+    }
+    if k == check.k_byte() {
+        return "0"
+    }
+    if k == check.k_float() {
+        return "0"
+    }
+    if k == check.k_bool() {
+        return "false"
+    }
+    if k == check.k_str() {
+        return "{u8:null,off:0,len:0}"
+    }
+    if k == check.k_cstr() {
+        return "\"\""
+    }
+    if k == check.k_slice() {
+        return "{a:null,off:0,len:0,cap:0}"
+    }
+    if k == check.k_struct() {
+        sn := g.ck.tyv[t].name
+        z := "{"
+        if collections.map_has(g.ck.structs, sn) {
+            [si, err] = collections.map_get(g.ck.structs, sn)
+            if err == nil {
+                fl := g.ck.structsv[si].fields
+                first := true
+                for fl != nil {
+                    if !first {
+                        z = z + ","
+                    }
+                    first = false
+                    z = z + "f_" + fl.v.n + ":" + jzero(g, fl.v.t)
+                    fl = fl.next
+                }
+            }
+        }
+        return z + "}"
+    }
+    if k == check.k_enum() {
+        // zero enum = variant 0 (+ its zeroed payload when it has one)
+        en := g.ck.tyv[t].name
+        z := "{tag:0"
+        if collections.map_has(g.ck.enums, en) {
+            [ei, err] = collections.map_get(g.ck.enums, en)
+            if err == nil {
+                vl := g.ck.enumsv[ei].vars
+                if vl != nil {
+                    pn := en + "." + vl.v.n
+                    if collections.map_has(g.ck.structs, pn) {
+                        [si2, err2] = collections.map_get(g.ck.structs, pn)
+                        if err2 == nil {
+                            p := "{"
+                            fl := g.ck.structsv[si2].fields
+                            first := true
+                            for fl != nil {
+                                if !first {
+                                    p = p + ","
+                                }
+                                first = false
+                                p = p + "f_" + fl.v.n + ":" + jzero(g, fl.v.t)
+                                fl = fl.next
+                            }
+                            z = z + ",p0:" + p + "}"
+                        }
+                    }
+                }
+            }
+        }
+        return z + "}"
+    }
+    // own/ref/mut/chan/shared/scope/fn/iface/void/unk — handles
+    return "null"
+}
+
+// JS reserved words oxl identifiers could collide with get `u_`
+fn jname(n: str) -> str {
+    rsv := "|break|case|catch|class|const|continue|debugger|default|delete|do|enum|export|extends|finally|function|import|instanceof|new|return|super|switch|this|throw|try|typeof|var|void|while|with|yield|static|let|of|get|set|async|await|null|true|false|if|else|for|in|"
+    if find(rsv, "|" + n + "|") >= 0 {
+        return "u_" + n
+    }
+    return n
+}
+
+// ---------- scoped locals (name -> ty), globals/fields via check ----------
+
+fn jref(g: mut G, n: str) -> str {
+    if g.inframe == 1 {
+        s := genv_get(g.fsl, n)
+        if s != -1 {
+            return "fr." + fslot_str(n, s)
+        }
+    }
+    return jname(n)
+}
+
+fn jfslot(g: mut G, name: str, z: str) -> str {
+    i := len(g.fdecls)
+    g.fdecls = push(g.fdecls, "v" + itoa(i) + ":" + z)
+    check.env_bind(g.fsl, name, i)
+    return "v" + itoa(i)
+}
+
+// ---------- conversions ----------
+
+fn jiface_wrap_v(g: mut G, e: ref parser.Node, v: str, w: str, implkey: str) -> str {
+    gvtab_use(g, w, implkey)
+    got := gsub(g, xty(g, e))
+    vt := "o_vt_" + cname(w) + "_" + gvtkey(implkey)
+    gk := tyk(g, got)
+    if gk == check.k_own() || gk == check.k_ref() || gk == check.k_mut() {
+        return "{obj: " + v + ", methods: " + vt + "}"
+    }
+    if gk == check.k_iface() {
+        return "{obj: " + v + ", methods: " + vt + "}"
+    }
+    if gk == check.k_struct() || gk == check.k_enum() {
+        // native boxes a value copy — a shallow clone mirrors memcpy
+        return "{obj: Object.assign({}, " + v + "), methods: " + vt + "}"
+    }
+    // word types box into a {v} cell so mut-recv writes land
+    return "{obj: {v: " + v + "}, methods: " + vt + "}"
+}
+
+fn jconv_v(g: mut G, e: ref parser.Node, v: str, want: int) -> str {
+    w := gsub(g, want)
+    got := gsub(g, xty(g, e))
+    if got >= 0 && tyk(g, got) == check.k_err() && w >= 0 && tyk(g, w) == check.k_slice() {
+        return "{a:null,off:0,len:0,cap:0}"
+    }
+    if w >= 0 && tyk(g, w) == check.k_slice() && got >= 0 && tyk(g, got) == check.k_own() {
+        gi := g.ck.tyv[got].i
+        if gi >= 0 && tyk(g, gi) == check.k_slice() {
+            return v + ".v"
+        }
+    }
+    if w < 0 || tyk(g, w) != check.k_iface() {
+        return v
+    }
+    wn := g.ck.tyv[w].name
+    gk := tyk(g, got)
+    if gk == check.k_err() {
+        return "{obj: null, methods: null}"
+    }
+    if gk == check.k_iface() {
+        gn := g.ck.tyv[got].name
+        if gn == wn {
+            return v
+        }
+        return jiface_wrap_v(g, e, v, wn, "iface:" + gn)
+    }
+    b := gty_base(g, got)
+    if len(b) > 0 {
+        return jiface_wrap_v(g, e, v, wn, b)
+    }
+    return v
+}
+
+fn jconv(g: mut G, e: ref parser.Node, want: int) -> str {
+    return jconv_v(g, e, jx(g, e), want)
+}
+
+// receiver adaptation: JS refs make value/ptr uniform except word-mut,
+// which boxes — caller handles `.v` at the deref/mut sites
+fn jword(g: mut G, t: int) -> bool {
+    k := tyk(g, gsub(g, t))
+    return k == check.k_int() || k == check.k_err() || k == check.k_float() || k == check.k_bool() || k == check.k_byte() || k == check.k_str() || k == check.k_cstr()
+}
+
+fn jrefk(g: mut G, t: int) -> bool {
+    k := tyk(g, gsub(g, t))
+    return k == check.k_own() || k == check.k_ref() || k == check.k_mut()
+}
+
+// receiver adaptation: JS object refs already alias — only word types
+// need the {v} cell so callee rebinds land in caller storage
+fn jadapt_v(g: mut G, e: ref parser.Node, ev: str, want: int) -> str {
+    got := gsub(g, xty(g, e))
+    w := gsub(g, want)
+    if jrefk(g, w) && jword(g, got) {
+        return "{v: " + ev + "}"
+    }
+    return ev
+}
+
+fn jarg_c(g: mut G, e: ref parser.Node, v: str, pt: int, bind: ref collections.Map) -> GArgOut {
+    o := GArgOut{v: "", pre: "", post: ""}
+    o.v = v
+    if pt < 0 {
+        return o
+    }
+    pt2 := pt
+    if bind != nil {
+        pt2 = check.subst_ty(g.ck, pt2, bind)
+    }
+    pt2 = gsub(g, pt2)
+    o.v = jconv_v(g, e, o.v, pt2)
+    raw := gsub(g, xty(g, e))
+    if jrefk(g, pt2) && len(o.v) > 2 && substr(o.v, len(o.v) - 2, len(o.v)) == ".v" {
+        o.v = substr(o.v, 0, len(o.v) - 2)
+    }
+    if tyk(g, raw) == check.k_own() {
+        pk := tyk(g, pt2)
+        if pk == check.k_mut() {
+            o.pre = "rt.rt_borrow_mut(" + o.v + "); "
+            o.post = "rt.rt_unborrow(" + o.v + "); "
+        }
+        if pk == check.k_ref() {
+            o.pre = "rt.rt_borrow_read(" + o.v + "); "
+            o.post = "rt.rt_unborrow(" + o.v + "); "
+        }
+    }
+    return o
+}
+
+fn jav(g: mut G, args: ref parser.NList) -> own GAv {
+    let head: own GAv = nil
+    let tail: own GAv = nil
+    l := args
+    for l != nil {
+        v := jx(g, l.v)
+        c := new(GAv)
+        c.v = v
+        if head == nil {
+            head = c
+            tail = c
+        } else {
+            tail.next = c
+            tail = tail.next
+        }
+        l = l.next
+    }
+    return head
+}
+
+// pair-call val ty, -1 for non-pair (the JS pair is untagged {val,err})
+fn jpair_vt(g: mut G, call: ref parser.Node) -> int {
+    return gpair_info(g, call).vt
+}
+
+// ---------- expr emission ----------
+
+// field access: `f_` prefix dodges prototype keys and keyword binds
+fn jxfield(g: mut G, obj: ref parser.Node, name: str) -> str {
+    base := check.callee_name(obj)
+    if len(base) > 0 {
+        qn := check.resolve_named(g.ck, base + "." + name)
+        ev := gev(g, qn)
+        if ev.ok {
+            return "{tag:" + itoa(ev.i) + "}"
+        }
+        fi := gfn(g, base + "." + name)
+        if fi >= 0 {
+            sig := g.ck.fnsv[fi]
+            if !check.sl_has(g.ck.susp, qn) && sig.retk != 2 {
+                return "o_f_" + cname(qn)
+            }
+        }
+        if collections.map_has(g.ck.globals, qn) {
+            return "o_g_" + cname(qn)
+        }
+    }
+    o := jx(g, obj)
+    return o + ".f_" + name
+}
+
+fn jfield_ty(g: mut G, sname: str, fname: str) -> int {
+    if !collections.map_has(g.ck.structs, sname) {
+        return -1
+    }
+    [si, err] = collections.map_get(g.ck.structs, sname)
+    if err != nil {
+        return -1
+    }
+    fl := g.ck.structsv[si].fields
+    for fl != nil {
+        if fl.v.n == fname {
+            return fl.v.t
+        }
+        fl = fl.next
+    }
+    return -1
+}
+
+fn jxlit(g: mut G, obj: ref parser.Node, fields: ref parser.NList) -> str {
+    name := check.callee_name(obj)
+    path := check.resolve_named(g.ck, name)
+    ev := gev(g, path)
+    init := ""
+    fl := fields
+    for fl != nil {
+        match fl.v {
+            parser.Node.NamedField{name, val} => {
+                v := jx(g, val)
+                ft := jfield_ty(g, path, name)
+                if ft >= 0 {
+                    v = jconv_v(g, val, v, ft)
+                }
+                if len(init) > 0 {
+                    init = init + ","
+                }
+                init = init + "f_" + name + ":" + v
+            }
+            _ => {
+            }
+        }
+        fl = fl.next
+    }
+    if ev.ok {
+        return "{tag:" + itoa(ev.i) + ",p" + itoa(ev.i) + ":{" + init + "}}"
+    }
+    return "{" + init + "}"
+}
+
+fn jxas(g: mut G, inner: ref parser.Node, ty: ref parser.Node) -> str {
+    ot := xty(g, inner)
+    bt := ot
+    if tyk(g, ot) == check.k_own() {
+        i2 := tyi(g, ot)
+        if i2 >= 0 {
+            bt = i2
+        }
+    }
+    iv := jx(g, inner)
+    wt := gty(g, ty)
+    bok := tyk(g, bt)
+    wk := tyk(g, wt)
+    if bok == check.k_str() && wk == check.k_slice() && tyk(g, tyi(g, wt)) == check.k_byte() {
+        return "rt.rt_bytes_str(" + iv + ")"
+    }
+    if bok == check.k_slice() && tyk(g, tyi(g, bt)) == check.k_byte() && wk == check.k_str() {
+        return "rt.rt_str_bytes(" + iv + ")"
+    }
+    if bok == check.k_int() && wk == check.k_byte() {
+        return "Number(BigInt.asUintN(8, " + iv + "))"
+    }
+    if bok == check.k_byte() && wk == check.k_int() {
+        return "BigInt(" + iv + ")"
+    }
+    if bok == check.k_int() && wk == check.k_float() {
+        return "Number(" + iv + ")"
+    }
+    if bok == check.k_float() && wk == check.k_int() {
+        return "rt.rt_to_int(Math.trunc(" + iv + "))"
+    }
+    tn := check.ty_str(ty)
+    ev := gev(g, check.resolve_named(g.ck, tn))
+    if !ev.ok {
+        return "(" + iv + ")"
+    }
+    return "((_ev) => { if (_ev.tag !== " + itoa(ev.i) + ") rt.rt_trap(9n); return _ev.p" + itoa(ev.i) + "; })(" + iv + ")"
+}
+
+fn jxname(g: mut G, n: str) -> str {
+    if n == "nil" {
+        return "null"
+    }
+    if n == "true" {
+        return "true"
+    }
+    if n == "false" {
+        return "false"
+    }
+    if g.inframe == 1 {
+        s := genv_get(g.fsl, n)
+        if s != -1 {
+            return "fr." + fslot_str(n, s)
+        }
+    }
+    if g_local(g, n) {
+        t := gx_lookup(g, n)
+        if t >= 0 && jrefk(g, t) && jword(g, tyi(g, gsub(g, t))) {
+            return jname(n) + ".v"
+        }
+        return jname(n)
+    }
+    gn3 := check.qname(g.ck.cur_mod, n)
+    if gn3 != n && collections.map_has(g.ck.globals, gn3) {
+        return "o_g_" + cname(gn3)
+    }
+    if collections.map_has(g.ck.globals, n) {
+        return "o_g_" + cname(n)
+    }
+    // named fn as a value — JS fns are already first-class refs
+    qn := check.resolve_named(g.ck, n)
+    if collections.map_has(g.ck.fns, qn) {
+        [fi, err] = collections.map_get(g.ck.fns, qn)
+        if err == nil {
+            if !check.sl_has(g.ck.susp, qn) && g.ck.fnsv[fi].retk != 2 {
+                return "o_f_" + cname(qn)
+            }
+        }
+    }
+    return jname(n)
+}
+
+fn jxun(g: mut G, op: str, inner: ref parser.Node) -> str {
+    v := jx(g, inner)
+    t := xty(g, inner)
+    if op == "!" {
+        return "(!" + v + ")"
+    }
+    if tyk(g, gdt(g, gsub(g, t))) == check.k_float() {
+        return "(-" + v + ")"
+    }
+    return "rt.rt_ineg(" + v + ")"
+}
+
+fn jxbin(g: mut G, op: str, l: ref parser.Node, r: ref parser.Node, e: ref parser.Node) -> str {
+    lt := xty(g, l)
+    lv := jx(g, l)
+    rv := jx(g, r)
+    ltk := tyk(g, gdt(g, gsub(g, lt)))
+    rtk := tyk(g, gdt(g, gsub(g, xty(g, e))))
+    if rtk == check.k_byte() && (op == "+" || op == "-" || op == "*" || op == "/" || op == "%" || op == "&" || op == "|" || op == "^") {
+        return "((" + lv + " " + op + " " + rv + ") & 0xff)"
+    }
+    if op == "+" && ltk == check.k_str() {
+        return "rt.rt_strcat(" + lv + ", " + rv + ")"
+    }
+    if (op == "==" || op == "!=") && ltk == check.k_str() {
+        neg := ""
+        if op == "!=" {
+            neg = "!"
+        }
+        return "(" + neg + "rt.rt_streq(" + lv + ", " + rv + "))"
+    }
+    if (op == "<" || op == "<=" || op == ">" || op == ">=") && ltk == check.k_str() {
+        return "(rt.rt_str_cmp(" + lv + ", " + rv + ") " + op + " 0)"
+    }
+    if (op == "==" || op == "!=") && tyk(g, gsub(g, lt)) == check.k_enum() {
+        c := "==="
+        if op == "!=" {
+            c = "!=="
+        }
+        return "(" + lv + ".tag " + c + " " + rv + ".tag)"
+    }
+    if op == "==" || op == "!=" {
+        lt2 := gsub(g, lt)
+        rt2 := gsub(g, xty(g, r))
+        if tyk(g, lt2) == check.k_iface() || tyk(g, rt2) == check.k_iface() {
+            le := lv
+            re := rv
+            if tyk(g, lt2) == check.k_iface() {
+                le = lv + ".obj"
+            }
+            if tyk(g, rt2) == check.k_iface() {
+                re = rv + ".obj"
+            }
+            c := "==="
+            if op == "!=" {
+                c = "!=="
+            }
+            return "(" + le + " " + c + " " + re + ")"
+        }
+        // nil equality: nil is `null` but zero-init'd err slots are 0n
+        if ltk == check.k_err() || rtk == check.k_err() || tyk(g, rt2) == check.k_err() {
+            c := "==="
+            if op == "!=" {
+                c = "!=="
+            }
+            return "(" + lv + " " + c + " " + rv + ")"
+        }
+        if rv == "null" || lv == "null" {
+            // null literal vs a maybe-err slot — cover both nil forms
+            c := "==="
+            neg := ""
+            if op == "!=" {
+                c = "!=="
+                neg = "!"
+            }
+            other := lv
+            if lv == "null" {
+                other = rv
+            }
+            return "(" + neg + "(" + other + " " + c + " null || " + other + " " + c + " 0n))"
+        }
+        c := "==="
+        if op == "!=" {
+            c = "!=="
+        }
+        return "(" + lv + " " + c + " " + rv + ")"
+    }
+    if ltk == check.k_int() || ltk == check.k_err() {
+        if op == "+" {
+            return "rt.rt_iadd(" + lv + ", " + rv + ")"
+        }
+        if op == "-" {
+            return "rt.rt_isub(" + lv + ", " + rv + ")"
+        }
+        if op == "*" {
+            return "rt.rt_imul(" + lv + ", " + rv + ")"
+        }
+        if op == "/" {
+            return "rt.rt_idiv(" + lv + ", " + rv + ")"
+        }
+        if op == "%" {
+            return "rt.rt_imod(" + lv + ", " + rv + ")"
+        }
+        if op == "<<" {
+            return "rt.rt_ishl(" + lv + ", " + rv + ")"
+        }
+        if op == ">>" {
+            return "rt.rt_ishr(" + lv + ", " + rv + ")"
+        }
+        if op == "&" {
+            return "rt.rt_iand(" + lv + ", " + rv + ")"
+        }
+        if op == "|" {
+            return "rt.rt_ior(" + lv + ", " + rv + ")"
+        }
+        if op == "^" {
+            return "rt.rt_ixor(" + lv + ", " + rv + ")"
+        }
+    }
+    if ltk == check.k_float() && op == "%" {
+        return "(" + lv + " % " + rv + ")"
+    }
+    return "(" + lv + " " + op + " " + rv + ")"
+}
+
+fn jxslice_val(g: mut G, obj: ref parser.Node) -> str {
+    ov := jx(g, obj)
+    ot := gdt(g, xty(g, obj))
+    if ot != xty(g, obj) {
+        // own/ref/mut over a slice — the JS box carries it at .v
+        return ov + ".v"
+    }
+    return ov
+}
+
+fn jxindex(g: mut G, obj: ref parser.Node, idx: ref parser.Node) -> str {
+    ot := gdt(g, gsub(g, xty(g, obj)))
+    iv := jx(g, idx)
+    if tyk(g, ot) == check.k_str() {
+        return "rt.rt_str_idx(" + jx(g, obj) + ", " + iv + ")"
+    }
+    return "rt.rt_sidx(" + jxslice_val(g, obj) + ", " + iv + ")"
+}
+
+fn jxslice(g: mut G, obj: ref parser.Node, lo: ref parser.Node, hi: ref parser.Node) -> str {
+    ot := gdt(g, gsub(g, xty(g, obj)))
+    av := "0n"
+    if lo != nil {
+        av = jx(g, lo)
+    }
+    if tyk(g, ot) == check.k_str() {
+        bv := jx(g, obj) + ".len"
+        if hi != nil {
+            bv = jx(g, hi)
+        }
+        return "rt.rt_substr(" + jx(g, obj) + ", " + av + ", " + bv + ")"
+    }
+    bv := jxslice_val(g, obj) + ".len"
+    if hi != nil {
+        bv = jx(g, hi)
+    }
+    return "rt.rt_sslice(" + jxslice_val(g, obj) + ", " + av + ", " + bv + ")"
+}
+
+// match-pattern binds as JS access exprs — variant payloads sit at
+// .p<i>.f_<name> (i = variant index)
+fn jarm(g: mut G, pat: ref parser.Node, acc: str, st: int) -> GArm {
+    r := GArm{has: -1, cond: "", binds: nil}
+    if pat == nil {
+        return r
+    }
+    k := check.nk(pat)
+    if k == 35 {
+        return r
+    }
+    if k == 46 {
+        match pat {
+            parser.Node.PatBind{name} => {
+                r.binds = gbnd(name, "_ms", st, nil)
+            }
+            _ => {
+            }
+        }
+        return r
+    }
+    if k == 36 {
+        match pat {
+            parser.Node.PatLit{v} => {
+                lv := jx(g, v)
+                if tyk(g, gdt(g, st)) == check.k_str() {
+                    r.has = 1
+                    r.cond = "rt.rt_streq(" + acc + ", " + lv + ")"
+                } else {
+                    r.has = 1
+                    r.cond = "(" + acc + " === " + lv + ")"
+                }
+            }
+            _ => {
+            }
+        }
+        return r
+    }
+    if k != 34 {
+        return r
+    }
+    match pat {
+        parser.Node.Pat{path, binds} => {
+            qpath := check.resolve_named(g.ck, path)
+            ev := gev(g, qpath)
+            r.has = 1
+            if !ev.ok {
+                r.cond = "false"
+                return r
+            }
+            r.cond = acc + ".tag === " + itoa(ev.i)
+            if !collections.map_has(g.ck.structs, qpath) {
+                return r
+            }
+            [si, err] = collections.map_get(g.ck.structs, qpath)
+            if err != nil {
+                return r
+            }
+            fields := g.ck.structsv[si].fields
+            let out: own GBnd = nil
+            if check.fall_positional(fields) {
+                wl := fields
+                bl := binds
+                for bl != nil && wl != nil {
+                    match bl.v {
+                        parser.Node.Name{n} => {
+                            if n != "_" {
+                                ce := acc + ".p" + itoa(ev.i) + ".f_" + wl.v.n
+                                out = gbnd(n, ce, wl.v.t, out)
+                            }
+                        }
+                        _ => {
+                        }
+                    }
+                    wl = wl.next
+                    bl = bl.next
+                }
+            } else {
+                bl := binds
+                for bl != nil {
+                    match bl.v {
+                        parser.Node.Name{n} => {
+                            if n != "_" {
+                                ce := acc + ".p" + itoa(ev.i) + ".f_" + n
+                                out = gbnd(n, ce, check.ffind(fields, n), out)
+                            }
+                        }
+                        _ => {
+                        }
+                    }
+                    bl = bl.next
+                }
+            }
+            r.binds = out
+        }
+        _ => {
+        }
+    }
+    return r
+}
+
+fn jmatch(g: mut G, scrut: ref parser.Node, arms: ref parser.NList) -> str {
+    st := xty(g, scrut)
+    rt := xty_match(g, scrut, arms)
+    valued := tyk(g, rt) != check.k_void() && tyk(g, rt) != check.k_unk()
+    acc := "_ms"
+    sv := jx(g, scrut)
+    o := "(() => { const _ms = " + sv + "; "
+    if valued {
+        o = o + "let _mr; "
+    }
+    first := true
+    a := arms
+    for a != nil {
+        match a.v {
+            parser.Node.MArm{pat, body} => {
+                ga := jarm(g, pat, acc, st)
+                if ga.has == 1 {
+                    if first {
+                        o = o + "if (" + ga.cond + ") { "
+                    }
+                    if !first {
+                        o = o + "else if (" + ga.cond + ") { "
+                    }
+                } else {
+                    o = o + "else { "
+                }
+                first = false
+                check.env_push(g.env)
+                pb := ga.binds
+                for pb != nil {
+                    o = o + "let " + jname(pb.n) + " = " + pb.ce + "; "
+                    check.env_bind(g.env, pb.n, pb.t)
+                    pb = pb.next
+                }
+                if body != nil && check.nk(body) == 23 {
+                    wpush(g)
+                    match body {
+                        parser.Node.List{items} => {
+                            li := items
+                            for li != nil {
+                                js(g, li.v)
+                                li = li.next
+                            }
+                        }
+                        _ => {
+                        }
+                    }
+                    wpop(g)
+                    o = o + wjoin(g.wlast)
+                } else if body != nil {
+                    bv := jx(g, body)
+                    if valued {
+                        o = o + "_mr = " + bv + "; "
+                    } else {
+                        o = o + "(" + bv + "); "
+                    }
+                }
+                check.env_pop(g.env)
+                o = o + "} "
+            }
+            _ => {
+            }
+        }
+        a = a.next
+    }
+    if valued {
+        o = o + "return _mr; "
+    }
+    return o + "})()"
+}
+
+// ---------- closure ----------
+
+// oxl `fn(p){body}` -> snapshot-capturing JS arrow. Captures are the
+// BodyScan locals passed through an IIFE so later mutation doesn't
+// leak in (C env-struct parity).
+fn jclosure(g: mut G, params: ref parser.NList, body: ref parser.Node) -> str {
+    sc := new(GS)
+    sc.l = nil
+    gscan_b(g, sc, body)
+    let caps: own GBnd = nil
+    u := sc.l
+    for u != nil {
+        n := u.v
+        for len(n) > 0 {
+            t := gx_lookup(g, n)
+            if t >= 0 {
+                if g_local(g, n) {
+                    caps = gbnd(n, "", t, caps)
+                }
+                break
+            }
+            ld := check.last_dot(n)
+            if ld < 0 {
+                break
+            }
+            n = substr(n, 0, ld)
+        }
+        u = u.next
+    }
+    ps := ""
+    pl := params
+    for pl != nil {
+        match pl.v {
+            parser.Node.Param{name} => {
+                if len(ps) > 0 {
+                    ps = ps + ", "
+                }
+                ps = ps + jname(name)
+            }
+            _ => {
+            }
+        }
+        pl = pl.next
+    }
+    wpush(g)
+    check.env_push(g.env)
+    check.env_push(g.benv)
+    pl2 := params
+    for pl2 != nil {
+        match pl2.v {
+            parser.Node.Param{name, ty} => {
+                check.env_bind(g.env, name, gty(g, ty))
+            }
+            _ => {
+            }
+        }
+        pl2 = pl2.next
+    }
+    wln(g, "{ const _dmark = rt.rt_defer_mark();")
+    cp0 := caps
+    for cp0 != nil {
+        wln(g, "    let " + jname(cp0.n) + " = _c_" + cname(cp0.n) + ";")
+        cp0 = cp0.next
+    }
+    sv := g.defers
+    g.defers = nil
+    jblk(g, body)
+    jdefers(g)
+    g.defers = sv
+    wln(g, "}")
+    wpop(g)
+    btxt := wjoin(g.wlast)
+    check.env_pop(g.benv)
+    check.env_pop(g.env)
+    capn := ""
+    capv := ""
+    cp := caps
+    for cp != nil {
+        if len(capn) > 0 {
+            capn = capn + ", "
+            capv = capv + ", "
+        }
+        capn = capn + "_c_" + cname(cp.n)
+        capv = capv + jref(g, cp.n)
+        cp = cp.next
+    }
+    inner := "(" + ps + ") => " + btxt
+    return "((" + capn + ") => " + inner + ")(" + capv + ")"
+}
+
+// ---------- builtins ----------
+
+fn jbuiltin(g: mut G, name: str, args: ref parser.NList, argvs: ref GAv) -> str {
+    a0 := ""
+    if argvs != nil {
+        a0 = argvs.v
+    }
+    j := gav_join(argvs)
+    if name == "assert" {
+        return "((" + a0 + ") ? void 0 : rt.rt_trap(3n))"
+    }
+    if name == "mkchan" || name == "smkchan" {
+        payload := -1
+        if args != nil {
+            payload = check.chan_payload_arg(g.ck, args.v)
+        }
+        drop := "null"
+        if payload >= 0 {
+            drop = jdrop_sym(g, payload)
+        }
+        scoped := name == "smkchan"
+        cap := "0n"
+        sc := "null"
+        if scoped {
+            if argvs != nil && argvs.next != nil {
+                cap = argvs.next.v
+            }
+            if argvs != nil && argvs.next != nil && argvs.next.next != nil {
+                sc = argvs.next.next.v
+            }
+        } else {
+            ci := 0
+            if payload >= 0 {
+                ci = 1
+            }
+            cv := gav_at(argvs, ci)
+            if len(cv) > 0 {
+                cap = cv
+            }
+        }
+        return "rt.rt_mkchan_scoped(" + sc + ", " + cap + ", " + drop + ")"
+    }
+    if name == "send" {
+        return "rt.rt_send(" + a0 + ", " + gav_at(argvs, 1) + ")"
+    }
+    if name == "try_send" {
+        return "rt.rt_try_send(" + a0 + ", " + gav_at(argvs, 1) + ")"
+    }
+    if name == "is_root" {
+        return "rt.rt_is_root()"
+    }
+    if name == "mkscope" {
+        return "rt.rt_scope_named()"
+    }
+    if name == "curscope" {
+        return "rt.rt_scope_current()"
+    }
+    if name == "scancel" {
+        return "rt.rt_scope_cancel(" + a0 + ")"
+    }
+    if name == "sjoin" {
+        return "rt.rt_trap(21n)"
+    }
+    if name == "recv" {
+        return "rt.rt_recv(" + a0 + ")"
+    }
+    if name == "sleep" {
+        return "rt.rt_sleep(" + a0 + ")"
+    }
+    if name == "msleep" {
+        return "rt.rt_msleep(" + a0 + ")"
+    }
+    if name == "usleep" {
+        return "rt.rt_usleep(" + a0 + ")"
+    }
+    if name == "itoa" {
+        return "rt.rt_itoa(" + a0 + ")"
+    }
+    if name == "ftoi" {
+        return "rt.rt_to_int(Math.trunc(" + a0 + "))"
+    }
+    if name == "itof" {
+        return "Number(" + a0 + ")"
+    }
+    if name == "argc" {
+        return "rt.rt_argc()"
+    }
+    if name == "argv" {
+        return "rt.rt_argv(" + a0 + ")"
+    }
+    if name == "len" {
+        return "rt.rt_len(" + a0 + ")"
+    }
+    if name == "byteat" || name == "substr" || name == "find" || name == "bufstr" || name == "poke8" || name == "poke16" || name == "poke32" {
+        return "rt.rt_" + name + "(" + j + ")"
+    }
+    if name == "atoi" || name == "mkbuf" || name == "htons" || name == "htonl" || name == "atof" || name == "ftoa" {
+        return "rt.rt_" + name + "(" + j + ")"
+    }
+    if name == "mkshared" {
+        return "rt.rt_mkshared(" + j + ")"
+    }
+    if name == "sget" {
+        return "rt.rt_sget(" + a0 + ")"
+    }
+    if name == "sset" {
+        return "rt.rt_sset(" + a0 + ", " + gav_at(argvs, 1) + ")"
+    }
+    if name == "scas" {
+        return "rt.rt_scas(" + j + ")"
+    }
+    if name == "sadd" {
+        return "rt.rt_sadd(" + a0 + ", " + gav_at(argvs, 1) + ")"
+    }
+    if name == "now" {
+        return "rt.rt_now()"
+    }
+    if name == "now_ms" {
+        return "rt.rt_now_ms()"
+    }
+    if name == "cstr" {
+        return "rt.rt_str_cstr(" + a0 + ")"
+    }
+    if name == "str" {
+        return "rt.rt_str(" + a0 + ")"
+    }
+    // env-backed surface — ffi fills these per flavor
+    if name == "readfile" || name == "writefile" || name == "exit" || name == "set_rcvtimo" || name == "set_rcvtimo_ms" || name == "set_sndtimo" || name == "sqlite_exec" || name == "sqlite_query" || name == "sqlite_open" || name == "sqlite_close" || name == "sqlite_exec_bind" {
+        return "globalThis.__oxl_ffi.rt_" + name + "(" + j + ")"
+    }
+    return ""
+}
+
+// extern arg/ret mapping per js-semantics §7
+fn jffi_arg(g: mut G, e: ref parser.Node, v: str, pt: int) -> str {
+    pt2 := gsub(g, pt)
+    pk := tyk(g, pt2)
+    if pk == check.k_str() {
+        return "rt.rt_str_cstr(" + v + ")"
+    }
+    if pk == check.k_slice() && tyk(g, tyi(g, pt2)) == check.k_byte() {
+        return v + ".a.subarray(" + v + ".off, " + v + ".off + " + v + ".len)"
+    }
+    return v
+}
+
+fn jffi_ret(g: mut G, expr: str, rt1: int) -> str {
+    k := tyk(g, rt1)
+    if k == check.k_str() {
+        return "rt.rt_str(" + expr + ")"
+    }
+    if k == check.k_slice() && tyk(g, tyi(g, rt1)) == check.k_byte() {
+        return "((_b) => ({a: _b, off: 0, len: _b ? _b.length : 0, cap: _b ? _b.length : 0}))(" + expr + ")"
+    }
+    return expr
+}
+
+// ---------- calls ----------
+
+fn jcall(g: mut G, f: ref parser.Node, args: ref parser.NList) -> str {
+    argvs := jav(g, args)
+    // indirect call through a fn value — a JS closure calls directly
+    ft := xfnval_ty(g, f)
+    if ft >= 0 && tyk(g, ft) == check.k_fn() {
+        fv := jx(g, f)
+        argl := ""
+        il2 := g.ck.tyv[ft].args
+        al2 := args
+        av2 := argvs
+        first := true
+        for al2 != nil {
+            v := av2.v
+            if il2 != nil {
+                v = jconv_v(g, al2.v, v, il2.v)
+                il2 = il2.next
+            }
+            if !first {
+                argl = argl + ", "
+            }
+            first = false
+            argl = argl + v
+            al2 = al2.next
+            av2 = av2.next
+        }
+        return fv + "(" + argl + ")"
+    }
+    name := check.callee_name(f)
+    if len(name) == 0 {
+        return "/*badcall*/null"
+    }
+    qn := check.resolve_named(g.ck, name)
+    // enum variant construction E.V(..)
+    ev := gev(g, qn)
+    if ev.ok {
+        pf := ""
+        if collections.map_has(g.ck.structs, qn) {
+            [si, err] = collections.map_get(g.ck.structs, qn)
+            if err == nil {
+                fl := g.ck.structsv[si].fields
+                i := 0
+                for fl != nil {
+                    if i > 0 {
+                        pf = pf + ","
+                    }
+                    pf = pf + "f_" + fl.v.n + ":" + gav_at(argvs, i)
+                    i = i + 1
+                    fl = fl.next
+                }
+            }
+        }
+        return "{tag:" + itoa(ev.i) + ",p" + itoa(ev.i) + ":{" + pf + "}}"
+    }
+    // `e.kind()` — enum tag accessor
+    if args == nil && check.nk(f) == 9 {
+        match f {
+            parser.Node.Field{obj, name} => {
+                if name == "kind" {
+                    ot := xty(g, obj)
+                    if tyk(g, ot) == check.k_enum() || tyk(g, ot) == check.k_own() || tyk(g, ot) == check.k_ref() || tyk(g, ot) == check.k_mut() {
+                        return "rt.rt_to_int((" + jx(g, obj) + ").tag)"
+                    }
+                }
+            }
+            _ => {
+            }
+        }
+    }
+    if qn == "print" || qn == "println" {
+        a0 := ""
+        if argvs != nil {
+            a0 = argvs.v
+        }
+        t := check.t_unk(g.ck)
+        if args != nil {
+            t = gdt(g, xty(g, args.v))
+        }
+        sfx := "i64"
+        a := a0
+        if tyk(g, t) == check.k_str() || tyk(g, t) == check.k_cstr() {
+            sfx = "str"
+        }
+        if tyk(g, t) == check.k_cstr() {
+            a = "rt.rt_str(" + a0 + ")"
+        }
+        if tyk(g, t) == check.k_float() {
+            sfx = "f64"
+        }
+        return "rt.rt_" + name + "_" + sfx + "(" + a + ")"
+    }
+    if qn == "close" {
+        a0 := "null"
+        if argvs != nil {
+            a0 = argvs.v
+        }
+        t := check.t_unk(g.ck)
+        if args != nil {
+            t = gdt(g, xty(g, args.v))
+        }
+        if tyk(g, t) == check.k_chan() {
+            return "rt.rt_close(" + a0 + ")"
+        }
+        return "globalThis.__oxl_ffi.close(" + a0 + ")"
+    }
+    if qn == "new" && args != nil {
+        sn := check.callee_name(args.v)
+        if len(sn) > 0 {
+            q := check.resolve_named(g.ck, sn)
+            // own S/own E is the raw object — no box (refs are plain)
+            if (collections.map_has(g.ck.structs, q) || collections.map_has(g.ck.enums, q)) && !gev(g, q).ok {
+                return jzero(g, check.ty_parse(g.ck, q))
+            }
+        }
+        st2 := xty(g, args.v)
+        if tyk(g, st2) == check.k_slice() {
+            return "rt.rt_slice_own(" + argvs.v + ")"
+        }
+        if jword(g, st2) {
+            // word/own values box into {v} so writes through the handle land
+            return "{v: " + argvs.v + "}"
+        }
+        // object values: own T is the raw ref — a shallow clone mirrors
+        // the native alloc+memcpy (nested own fields stay shared)
+        return "Object.assign({}, " + argvs.v + ")"
+    }
+    if qn == "mkslice" && args != nil {
+        et := check.t_unk(g.ck)
+        if check.nk(args.v) == 2 {
+            match args.v {
+                parser.Node.Name{n} => {
+                    et = check.ty_parse(g.ck, n)
+                }
+                _ => {
+                }
+            }
+        }
+        if check.nk(args.v) == 3 {
+            et = gty(g, args.v)
+        }
+        n := "0n"
+        if args.next != nil {
+            n = gav_at(argvs, 1)
+        }
+        ek := tyk(g, gsub(g, et))
+        if ek == check.k_slice() && tyk(g, tyi(g, gsub(g, et))) == check.k_byte() {
+            return "rt.rt_mkslice_b(" + n + ")"
+        }
+        if ek == check.k_byte() {
+            return "rt.rt_mkslice_b(" + n + ")"
+        }
+        if ek == check.k_int() || ek == check.k_err() || ek == check.k_float() || ek == check.k_bool() {
+            return "rt.rt_mkslice(" + n + ", " + jzero(g, et) + ")"
+        }
+        // object elems need a fresh value per slot — fill() aliases
+        return "(() => { const _n = Number(" + n + "); const _a = new Array(_n); for (let _i = 0; _i < _n; _i++) _a[_i] = " + jzero(g, et) + "; return {a: _a, off: 0, len: _n, cap: _n}; })()"
+    }
+    if qn == "push" && args != nil {
+        st := xty(g, args.v)
+        el := check.t_unk(g.ck)
+        owned := false
+        if tyk(g, st) == check.k_slice() {
+            el = tyi(g, st)
+        }
+        if tyk(g, st) == check.k_own() || tyk(g, st) == check.k_ref() || tyk(g, st) == check.k_mut() {
+            i := tyi(g, st)
+            if tyk(g, i) == check.k_slice() {
+                el = tyi(g, i)
+                owned = true
+            }
+        }
+        sv := argvs.v
+        if owned {
+            sv = sv + ".v"
+        }
+        v := gav_at(argvs, 1)
+        if tyk(g, el) == check.k_byte() {
+            return "rt.rt_slice_push_b(" + sv + ", " + v + ")"
+        }
+        return "rt.rt_slice_push(" + sv + ", " + v + ")"
+    }
+    if qn == "len" && args != nil {
+        return "rt.rt_len(" + argvs.v + ")"
+    }
+    b := jbuiltin(g, qn, args, argvs)
+    if len(b) > 0 {
+        return b
+    }
+    // method + iface dispatch + mono generics
+    cp := gcall_plan(g, f, args)
+    if cp.k == 2 {
+        match f {
+            parser.Node.Field{obj} => {
+                ov := jx(g, obj)
+                argl := ""
+                il := cp.ps
+                al := args
+                av := argvs
+                for al != nil {
+                    v := av.v
+                    if il != nil {
+                        v = jconv_v(g, al.v, v, il.v)
+                        il = il.next
+                    }
+                    argl = argl + ", " + v
+                    al = al.next
+                    av = av.next
+                }
+                return "((_iv) => _iv.methods." + cp.mname + "(_iv.obj" + argl + "))(" + ov + ")"
+            }
+            _ => {
+            }
+        }
+    }
+    fi := gfn(g, name)
+    eq := qn
+    if fi < 0 && cp.k == 1 {
+        fi = gfn(g, cp.q)
+        eq = cp.q
+    }
+    if fi < 0 {
+        // no fnsv entry — an extern: ffi boundary mapping applies
+        argl := ""
+        il := args
+        av := argvs
+        first := true
+        for il != nil {
+            if !first {
+                argl = argl + ", "
+            }
+            first = false
+            argl = argl + av.v
+            il = il.next
+            av = av.next
+        }
+        return "globalThis.__oxl_ffi." + name + "(" + argl + ")"
+    }
+    sig := g.ck.fnsv[fi]
+    let bind: own collections.Map = nil
+    mangled := ""
+    callee := "globalThis.__oxl_ffi." + name
+    if sig.is_extern == 0 {
+        callee = "o_f_" + cname(eq)
+        if sig.typarams != nil {
+            bind = gcall_bindf(g, fi, f, args, cp.dotted)
+            mangled = ginst_name(g, eq, sig.typarams, bind)
+            callee = "o_f_" + cname(mangled)
+        }
+    }
+    pre := ""
+    post := ""
+    il := sig.params
+    let coerced: own GAv = nil
+    let ctail: own GAv = nil
+    if cp.k == 1 && cp.dotted == 1 && il != nil {
+        pt := il.v
+        if bind != nil {
+            pt = check.subst_ty(g.ck, pt, bind)
+        }
+        pt = gsub(g, pt)
+        match f {
+            parser.Node.Field{obj} => {
+                c := new(GAv)
+                c.v = jadapt_v(g, obj, jx(g, obj), pt)
+                raw := gsub(g, xty(g, obj))
+                if tyk(g, raw) == check.k_own() {
+                    pk := tyk(g, pt)
+                    if pk == check.k_mut() {
+                        pre = pre + "rt.rt_borrow_mut(" + c.v + "); "
+                        post = "rt.rt_unborrow(" + c.v + "); " + post
+                    }
+                    if pk == check.k_ref() {
+                        pre = pre + "rt.rt_borrow_read(" + c.v + "); "
+                        post = "rt.rt_unborrow(" + c.v + "); " + post
+                    }
+                }
+                coerced = c
+                ctail = c
+            }
+            _ => {
+            }
+        }
+        il = il.next
+    }
+    al := args
+    av := argvs
+    for al != nil {
+        v := av.v
+        if il != nil {
+            o := jarg_c(g, al.v, v, il.v, bind)
+            v = o.v
+            pre = pre + o.pre
+            post = post + o.post
+            il = il.next
+        }
+        c := new(GAv)
+        c.v = v
+        if coerced == nil {
+            coerced = c
+            ctail = c
+        } else {
+            ctail.next = c
+            ctail = ctail.next
+        }
+        al = al.next
+        av = av.next
+    }
+    rt1 := sig.ret1
+    if bind != nil {
+        rt1 = check.subst_ty(g.ck, rt1, bind)
+    }
+    rt1 = gsub(g, rt1)
+    if sig.typarams != nil {
+        ginst_queue(g, eq, sig.typarams, bind)
+    }
+    inner := callee + "(" + gav_join(coerced) + ")"
+    if sig.is_extern != 0 {
+        if sig.retk == 1 {
+            inner = jffi_ret(g, inner, rt1)
+        }
+        if sig.retk == 2 {
+            inner = "((_r) => ({val: " + jffi_ret(g, "_r.val", rt1) + ", err: _r.err}))(" + inner + ")"
+        }
+    }
+    if len(pre) == 0 {
+        return inner
+    }
+    if sig.retk == 0 {
+        return "(() => { " + pre + inner + "; " + post + "})()"
+    }
+    return "(() => { " + pre + "const __rc = " + inner + "; " + post + "return __rc; })()"
+}
+
+// ---------- defers ----------
+
+fn jdefers(g: mut G) {
+    if g.inframe == 1 {
+        wln(g, "    rt.rt_defer_drain_to(fr._dmark);")
+    } else {
+        wln(g, "    rt.rt_defer_drain_to(_dmark);")
+    }
+}
+
+// `defer call` — registration temps eval args; a JS arrow is the
+// thunk, capturing the temps directly (no env struct needed)
+fn jdefer(g: mut G, call: own parser.Node) {
+    di := 0
+    d := g.defers
+    for d != nil {
+        di = di + 1
+        d = d.next
+    }
+    g.defers = parser.ncons(new(parser.Node.Name{n: "", lo: 0, hi: 0}), g.defers)
+    let rewritten: own parser.Node = nil
+    match call {
+        parser.Node.Call{f, args} => {
+            if args != nil {
+                let nargs: own parser.NList = nil
+                i := 0
+                al := args
+                for al != nil {
+                    t := xty(g, al.v)
+                    an := "_da" + itoa(di) + "_" + itoa(i)
+                    v := jx(g, al.v)
+                    wln(g, "    const " + an + " = " + v + ";")
+                    check.env_bind(g.env, an, t)
+                    nargs = parser.ncons(new(parser.Node.Name{n: an, lo: 0, hi: 0}), nargs)
+                    i = i + 1
+                    al = al.next
+                }
+                rewritten = new(parser.Node.Call{f: f, args: dnrev(nargs)})
+            } else {
+                rewritten = new(parser.Node.Call{f: f, args: args})
+            }
+        }
+        _ => {
+            rewritten = call
+        }
+    }
+    save_frame := g.inframe
+    g.inframe = 0
+    wpush(g)
+    v2 := jx(g, rewritten)
+    wpop(g)
+    cbody := wjoin(g.wlast)
+    g.inframe = save_frame
+    wln(g, "    rt.rt_defer_push(() => { " + cbody + "(" + v2 + "); });")
+}
+
+// ---------- stmt emission ----------
+
+fn jblk(g: mut G, body: ref parser.Node) {
+    if body == nil || check.nk(body) != 23 {
+        return
+    }
+    match body {
+        parser.Node.List{items} => {
+            l := items
+            for l != nil {
+                js(g, l.v)
+                l = l.next
+            }
+        }
+        _ => {
+        }
+    }
+}
+
+fn jlet2(g: mut G, names: str, call: ref parser.Node) {
+    i := find(names, ",")
+    na := names
+    nb := ""
+    if i >= 0 {
+        na = substr(names, 0, i)
+        nb = substr(names, i + 1, len(names))
+    }
+    vt := jpair_vt(g, call)
+    if vt < 0 {
+        vt = check.t_unk(g.ck)
+    }
+    n := g.tmpn
+    g.tmpn = g.tmpn + 1
+    c := jx(g, call)
+    wln(g, "    const _r" + itoa(n) + " = " + c + ";")
+    if len(na) > 0 && na != "_" {
+        wln(g, "    let " + jname(na) + " = _r" + itoa(n) + ".val;")
+        check.env_bind(g.env, na, vt)
+    }
+    if len(nb) > 0 && nb != "_" {
+        wln(g, "    let " + jname(nb) + " = _r" + itoa(n) + ".err;")
+        check.env_bind(g.env, nb, check.t_err(g.ck))
+    }
+}
+
+fn js(g: mut G, s: ref parser.Node) {
+    if s == nil {
+        return
+    }
+    match s {
+        parser.Node.Let{name, ty, init} => {
+            t := check.t_unk(g.ck)
+            if ty != nil {
+                t = gty(g, ty)
+            }
+            if ty == nil {
+                t = xty(g, init)
+            }
+            v := jzero(g, t)
+            if init != nil {
+                v = jx(g, init)
+            }
+            v = jconv_v(g, init, v, t)
+            wln(g, "    let " + jname(name) + " = " + v + ";")
+            check.env_bind(g.env, name, t)
+        }
+        parser.Node.Bind{name, init} => {
+            t := xty(g, init)
+            v := jzero(g, t)
+            if init != nil {
+                v = jx(g, init)
+            }
+            v = jconv_v(g, init, v, t)
+            wln(g, "    let " + jname(name) + " = " + v + ";")
+            check.env_bind(g.env, name, t)
+        }
+        parser.Node.Let2{names, call} => {
+            jlet2(g, names, call)
+        }
+        parser.Node.Assign{target, val} => {
+            v := jx(g, val)
+            v = jconv_v(g, val, v, xty(g, target))
+            match target {
+                parser.Node.Index{obj, idx} => {
+                    wln(g, "    rt.rt_sidx_set(" + jxslice_val(g, obj) + ", " + jx(g, idx) + ", " + v + ");")
+                    return
+                }
+                _ => {
+                }
+            }
+            t := jx(g, target)
+            wln(g, "    " + t + " = " + v + ";")
+        }
+        parser.Node.ExprStmt{e} => {
+            v := jx(g, e)
+            wln(g, "    (" + v + ");")
+        }
+        parser.Node.Defer{call} => {
+            jdefer(g, call)
+        }
+        parser.Node.Ret{vals} => {
+            jdefers(g)
+            if vals == nil {
+                wln(g, "    return;")
+            } else if g.retk == 2 && vals.next != nil {
+                v := jx(g, vals.v)
+                v = jconv_v(g, vals.v, v, g.cret)
+                e2 := jx(g, vals.next.v)
+                wln(g, "    return {val: " + v + ", err: " + e2 + "};")
+            } else {
+                v := jx(g, vals.v)
+                wln(g, "    return " + v + ";")
+            }
+        }
+        parser.Node.If{cond, then, els} => {
+            c := jx(g, cond)
+            wln(g, "    if (" + c + ") {")
+            check.env_push(g.env)
+            jblk(g, then)
+            check.env_pop(g.env)
+            if els == nil {
+                wln(g, "    }")
+            } else if check.nk(els) == 23 {
+                wln(g, "    } else {")
+                check.env_push(g.env)
+                jblk(g, els)
+                check.env_pop(g.env)
+                wln(g, "    }")
+            } else {
+                wl(g, "    } else ")
+                js(g, els)
+            }
+        }
+        parser.Node.For{cond, body} => {
+            if cond == nil {
+                wln(g, "    for (;;) {")
+            } else {
+                c := jx(g, cond)
+                wln(g, "    while (" + c + ") {")
+            }
+            check.env_push(g.env)
+            jblk(g, body)
+            check.env_pop(g.env)
+            wln(g, "    }")
+        }
+        parser.Node.Break => {
+            wln(g, "    break;")
+        }
+        parser.Node.Continue => {
+            wln(g, "    continue;")
+        }
+        parser.Node.Scope{body} => {
+            id := g.scopen
+            g.scopen = g.scopen + 1
+            wln(g, "    { const _sc" + itoa(id) + " = rt.rt_scope_make(); rt.rt_scope_enter(_sc" + itoa(id) + ");")
+            check.env_push(g.env)
+            jblk(g, body)
+            check.env_pop(g.env)
+            wln(g, "      rt.rt_scope_leave(_sc" + itoa(id) + "); }")
+        }
+        parser.Node.Spawn{e} => {
+            wln(g, "    rt.rt_trap(21n);")
+        }
+        parser.Node.Go{e} => {
+            wln(g, "    rt.rt_trap(21n);")
+        }
+        parser.Node.GoIn{sc, e} => {
+            wln(g, "    rt.rt_trap(21n);")
+        }
+        parser.Node.SpawnBlocking{e} => {
+            wln(g, "    rt.rt_trap(21n);")
+        }
+        parser.Node.Select{arms} => {
+            wln(g, "    rt.rt_trap(21n);")
+        }
+        parser.Node.Unsafe{body} => {
+            check.env_push(g.env)
+            jblk(g, body)
+            check.env_pop(g.env)
+        }
+        parser.Node.List{items} => {
+            l := items
+            for l != nil {
+                js(g, l.v)
+                l = l.next
+            }
+        }
+        _ => {
+        }
+    }
+}
+
+// ---------- chan-payload drop thunks (JS: GC owns payloads — shape
+// parity only, mkchan still passes a drop slot per the contract) ----------
+
+fn jdrop_sym(g: mut G, payload: int) -> str {
+    payload = gsub(g, payload)
+    k := tyk(g, payload)
+    if k == check.k_struct() || k == check.k_enum() {
+        n := g.ck.tyv[payload].name
+        if !sl_has_str(g.drop_tys, n) {
+            g.drop_tys = push(g.drop_tys, n)
+        }
+        return "o_drop_" + cname(n)
+    }
+    if k == check.k_own() && tyk(g, tyi(g, payload)) == check.k_slice() {
+        g.drop_slice = 1
+        return "o_drop_ownslice"
+    }
+    g.drop_word = 1
+    return "o_drop_word"
+}
+
+fn jemit_drops(g: mut G, ru: int) {
+    wpush(g)
+    i := 0
+    for i < len(g.drop_tys) {
+        wln(g, "function o_drop_" + cname(g.drop_tys[i]) + "(_v) {}")
+        i = i + 1
+    }
+    if g.drop_word != 0 {
+        wln(g, "function o_drop_word(_v) {}")
+    }
+    if g.drop_slice != 0 {
+        wln(g, "function o_drop_ownslice(_v) {}")
+    }
+    wpop(g)
+    i = 0
+    for i < len(g.wlast) {
+        g.units[ru].ob = push(g.units[ru].ob, g.wlast[i])
+        i = i + 1
+    }
+}
+
+// ---------- iface vtabs ----------
+
+// one (iface, impl) pair -> `const o_vt_<w>_<impl> = { m: thunk, … }`
+// Thunks normalize the receiver: impl methods on a value recv see the
+// object directly; impls on own see it too (refs are raw); boxed word
+// impls unwrap `.v`; iface: impls forward through the inner iface.
+fn jemvtab_one(g: mut G, vu: ref GVU) {
+    ii := check.iface_ent(g.ck, vu.w)
+    if ii < 0 {
+        return
+    }
+    obj := "o"
+    ents := ""
+    ml := g.ck.ifacesv[ii].methods
+    for ml != nil {
+        m := ml.v
+        if len(vu.impl) > 6 && substr(vu.impl, 0, 6) == "iface:" {
+            ents = ents + m.n + ": (" + obj + ", ...a) => " + obj + ".methods." + m.n + "(" + obj + ".obj, ...a),"
+        } else {
+            fname := vu.impl + "." + m.n
+            fi := gfn(g, fname)
+            if fi < 0 {
+                ents = ents + m.n + ": () => rt.rt_trap(21n),"
+            } else {
+                sig := g.ck.fnsv[fi]
+                callee := "o_f_" + cname(fname)
+                if sig.typarams != nil {
+                    b2 := gvtab_bind(g, fi, m)
+                    if b2 != nil {
+                        callee = "o_f_" + cname(ginst_name(g, fname, sig.typarams, b2))
+                    }
+                }
+                // receiver shape: the impl's declared recv param[0]
+                rp := sig.params
+                recv := obj
+                if rp != nil {
+                    rk := tyk(g, gsub(g, rp.v))
+                    if rk == check.k_int() || rk == check.k_float() || rk == check.k_bool() || rk == check.k_byte() || rk == check.k_str() || rk == check.k_err() {
+                        recv = obj + ".v"
+                    }
+                }
+                // word impls box at conv — the .v unwrap only for
+                // value receivers; ref/mut recvs take the box itself
+                implk := 0
+                if collections.map_has(g.ck.structs, vu.impl) || collections.map_has(g.ck.enums, vu.impl) {
+                    implk = 1
+                }
+                if implk == 0 {
+                    // non-struct impl (word types): boxed at wrap
+                    recv = obj + ".v"
+                    if rp != nil {
+                        rk := tyk(g, gsub(g, rp.v))
+                        if rk == check.k_own() || rk == check.k_ref() || rk == check.k_mut() {
+                            recv = obj
+                        }
+                    }
+                }
+                ents = ents + m.n + ": (" + obj + ", ...a) => " + callee + "(" + recv + ", ...a),"
+            }
+        }
+        ml = ml.next
+    }
+    g.vout = push(g.vout, "const " + "o_vt_" + cname(vu.w) + "_" + gvtkey(vu.impl) + " = {" + ents + "};\n")
+}
+
+// ---------- fn emission ----------
+
+fn jemit_named_fn(g: mut G, i: int, qn: str, base: str) {
+    match g.its[i].node {
+        parser.Node.Fn{recv, params, ret, body, ex} => {
+            if ex {
+                return
+            }
+            g.cur = qn
+            g.retk = gretdk(g, ret)
+            g.cret = gsub(g, gret1(g, ret))
+            g.defers = nil
+            if check.sl_has(g.ck.susp, base) {
+                // W3: susp fns emit as poll frames — no o_f_ callable
+                g.inframe = 1
+                g.inframe = 0
+                if qn == "main" {
+                    g.maink = 1
+                }
+                return
+            }
+            ps := ""
+            if recv != nil {
+                match recv {
+                    parser.Node.Param{name} => {
+                        ps = jname(name)
+                    }
+                    _ => {
+                    }
+                }
+            }
+            pl := params
+            for pl != nil {
+                match pl.v {
+                    parser.Node.Param{name} => {
+                        if len(ps) > 0 {
+                            ps = ps + ", "
+                        }
+                        ps = ps + jname(name)
+                    }
+                    _ => {
+                    }
+                }
+                pl = pl.next
+            }
+            wln(g, "function o_f_" + cname(qn) + "(" + ps + ") {")
+            wln(g, "    const _dmark = rt.rt_defer_mark();")
+            check.env_push(g.env)
+            if recv != nil {
+                match recv {
+                    parser.Node.Param{name, ty} => {
+                        check.env_bind(g.env, name, gty(g, ty))
+                    }
+                    _ => {
+                    }
+                }
+            }
+            pl2 := params
+            for pl2 != nil {
+                match pl2.v {
+                    parser.Node.Param{name, ty} => {
+                        check.env_bind(g.env, name, gty(g, ty))
+                    }
+                    _ => {
+                    }
+                }
+                pl2 = pl2.next
+            }
+            jblk(g, body)
+            jdefers(g)
+            check.env_pop(g.env)
+            wln(g, "}\n")
+            if qn == "main" {
+                g.maink = 2
+            }
+        }
+        _ => {
+        }
+    }
+}
+
+fn jfunc(g: mut G, i: int) {
+    if check.nk(g.its[i].node) != 24 {
+        return
+    }
+    match g.its[i].node {
+        parser.Node.Fn{name, recv, typarams} => {
+            if typarams != nil {
+                return
+            }
+            gset_ctx(g, i)
+            qn := check.fn_qname(g.ck, g.its[i].mod, recv, name)
+            jemit_named_fn(g, i, qn, qn)
+        }
+        _ => {
+        }
+    }
+}
+
+fn jfunc_inst(g: mut G, iq: str, im: str, ibind: own collections.Map) {
+    fi := gfn_item(g, iq)
+    if fi < 0 {
+        return
+    }
+    gset_ctx(g, fi)
+    si := -1
+    if collections.map_has(g.ck.fns, iq) {
+        [si2, se] = collections.map_get(g.ck.fns, iq)
+        if se == nil {
+            si = si2
+        }
+    }
+    if si >= 0 {
+        g.ck.ty_scope = check.tp_names(g.ck.fnsv[si].typarams)
+        g.ck.cur_ty_params = check.tp_clone(g.ck.fnsv[si].typarams)
+    }
+    g.subst = ibind
+    jemit_named_fn(g, fi, im, iq)
+    g.subst = nil
+    g.ck.ty_scope = nil
+    g.ck.cur_ty_params = nil
+}
+
+fn jemit_static(g: mut G, i: int) {
+    if check.nk(g.its[i].node) != 10 {
+        return
+    }
+    match g.its[i].node {
+        parser.Node.Let{name} => {
+            gset_ctx(g, i)
+            g.head = push(g.head, "let o_g_" + cname(check.qname(g.ck.cur_mod, name)) + ";")
+        }
+        _ => {
+        }
+    }
+}
+
+// ---------- genall ----------
+
+fn jgenall(g: mut G) -> str {
+    g.units = mkslice(GUnit, 0)
+    g.dpos = collections.map_new()
+    g.dchain = mkslice(int, 0)
+    uof := collections.map_new()
+    // file-scope globals — `let` decls now, init inside oxl_main
+    i := 0
+    for i < len(g.its) {
+        if check.nk(g.its[i].node) == 10 {
+            match g.its[i].node {
+                parser.Node.Let{name} => {
+                    ui := gubegin(g)
+                    collections.map_set(uof, itoa(i), ui)
+                    s := gusnap(g)
+                    jemit_static(g, i)
+                    gudrain(g, ui, s)
+                    gdef(g, ui, "o_g_" + cname(check.qname(g.its[i].mod, name)))
+                    g.units[ui].root = 1 - ghasdot(check.qname(g.its[i].mod, name))
+                }
+                _ => {
+                }
+            }
+        }
+        i = i + 1
+    }
+    // externs — no JS decl; the bare name def keeps ffi spellings live
+    i = 0
+    for i < len(g.its) {
+        if check.nk(g.its[i].node) == 24 {
+            match g.its[i].node {
+                parser.Node.Fn{ex, name} => {
+                    if ex {
+                        ui := gubegin(g)
+                        s := gusnap(g)
+                        gudrain(g, ui, s)
+                        gdef(g, ui, name)
+                    }
+                }
+                _ => {
+                }
+            }
+        }
+        i = i + 1
+    }
+    // fn units — bodies (frames for susp fns land in W3)
+    g.w = mkslice(str, 0)
+    i = 0
+    for i < len(g.its) {
+        if check.nk(g.its[i].node) == 24 {
+            match g.its[i].node {
+                parser.Node.Fn{ex, name, recv, typarams, ret} => {
+                    if !ex && typarams == nil {
+                        ui := gubegin(g)
+                        s := gusnap(g)
+                        jfunc(g, i)
+                        gudrain(g, ui, s)
+                        qn := check.fn_qname(g.ck, g.its[i].mod, recv, name)
+                        gdef(g, ui, "o_f_" + cname(qn))
+                        if gretdk(g, ret) == 2 {
+                            gdef(g, ui, "o_ret_" + cname(qn))
+                        }
+                        if check.sl_has(g.ck.susp, qn) {
+                            gdef(g, ui, "o_frm_" + cname(qn))
+                            gdef(g, ui, "o_poll_" + cname(qn))
+                        }
+                    }
+                }
+                _ => {
+                }
+            }
+        }
+        i = i + 1
+    }
+    // global initializers
+    i = 0
+    for i < len(g.its) {
+        if check.nk(g.its[i].node) == 10 {
+            match g.its[i].node {
+                parser.Node.Let{name, ty, init} => {
+                    gset_ctx(g, i)
+                    t := check.t_unk(g.ck)
+                    if ty != nil {
+                        t = gty(g, ty)
+                    }
+                    if ty == nil {
+                        t = xty(g, init)
+                    }
+                    [ui, uerr] = collections.map_get(uof, itoa(i))
+                    if uerr == nil {
+                        s := gusnap(g)
+                        v := jx(g, init)
+                        v = jconv_v(g, init, v, t)
+                        g.ginit = push(g.ginit, "    o_g_" + cname(check.qname(g.its[i].mod, name)) + " = " + v + ";")
+                        gudrain_init(g, ui, s)
+                    }
+                }
+                _ => {
+                }
+            }
+        }
+        i = i + 1
+    }
+    // mono insts + vtab-seeded method insts (same co-fixpoint)
+    progress := true
+    for progress {
+        progress = false
+        for g.insts != nil {
+            in := g.insts
+            g.insts = in.next
+            progress = true
+            ui := gubegin(g)
+            s := gusnap(g)
+            jfunc_inst(g, in.q, in.mangled, in.bind)
+            gudrain(g, ui, s)
+            gdef(g, ui, "o_f_" + cname(in.mangled))
+            gdef(g, ui, "o_ret_" + cname(in.mangled))
+            gdef(g, ui, "o_frm_" + cname(in.mangled))
+            gdef(g, ui, "o_poll_" + cname(in.mangled))
+        }
+        if gseed_vtab_insts(g) > 0 {
+            progress = true
+        }
+    }
+    // concrete vtabs — method-table objects per (iface, impl) pair
+    vu := g.vtabs
+    for vu != nil {
+        ui := gubegin(g)
+        s := gusnap(g)
+        jemvtab_one(g, vu)
+        gudrain(g, ui, s)
+        gdef(g, ui, "o_vt_" + cname(vu.w) + "_" + gvtkey(vu.impl))
+        vu = vu.next
+    }
+    // oxl_main — root unit: async so susp mains/tests can await frames
+    ru := gubegin(g)
+    g.units[ru].root = 1
+    if g.testm == 1 {
+        tb := "async function oxl_main() {\n@@GLOBALS@@"
+        i = 0
+        id := 0
+        for i < len(g.its) {
+            if check.nk(g.its[i].node) == 24 {
+                match g.its[i].node {
+                    parser.Node.Fn{name} => {
+                        if len(name) > 5 && substr(name, 0, 5) == "test_" {
+                            qn := check.qname(g.its[i].mod, name)
+                            cn := cname(qn)
+                            sid := itoa(id)
+                            tb = tb + "    { const _t" + sid + " = rt.rt_scope_make(); rt.rt_scope_enter(_t" + sid + "); let _e" + sid + " = 0n; try { "
+                            if check.sl_has(g.ck.susp, qn) {
+                                tb = tb + "await rt.rt_run_root(o_frm_" + cn + "()); "
+                            } else {
+                                tb = tb + "o_f_" + cn + "(); "
+                            }
+                            tb = tb + "_e" + sid + " = rt.rt_scope_try(_t" + sid + "); } catch (_x) { _e" + sid + " = (_x && _x.code !== undefined) ? _x.code : 1n; try { rt.rt_scope_leave(_t" + sid + "); } catch (_y) {} } "
+                            tb = tb + "rt.rt_print_str(rt.rt_str_lit(\"" + base64.encode(("  " + name + " ... ") as []byte) + "\")); if (_e" + sid + ") rt.rt_println_str(rt.rt_str_lit(\"" + base64.encode("FAIL" as []byte) + "\")); else rt.rt_println_str(rt.rt_str_lit(\"" + base64.encode("ok" as []byte) + "\")); }\n"
+                            id = id + 1
+                        }
+                    }
+                    _ => {
+                    }
+                }
+            }
+            i = i + 1
+        }
+        // scope_try yields the code: 0/ok when nothing trapped — the
+        // C prints FAIL on nonzero; mirror with a small conditional
+        g.units[ru].ob = push(g.units[ru].ob, tb + "}\n")
+    }
+    if g.testm == 0 && g.maink == 1 {
+        g.units[ru].ob = push(g.units[ru].ob, "async function oxl_main() {\n@@GLOBALS@@    rt.rt_trap(21n);\n}\n")
+    }
+    if g.testm == 0 && g.maink == 2 {
+        g.units[ru].ob = push(g.units[ru].ob, "async function oxl_main() {\n@@GLOBALS@@    o_f_main();\n}\n")
+    }
+    if g.testm == 0 && g.maink == 0 {
+        g.units[ru].ob = push(g.units[ru].ob, "async function oxl_main() {\n@@GLOBALS@@}\n")
+    }
+    jemit_drops(g, ru)
+    // mark
+    g.live = mkslice(int, len(g.units))
+    work := mkslice(int, 0)
+    i = 0
+    for i < len(g.units) {
+        if g.units[i].root != 0 {
+            g.live[i] = 1
+            work = push(work, i)
+        }
+        i = i + 1
+    }
+    for len(work) > 0 {
+        t := work[len(work) - 1]
+        work = work[0:len(work) - 1]
+        g.uhits = mkslice(int, 0)
+        j := 0
+        for j < len(g.units[t].hd) {
+            gscan(g, g.units[t].hd[j])
+            j = j + 1
+        }
+        j = 0
+        for j < len(g.units[t].tp) {
+            gscan(g, g.units[t].tp[j])
+            j = j + 1
+        }
+        j = 0
+        for j < len(g.units[t].fd) {
+            gscan(g, g.units[t].fd[j])
+            j = j + 1
+        }
+        j = 0
+        for j < len(g.units[t].cp) {
+            gscan(g, g.units[t].cp[j])
+            j = j + 1
+        }
+        j = 0
+        for j < len(g.units[t].vt) {
+            gscan(g, g.units[t].vt[j])
+            j = j + 1
+        }
+        j = 0
+        for j < len(g.units[t].fb) {
+            gscan(g, g.units[t].fb[j])
+            j = j + 1
+        }
+        j = 0
+        for j < len(g.units[t].ob) {
+            gscan(g, g.units[t].ob[j])
+            j = j + 1
+        }
+        j = 0
+        for j < len(g.units[t].cb) {
+            gscan(g, g.units[t].cb[j])
+            j = j + 1
+        }
+        j = 0
+        for j < len(g.units[t].gi) {
+            gscan(g, g.units[t].gi[j])
+            j = j + 1
+        }
+        j = 0
+        for j < len(g.uhits) {
+            h := g.uhits[j]
+            if g.live[h] == 0 {
+                g.live[h] = 1
+                work = push(work, h)
+            }
+            j = j + 1
+        }
+    }
+    ginits := ""
+    i = 0
+    for i < len(g.units) {
+        if g.live[i] != 0 {
+            ginits = ginits + wjoin(g.units[i].gi)
+        }
+        i = i + 1
+    }
+    i = 0
+    for i < len(g.units[ru].ob) {
+        g.units[ru].ob[i] = gsplice(g.units[ru].ob[i], "@@GLOBALS@@", ginits)
+        i = i + 1
+    }
+    out := "import * as rt from './rt.mjs'\n\n"
+    i = 0
+    for i < len(g.units) {
+        if g.live[i] != 0 {
+            out = out + wjoin(g.units[i].hd)
+        }
+        i = i + 1
+    }
+    i = 0
+    for i < len(g.units) {
+        if g.live[i] != 0 {
+            out = out + wjoin(g.units[i].tp)
+        }
+        i = i + 1
+    }
+    i = 0
+    for i < len(g.units) {
+        if g.live[i] != 0 {
+            out = out + wjoin(g.units[i].fd)
+        }
+        i = i + 1
+    }
+    i = 0
+    for i < len(g.units) {
+        if g.live[i] != 0 {
+            out = out + wjoin(g.units[i].cp)
+        }
+        i = i + 1
+    }
+    i = 0
+    for i < len(g.units) {
+        if g.live[i] != 0 {
+            out = out + wjoin(g.units[i].vt)
+        }
+        i = i + 1
+    }
+    i = 0
+    for i < len(g.units) {
+        if g.live[i] != 0 {
+            out = out + wjoin(g.units[i].fb)
+        }
+        i = i + 1
+    }
+    i = 0
+    for i < len(g.units) {
+        if g.live[i] != 0 {
+            out = out + wjoin(g.units[i].ob)
+        }
+        i = i + 1
+    }
+    i = 0
+    for i < len(g.units) {
+        if g.live[i] != 0 {
+            out = out + wjoin(g.units[i].cb)
+        }
+        i = i + 1
+    }
+    return out + "rt.__oxl_boot(oxl_main)\n"
+}
+
+// emit_js is the library entry mirroring emit() — same CkRes in,
+// one ES-module text out.
+fn emit_js(r: own check.CkRes, testm: int) -> str {
+    g := new(G)
+    g.ck = r.ck
+    g.its = r.items
+    g.fidx = collections.map_new()
+    i := 0
+    for i < len(g.its) {
+        if check.nk(g.its[i].node) == 24 {
+            match g.its[i].node {
+                parser.Node.Fn{name, recv} => {
+                    gset_ctx(g, i)
+                    collections.map_set(g.fidx, check.fn_qname(g.ck, g.its[i].mod, recv, name), i)
+                }
+                _ => {
+                }
+            }
+        }
+        i = i + 1
+    }
+    g.env = check.env_new()
+    g.benv = check.env_new()
+    g.fsl = check.env_new()
+    g.w = mkslice(str, 0)
+    g.wst = nil
+    g.wlast = mkslice(str, 0)
+    g.head = mkslice(str, 0)
+    g.out = mkslice(str, 0)
+    g.tramp = mkslice(str, 0)
+    g.fhead = mkslice(str, 0)
+    g.fbody = mkslice(str, 0)
+    g.clpro = mkslice(str, 0)
+    g.clbod = mkslice(str, 0)
+    g.ginit = mkslice(str, 0)
+    g.defers = nil
+    g.fnv = nil
+    g.fdecls = mkslice(str, 0)
+    g.sdecls = mkslice(str, 0)
+    g.states = mkslice(int, 0)
+    g.loops = mkslice(GLab, 0)
+    g.sopen = mkslice(int, 0)
+    g.tmpn = 0
+    g.scopen = 0
+    g.cln = 0
+    g.staten = 0
+    g.labeln = 0
+    g.hoistn = 0
+    g.retk = 0
+    g.cret = -1
+    g.subst = nil
+    g.drop_tys = mkslice(str, 0)
+    g.drop_word = 0
+    g.drop_slice = 0
+    g.insts = nil
+    g.inst_done = collections.map_new()
+    g.vtabs = nil
+    g.vtab_set = collections.map_new()
+    g.vout = mkslice(str, 0)
+    g.cur = ""
+    g.inframe = 0
+    g.maink = 0
+    g.testm = testm
+    g.units = mkslice(GUnit, 0)
+    g.dpos = collections.map_new()
+    g.dchain = mkslice(int, 0)
+    g.uhits = mkslice(int, 0)
+    g.live = mkslice(int, 0)
+    return jgenall(g)
+}
+
+// ---------- expr dispatcher ----------
+
+fn jx(g: mut G, e: ref parser.Node) -> str {
+    if e == nil {
+        return "null"
+    }
+    out := match e {
+        parser.Node.JInt(v) => itoa(v) + "n",
+        parser.Node.JFloat(v) => v,
+        parser.Node.JStr(v) => "rt.rt_str_lit(\"" + base64.encode(v as []byte) + "\")",
+        parser.Node.Name{n} => jxname(g, n),
+        parser.Node.Call{f, args} => jcall(g, f, args),
+        parser.Node.Field{obj, name} => jxfield(g, obj, name),
+        parser.Node.Lit{obj, fields} => jxlit(g, obj, fields),
+        parser.Node.As{e, ty} => jxas(g, e, ty),
+        parser.Node.Bin{op, l, r} => jxbin(g, op, l, r, e),
+        parser.Node.Un{op, e} => jxun(g, op, e),
+        parser.Node.Match{e, arms} => jmatch(g, e, arms),
+        parser.Node.Index{obj, idx} => jxindex(g, obj, idx),
+        parser.Node.Slice{obj, lo, hi} => jxslice(g, obj, lo, hi),
+        parser.Node.Closure{params, body} => jclosure(g, params, body),
+        _ => "null"
+    }
+    return out
+}

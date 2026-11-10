@@ -5854,12 +5854,15 @@ fn emit(r: own check.CkRes, testm: int) -> str {
 // thin main is a one-line call.
 fn run() {
     testm := 0
+    jsm := 0
     file := ""
     ai := 1
     for ai < argc() {
         a := argv(ai)
         if a == "--test" {
             testm = 1
+        } else if a == "--js" {
+            jsm = 1
         } else {
             file = a
         }
@@ -5879,5 +5882,9 @@ fn run() {
         }
         exit(1)
     }
-    print(emit(r, testm))
+    if jsm == 1 {
+        print(emit_js(r, testm))
+    } else {
+        print(emit(r, testm))
+    }
 }

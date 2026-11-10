@@ -344,6 +344,31 @@ static void park_add(RtTask *t, RtScope *s, void *obj, int kind) {
     oxl_mu_unlock(&s->mu);
 }
 
+/* park registration + cancel check under one s->mu hold — the same
+ * pattern sleep_poll uses: a wake walk that ran before the insert left
+ * cancel set and no wake behind, so the caller must unwind instead of
+ * returning PENDING forever. Returns 1 when the scope was already
+ * cancelled (task NOT registered); the caller owns the exit. */
+static int park_add_scoped(RtTask *t, void *obj, int kind) {
+    RtScope *s = t->scope;
+    if (!s) { t->parked = 1; t->waitobj = obj; t->waitkind = kind; return 0; }
+    int cancelled = 0;
+    oxl_mu_lock(&s->mu);
+    if (s->cancel) {
+        cancelled = 1;
+    } else {
+        task_ref(t);
+        t->parked = 1;
+        t->park_scope = s;
+        t->waitobj = obj;
+        t->waitkind = kind;
+        t->pnext = s->parked;
+        s->parked = t;
+    }
+    oxl_mu_unlock(&s->mu);
+    return cancelled;
+}
+
 /* drop `t` from its scope's parked list (idempotent hygiene; the claim
  * itself is the CAS on `parked`) */
 static void park_del(RtTask *t) {
@@ -1520,11 +1545,12 @@ static int sel_fire(RtChan *ch, int64_t v) {
 }
 
 /* park a frame receiver: node = the task itself on recvq */
-static void chan_park_recv(RtChan *ch, RtTask *t) {
-    park_add(t, t->scope, ch, WK_RECV);
+static int chan_park_recv(RtChan *ch, RtTask *t) {
+    if (park_add_scoped(t, ch, WK_RECV)) return 1;
     task_ref(t); /* the recvq node's ref — leaves with the node */
     t->next = ch->recvq;
     ch->recvq = t;
+    return 0;
 }
 
 /* pop the first claimable parked receiver. ch->mu held; on success the
@@ -1780,7 +1806,12 @@ int rt_recv_poll(RtChan *ch, RtTask *t) {
         oxl_mu_unlock(&ch->mu);
         return RT_READY;
     }
-    chan_park_recv(ch, t);
+    if (chan_park_recv(ch, t)) {
+        /* cancelled before registration: no wake walk will ever find
+         * us — unwind now instead of parking forever */
+        oxl_mu_unlock(&ch->mu);
+        task_unwind();
+    }
     oxl_mu_unlock(&ch->mu);
     return RT_PENDING;
 }
@@ -1822,13 +1853,19 @@ int rt_send_poll(RtChan *ch, int64_t v, RtTask *t) {
         oxl_mu_unlock(&ch->mu);
         return RT_READY;
     }
+    if (park_add_scoped(t, ch, WK_SEND)) {
+        /* cancelled before registration: the payload never delivered —
+         * reclaim it through the chan thunk like a cancel-wake does */
+        oxl_mu_unlock(&ch->mu);
+        if (ch->drop_elem) ch->drop_elem(v);
+        task_unwind();
+    }
     SendReq *sr = xmalloc(sizeof *sr);
     sr->t = t;
     sr->v = v;
     sr->next = ch->sendq;
     ch->sendq = sr;
     task_ref(t); /* the sendq node's ref — leaves with the node */
-    park_add(t, t->scope, ch, WK_SEND);
     oxl_mu_unlock(&ch->mu);
     return RT_PENDING;
 }
@@ -2225,7 +2262,18 @@ int rt_select_poll(RtChan **chs, int n, int64_t tmo_ms, int has_else, RtTask *t)
     s->t = t;
     task_ref(t); /* the RtSel's ref — released when s is freed */
     t->sel = s;
-    park_add(t, t->scope, s, WK_SEL);
+    if (park_add_scoped(t, s, WK_SEL)) {
+        /* cancelled before registration: nothing armed yet — unlock,
+         * drop the RtSel ref, and unwind rather than park forever */
+        for (int i = 0; i < n; i++)
+            if (i == 0 || sorted[i] != sorted[i - 1])
+                oxl_mu_unlock(&sorted[i]->mu);
+        free(sorted);
+        t->sel = NULL;
+        task_unref(t);
+        free(s);
+        task_unwind();
+    }
     for (int i = 0; i < n; i++) {
         s->w[i].sel = s;
         s->w[i].slot = i;

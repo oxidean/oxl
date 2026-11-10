@@ -1702,4 +1702,14 @@ else
     echo "  (skipped: gtk4 not installed)"
 fi
 
+echo "== w1 js runtime smoke =="
+# node-gated: the hand-written driver exercises the rt.mjs poll
+# contract (spawn/scope/trap/defer/chan/err) — W1's suite gate;
+# skips cleanly where node is absent
+if command -v node >/dev/null 2>&1; then
+    node tests/js/rt-core-smoke.mjs || { echo "FAIL rt-core-smoke"; exit 1; }
+else
+    echo "  (skipped: node not installed)"
+fi
+
 echo "ALL TESTS PASSED"

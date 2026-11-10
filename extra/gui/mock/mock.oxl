@@ -17,6 +17,8 @@ import "std/sync"
 // `msleep` would need a task frame the vtable lacks
 extern fn rt_msleep(ms: int)
 
+extern fn rt_str_free(s: str)
+
 // ---- recorded protocol log ----
 struct LE { what: str, h: int, arg: int, next: own LE }
 
@@ -387,11 +389,15 @@ fn (m Mock) exec(c: own gui.Cmd) {
         r2 := new(gui.CmdResult)
         r2.e = nil
         r2.handle = 0
+        s := ""
+        owned := 0
         match v {
             gui.PropVal.Text(t) => {
                 // reply strs are per-reply own copies — the store's
                 // backing stays with the store; read_prop frees this one
-                r2.val = gui.PropVal.Text(gui.str_own(t))
+                s = gui.str_own(t)
+                owned = 1
+                r2.val = gui.PropVal.Text(s)
             }
             gui.PropVal.Flag(f) => {
                 r2.val = gui.PropVal.Flag(f)
@@ -400,7 +406,11 @@ fn (m Mock) exec(c: own gui.Cmd) {
                 r2.val = gui.PropVal.Num(n)
             }
         }
-        try_send(c.reply, r2)
+        // a lost reply drops the envelope but not the embedded str
+        // word's backing — release our copy ourselves
+        if !try_send(c.reply, r2) && owned == 1 {
+            rt_str_free(s)
+        }
         return
     }
 }

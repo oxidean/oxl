@@ -321,6 +321,14 @@ fn (b mut EventBuf) post(e: own Event) -> int {
             b.wt = wt_set(b.wt, e.target, 2, 1)
         }
     }
+    match e.data {
+        EventData.Text(t) => {
+            // intern before the coalesce check too — a queued survivor
+            // must hold the owned copy, not the poster's borrowed str
+            e.data = EventData.Text(eb_intern_l(b, t))
+        }
+        _ => {}
+    }
     if e.kind == EventKind.text_changed && b.q != nil {
         if b.q.v.kind == EventKind.text_changed && b.q.v.target == e.target {
             b.q.v = e
@@ -328,12 +336,6 @@ fn (b mut EventBuf) post(e: own Event) -> int {
             try_send(b.ping, 1)
             return 1
         }
-    }
-    match e.data {
-        EventData.Text(t) => {
-            e.data = EventData.Text(eb_intern_l(b, t))
-        }
-        _ => {}
     }
     elig := ev_eligible(b, e)
     if elig == 1 && b.elig >= b.cap {
@@ -572,6 +574,50 @@ let g_rp: own PN = nil
 let g_rp_n: int = 0
 let g_rp_mu: shared = nil
 
+struct SC { s: shared, next: own SC }
+
+let g_cells: own SC = nil
+let g_cells_n: int = 0
+let g_cell_mu: shared = nil
+
+// flag cells for per-call sent/settled markers — mkshared has no free
+// path, so one-shot cells would grow the heap with UI activity. Pool
+// like the reply chans: bounded by peak in-flight calls, val reset on
+// take; pooled cells are kept, never freed.
+fn cell_take() -> shared {
+    if g_cell_mu != nil {
+        sync.mlock(g_cell_mu)
+        n := g_cells
+        if n != nil {
+            g_cells = n.next
+            g_cells_n = g_cells_n - 1
+        }
+        sync.munlock(g_cell_mu)
+        if n != nil {
+            sset(n.s, 0)
+            return n.s
+        }
+    }
+    return mkshared(0)
+}
+
+fn cell_put(s: shared) {
+    if g_cell_mu == nil {
+        return
+    }
+    sync.mlock(g_cell_mu)
+    if g_cells_n >= 16 {
+        sync.munlock(g_cell_mu)
+        return
+    }
+    n := new(SC)
+    n.s = s
+    n.next = g_cells
+    g_cells = n
+    g_cells_n = g_cells_n + 1
+    sync.munlock(g_cell_mu)
+}
+
 // a cap-1 chan per round trip — drawn from the pool when one is
 // available, else smkchan'd fresh against the mailbox scope
 fn reply_chan() -> chan own CmdResult {
@@ -623,9 +669,11 @@ fn reply_pool_put(rc: chan own CmdResult) {
 // flips the backend's try_send to false so its reconcile runs
 fn reply_done(rc: chan own CmdResult, settled: shared) {
     if sget(settled) != 0 {
+        cell_put(settled)
         reply_pool_put(rc)
         return
     }
+    cell_put(settled)
     close(rc)
 }
 
@@ -732,17 +780,19 @@ fn credit_unless(sent: shared, n: int) {
     if sget(sent) == 0 {
         g_eb.add_dropped(n)
     }
+    cell_put(sent)
 }
 
 fn credit_marker(sent: shared, n: int) {
     if sget(sent) == 0 {
         g_eb.add_dp(n)
     }
+    cell_put(sent)
 }
 
 // blocking send of the overflow marker; a cancelled send credits n back.
 fn send_marked(n: int) {
-    sent := mkshared(0)
+    sent := cell_take()
     defer credit_marker(sent, n)
     m := new(Event)
     m.kind = EventKind.overflow
@@ -754,7 +804,7 @@ fn send_marked(n: int) {
 
 // blocking send of one event; a cancelled send counts it as dropped.
 fn send_event(e: own Event) {
-    sent := mkshared(0)
+    sent := cell_take()
     defer credit_unless(sent, 1)
     send(g_sess.events, e)
     sset(sent, 1)
@@ -897,6 +947,10 @@ fn run(b: Backend, app: fn(chan own Event)) -> err {
     g_rp = nil
     g_rp_n = 0
     g_rp_mu = sync.mutex()
+
+    g_cells = nil
+    g_cells_n = 0
+    g_cell_mu = sync.mutex()
 
     spawn watcher(b, g_sess.retire)
     scope {
@@ -1070,7 +1124,7 @@ fn create(kind: WidgetKind, parent: int, props: own []Prop) -> [int, err] {
     // mid-recv or an early error flips the backend's try_send to false
     // so its reconcile runs; a resolved recv re-pools the open+drained
     // chan instead (see reply_done)
-    settled := mkshared(0)
+    settled := cell_take()
     defer reply_done(rc, settled)
     c := mk_cmd(CmdKind.new_kind, parent, 0)
     c.widget = kind
@@ -1244,7 +1298,7 @@ fn read_prop(h: int, id: int) -> [PropVal, err] {
         return PropVal.Num(0), err_stopped()
     }
     rc := reply_chan()
-    settled := mkshared(0)
+    settled := cell_take()
     defer reply_done(rc, settled)
     c := mk_cmd(CmdKind.read, h, 0)
     c.prop = Prop{id: id, val: PropVal.Num(0)}

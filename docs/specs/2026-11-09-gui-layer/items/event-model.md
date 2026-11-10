@@ -298,9 +298,13 @@ its first selftest):
   reply publication must be non-suspending and a blocking `send`
   is off the table there. The ownership contract is pinned
   regardless of payload kind: `true` moves the value in, `false`
-  leaves ownership with the caller (retry or drop is its choice)
-  — a conditional-move the checker special-cases on the builtin,
-  exactly like the cancelled-send revert below. For the `reply`
+  leaves a plain-word payload untouched and drops an `own`
+  payload through the chan's drop thunk — the send is statically
+  a move either way, so the `false` caller reconciles side
+  effects rather than retrying the value. (The originally
+  considered conditional-move — `false` returning ownership —
+  needed a checker special-case on the builtin; v0 keeps the
+  single move rule, matching the cancelled-send revert below.) For the `reply`
   use the `false` branch is unreachable by construction: each
   cap-1 reply chan is allocated fresh per `Cmd` and receives
   exactly one send. A non-`own` `false` branch is unambiguous for

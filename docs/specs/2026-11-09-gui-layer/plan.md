@@ -30,7 +30,9 @@ you want verdicted, and again after the last fix commit.
       covering `chan own T` payloads too: `pump`'s reply publication
       must be non-suspending (iface methods can't suspend across a
       vtable), so `try_send` on `chan own CmdResult` is the legal
-      reply path — `true` moves the payload, `false` retains it.
+      reply path — `true` moves the payload, `false` drops an
+      `own` payload via the chan thunk (statically a move; the
+      caller reconciles rather than retries).
       Also here: the runtime marks the task `rt_run_root` is
       ENTERED for (`is_root` — `external` can't discriminate the
       root task from `rt_spawnb_task` tasks) so `gui.run`'s

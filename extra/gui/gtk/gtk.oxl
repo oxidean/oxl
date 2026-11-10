@@ -31,6 +31,8 @@ extern fn gx_read_str(h: int, id: int) -> cstr
 
 extern fn gx_read_has(h: int, id: int) -> int
 
+extern fn rt_str_free(s: str)
+
 extern fn gx_read_num(h: int, id: int) -> int
 
 extern fn gx_attach(parent: int, child: int)
@@ -289,11 +291,18 @@ fn (g Gtk) exec(c: own gui.Cmd) {
         if gx_read_has(c.target, c.prop.id) == 0 {
             r2.e = errors.new("gui/gtk: unsupported prop")
             r2.val = gui.PropVal.Num(0)
-        } else {
-            r2.e = nil
-            r2.val = gui.PropVal.Text(gui.str_own(str(gx_read_str(c.target, c.prop.id))))
+            try_send(c.reply, r2)
+            return
         }
-        try_send(c.reply, r2)
+        // own copy crosses the reply boundary — a lost reply drops the
+        // envelope through the chan thunk but the embedded str word
+        // stays a word, so its backing is ours to release
+        s := gui.str_own(str(gx_read_str(c.target, c.prop.id)))
+        r2.e = nil
+        r2.val = gui.PropVal.Text(s)
+        if !try_send(c.reply, r2) {
+            rt_str_free(s)
+        }
         return
     }
 }

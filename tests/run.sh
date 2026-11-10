@@ -1702,4 +1702,88 @@ else
     echo "  (skipped: gtk4 not installed)"
 fi
 
+echo "== toolchain shim + version manager (i60) =="
+# offline shim suite: fake installed toolchains, no network. Asserts
+# the spec's resolution order (env > .oxl-version > oxl.mod toolchain
+# > default), the 127-on-missing contract, and every `oxl toolchain`
+# verb staying inside the shim.
+tch="$scratch/tchome"; mkdir -p "$tch"
+for v in v0.1.0 v0.2.0; do
+    mkdir -p "$tch/versions/$v/oxl-toolchain"
+    printf '#!/bin/sh\necho "FAKE %s $@"\n' "$v" > "$tch/versions/$v/oxl-toolchain/oxl"
+    chmod +x "$tch/versions/$v/oxl-toolchain/oxl"
+done
+echo v0.1.0 > "$tch/default-version"
+# the shim embeds in install.sh — --shim-only extracts it without a download
+OXL_HOME="$tch" sh scripts/install.sh --shim-only >/dev/null
+SHIM="$tch/bin/oxl"
+tcw="$scratch/tcwork"; mkdir -p "$tcw/proj"
+
+# default resolution (bare dir, no config anywhere)
+out=$(cd "$tcw" && OXL_HOME="$tch" "$SHIM" check x)
+[ "$out" = "FAKE v0.1.0 check x" ] || { echo "FAIL shim default: $out"; exit 1; }
+# env beats everything
+out=$(cd "$tcw" && OXL_HOME="$tch" OXL_TOOLCHAIN=v0.2.0 "$SHIM" run)
+[ "$out" = "FAKE v0.2.0 run" ] || { echo "FAIL shim env: $out"; exit 1; }
+# oxl.mod toolchain directive beats default (walk-up from proj/)
+printf 'module example.com/m\n\noxl 0.3\ntoolchain v0.2.0\n' > "$tcw/oxl.mod"
+out=$(cd "$tcw/proj" && OXL_HOME="$tch" "$SHIM" build)
+[ "$out" = "FAKE v0.2.0 build" ] || { echo "FAIL shim directive: $out"; exit 1; }
+# .oxl-version beats a NEARER oxl.mod directive — precedence, not proximity
+echo v0.1.0 > "$tcw/proj/.oxl-version"
+out=$(cd "$tcw/proj" && OXL_HOME="$tch" "$SHIM" build)
+[ "$out" = "FAKE v0.1.0 build" ] || { echo "FAIL shim dotfile-precedence: $out"; exit 1; }
+# nearer oxl.mod without a pin shadows an ancestor's directive
+mkdir -p "$tcw/proj/inner"
+printf 'module example.com/inner\n\noxl 0.3\n' > "$tcw/proj/inner/oxl.mod"
+rm "$tcw/proj/.oxl-version"
+out=$(cd "$tcw/proj/inner" && OXL_HOME="$tch" "$SHIM" build)
+[ "$out" = "FAKE v0.1.0 build" ] || { echo "FAIL shim mod-shadow: $out"; exit 1; }
+# missing resolved version -> exit 127 with the install hint
+rc=0
+out=$(cd "$tcw" && OXL_HOME="$tch" OXL_TOOLCHAIN=v9.9.9 "$SHIM" build 2>&1) || rc=$?
+[ "$rc" = 127 ] && grep -q "toolchain install v9.9.9" <<<"$out" || {
+    echo "FAIL shim missing-127: rc=$rc $out"; exit 1; }
+# verbs: list marks the default; use flips it; current names the source
+out=$(OXL_HOME="$tch" "$SHIM" toolchain list)
+grep -q '^v0.1.0 (default)$' <<<"$out" && grep -q '^v0.2.0$' <<<"$out" || {
+    echo "FAIL toolchain list: $out"; exit 1; }
+out=$(OXL_HOME="$tch" "$SHIM" toolchain use v0.2.0)
+[ "$(cat "$tch/default-version")" = "v0.2.0" ] || { echo "FAIL toolchain use"; exit 1; }
+out=$(cd "$tcw/proj/inner" && OXL_HOME="$tch" "$SHIM" toolchain current)
+grep -q '^v0.2.0.*default-version' <<<"$out" || { echo "FAIL toolchain current: $out"; exit 1; }
+# use --local writes ./.oxl-version; uninstall refuses the default, --force wins
+out=$(cd "$tcw/proj" && OXL_HOME="$tch" "$SHIM" toolchain use --local v0.1.0)
+[ "$(cat "$tcw/proj/.oxl-version")" = "v0.1.0" ] || { echo "FAIL use --local"; exit 1; }
+rc=0
+out=$(OXL_HOME="$tch" "$SHIM" toolchain uninstall v0.2.0 2>&1) || rc=$?
+[ "$rc" != 0 ] && grep -q "is the default" <<<"$out" || {
+    echo "FAIL uninstall-default-guard: rc=$rc $out"; exit 1; }
+out=$(OXL_HOME="$tch" "$SHIM" toolchain uninstall v0.2.0 --force)
+[ ! -d "$tch/versions/v0.2.0" ] || { echo "FAIL uninstall --force"; exit 1; }
+# `version` is a real-binary verb reporting the RELEASE file stamp
+# (else dev) — probe it on the actual drivers
+out=$("$OXL" version)
+grep -qE '^oxl (dev|v[0-9]+\.[0-9]+\.[0-9]+) \(language [0-9]+\.[0-9]+\)$' <<<"$out" || {
+    echo "FAIL self version shape: $out"; exit 1; }
+out=$("$SEEDOXL" version)
+grep -qE '^oxl (dev|v[0-9]+\.[0-9]+\.[0-9]+) \(language [0-9]+\.[0-9]+\)$' <<<"$out" || {
+    echo "FAIL seed version shape: $out"; exit 1; }
+# RELEASE stamp is picked up beside the exe
+cp "$OXL" "$scratch/oxl-stamp$EXE" && echo v7.7.7 > "$scratch/RELEASE"
+out=$("$scratch/oxl-stamp$EXE" version)
+[ "$out" = "oxl v7.7.7 (language 0.3)" ] || { echo "FAIL version stamp: $out"; exit 1; }
+# a manifest carrying `toolchain` builds clean on both drivers
+printf 'module example.com/tc\n\noxl 0.3\ntoolchain v0.9.0\n' > "$tcw/proj/inner/oxl.mod"
+printf 'package main\n\nfn main() { println("tc") }\n' > "$tcw/proj/inner/main.oxl"
+out=$("$OXL" run "$tcw/proj/inner" 2>&1)
+[ "$out" = "tc" ] || { echo "FAIL self toolchain-manifest: $out"; exit 1; }
+out=$("$SEEDOXL" run "$tcw/proj/inner" 2>&1)
+[ "$out" = "tc" ] || { echo "FAIL seed toolchain-manifest: $out"; exit 1; }
+# and `mod tidy` preserves the directive
+rm "$tcw/proj/inner/main.oxl"
+(cd "$tcw/proj/inner" && "$OXL" mod tidy >/dev/null 2>&1)
+grep -q '^toolchain v0.9.0$' "$tcw/proj/inner/oxl.mod" || {
+    echo "FAIL tidy preserves toolchain"; cat "$tcw/proj/inner/oxl.mod"; exit 1; }
+
 echo "ALL TESTS PASSED"

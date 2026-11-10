@@ -75,6 +75,9 @@ let P_TITLE = 2
 
 let P_PLACEHOLDER = 3
 
+// read-only: row count of a list widget
+let P_ROWS = 4
+
 // ---- knobs (set before run) ----
 let g_event_cap = 256
 
@@ -768,6 +771,10 @@ struct Button { h: int }
 
 struct Entry { h: int }
 
+struct List { h: int }
+
+struct Scrolled { h: int }
+
 fn (w Window) handle() -> int {
     return w.h
 }
@@ -814,6 +821,22 @@ fn (e Entry) handle() -> int {
 
 fn (e Entry) kind() -> WidgetKind {
     return WidgetKind.entry
+}
+
+fn (l List) handle() -> int {
+    return l.h
+}
+
+fn (l List) kind() -> WidgetKind {
+    return WidgetKind.list
+}
+
+fn (s Scrolled) handle() -> int {
+    return s.h
+}
+
+fn (s Scrolled) kind() -> WidgetKind {
+    return WidgetKind.scrolled
 }
 
 // ---- creation ----
@@ -898,6 +921,22 @@ fn entry(placeholder: str) -> [Entry, err] {
         return Entry{h: 0}, e
     }
     return Entry{h: h}, nil
+}
+
+fn list() -> [List, err] {
+    [h, e] = create(WidgetKind.list, 0, nil)
+    if e != nil {
+        return List{h: 0}, e
+    }
+    return List{h: h}, nil
+}
+
+fn scrolled() -> [Scrolled, err] {
+    [h, e] = create(WidgetKind.scrolled, 0, nil)
+    if e != nil {
+        return Scrolled{h: 0}, e
+    }
+    return Scrolled{h: h}, nil
 }
 
 // ---- tree ops ----
@@ -997,6 +1036,22 @@ fn (e Entry) text() -> [str, err] {
         }
         PropVal.Num(n) => {
             return "", err_gone()
+        }
+    }
+}
+
+// current row count — read-only, always live on the backend
+fn (l List) rows() -> [int, err] {
+    [v, e] = read_prop(l.h, P_ROWS)
+    if e != nil {
+        return 0, e
+    }
+    match v {
+        PropVal.Num(n) => {
+            return n, nil
+        }
+        _ => {
+            return 0, errors.new("gui: unexpected P_ROWS payload")
         }
     }
 }

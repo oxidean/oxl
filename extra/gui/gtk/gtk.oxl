@@ -1,0 +1,376 @@
+package gtk
+
+// extra/gui/gtk — GTK4 backend over gtk_shim.c (spec G2).
+//
+// Handles are the shim's monotonic int64s. Toolkit signals never
+// enter oxl directly: the shim's trampolines push raw triples onto a
+// C ring, and pump marshals them into gui.Events between Cmd drains —
+// all GTK access stays on the root task. Non-shim state (the alive
+// set feeding dead-handle checks and the exit sweep) is touched only
+// on the pump task; stop/wake cross tasks via the shared flag and
+// gx_wake.
+//
+// The shim compiles once per app build:
+//   cc -O2 $(pkg-config --cflags gtk4) -c extra/gui/gtk/gtk_shim.c -o gtk_shim.o
+//   LANG_LDFLAGS="gtk_shim.o $(pkg-config --libs gtk4)" oxl build app.oxl
+import "std/errors"
+
+import "github.com/oxidean/oxl/extra/gui"
+
+extern fn gx_init()
+
+extern fn gx_create(kind: int) -> int
+
+extern fn gx_destroy(h: int)
+
+extern fn gx_set_text(h: int, id: int, s: str)
+
+extern fn gx_read_str(h: int, id: int) -> cstr
+
+extern fn gx_read_has(h: int, id: int) -> int
+
+extern fn gx_read_num(h: int, id: int) -> int
+
+extern fn gx_attach(parent: int, child: int)
+
+extern fn gx_detach(parent: int, child: int)
+
+extern fn gx_iter(may_block: int)
+
+extern fn gx_wake()
+
+extern fn gx_ev_next() -> int
+
+extern fn gx_ev_kind() -> int
+
+extern fn gx_ev_aux() -> int
+
+// shim event codes
+let E_CLICKED = 1
+
+let E_ACTIVATED = 2
+
+let E_TEXT_CHANGED = 3
+
+let E_CLOSE_REQUESTED = 4
+
+let E_ROW_ACTIVATED = 5
+
+// shim widget kinds — mirror kind order in gui.WidgetKind
+fn kind_to_i(k: gui.WidgetKind) -> int {
+    match k {
+        gui.WidgetKind.window => {
+            return 1
+        }
+        gui.WidgetKind.vbox => {
+            return 2
+        }
+        gui.WidgetKind.hbox => {
+            return 3
+        }
+        gui.WidgetKind.label => {
+            return 4
+        }
+        gui.WidgetKind.button => {
+            return 5
+        }
+        gui.WidgetKind.entry => {
+            return 6
+        }
+        gui.WidgetKind.list => {
+            return 7
+        }
+        gui.WidgetKind.scrolled => {
+            return 8
+        }
+    }
+}
+
+// ---- backend ----
+struct Gtk { stopf: shared }
+
+struct AH { h: int, next: own AH }
+
+// live-handle set — pump-task only; feeds dead-handle reconcile and
+// the exit sweep.
+let g_alive: own AH = nil
+
+fn al_add(h: int) {
+    a := new(AH)
+    a.h = h
+    a.next = g_alive
+    g_alive = a
+}
+
+fn al_has(h: int) -> int {
+    l := g_alive
+    for l != nil {
+        if l.h == h {
+            return 1
+        }
+        l = l.next
+    }
+    return 0
+}
+
+fn al_del(h: int) {
+    let out: own AH = nil
+    l := g_alive
+    for l != nil {
+        n := l.next
+        if l.h == h {
+            l.next = nil
+        } else {
+            l.next = out
+            out = l
+        }
+        l = n
+    }
+    g_alive = out
+}
+
+// the backend: gtk_init runs on the calling (root) task — same thread
+// pump later iterates on.
+fn backend() -> Gtk {
+    gx_init()
+    return Gtk{stopf: mkshared(0)}
+}
+
+// dev gate (stderr): every iface method except stop/wake must run on
+// the root task — gui.run guarantees it via is_root, so a violation
+// means a caller reached the iface directly. Reported, not fatal —
+// protocol violations are development aids per backend-protocol.md.
+fn aff_check(what: str) {
+    if !is_root() {
+        println("gui/gtk: " + what + " off the root task — call through gui.run only")
+    }
+}
+
+// ---- iface methods ----
+
+// props apply in order post-create — creation cannot fail for a
+// known kind (no display means gtk_init already aborted).
+fn (g Gtk) new(kind: gui.WidgetKind, props: own []gui.Prop) -> [int, err] {
+    aff_check("new")
+    ki := kind_to_i(kind)
+    h := gx_create(ki)
+    if h == 0 {
+        return 0, errors.new("gui/gtk: unknown widget kind")
+    }
+    if props != nil {
+        i := 0
+        for i < len(props) {
+            g.set_prop(h, props[i])
+            i = i + 1
+        }
+    }
+    al_add(h)
+    return h, nil
+}
+
+// text-valued props only today; a wrong-kind set reaches the shim,
+// which reports it to stderr (the dev gate).
+fn (g Gtk) set_prop(h: int, p: gui.Prop) {
+    aff_check("set_prop")
+    match p.val {
+        gui.PropVal.Text(s) => {
+            gx_set_text(h, p.id, s)
+        }
+        _ => {
+            println("gui/gtk: non-text prop write unsupported")
+        }
+    }
+}
+
+fn (g Gtk) attach(parent: int, child: int) {
+    gx_attach(parent, child)
+}
+
+fn (g Gtk) detach(parent: int, child: int) {
+    gx_detach(parent, child)
+}
+
+fn (g Gtk) destroy(h: int) {
+    if al_has(h) == 1 {
+        al_del(h)
+    }
+    gx_destroy(h)
+}
+
+// exec one Cmd on the pump task — same reconcile rules as the mock:
+// a dead parent resolves err_gone before create, and a lost reply
+// (try_send false) destroys the just-created handle on the spot.
+fn (g Gtk) exec(c: own gui.Cmd) {
+    if c.kind == gui.CmdKind.new_kind {
+        if c.target != 0 && al_has(c.target) == 0 {
+            r := new(gui.CmdResult)
+            r.e = gui.err_gone()
+            r.handle = 0
+            r.val = gui.PropVal.Num(0)
+            try_send(c.reply, r)
+            return
+        }
+        [h, e] = g.new(c.widget, c.props)
+        if e != nil {
+            r := new(gui.CmdResult)
+            r.e = e
+            r.handle = 0
+            r.val = gui.PropVal.Num(0)
+            try_send(c.reply, r)
+            return
+        }
+        if c.target != 0 {
+            g.attach(c.target, h)
+        }
+        r2 := new(gui.CmdResult)
+        r2.e = nil
+        r2.handle = h
+        r2.val = gui.PropVal.Num(0)
+        if !try_send(c.reply, r2) {
+            g.destroy(h)
+        }
+        return
+    }
+    if c.kind == gui.CmdKind.set_prop {
+        g.set_prop(c.target, c.prop)
+        return
+    }
+    if c.kind == gui.CmdKind.attach {
+        g.attach(c.target, c.arg)
+        return
+    }
+    if c.kind == gui.CmdKind.detach {
+        g.detach(c.target, c.arg)
+        return
+    }
+    if c.kind == gui.CmdKind.destroy {
+        g.destroy(c.target)
+        return
+    }
+    if c.kind == gui.CmdKind.dismiss_close {
+        // veto already held at the shim — nothing to release; the
+        // window survives per the contract.
+        return
+    }
+    if c.kind == gui.CmdKind.read {
+        if al_has(c.target) == 0 {
+            r := new(gui.CmdResult)
+            r.e = gui.err_gone()
+            r.handle = 0
+            r.val = gui.PropVal.Num(0)
+            try_send(c.reply, r)
+            return
+        }
+        if c.prop.id == gui.P_ROWS {
+            n := gx_read_num(c.target, c.prop.id)
+            r := new(gui.CmdResult)
+            r.handle = 0
+            if n < 0 {
+                r.e = errors.new("gui/gtk: P_ROWS on non-list")
+                r.val = gui.PropVal.Num(0)
+            } else {
+                r.e = nil
+                r.val = gui.PropVal.Num(n)
+            }
+            try_send(c.reply, r)
+            return
+        }
+        r2 := new(gui.CmdResult)
+        r2.handle = 0
+        if gx_read_has(c.target, c.prop.id) == 0 {
+            r2.e = errors.new("gui/gtk: unsupported prop")
+            r2.val = gui.PropVal.Num(0)
+        } else {
+            r2.e = nil
+            r2.val = gui.PropVal.Text(str(gx_read_str(c.target, c.prop.id)))
+        }
+        try_send(c.reply, r2)
+        return
+    }
+}
+
+// marshal one ring entry into a core Event and post it — never blocks.
+fn deliver(events: mut gui.EventBuf, h: int, k: int, aux: int) {
+    e := new(gui.Event)
+    e.target = h
+    e.data = gui.EventData.None
+    if k == E_CLICKED {
+        e.kind = gui.EventKind.clicked
+    }
+    if k == E_ACTIVATED {
+        e.kind = gui.EventKind.activated
+    }
+    if k == E_CLOSE_REQUESTED {
+        e.kind = gui.EventKind.close_requested
+    }
+    if k == E_ROW_ACTIVATED {
+        e.kind = gui.EventKind.row_activated
+        e.data = gui.EventData.Index(aux)
+    }
+    if k == E_TEXT_CHANGED {
+        e.kind = gui.EventKind.text_changed
+        if gx_read_has(h, gui.P_TEXT) == 1 {
+            e.data = gui.EventData.Text(str(gx_read_str(h, gui.P_TEXT)))
+        }
+    }
+    events.post(e)
+}
+
+// pump — the GTK main context on the root task. Each pass drains the
+// signal ring, drains pending Cmds, then runs one context iteration:
+// nonblocking while work flows (a command burst must not starve the
+// ring), blocking when idle — gx_wake/interrupts or a shim wake flag
+// left by wake()/stop() break the wait.
+fn (g Gtk) pump(events: mut gui.EventBuf, cmds: mut gui.CmdBuf) {
+    aff_check("pump")
+    for 1 == 1 {
+        for 1 == 1 {
+            h := gx_ev_next()
+            if h == 0 {
+                break
+            }
+            deliver(events, h, gx_ev_kind(), gx_ev_aux())
+        }
+        q := cmds.drain()
+        worked := 0
+        for q != nil {
+            c := q.v
+            r := q.next
+            q.next = nil
+            g.exec(c)
+            q = r
+            worked = 1
+        }
+        if sget(g.stopf) == 1 {
+            break
+        }
+        gx_iter(1 - worked)
+    }
+    g.sweep()
+}
+
+// live-handle sweep — pump never returns with live handles. Windows
+// take their children; gx_destroy's idempotence makes doubles a no-op.
+fn (g Gtk) sweep() {
+    for 1 == 1 {
+        l := g_alive
+        if l == nil {
+            return
+        }
+        h := l.h
+        al_del(h)
+        gx_destroy(h)
+    }
+}
+
+// stop — idempotent, safe from any task: set the flag and interrupt
+// the context wait so pump observes it on the next pass.
+fn (g Gtk) stop() {
+    sset(g.stopf, 1)
+    gx_wake()
+}
+
+// wake — nudge a blocked pump so a posted Cmd is seen promptly.
+fn (g Gtk) wake() {
+    gx_wake()
+}

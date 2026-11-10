@@ -144,6 +144,79 @@ fn prop_get(h: int, id: int) -> own gui.PropVal {
     return nil
 }
 
+// ---- child edges — backs the computed P_ROWS prop ----
+struct CE { parent: int, child: int, next: own CE }
+
+let g_edges: own CE = nil
+
+fn edge_count(parent: int) -> int {
+    n := 0
+    l := g_edges
+    for l != nil {
+        if l.parent == parent {
+            n = n + 1
+        }
+        l = l.next
+    }
+    return n
+}
+
+// caller holds the global lock
+fn edge_sync_rows(parent: int) {
+    prop_put(parent, gui.P_ROWS, gui.PropVal.Num(edge_count(parent)))
+}
+
+fn edge_add(parent: int, child: int) {
+    e := new(CE)
+    e.parent = parent
+    e.child = child
+    e.next = g_edges
+    g_edges = e
+    edge_sync_rows(parent)
+}
+
+fn edge_rm(parent: int, child: int) {
+    let out: own CE = nil
+    l := g_edges
+    for l != nil {
+        n := l.next
+        if l.parent == parent && l.child == child {
+            l.next = nil
+        } else {
+            l.next = out
+            out = l
+        }
+        l = n
+    }
+    g_edges = out
+    edge_sync_rows(parent)
+}
+
+// caller holds the global lock: detach h from its parent and drop the
+// subtree's edges — mirrors toolkit teardown (destroy removes a widget
+// from its parent and frees its children)
+fn edge_drop_all(h: int) {
+    let out: own CE = nil
+    l := g_edges
+    for l != nil {
+        n := l.next
+        if l.parent == h || l.child == h {
+            if l.child == h {
+                p := l.parent
+                l.next = nil
+                edge_sync_rows(p)
+            } else {
+                l.next = nil
+            }
+        } else {
+            l.next = out
+            out = l
+        }
+        l = n
+    }
+    g_edges = out
+}
+
 // ---- Backend impl ----
 fn (m Mock) new(kind: gui.WidgetKind, props: own []gui.Prop) -> [int, err] {
     mlockg()
@@ -155,10 +228,12 @@ fn (m Mock) new(kind: gui.WidgetKind, props: own []gui.Prop) -> [int, err] {
     sset(m.hnext, sget(m.hnext) + 1)
     h := sget(m.hnext)
     al_add(h)
-    i := 0
-    for i < len(props) {
-        prop_put(h, props[i].id, props[i].val)
-        i = i + 1
+    if props != nil {
+        i := 0
+        for i < len(props) {
+            prop_put(h, props[i].id, props[i].val)
+            i = i + 1
+        }
     }
     munlockg()
     return h, nil
@@ -178,12 +253,14 @@ fn (m Mock) set_prop(h: int, p: gui.Prop) {
 fn (m Mock) attach(parent: int, child: int) {
     mlockg()
     logit("attach", parent, child)
+    edge_add(parent, child)
     munlockg()
 }
 
 fn (m Mock) detach(parent: int, child: int) {
     mlockg()
     logit("detach", parent, child)
+    edge_rm(parent, child)
     munlockg()
 }
 
@@ -191,6 +268,7 @@ fn (m Mock) destroy(h: int) {
     mlockg()
     if al_has(h) == 1 {
         al_del(h)
+        edge_drop_all(h)
         logit("destroy", h, 0)
     }
     munlockg()

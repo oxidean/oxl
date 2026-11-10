@@ -31,6 +31,11 @@ and Windows (x86_64, via MinGW gcc or LLVM clang) build from source.
    ```
 </Steps>
 
+The installer verifies each download against the release's `.sha256`
+using `sha256sum`, `shasum`, or `openssl` — first found on `PATH` —
+and `latest` resolves the newest **toolchain** release: an `extra/v*`
+extras release never shadows it.
+
 ## The version manager
 
 The `oxl` on `PATH` is a dispatch shim — multiple toolchains live side by
@@ -53,6 +58,10 @@ oxl toolchain current            # resolved tag + its source
 
 A resolved-but-missing toolchain exits with the install command that
 fixes it — nothing is auto-downloaded mid-build.
+
+`oxl toolchain` verbs live in the shim — a source-built `oxl` binary
+answers `unknown command`; only release installs under `~/.oxl` are
+managed.
 
 <Aside type="note">
 The `oxl` directive in `oxl.mod` is a **language** floor enforced by the

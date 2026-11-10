@@ -29,9 +29,12 @@ export PATH="$HOME/.oxl/bin:$PATH"
   default-version          the fallback tag
 ```
 
-The installer verifies the release's `.sha256` when one is published
-(new releases ship the sidecar; releases cut before it warn and skip).
-It never runs the toolchain — only unpacks it.
+The installer needs `curl`, `tar`, and one sha256 tool — it tries
+`sha256sum`, `shasum -a 256`, then `openssl dgst -sha256`. It verifies
+the release's `.sha256` when one is published (new releases ship the
+sidecar; releases cut before it warn and skip). With no sha256 tool on
+`PATH` it warns and skips verification — install coreutils or openssl
+for a verified install. It never runs the toolchain — only unpacks it.
 
 Prebuilt tarballs ship for **Linux x86_64**. On any other platform the
 installer stops with a pointer to [building from
@@ -47,6 +50,10 @@ dispatch to — first hit wins:
 2. `.oxl-version` — a dotfile pin, found by walking up from the cwd
 3. `toolchain vX.Y.Z` in the nearest `oxl.mod` — the project's pin
 4. `~/.oxl/default-version` — the fallback
+
+The `oxl toolchain` verbs live in the shim — a source-built `oxl`
+binary answers `unknown command`; only release installs under `~/.oxl`
+are managed.
 
 Resolution is per-command, so two projects can pin different toolchains
 and both just work:
@@ -74,7 +81,8 @@ the dispatch pin.
 
 ## Keeping the toolchain fresh
 
-`oxl toolchain install latest` fetches the newest release; `oxl
+`oxl toolchain install latest` fetches the newest **toolchain**
+release — an `extra/v*` extras release never shadows it. `oxl
 toolchain use <tag>` moves the default. Nothing is auto-installed —
 a missing version always names the command that fixes it.
 

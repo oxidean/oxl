@@ -1729,14 +1729,17 @@ out=$(cd "$tcw" && OXL_HOME="$tch" OXL_TOOLCHAIN=v0.2.0 "$SHIM" run)
 printf 'module example.com/m\n\noxl 0.3\ntoolchain v0.2.0\n' > "$tcw/oxl.mod"
 out=$(cd "$tcw/proj" && OXL_HOME="$tch" "$SHIM" build)
 [ "$out" = "FAKE v0.2.0 build" ] || { echo "FAIL shim directive: $out"; exit 1; }
-# .oxl-version beats a NEARER oxl.mod directive — precedence, not proximity
-echo v0.1.0 > "$tcw/proj/.oxl-version"
+# .oxl-version beats a NEARER oxl.mod directive — precedence, not proximity:
+# the dotfile sits FARTHER up the tree and must still win
+mv "$tcw/oxl.mod" "$tcw/proj/oxl.mod"
+echo v0.1.0 > "$tcw/.oxl-version"
 out=$(cd "$tcw/proj" && OXL_HOME="$tch" "$SHIM" build)
 [ "$out" = "FAKE v0.1.0 build" ] || { echo "FAIL shim dotfile-precedence: $out"; exit 1; }
+rm "$tcw/.oxl-version"
+mv "$tcw/proj/oxl.mod" "$tcw/oxl.mod"
 # nearer oxl.mod without a pin shadows an ancestor's directive
 mkdir -p "$tcw/proj/inner"
 printf 'module example.com/inner\n\noxl 0.3\n' > "$tcw/proj/inner/oxl.mod"
-rm "$tcw/proj/.oxl-version"
 out=$(cd "$tcw/proj/inner" && OXL_HOME="$tch" "$SHIM" build)
 [ "$out" = "FAKE v0.1.0 build" ] || { echo "FAIL shim mod-shadow: $out"; exit 1; }
 # missing resolved version -> exit 127 with the install hint

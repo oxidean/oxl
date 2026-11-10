@@ -4,7 +4,7 @@ product:
   name: oxl
   repo: oxidean/oxl
   tag_pattern: "v*"
-version: "0.8.2"
+version: "0.9.1"
 pages:
   - label: oxl
     link: /

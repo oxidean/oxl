@@ -234,6 +234,9 @@ struct RtTask {
      * a waker swaps PARKED->WAKE_REQ or plants WAKE_REQ for the driver
      * to self-enqueue when it actually leaves the C stack */
     volatile int wstate;
+    volatile int started;   /* the body/poll ran at least once — defers
+        may be registered; the cancel-before-start skip is only safe
+        once this is set (never-run tasks carry no defers to drain) */
     struct RtDefer *defers;  /* fn-scope defer stack (LIFO) */
     /* one hold per still-open inner scope + one self-hold taken while
      * settling — the frame frees when the last hold drops, so children
@@ -342,6 +345,31 @@ static void park_add(RtTask *t, RtScope *s, void *obj, int kind) {
     t->pnext = s->parked;
     s->parked = t;
     oxl_mu_unlock(&s->mu);
+}
+
+/* park registration + cancel check under one s->mu hold — the same
+ * pattern sleep_poll uses: a wake walk that ran before the insert left
+ * cancel set and no wake behind, so the caller must unwind instead of
+ * returning PENDING forever. Returns 1 when the scope was already
+ * cancelled (task NOT registered); the caller owns the exit. */
+static int park_add_scoped(RtTask *t, void *obj, int kind) {
+    RtScope *s = t->scope;
+    if (!s) { t->parked = 1; t->waitobj = obj; t->waitkind = kind; return 0; }
+    int cancelled = 0;
+    oxl_mu_lock(&s->mu);
+    if (s->cancel) {
+        cancelled = 1;
+    } else {
+        task_ref(t);
+        t->parked = 1;
+        t->park_scope = s;
+        t->waitobj = obj;
+        t->waitkind = kind;
+        t->pnext = s->parked;
+        s->parked = t;
+    }
+    oxl_mu_unlock(&s->mu);
+    return cancelled;
 }
 
 /* drop `t` from its scope's parked list (idempotent hygiene; the claim
@@ -703,6 +731,7 @@ static void run_task(RtTask *t) {
     volatile int trapped = 0;
     if (t->is_frame) {
         t->wstate = WS_ONSTACK;
+        t->started = 1;
         if (setjmp(tls_jb) == 0) {
             if (t->poll(t->frame, t) == RT_PENDING) {
                 /* leaving the C stack: a waker that already fired
@@ -720,6 +749,7 @@ static void run_task(RtTask *t) {
         }
         /* READY / CANCEL / trapped(longjmp) all land here */
     } else {
+        t->started = 1;
         if (setjmp(tls_jb) == 0) t->fn(t->arg);
         else trapped = 1;
         /* cancel-unwound (task_unwind) lands here */
@@ -786,7 +816,7 @@ static void *worker(void *_p) {
         pool.head = t->next;
         if (!pool.head) pool.tail = NULL;
         oxl_mu_unlock(&pool.mu);
-        if (!t->scope || !t->scope->cancel) run_task(t);
+        if (!t->scope || !t->scope->cancel || !t->started) run_task(t);
         else {
             /* cancelled before it ran: earlier poll rounds may still
              * have registered defers — drain them under a live setjmp
@@ -882,10 +912,12 @@ static void *task_wrap_frame(void *p) {
     volatile int trapped = 0;
     if (setjmp(tls_jb) == 0) {
         while (1) {
-            /* cancelled before it ran: settle like the pool worker
-             * instead of re-polling into a dead scope */
-            if (t->scope && t->scope->cancel) break;
+            /* cancelled after it started: settle like the pool worker.
+             * A never-started task still polls once — its body must run
+             * far enough to register the defers the unwind drains. */
+            if (t->scope && t->scope->cancel && t->started) break;
             t->wstate = WS_ONSTACK;
+            t->started = 1;
             if (t->poll(t->frame, t) != RT_PENDING) break;
             if (__sync_lock_test_and_set(&t->wstate, WS_PARKED) == WS_WAKEREQ)
                 continue; /* wake already landed */
@@ -1024,10 +1056,11 @@ int rt_run_root(RtFrame *fr) {
     volatile int trapped = 0;
     if (setjmp(tls_jb) == 0) {
         while (1) {
-            /* same cancel gate as the pool worker: a cancel-woken task
-             * settles instead of re-polling into a dead scope */
-            if (t->scope && t->scope->cancel) break;
+            /* same cancel gate as the pool worker — gated on started so
+             * a never-run task still reaches its body (and its defers) */
+            if (t->scope && t->scope->cancel && t->started) break;
             t->wstate = WS_ONSTACK;
+            t->started = 1;
             if (t->poll(fr, t) != RT_PENDING) break;
             if (__sync_lock_test_and_set(&t->wstate, WS_PARKED) == WS_WAKEREQ)
                 continue;
@@ -1520,11 +1553,12 @@ static int sel_fire(RtChan *ch, int64_t v) {
 }
 
 /* park a frame receiver: node = the task itself on recvq */
-static void chan_park_recv(RtChan *ch, RtTask *t) {
-    park_add(t, t->scope, ch, WK_RECV);
+static int chan_park_recv(RtChan *ch, RtTask *t) {
+    if (park_add_scoped(t, ch, WK_RECV)) return 1;
     task_ref(t); /* the recvq node's ref — leaves with the node */
     t->next = ch->recvq;
     ch->recvq = t;
+    return 0;
 }
 
 /* pop the first claimable parked receiver. ch->mu held; on success the
@@ -1780,7 +1814,12 @@ int rt_recv_poll(RtChan *ch, RtTask *t) {
         oxl_mu_unlock(&ch->mu);
         return RT_READY;
     }
-    chan_park_recv(ch, t);
+    if (chan_park_recv(ch, t)) {
+        /* cancelled before registration: no wake walk will ever find
+         * us — unwind now instead of parking forever */
+        oxl_mu_unlock(&ch->mu);
+        task_unwind();
+    }
     oxl_mu_unlock(&ch->mu);
     return RT_PENDING;
 }
@@ -1822,13 +1861,19 @@ int rt_send_poll(RtChan *ch, int64_t v, RtTask *t) {
         oxl_mu_unlock(&ch->mu);
         return RT_READY;
     }
+    if (park_add_scoped(t, ch, WK_SEND)) {
+        /* cancelled before registration: the payload never delivered —
+         * reclaim it through the chan thunk like a cancel-wake does */
+        oxl_mu_unlock(&ch->mu);
+        if (ch->drop_elem) ch->drop_elem(v);
+        task_unwind();
+    }
     SendReq *sr = xmalloc(sizeof *sr);
     sr->t = t;
     sr->v = v;
     sr->next = ch->sendq;
     ch->sendq = sr;
     task_ref(t); /* the sendq node's ref — leaves with the node */
-    park_add(t, t->scope, ch, WK_SEND);
     oxl_mu_unlock(&ch->mu);
     return RT_PENDING;
 }
@@ -2225,7 +2270,18 @@ int rt_select_poll(RtChan **chs, int n, int64_t tmo_ms, int has_else, RtTask *t)
     s->t = t;
     task_ref(t); /* the RtSel's ref — released when s is freed */
     t->sel = s;
-    park_add(t, t->scope, s, WK_SEL);
+    if (park_add_scoped(t, s, WK_SEL)) {
+        /* cancelled before registration: nothing armed yet — unlock,
+         * drop the RtSel ref, and unwind rather than park forever */
+        for (int i = 0; i < n; i++)
+            if (i == 0 || sorted[i] != sorted[i - 1])
+                oxl_mu_unlock(&sorted[i]->mu);
+        free(sorted);
+        t->sel = NULL;
+        task_unref(t);
+        free(s);
+        task_unwind();
+    }
     for (int i = 0; i < n; i++) {
         s->w[i].sel = s;
         s->w[i].slot = i;

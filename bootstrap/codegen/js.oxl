@@ -818,6 +818,66 @@ fn jmatch(g: mut G, scrut: ref parser.Node, arms: ref parser.NList) -> str {
     return o + "})()"
 }
 
+// stmt-position match — plain if/else, no IIFE. `jmatch` wraps arms
+// in `(() => {...})()` so expression uses yield a value; in stmt
+// position that arrow swallows `return`/`break`/`continue` — they must
+// bind to the enclosing fn (C `gmatch` stmt parity).
+fn jmatch_stmt(g: mut G, scrut: ref parser.Node, arms: ref parser.NList) {
+    st := xty(g, scrut)
+    n := g.tmpn
+    g.tmpn = g.tmpn + 1
+    acc := "_ms" + itoa(n)
+    sv := jx(g, scrut)
+    wln(g, "    { const " + acc + " = " + sv + ";")
+    first := true
+    a := arms
+    for a != nil {
+        match a.v {
+            parser.Node.MArm{pat, body} => {
+                ga := jarm(g, pat, acc, st)
+                if ga.has == 1 {
+                    if first {
+                        wln(g, "      if (" + ga.cond + ") {")
+                    }
+                    if !first {
+                        wln(g, "      else if (" + ga.cond + ") {")
+                    }
+                } else {
+                    wln(g, "      else {")
+                }
+                first = false
+                check.env_push(g.env)
+                pb := ga.binds
+                for pb != nil {
+                    wln(g, "      let " + jname(pb.n) + " = " + pb.ce + ";")
+                    check.env_bind(g.env, pb.n, pb.t)
+                    pb = pb.next
+                }
+                if body != nil && check.nk(body) == 23 {
+                    jblk(g, body)
+                } else if body != nil && check.nk(body) == 32 {
+                    match body {
+                        parser.Node.Match{e, arms} => {
+                            jmatch_stmt(g, e, arms)
+                        }
+                        _ => {
+                        }
+                    }
+                } else if body != nil {
+                    bv := jx(g, body)
+                    wln(g, "      (" + bv + ");")
+                }
+                check.env_pop(g.env)
+                wln(g, "      }")
+            }
+            _ => {
+            }
+        }
+        a = a.next
+    }
+    wln(g, "    }")
+}
+
 // ---------- closure ----------
 
 // oxl `fn(p){body}` -> snapshot-capturing JS arrow. Captures are the
@@ -1460,13 +1520,13 @@ fn jdefer(g: mut G, call: own parser.Node) {
             rewritten = call
         }
     }
-    save_frame := g.inframe
-    g.inframe = 0
+    // keep g.inframe: frame-slotted names must emit fr.* inside the
+    // thunk — the arrow captures the live `fr` binding of the poll fn
+    // it was registered in, and the frame outlives the drain
     wpush(g)
     v2 := jx(g, rewritten)
     wpop(g)
     cbody := wjoin(g.wlast)
-    g.inframe = save_frame
     wln(g, "    rt.rt_defer_push(() => { " + cbody + "(" + v2 + "); });")
 }
 
@@ -1564,6 +1624,16 @@ fn js(g: mut G, s: ref parser.Node) {
             wln(g, "    " + t + " = " + v + ";")
         }
         parser.Node.ExprStmt{e} => {
+            if check.nk(e) == 32 {
+                match e {
+                    parser.Node.Match{e, arms} => {
+                        jmatch_stmt(g, e, arms)
+                        return
+                    }
+                    _ => {
+                    }
+                }
+            }
             v := jx(g, e)
             wln(g, "    (" + v + ");")
         }
@@ -1670,6 +1740,9 @@ fn js(g: mut G, s: ref parser.Node) {
                 js(g, l.v)
                 l = l.next
             }
+        }
+        parser.Node.Match{e, arms} => {
+            jmatch_stmt(g, e, arms)
         }
         _ => {
         }

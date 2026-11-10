@@ -116,6 +116,9 @@ vtag() { # raw -> normalized tag on stdout; nonzero exit if invalid
 # platform asset suffix, e.g. linux-x86_64
 asset_os_arch() {
     os=$(uname -s | tr '[:upper:]' '[:lower:]')
+    case "$os" in
+        mingw*|msys*|cygwin*|windows*) os=windows ;;
+    esac
     arch=$(uname -m)
     case "$arch" in
         x86_64|amd64) arch=x86_64 ;;

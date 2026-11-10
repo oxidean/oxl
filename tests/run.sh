@@ -1846,7 +1846,7 @@ echo "== i60 install pipeline — file:// release fixture =="
 # end-to-end: download -> sha256 verify -> stage -> atomic mv -> verbs.
 # OXL_RELEASE_BASE takes file:// so the whole pipeline runs offline.
 reldir="$scratch/relfix"; mkdir -p "$reldir/download/v9.9.9" "$reldir/download/v9.9.8"
-case "$(uname -s)" in Linux) tch_os=linux ;; Darwin) tch_os=macos ;; *) tch_os=linux ;; esac
+case "$(uname -s)" in Linux) tch_os=linux ;; Darwin) tch_os=darwin ;; *) tch_os=windows ;; esac
 case "$(uname -m)" in x86_64) tch_arch=x86_64 ;; arm64|aarch64) tch_arch=arm64 ;; *) tch_arch=x86_64 ;; esac
 tch_asset="oxl-toolchain-$tch_os-$tch_arch.tar.gz"
 mkdir -p "$reldir/work/oxl-toolchain"

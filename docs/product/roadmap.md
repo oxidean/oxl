@@ -42,11 +42,15 @@ Milestone map: [docs/specs/2026-11-07-phase-2-plan/](../specs/2026-11-07-phase-2
   `std`, `oxl.work` workspaces, git-backed index + `oxl publish`
   (absorbs registry), polish issues
 - **G — portable GUI layer** in the language (charter path) as
-  `extra/gui` + `extra/gui/gtk` — spec:
+  `extra/gui` + `extra/gui/gtk` — shipped; spec:
   `docs/specs/2026-11-09-gui-layer/`
+- **W — web compilation target**: shipped — `--target js` emit
+  (node + browser flavors), `extra/gui/dom` backend, `web-todo`
+  reference app; spec: `docs/specs/2026-11-10-web-target/`
 - Parked on triggers: LLVM backend (behind the `interfaces.md`
-  codegen seam), web compilation target (JS/HTML/CSS — guardrail in
-  `docs/specs/2026-11-04-0132-v0-2-forward/items/parked-web.md`), D4 shape-generics, parked-stdlib list
+  codegen seam), D4 shape-generics, reflection-class stdlib
+  (runtime type descriptors), TLS/x509, `pin` primitive,
+  parked-stdlib list
 
 (The compiler already compiles itself — see `docs/self-hosting.md`;
 "T" retires the Rust seed driver, not the compiler.)

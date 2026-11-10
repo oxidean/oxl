@@ -4,6 +4,26 @@ Stages are sequential unless marked parallel-ok. Each lands as a
 PR through the standard loop (suite green → CodeRabbit → merge).
 W0 is this spec docset.
 
+- [done] **W0 — spec** — PR #63 — this directory, WI-0007
+      artifacts, ADR-0010.
+- [done] **W1 — `runtime/rt.mjs` core** — the milestone-w PR —
+      scheduler, scopes, chans, defers, str/slice/err, ffi shell.
+- [done] **W2 — js emitter non-concurrency** — the milestone-w PR —
+      `bootstrap/codegen/js.oxl` emit lane.
+- [done] **W3 — concurrency surface** — the milestone-w PR — susp
+      poll machines, spawn/goin/scopes, chans/select/try_send.
+- [done] **W4 — driver lane + suite** — the milestone-w PR —
+      `--target js` on build/run/test, w4 whitelist.
+- [done] **W5 — env shims + susp-pump** — the milestone-w PR —
+      rt-node/rt-browser flavors, gui core `susp_pump`/`pump_iter`/
+      `pump_edge` contract, mock converted, gui_* joined the lane;
+      `jmatch_stmt` fixed a swallowed-`return` emitter bug the port
+      exposed. (rt-dom provider rode ahead into W6.)
+- [done] **W6 — `extra/gui/dom` + reference app + docs** — the
+      milestone-w PR — DOM backend + headless tree, examples/
+      web-todo + --html, docs/web-target.md, gui-backends DOM
+      section; WI-0007 shipped.
+
 ## W0 — spec (this docset)
 
 `shape.md`, `plan.md`, `js-semantics.md`, `items/dom-backend.md`,

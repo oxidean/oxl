@@ -2,9 +2,9 @@
   "schema_version": 1,
   "id": "WI-0007",
   "title": "milestone W — web compilation target (JS/HTML/CSS)",
-  "state": "implementing",
+  "state": "archived",
   "profile": "normal",
-  "current_stage": "implementation",
+  "current_stage": "shipping",
   "created_at": "2026-11-10T11:20:09Z",
-  "updated_at": "2026-11-10T11:53:24Z"
+  "updated_at": "2026-11-10T20:29:10Z"
 }

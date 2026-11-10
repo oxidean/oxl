@@ -56,18 +56,34 @@ signals never enter oxl directly). It proved:
   asserts through the read path — the same `List.rows()` count the
   mock computes from child edges.
 
-## The DOM case (honest sketch)
+## The DOM backend (shipped)
 
-A third backend over a DOM protocol (websocket/CDP-style, or the
-parked web target) maps without schema changes: `Prop` serializes
-to attribute/property pairs, `WidgetKind` to element roles, the
-`Event` kinds to DOM event names. Two real deltas: a remote pump is
-latency-bound (the mailbox absorbs it unchanged), and row widgets
-want a virtual-list extension — an `extra/gui/dom` sketch stays a
-spec-shaped possibility, not committed surface. The honest verdict:
-the protocol ports; nothing in the contract is GTK-shaped beyond
-the thread rule, and even that (a main-loop thread) holds in the
-DOM world.
+`extra/gui/dom` is the third backend, shipped with the web target
+(milestone W): `window`→an owned `<div>` under the configured root
+(`#app` else `<body>` — `destroy` removes only the owned child,
+never the host), containers→`<div>`, `label`→`<span>`,
+`button`→`<button>`, `entry`→`<input>`, `list`→`<ul>` with rows as
+`<li>`, `scrolled`→`<div>` + overflow CSS. `PropVal.Text` →
+`textContent` (`entry` reads/writes `.value`),
+`P_PLACEHOLDER`→placeholder, `P_ROWS`→live child count (read-only;
+a `set_prop` is a contract violation). Events map `click`→clicked,
+`input`→text_changed, Enter-keydown→activated, li-`click`→
+row_activated with the row index in `EventData.Index`, and a
+custom `oxl-close` event→close_requested — `change` is never used
+(blur-after-edit would submit without an Enter action).
+
+The backend answers the susp-pump contract rather than owning a
+blocking loop: `susp_pump() == 1`, `pump_iter` does one bounded
+pass (dom-event queue + CmdBuf drain), `pump_edge` is the wake
+chan every edge lands on — `stop`, `wake`, and event injection all
+nudge it. That is what lets a single-threaded scheduler drive GUI
+apps at all; the DOM world also makes the thread rule trivial
+(everything is the main thread). A headless object tree in
+`rt-dom.mjs` gives node runs the same element/append/listener
+semantics, which is how `tests/gui_dom.oxl` and
+`examples/web-todo`'s selftest verify the contract end-to-end
+without a browser. A virtual-list extension for very large
+`P_ROWS` stays a watch item (v1 renders eagerly).
 
 ## The `pin` question, revisited
 

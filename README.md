@@ -186,7 +186,9 @@ replace github.com/oxidean/widget => ../widget
 
 Directives: `module` (this module's path), `oxl` (minimum toolchain
 version), `require` (a dependency at a version, also in a parenthesized
-block), and `replace` (pin a dependency to a local directory). The
+block), `replace` (pin a dependency to a local directory), and
+`toolchain` (toolchain pin — parsed by the language, consumed by the
+version-manager shim). The
 toolchain walks up from the entry file to the nearest `oxl.mod`;
 without one, only `std/` imports resolve.
 

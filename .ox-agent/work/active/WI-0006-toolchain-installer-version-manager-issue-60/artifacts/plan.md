@@ -18,13 +18,15 @@ Single-PR delivery, staged commits. Each stage lands suite-green.
   manifest carrying `toolchain` to prove it.
 - `oxl version` subcommand, both drivers:
   `oxl <OXL_RELEASE-stamped tag|"dev"> (language <X.Y.Z>)`.
-  Rust: `option_env!("OXL_RELEASE")`. Self-hosted: always `dev`.
+  Both drivers: read `<exe-dir>/RELEASE` at runtime
+  (`rt_readfile`; absent → `dev`) — the self-hosted driver stamps
+  too, unlike a compile-time env.
   Usage text + unknown-command paths updated.
 
 ## S2 — release workflow
 
-- `OXL_RELEASE: ${{ needs.version.outputs.tag }}` on the toolchain
-  build step → stamped binary.
+- `echo <tag> > RELEASE` inside the toolchain tree → runtime-stamped
+  tarball (read by both drivers).
 - `sha256sum oxl-toolchain-linux-x86_64.tar.gz > …sha256`; attach the
   sidecar in the release step.
 

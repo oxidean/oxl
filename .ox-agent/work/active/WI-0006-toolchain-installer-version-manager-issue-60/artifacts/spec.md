@@ -30,8 +30,10 @@ install instructions.
 4. **Missing resolved version**: instruct-and-exit (status 127)
    naming `oxl toolchain install <tag>` — no silent network on build.
 5. **`oxl version`** added to both drivers: prints the release tag
-   when stamped at build (`option_env!("OXL_RELEASE")`), else `dev`,
-   plus the language version. Release workflow stamps `OXL_RELEASE`.
+   read from a `RELEASE` file shipped beside the binary (the release
+   workflow writes it into the toolchain tree — both drivers read it
+   at runtime via `rt_readfile`), else `dev`, plus the language
+   version.
 6. **Release integrity**: workflow publishes `<asset>.sha256`
    alongside the tarball; installer verifies when the file exists.
 7. **Platforms**: today only `linux-x86_64` ships. The installer maps
@@ -53,7 +55,8 @@ $OXL_HOME/                    (default ~/.oxl)
 
 - `install.sh` (`scripts/install.sh`, curl-pipeable):
   `install.sh [vX.Y.Z|latest]`, env `OXL_HOME`/`OXL_VERSION`; resolves
-  the tag (GitHub API for `latest`), downloads the platform asset,
+  the tag (`/releases/latest` redirect — no API quota; extras-lane
+  tags rejected), downloads the platform asset,
   verifies `.sha256` when published, unpacks to `versions/<tag>/`,
   writes/refreshes the shim, seeds `default-version` if absent, prints
   PATH guidance. Idempotent; `--default` forces the default switch.

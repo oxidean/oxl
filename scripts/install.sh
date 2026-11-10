@@ -16,7 +16,6 @@ set -eu
 
 OXL_HOME="${OXL_HOME:-$HOME/.oxl}"
 BASE="${OXL_RELEASE_BASE:-https://github.com/oxidean/oxl/releases}"
-REPO_RAW="https://raw.githubusercontent.com/oxidean/oxl/main"
 
 want="latest"
 shim_only=0
@@ -38,6 +37,7 @@ env: OXL_HOME (def ~/.oxl), OXL_VERSION (same as the arg),
      OXL_RELEASE_BASE (release host override)
 EOF
             exit 0 ;;
+        --) ;;
         latest|v[0-9]*|[0-9]*) want="$a" ;;
         *) echo "install.sh: unknown argument \`$a\`" >&2; exit 2 ;;
     esac
@@ -48,7 +48,7 @@ done
 # ---------- the shim (single source — also serves `oxl toolchain`) ----------
 write_shim() {
     mkdir -p "$OXL_HOME/bin" "$OXL_HOME/versions"
-    cat > "$OXL_HOME/bin/oxl" <<'SHIM_EOF'
+    cat > "$OXL_HOME/bin/.oxl.tmp.$$" <<'SHIM_EOF'
 #!/bin/sh
 # oxl — toolchain version manager + dispatcher (gvm-style).
 # Resolves a release tag, execs versions/<tag>/oxl-toolchain/oxl.
@@ -82,7 +82,10 @@ vtag() { # raw -> normalized tag on stdout; nonzero exit if invalid
     # single line only — grep -q matches ANY line, so a multiline tag
     # would pass on its first line and traverse $VERS paths downstream
     [ "$(printf '%s' "$t" | tr -d '[:space:]')" = "$t" ] || return 1
-    echo "$t" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+([-+][A-Za-z0-9._-]+)?$' \
+    # semver.rs parity: numeric fields reject leading zeros, idents are
+    # alnum+'-' dot-separated. Residual gap: numeric pre idents with
+    # leading zeros (v1.2.3-01) pass here — ERE can't express it.
+    echo "$t" | grep -qE '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$' \
         || return 1
     echo "$t"
 }
@@ -130,7 +133,7 @@ resolve() { # echoes "tag<TAB>source" or nothing
     d=$(pwd -P)
     while :; do
         if [ -f "$d/.oxl-version" ]; then
-            t=$(head -n1 "$d/.oxl-version" | tr -d '[:space:]')
+            t=$(head -n1 "$d/.oxl-version" | tr -d '\r\n' | sed 's/^[ \t]*//;s/[ \t]*$//')
             [ -n "$t" ] && { v=$(vtag "$t") || die "invalid version in $d/.oxl-version: $t"
                 echo "$v	$d/.oxl-version"; return; }
         fi
@@ -147,14 +150,17 @@ resolve() { # echoes "tag<TAB>source" or nothing
             # form is an error, not a silent skip
             pa=$(awk '
                 { sub(/(^|[ \t])\/\/.*/, "") }
-                /^[ \t]*toolchain([ \t]|$)/ {
+                /^[ \t]*(require|replace)[ \t]*\(/ { depth++ }
+                /^[ \t]*\)/ { if (depth > 0) depth-- }
+                depth == 0 && /^[ \t]*toolchain([ \t]|$)/ {
                     n++
                     r = $0
                     sub(/^[ \t]*toolchain[ \t]*/, "", r)
-                    gsub(/^[ \t]+|[ \t]+$/, "", r)
+                    gsub(/^[ \t\r]+|[ \t\r]+$/, "", r)
                     if (n == 1) first = r
                 }
-                END { print n+0; if (n == 1) print first }' "$d/oxl.mod")
+                END { print n+0; if (n == 1) print first }' "$d/oxl.mod") \
+                || die "cannot read $d/oxl.mod"
             case "$(printf '%s\n' "$pa" | sed -n '1p')" in
                 0) ;;
                 1) t=$(printf '%s\n' "$pa" | sed -n '2p')
@@ -172,7 +178,7 @@ resolve() { # echoes "tag<TAB>source" or nothing
         d=$(dirname "$d")
     done
     if [ -f "$OXL_HOME/default-version" ]; then
-        t=$(head -n1 "$OXL_HOME/default-version" | tr -d '[:space:]')
+        t=$(head -n1 "$OXL_HOME/default-version" | tr -d '\r\n' | sed 's/^[ \t]*//;s/[ \t]*$//')
         [ -n "$t" ] && { v=$(vtag "$t") || die "invalid version in default-version: $t"
             echo "$v	default-version"; return; }
     fi
@@ -188,19 +194,26 @@ tc_install() { # tag|latest
     suf=$(asset_os_arch)
     asset="oxl-toolchain-$suf.tar.gz"
     mkdir -p "$VERS"
-    tmp=$(mktemp -d); stage=$(mktemp -d "$VERS/.stage.XXXXXX")
-    trap 'rm -rf "$tmp" "$stage"' EXIT
+    rm -rf "$VERS"/.stage.* 2>/dev/null || :  # orphans from killed installs
+    stage=""
+    tmp=$(mktemp -d "${TMPDIR:-/tmp}/oxl-install.XXXXXX")
+    trap 'rm -rf "$tmp" ${stage:+"$stage"}' EXIT
+    stage=$(mktemp -d "$VERS/.stage.XXXXXX")
     echo "oxl: downloading $tag ($asset)"
     fetch "$BASE/download/$tag/$asset" "$tmp/$asset" \
         || die "no toolchain asset for $suf at $tag — build from source instead:
     https://github.com/oxidean/oxl#building-from-source"
-    if fetch "$BASE/download/$tag/$asset.sha256" "$tmp/$asset.sha256" 2>/dev/null; then
+    sha_code=$(curl -fsSL "$BASE/download/$tag/$asset.sha256" -o "$tmp/$asset.sha256" \
+        -w '%{http_code}' 2>/dev/null) && sha_rc=0 || sha_rc=$?
+    if [ "${sha_rc:-1}" = 0 ]; then
         if have sha256sum; then (cd "$tmp" && sha256sum -c "$asset.sha256");
         elif have shasum; then (cd "$tmp" && shasum -a 256 -c "$asset.sha256");
         else echo "oxl: warning: no sha256 tool — skipping integrity check" >&2; fi \
             || die "sha256 mismatch on $asset — download corrupted or tampered"
-    else
+    elif [ "${sha_code:-}" = "404" ]; then
         echo "oxl: warning: $tag ships no .sha256 — skipping integrity check" >&2
+    else
+        die "checksum fetch failed for $asset (http ${sha_code:-none}) — refusing unverified install"
     fi
     tar xzf "$tmp/$asset" -C "$stage" \
         || die "corrupt tarball for $tag"
@@ -211,6 +224,8 @@ tc_install() { # tag|latest
     [ -e "$VERS/$tag" ] && die "$tag appeared during install — retry"
     chmod 755 "$stage"
     mv "$stage" "$VERS/$tag"
+    [ -x "$VERS/$tag/oxl-toolchain/oxl" ] \
+        || die "$tag install raced — a same-tag dir appeared; retry"
     rm -rf "$tmp"; trap - EXIT
     echo "oxl: installed $tag -> $VERS/$tag"
     [ -f "$OXL_HOME/default-version" ] || echo "$tag" > "$OXL_HOME/default-version"
@@ -219,14 +234,15 @@ tc_install() { # tag|latest
 tc_uninstall() {
     tag=""; force=0
     for a in "$@"; do
-        case "$a" in --force) force=1 ;; *) tag="$a" ;; esac
+        case "$a" in --force) force=1 ;; *) [ -z "$tag" ] || die "unexpected argument: $a"; tag="$a" ;; esac
     done
     [ -n "$tag" ] || { echo "usage: oxl toolchain uninstall <tag> [--force]" >&2; exit 2; }
     raw=$tag; tag=$(vtag "$raw") || die "invalid toolchain tag: $raw"
     [ -d "$VERS/$tag" ] || die "$tag is not installed"
-    if [ -f "$OXL_HOME/default-version" ] \
-        && [ "$(cat "$OXL_HOME/default-version")" = "$tag" ] && [ "$force" = 0 ]; then
-        die "$tag is the default — \`oxl toolchain uninstall $tag --force\` to remove anyway"
+    if [ -f "$OXL_HOME/default-version" ] && [ "$force" = 0 ]; then
+        def=$(head -n1 "$OXL_HOME/default-version" | tr -d '\r\n' | sed 's/^[ \t]*//;s/[ \t]*$//')
+        [ "$(vtag "$def" 2>/dev/null || printf '%s' "$def")" = "$tag" ] \
+            && die "$tag is the default — \`oxl toolchain uninstall $tag --force\` to remove anyway"
     fi
     rm -rf "${VERS:?}/$tag"
     echo "oxl: removed $tag"
@@ -235,8 +251,9 @@ tc_uninstall() {
 tc_use() {
     local_tag=""; tag=""
     for a in "$@"; do
-        case "$a" in --local) local_tag=1 ;; *) tag="$a" ;; esac
+        case "$a" in --local) local_tag=1 ;; *) [ -z "$tag" ] || die "unexpected argument: $a"; tag="$a" ;; esac
     done
+    [ -n "$tag" ] || { echo "usage: oxl toolchain use [--local] <tag>" >&2; exit 2; }
     raw=$tag; tag=$(vtag "$raw") || die "invalid toolchain tag: $raw"
     [ -d "$VERS/$tag" ] || die "$tag is not installed — \`oxl toolchain install $tag\` first"
     if [ "$local_tag" ]; then
@@ -267,7 +284,10 @@ if [ "${1:-}" = toolchain ]; then
         uninstall) shift; tc_uninstall "$@" ;;
         use)       shift; tc_use "$@" ;;
         list|ls)   tc_list ;;
-        default)   [ -f "$OXL_HOME/default-version" ] && cat "$OXL_HOME/default-version" || die "no default — \`oxl toolchain use <tag>\`" ;;
+        default)   { [ -f "$OXL_HOME/default-version" ] && [ -s "$OXL_HOME/default-version" ]; } \
+                       || die "no default — \`oxl toolchain use <tag>\`"
+                   def=$(head -n1 "$OXL_HOME/default-version" | tr -d '\r\n' | sed 's/^[ \t]*//;s/[ \t]*$//')
+                   vtag "$def" || die "invalid version in default-version: $def" ;;
         current)
             r=$(resolve); [ -n "$r" ] || die "no version resolved — set one with \`oxl toolchain use <tag>\`"
             tag=${r%%	*}; src=${r#*	}
@@ -289,7 +309,8 @@ exe=$(exe_for "$tag")
 install it with:  oxl toolchain install $tag"
 exec "$exe" "$@"
 SHIM_EOF
-    chmod +x "$OXL_HOME/bin/oxl"
+    chmod +x "$OXL_HOME/bin/.oxl.tmp.$$" \
+        && mv "$OXL_HOME/bin/.oxl.tmp.$$" "$OXL_HOME/bin/oxl"
     echo "wrote $OXL_HOME/bin/oxl"
 }
 

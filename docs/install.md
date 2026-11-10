@@ -63,7 +63,7 @@ oxl toolchain uninstall v0.8.0  # remove (refuses the default; --force)
 A resolved-but-missing toolchain exits 127 naming the fix:
 
 ```
-oxl: toolchain v0.10.0 (from ./oxl.mod toolchain directive) is not
+oxl: toolchain v0.10.0 (from /path/to/oxl.mod toolchain directive) is not
 installed — install it with:  oxl toolchain install v0.10.0
 ```
 

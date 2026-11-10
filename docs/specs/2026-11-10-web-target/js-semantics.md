@@ -259,7 +259,8 @@ Arg mapping (mirrors the checker FFI whitelist
 | `[]byte` | `Uint8Array` view (shared — callee writes land in caller storage) |
 | `[]T` other | `{a,off,len,cap}` (shims must respect views) |
 | `own/ref/mut` | raw ref |
-| `chan`/`shared`/scope/fn/iface | raw object |
+| `chan`/`shared`/fn | raw object |
+| scope/iface | not extern-arggable today — the checker FFI whitelist (`check.oxl:3878`) admits no `k_scope`/`k_iface`; reserved for the DOM boundary, which crosses via handle ints |
 | `own void` | raw ref — opaque handle convention |
 
 Return mapping inverts the table; `{val, err}` for pair fns.

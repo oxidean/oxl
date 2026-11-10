@@ -46,7 +46,7 @@ Milestone map: [docs/specs/2026-11-07-phase-2-plan/](../specs/2026-11-07-phase-2
 - **W — web compilation target** (JS/HTML/CSS): un-parked — G landed
   and the widget tree proved DOM-mappable
   (`docs/gui-backends.md`); the trigger fires the item into the map
-  via WI-0007, its spec stage the first gate
+  via WI-0007 — spec `docs/specs/2026-11-10-web-target/`
 - Parked on triggers: LLVM backend (behind the `interfaces.md`
   codegen seam), D4 shape-generics, parked-stdlib list
 

@@ -4,7 +4,6 @@ package main
 // widget kind constructible, props round-trip through the element
 // store, fired DOM events land as core Events through the real
 // listener->queue->pump_iter->EventBuf path, and teardown sweeps.
-
 import "github.com/oxidean/oxl/extra/gui"
 
 import "github.com/oxidean/oxl/extra/gui/dom"

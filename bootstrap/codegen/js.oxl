@@ -14,6 +14,7 @@ package codegen
 import "oxl/bootstrap/check"
 
 import "std/collections"
+
 import "std/encoding/base64"
 
 // ---------- zero values (the JS gcty analog) ----------
@@ -110,7 +111,6 @@ fn jname(n: str) -> str {
 }
 
 // ---------- scoped locals (name -> ty), globals/fields via check ----------
-
 fn jref(g: mut G, n: str) -> str {
     if g.inframe == 1 {
         s := genv_get(g.fsl, n)
@@ -129,7 +129,6 @@ fn jfslot(g: mut G, name: str, z: str) -> str {
 }
 
 // ---------- conversions ----------
-
 fn jiface_wrap_v(g: mut G, e: ref parser.Node, v: str, w: str, implkey: str) -> str {
     gvtab_use(g, w, implkey)
     got := gsub(g, xty(g, e))
@@ -259,7 +258,6 @@ fn jav(g: mut G, args: ref parser.NList) -> own GAv {
     }
     return head
 }
-
 
 // jav_decl — declared-ty arg list for spawn/fsusp fills: the receiver
 // leads when dotted, each arg adapts to its (subst'd) param ty
@@ -975,7 +973,6 @@ fn jclosure(g: mut G, params: ref parser.NList, body: ref parser.Node) -> str {
 }
 
 // ---------- builtins ----------
-
 fn jbuiltin(g: mut G, name: str, args: ref parser.NList, argvs: ref GAv) -> str {
     a0 := ""
     if argvs != nil {
@@ -1137,7 +1134,6 @@ fn jffi_ret(g: mut G, expr: str, rt1: int) -> str {
 }
 
 // ---------- calls ----------
-
 fn jcall(g: mut G, f: ref parser.Node, args: ref parser.NList) -> str {
     argvs := jav(g, args)
     // indirect call through a fn value — a JS closure calls directly
@@ -1475,7 +1471,6 @@ fn jcall(g: mut G, f: ref parser.Node, args: ref parser.NList) -> str {
 }
 
 // ---------- defers ----------
-
 fn jdefers(g: mut G) {
     if g.inframe == 1 {
         wln(g, "    rt.rt_defer_drain_to(fr._dmark);")
@@ -1531,7 +1526,6 @@ fn jdefer(g: mut G, call: own parser.Node) {
 }
 
 // ---------- stmt emission ----------
-
 fn jblk(g: mut G, body: ref parser.Node) {
     if body == nil || check.nk(body) != 23 {
         return
@@ -1751,7 +1745,6 @@ fn js(g: mut G, s: ref parser.Node) {
 
 // ---------- chan-payload drop thunks (JS: GC owns payloads — shape
 // parity only, mkchan still passes a drop slot per the contract) ----------
-
 fn jdrop_sym(g: mut G, payload: int) -> str {
     payload = gsub(g, payload)
     k := tyk(g, payload)
@@ -1857,7 +1850,6 @@ fn jemvtab_one(g: mut G, vu: ref GVU) {
 }
 
 // ---------- fn emission ----------
-
 fn jemit_named_fn(g: mut G, i: int, qn: str, base: str) {
     match g.its[i].node {
         parser.Node.Fn{recv, params, ret, body, ex} => {
@@ -1991,7 +1983,6 @@ fn jemit_static(g: mut G, i: int) {
         }
     }
 }
-
 
 // ---------- suspension state machine (W3 — js port of fsusp_*/fstmt/gframe) ----------
 // JS has no goto: a susp fn emits as `for(;;) switch (fr.state)` — a
@@ -3083,7 +3074,6 @@ fn jframe(g: mut G, qn: str, recv: ref parser.Node, params: ref parser.NList, re
 }
 
 // ---------- genall ----------
-
 fn jgenall(g: mut G) -> str {
     g.units = mkslice(GUnit, 0)
     g.dpos = collections.map_new()
@@ -3553,20 +3543,20 @@ fn jx(g: mut G, e: ref parser.Node) -> str {
         }
     }
     out := match e {
-        parser.Node.JInt(v) => itoa(v) + "n",
-        parser.Node.JFloat(v) => v,
-        parser.Node.JStr(v) => "rt.rt_str_lit(\"" + base64.encode(junesc(v)) + "\")",
-        parser.Node.Name{n} => jxname(g, n),
-        parser.Node.Call{f, args} => jcall(g, f, args),
-        parser.Node.Field{obj, name} => jxfield(g, obj, name),
-        parser.Node.Lit{obj, fields} => jxlit(g, obj, fields),
-        parser.Node.As{e, ty} => jxas(g, e, ty),
-        parser.Node.Bin{op, l, r} => jxbin(g, op, l, r, e),
-        parser.Node.Un{op, e} => jxun(g, op, e),
-        parser.Node.Match{e, arms} => jmatch(g, e, arms),
-        parser.Node.Index{obj, idx} => jxindex(g, obj, idx),
-        parser.Node.Slice{obj, lo, hi} => jxslice(g, obj, lo, hi),
-        parser.Node.Closure{params, body} => jclosure(g, params, body),
+        parser.Node.JInt(v) => itoa(v) + "n"
+        parser.Node.JFloat(v) => v
+        parser.Node.JStr(v) => "rt.rt_str_lit(\"" + base64.encode(junesc(v)) + "\")"
+        parser.Node.Name{n} => jxname(g, n)
+        parser.Node.Call{f, args} => jcall(g, f, args)
+        parser.Node.Field{obj, name} => jxfield(g, obj, name)
+        parser.Node.Lit{obj, fields} => jxlit(g, obj, fields)
+        parser.Node.As{e, ty} => jxas(g, e, ty)
+        parser.Node.Bin{op, l, r} => jxbin(g, op, l, r, e)
+        parser.Node.Un{op, e} => jxun(g, op, e)
+        parser.Node.Match{e, arms} => jmatch(g, e, arms)
+        parser.Node.Index{obj, idx} => jxindex(g, obj, idx)
+        parser.Node.Slice{obj, lo, hi} => jxslice(g, obj, lo, hi)
+        parser.Node.Closure{params, body} => jclosure(g, params, body)
         _ => "null"
     }
     return out

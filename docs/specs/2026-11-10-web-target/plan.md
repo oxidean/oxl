@@ -79,11 +79,14 @@ skips cleanly where node is absent.
 `runtime/rt-browser.mjs`: same names → `err` stubs. `extra/gui`
 + `extra/gui/mock` verified ported (they're pure oxl over the
 concurrency surface). One specified change rides this stage:
-`pump` becomes a susp frame task that parks on `stop`/`wake`
-edges — the existing synchronous spin starves a single-threaded
-scheduler, and `gui.run`'s shutdown-on-return contract means
-`pump` may only return after `stop`. Any further change is a
-finding. `flag` under node.
+`pump` becomes a susp frame task that parks on `stop`/`wake`/
+inject edges — the existing synchronous spin starves a
+single-threaded scheduler, and `gui.run`'s shutdown-on-return
+contract means `pump` may only return after `stop`. Injection is
+a wake source: `Mock.inject` (and `dom`'s equivalent) queues the
+event *and* nudges the pump — otherwise a parked pump never sees
+it and `tests/gui_mock.oxl` blocks on delivery. Any further
+change is a finding. `flag` under node.
 
 Gate: `os`/`exec`/`net` smoke files green under node; browser
 stub contract asserted (calls return `err`, never throw

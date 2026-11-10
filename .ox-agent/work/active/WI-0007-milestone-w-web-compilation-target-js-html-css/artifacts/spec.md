@@ -31,11 +31,15 @@ the DOM story that justifies it.
   — `len`/`byteat`/`substr`/`str as []byte` stay byte-faithful;
   `std/unicode/utf8`'s manual decoder ports literally. JS `string`
   only exists at edges: literals decode via TextEncoder once, and
-  `rt_print_str`/DOM/`__oxl_ffi` boundaries decode on crossing.
-- **Slices are `{a: Array, off, len, cap}`** — one view type; same
-  backing-store trick as strings (`[]byte` may share Uint8Array
-  storage where interop needs it). `push` mutates within `cap`,
-  bounds failures `rt_trap(10)`.
+  `__oxl_ffi` string args and DOM `set_prop` decode on crossing;
+  `rt_print_str` (and byte-oriented fd writes) emit the raw `u8`
+  range under Node — a str can carry non-UTF-8 bytes that native
+  writes verbatim (js-semantics.md §3).
+- **Slices are `{a: Array|Uint8Array, off, len, cap}`** — one view
+  type; `[]byte` is *always* `Uint8Array`-backed (not an interop
+  option) — externs like `rt_fd_read` write through the caller's
+  view, and a plain `Array` silently drops callee writes. `push`
+  mutates within `cap`, bounds failures `rt_trap(10)`.
 - **Executor is frame-task-only.** Every spawned call — susp fn,
   builtin call, anything — lowers to a poll-able micro-frame on a
   `queueMicrotask`/`setImmediate` run queue. The blocking surface
@@ -95,10 +99,15 @@ the DOM story that justifies it.
   node exec for `run`/`test`; `--html` scaffold.
 - std: pure-oxl set ports unchanged (they compile through the new
   emitter); `os`/`exec`/`net`/`filepath`/`flag`/`log` and the
-  `http` client paths work under Node via rt-node shims;
-  `http.serve` is excluded from the node claim — its
-  `spawnBlocking` accept/handler model traps under the §8
-  blocking list pending a specified non-blocking serve path;
+  `http` client paths work under Node — `net`/`dns` externs are
+  split-phase: `__oxl_ffi` starters return a completion cell and
+  `net` awaits it on a `recv`, so `dial`/`Conn.read` park the
+  calling frame task instead of blocking a thread (the §8
+  exclusion covers host-blocking primitives, not async-driven
+  I/O resumed off the run queue); `http.serve` is excluded from
+  the node claim — its `spawnBlocking` accept/handler model
+  traps under the §8 blocking list pending a specified
+  non-blocking serve path;
   browser env gets stubs.
 - `extra/gui` + `extra/gui/mock` port unchanged (the conformance
   suite); `extra/gui/dom` new backend + `examples/web-todo`.

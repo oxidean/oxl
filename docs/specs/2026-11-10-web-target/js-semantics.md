@@ -109,7 +109,7 @@ rt.__oxl_boot(oxl_main)   // entry: installs run queue, runs root
   the raw bytes `u8[off..off+len]` — a str can carry arbitrary
   bytes via `[]byte as str`, so decoding would corrupt non-UTF-8
   payloads where native writes them verbatim. Node:
-  `process.stdout.write(Buffer.from(u8.buffer, off, len))`;
+  `process.stdout.write(Buffer.from(u8.buffer, u8.byteOffset + off, len))`;
   browser: byte-accurate console write or documented
   replacement-char divergence. The same rule holds for
   byte-oriented file output: `rt_fd_write`/file ops pass the
@@ -122,15 +122,22 @@ rt.__oxl_boot(oxl_main)   // entry: installs run queue, runs root
   into the caller's slice, so the backing must be a shared
   typed-array view — a plain `Array` (or a copy at the boundary)
   would silently drop callee writes.
-- `mkslice`/`[]T{…}` literals: fresh array, `off=0`, `cap=len`
-  (literal) or `cap≥len` (`mkslice`).
+- `mkslice`/`[]T{…}` literals: fresh backing, `off=0`, `cap=len`
+  (literal) or `cap≥len` (`mkslice`); `mkslice` fills every
+  element with the type-correct zero — `0n` int/err, `0`
+  float/byte, `false` bool, `null`/zero-views for refs — matching
+  `rt_mkslice`'s memset; a bare `new Array(n)` leaves holes that
+  read `undefined`, so `fill` (or a sized `Uint8Array`) is
+  required.
 - `s[i]`: `rt_trap(10)` if `i<0 || i>=s.len`, else
   `a[off+rt_to_num(i)]`.
 - `s[i:j]`: bounds-trap on i,j; `{a, off+i, len:j-i, cap:cap-i}`
   — **aliasing**: writes through the sub-view hit the parent.
 - `push(s, v)`: if `len<cap` → `a[off+len]=v`, `len++` in place;
-  else allocate `new Array(2*cap)` (or `max(4,2*cap)`),
-  copy, `cap=2*cap`. Slice value is a *struct copy* — push
+  else reallocate — `new Array(2*cap)` for general slices,
+  `new Uint8Array(2*cap)` for `[]byte` so the §4 typed-backing
+  contract survives a grow — copy, `cap=2*cap`. Slice value is a
+  *struct copy* — push
   returns/assigns like native (callers already treat `push`
   as a builtin that may re-seat).
 - `own []T`: a boxed view — `{v: slice}` where `v` re-seats on
@@ -167,9 +174,11 @@ chan = {
   parked receiver, marks closed, wakes all waiters; send on
   closed completes silently (payload GC'd — no drop needed);
   recv on closed+drained → `closed` result.
-- `try_send(ch,v)`: `true` iff delivered (buffered slot, parked
-  receiver, or empty rendezvous); `false` on full **or closed**
-  — payload drops (GC; drop-on-false rule, see
+- `try_send(ch,v)`: `true` iff a buffered slot accepts it or a
+  parked receiver takes the rendezvous; `false` on full, closed,
+  **or an unbuffered chan with no waiter** — nothing is deposited
+  for a later receiver (rt.c parity) — payload drops (GC;
+  drop-on-false rule, see
   `docs/specs/2026-11-09-gui-layer/items/event-model.md`).
 - select: per-arm waiter nodes on `selq`; readiness per rt.c
   (buffered / parked sends / rendezvous / closed); winner pick

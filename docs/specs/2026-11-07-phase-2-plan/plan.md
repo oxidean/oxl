@@ -100,7 +100,7 @@ main (PRs #56, #59).
 shipped. WI-0007; spec proposed at
 `docs/specs/2026-11-10-web-target/` (lands with its own spec PR).*
 
-**Scope sketch:** a JavaScript emit target — `runtime/rt.js`
+**Scope sketch:** a JavaScript emit target — `runtime/rt.mjs`
 semantic runtime; a `bootstrap/codegen/js` emitter (the value
 surface first, then `susp` fns as poll state-machines); the full
 concurrency surface (chans/select/named scopes over a microtask

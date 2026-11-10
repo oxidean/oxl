@@ -30,7 +30,7 @@ oxl `str` = `{p,n}` UTF-8 bytes; `len()`/`byteat`/`substr`/`str as
 
 | option | shape | tradeoff |
 |---|---|---|
-| **A. `OxlStr{u8,off,len}` view** | Uint8Array backing + offset; literals TextEncoder-encoded at init; `substr` = O(1) view; `as []byte` = same buffer | byte-faithful — every std byte op ports literally; boundary (DOM/console/extern) pays a decode per crossing; two artifacts (view vs JS string) need care at extern edges |
+| **A. `OxlStr{u8,off,len}` view** | Uint8Array backing + offset; literals TextEncoder-encoded at init; `substr` = O(1) view; `as []byte` = copy of the view's bytes | byte-faithful — every std byte op ports literally; boundary (DOM/console/extern) pays a decode per crossing; two artifacts (view vs JS string) need care at extern edges |
 | B. JS `string` | str → string | idiomatic, free DOM interop; `len`/`byteat`/`substr` all wrong; `str as []byte` forces re-encode anyway — the byte ops can't be faked |
 | C. Array-of-codepoints | str → uint32 array | correct indexing but `len()` becomes codepoints not bytes — still a semantic lie, and every literal pays explode |
 

@@ -18,8 +18,10 @@ A JS backend is a **sibling emitter package** consuming the same
   `compile_res` (`codegen.emit` at `:138`) and `emit_and_cc` (`:505`).
 - **Runtime sidecar** — `emit_and_cc` copies `rt.h`/`rt.c` into a
   scratch dir (`:351-371`); `runtime_dir()`'s ancestor probe
-  (`:208-252`) already locates `runtime/` — a `runtime/rt.js` probe
-  reuses it verbatim.
+  (`:208-252`) locates `runtime/` by testing for `runtime/rt.c`.
+  The JS lane needs its own probe keyed on `runtime/rt.mjs` that
+  keeps climbing past trees carrying only `rt.c` — a checkout
+  without the JS runtime must not satisfy it and stop the walk.
 - **Test lane** — `tests/run.sh` has no manifest; per-test
   `grep -q` asserts. A `command -v node`-gated JS section reuses
   the same output greps; `tests/diag/`+`tests/mod/` are check-side
@@ -34,7 +36,7 @@ no dual-driver parity check.
 
 `rt.c` (~4.4k lines) splits ~35% platform machinery a JS GC erases
 (arena/ObjHdr/borrow bookkeeping, mutex/CV/thread veneer) and ~65%
-semantics `rt.js` must re-express: scope trees + cancellation +
+semantics `rt.mjs` must re-express: scope trees + cancellation +
 trap propagation, defer stacks, channel rendezvous/buffering/
 select, named scopes, err registry, slice/str/bounds traps.
 
@@ -74,7 +76,7 @@ arg whitelist: `check.oxl:3873-3882`.
 
 ## std/extra portability
 
-Pure-oxl (ports once rt.js builtins land): `bufio cmp collections
+Pure-oxl (ports once rt.mjs builtins land): `bufio cmp collections
 crypto/{aes,chacha20,sha256} encoding/{base64,binary,csv,hex} fmt
 hash io maps math/rand regexp slices sort sync testing bytes
 strings unicode/utf8 encoding/json errors strconv log math time
@@ -96,7 +98,7 @@ nothing GTK-shaped beyond the thread rule" (`docs/gui-backends.md`).
 3. Blocking surface (`spawnBlocking`/blocking recv/`usleep`) on a
    single-threaded target: runtime trap vs Worker vs reject.
 4. Extern binding convention + env flavors (node vs browser).
-5. Emit form: single-file `out.js` vs sidecar rt.js; module type.
+5. Emit form: single-file `out.js` vs sidecar rt.mjs; module type.
 6. HTML/CSS story scope: `gui/dom` backend + host-page scaffold
    vs a broader static emit.
 7. Blocking-FFI compile-time vs runtime enforcement.

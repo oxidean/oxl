@@ -38,7 +38,7 @@ env: OXL_HOME (def ~/.oxl), OXL_VERSION (same as the arg),
      OXL_RELEASE_BASE (release host override)
 EOF
             exit 0 ;;
-        v[0-9]*|[0-9]*) want="$a" ;;
+        latest|v[0-9]*|[0-9]*) want="$a" ;;
         *) echo "install.sh: unknown argument \`$a\`" >&2; exit 2 ;;
     esac
 done
@@ -107,11 +107,19 @@ fetch() { # url out  — download url to file out
 
 latest_tag() {
     # releases/latest 302s to releases/tag/<tag> — the redirect target
-    # carries the tag; no API quota involved
+    # carries the tag; no API quota involved. Take the full tag path,
+    # not the basename: the extras lane (extra/vX.Y.Z) can hold
+    # GitHub's "latest" and basename extraction would strip `extra/`
+    # and resolve an unrelated toolchain tag.
     have curl || die "curl is required for toolchain install"
     url=$(curl -fsIL -o /dev/null -w '%{url_effective}' "$BASE/latest") \
         || die "cannot resolve latest release at $BASE/latest"
-    echo "${url##*/}"
+    case "$url" in
+        */releases/tag/*) lt="${url##*/releases/tag/}" ;;
+        *) lt="${url##*/}" ;;
+    esac
+    vtag "$lt" 2>/dev/null \
+        || die "latest release is not a toolchain tag ($lt) — pass a tag explicitly"
 }
 
 resolve() { # echoes "tag<TAB>source" or nothing
@@ -292,7 +300,17 @@ write_shim
 if [ "$want" = latest ]; then
     url=$(curl -fsIL -o /dev/null -w '%{url_effective}' "$BASE/latest") \
         || { echo "install.sh: cannot resolve latest release at $BASE/latest" >&2; exit 1; }
-    want="${url##*/}"
+    # full tag path — an extras-lane tag (extra/vX.Y.Z) can hold
+    # "latest"; basename extraction would strip `extra/` and resolve
+    # an unrelated toolchain tag
+    case "$url" in
+        */releases/tag/*) want="${url##*/releases/tag/}" ;;
+        *) want="${url##*/}" ;;
+    esac
+    case "$want" in
+        v[0-9]*.[0-9]*.[0-9]*) ;;
+        *) echo "install.sh: latest release is not a toolchain tag ($want) — pass one: install.sh vX.Y.Z" >&2; exit 1 ;;
+    esac
 fi
 "$OXL_HOME/bin/oxl" toolchain install "$want"
 tag="$want"

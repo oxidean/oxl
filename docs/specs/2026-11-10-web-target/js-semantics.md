@@ -144,10 +144,13 @@ rt.__oxl_boot(oxl_main)   // entry: installs run queue, runs root
   so the first push after `mkslice(T, 0)` can store): `new
   Array(ncap)` for general slices, `new Uint8Array(ncap)` for
   `[]byte` so the §4 typed-backing contract survives a grow —
-  copy, `cap=ncap`. Slice value is a
-  *struct copy* — push
-  returns/assigns like native (callers already treat `push`
-  as a builtin that may re-seat).
+  the copy normalizes the view: the existing `len` elements
+  (from the view beginning at `off`) land at index 0 of the new
+  backing, `off` resets to 0, `cap=ncap`, then `v` appends and
+  `len` increments. A slice that does not grow keeps its view —
+  no copy, `off`/`cap` unchanged. Slice value is a *struct
+  copy* — push returns/assigns like native (callers already
+  treat `push` as a builtin that may re-seat).
 - `own []T`: a boxed view — `{v: slice}` where `v` re-seats on
   grow; `*p` derefs to the view.
 - `mkbuf`/`poke8`/`bufstr`/`mkshared`-adjacent byte-buffer

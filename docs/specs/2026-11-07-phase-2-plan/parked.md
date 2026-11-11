@@ -43,7 +43,7 @@ firing moves the item into the milestone map via a new work item.
   milestone spec merged (`docs/specs/2026-11-11-type-descriptors/`);
   implementation tracked as WI-0008 (un-parks on impl)
 - `crypto/tls`, `x509`, asymmetric crypto: a TLS stack is a project,
-  not a package — spec in flight (`docs/specs/2026-11-11-tls-x509/`)
+  not a package — spec in flight on `docs/tls-x509-spec`
 - `compress`/`archive` landed (`compress/{flate,zlib,gzip}`,
   `archive/{tar,zip}`); `net/url`, `container/{heap,list,ring}`
   implementations in flight on their own PRs — drop from this list

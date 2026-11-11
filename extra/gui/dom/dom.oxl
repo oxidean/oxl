@@ -49,6 +49,8 @@ extern fn oxl_dom_fire(h: int, kind: int)
 
 extern fn oxl_dom_tag(h: int) -> cstr
 
+extern fn oxl_dom_style(h: int, name: str, v: str)
+
 extern fn rt_str_free(s: str)
 
 // dom event codes — mirror runtime/rt-dom.mjs's table
@@ -178,6 +180,9 @@ fn (d Dom) new(kind: gui.WidgetKind, props: own []gui.Prop) -> [int, err] {
         gui.WidgetKind.entry => {
             oxl_dom_listen(h, D_INPUT)
             oxl_dom_listen(h, D_ENTER)
+        }
+        gui.WidgetKind.scrolled => {
+            oxl_dom_style(h, "overflow", "auto")
         }
         _ => {
         }

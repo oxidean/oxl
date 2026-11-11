@@ -340,11 +340,11 @@ function join_scope(s) {
 /* frame-task join: register as the scope's joiner, or READY if drained */
 export function rt_scope_join_poll(s, t) {
   if (!s) return RT_READY
-  if (park_add_scoped(t, s, WK_JOIN)) {
-    /* cancelled before registration — no wake will find us; treat like
-     * the drain path: READY so the poll's cancel check exits cleanly */
-    return RT_CANCEL
-  }
+  /* joiners park unconditionally on the JOINED scope's drain — the
+   * joiner's own cancel state must not run rt_scope_finish early on a
+   * scope whose children still run (native parks the same way):
+   * scope_cancel_wake skips WK_JOIN, scope_done wakes at drain */
+  park_add(t, t.scope, s, WK_JOIN)
   if (s.pending > 0) {
     s.join_task = t
     return RT_PENDING
@@ -650,7 +650,7 @@ function settle_common(t, trapped) {
   task_defers_drain(t)
   tls_task = null
   if (t.sel) rt_select_arm(t)
-  scope_done(t.scope)
+  if (!t.external) scope_done(t.scope)
   task_release_frame(t, trapped)
 }
 
@@ -667,7 +667,7 @@ function settle_skipped(t) {
   }
   tls_task = null
   if (t.sel) rt_select_arm(t)
-  scope_done(t.scope)
+  if (!t.external) scope_done(t.scope)
   task_release_frame(t, 0)
 }
 
@@ -1532,6 +1532,7 @@ const te = new TextEncoder()
 const td = new TextDecoder()
 
 export function rt_str(js) {
+  if (js && typeof js === 'object' && js.u8 instanceof Uint8Array) return js
   const u8 = te.encode(js)
   return { u8, off: 0, len: u8.length }
 }
@@ -1637,11 +1638,10 @@ export function rt_atoi(s) {
   const js = rt_str_cstr(s)
   const m = js.match(/^[\s]*([+-]?[0-9]+)/)
   if (!m) return 0n
-  try {
-    return I64(BigInt(m[1]))
-  } catch {
-    return m[1][0] === '-' ? (-1n << 63n) : (1n << 63n) - 1n
-  }
+  /* strtoll parity: saturate at i64 edges rather than wrap */
+  const v = BigInt(m[1])
+  const MIN = -(1n << 63n), MAX = (1n << 63n) - 1n
+  return v < MIN ? MIN : v > MAX ? MAX : v
 }
 export function rt_atof(s) {
   /* strtod parity: inf/infinity/nan literals parse, overflow gives
@@ -1649,6 +1649,9 @@ export function rt_atof(s) {
   const js = rt_str_cstr(s)
   const m = js.match(/^[\s]*([+-]?(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?|[+-]?(?:inf(?:inity)?|nan))/i)
   if (!m) return 0
+  const low = m[1].toLowerCase()
+  if (low.endsWith('nan')) return NaN
+  if (low.endsWith('inf') || low.endsWith('infinity')) return low[0] === '-' ? -Infinity : Infinity
   return parseFloat(m[1])
 }
 
@@ -1841,7 +1844,6 @@ export function rt_println_str(s) {
 }
 const NL8 = new Uint8Array([10])
 export function rt_print_i64(v) {
-  env.write(1, te.encode(BigInt(v).toString()), 0, 0)
   const e = te.encode(BigInt(v).toString())
   env.write(1, e, 0, e.length)
 }
@@ -1890,7 +1892,8 @@ export const rt_ior = (a, b) => I64(BigInt(a) | BigInt(b))
 export const rt_ixor = (a, b) => I64(BigInt(a) ^ BigInt(b))
 export const rt_inot = (a) => I64(~BigInt(a))
 export const rt_to_num = (i) => Number(i)
-export const rt_to_int = (n) => I64(BigInt(n))
+export const rt_to_int = (n) =>
+  Number.isFinite(n) && n >= -(2 ** 63) && n < 2 ** 63 ? I64(BigInt(n)) : -(1n << 63n)
 
 /* ---------------- err registry (RT_ERR_BASE FNV, verbatim) ---------------- */
 

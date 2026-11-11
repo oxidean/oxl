@@ -212,6 +212,13 @@ export function install(api) {
       }
     },
 
+    /* ---------- sqlite — C-lib dep, no js-lane mapping ---------- */
+    rt_sqlite_open: trap21,
+    rt_sqlite_exec: trap21,
+    rt_sqlite_query: trap21,
+    rt_sqlite_close: trap21,
+    rt_sqlite_exec_bind: trap21,
+
     /* ---------- net — sync-blocking natives can't run on one thread.
      * These get the honest trap until W5's node-socket shims land. */
     rt_sock_open: trap21,

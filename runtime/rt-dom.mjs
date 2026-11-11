@@ -156,11 +156,16 @@ export function install(api) {
     return -1n
   }
 
-  /* listeners — dom kind ints; the oxl side maps them to gui kinds */
+  /* listeners — dom kind ints; the oxl side maps them to gui kinds.
+   * Deduped per element+kind: re-attaching a row under a <ul>
+   * re-calls listen and must not stack a second handler */
   F.oxl_dom_listen = (h, kind) => {
     const el = get(h)
     if (!el) return
     const k = BigInt(kind)
+    const lk = el.__oxl_lk || (el.__oxl_lk = new Set())
+    if (lk.has(k)) return
+    lk.add(k)
     if (k === D_CLICK) {
       const f = () => pushEv(el, D_CLICK, 0n)
       el.addEventListener('click', f)
@@ -177,7 +182,12 @@ export function install(api) {
       return
     }
     if (k === D_ROWCLICK) {
-      const f = () => {
+      const f = (e) => {
+        if (REAL && e && e.target) {
+          for (let x = e.target; x && x !== el; x = x.parentNode) {
+            if (x.__oxl_h) return
+          }
+        }
         const p = REAL ? el.parentNode : el.parent
         const idx = p ? Array.prototype.indexOf.call(p.children, el) : -1
         pushEv(el, D_ROWCLICK, BigInt(idx < 0 ? 0 : idx))
@@ -208,6 +218,13 @@ export function install(api) {
     else if (k === D_INPUT) el.dispatch('input')
     else if (k === D_ENTER) el.dispatch('keydown', { key: 'Enter' })
     else if (k === D_CLOSE) el.dispatch('oxl-close')
+  }
+
+  /* inline style — el.style[k] = v (headless carries a plain map) */
+  F.oxl_dom_style = (h, name, v) => {
+    const el = get(h)
+    if (!el) return
+    el.style[String(STR(name))] = String(STR(v))
   }
 
   /* headless inspection — tests read the tree the backend built */

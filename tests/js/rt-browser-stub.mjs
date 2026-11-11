@@ -81,6 +81,8 @@ const trappers = [
   'rt_sock_port', 'rt_sock_connect_ipv4', 'rt_bind_any',
   'rt_set_reuseaddr', 'rt_set_rcvtimo', 'rt_set_rcvtimo_ms',
   'rt_set_sndtimo', 'rt_lookup_start',
+  'rt_sqlite_open', 'rt_sqlite_exec', 'rt_sqlite_query',
+  'rt_sqlite_close', 'rt_sqlite_exec_bind',
 ]
 for (const name of trappers) {
   ok(typeof F[name] === 'function', name + ' bound')

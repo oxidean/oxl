@@ -37,7 +37,7 @@ fn jzero(g: mut G, t: int) -> str {
         return "false"
     }
     if k == check.k_str() {
-        return "{u8:null,off:0,len:0}"
+        return "{u8:new Uint8Array(0),off:0,len:0}"
     }
     if k == check.k_cstr() {
         return "\"\""
@@ -943,14 +943,23 @@ fn jclosure(g: mut G, params: ref parser.NList, body: ref parser.Node) -> str {
     sv := g.defers
     sretk := g.retk
     scret := g.cret
+    sinf := g.inframe
     g.defers = nil
     g.retk = 0
     g.cret = xclret(g, body)
+    // the body is a plain fn context, not the enclosing frame:
+    // captured names must resolve to the `let` rebinds (jname), not
+    // live fr.* slots — otherwise loop closures share one slot and
+    // mutations leak across captures. It also keeps `defer` correct:
+    // jdefers drains the closure's own _dmark rather than popping the
+    // enclosing frame's defers early.
+    g.inframe = 0
     jblk(g, body)
     jdefers(g)
     g.defers = sv
     g.retk = sretk
     g.cret = scret
+    g.inframe = sinf
     wln(g, "}")
     wpop(g)
     btxt := wjoin(g.wlast)
@@ -1111,19 +1120,6 @@ fn jbuiltin(g: mut G, name: str, args: ref parser.NList, argvs: ref GAv) -> str 
     return ""
 }
 
-// extern arg/ret mapping per js-semantics §7
-fn jffi_arg(g: mut G, e: ref parser.Node, v: str, pt: int) -> str {
-    pt2 := gsub(g, pt)
-    pk := tyk(g, pt2)
-    if pk == check.k_str() {
-        return "rt.rt_str_cstr(" + v + ")"
-    }
-    if pk == check.k_slice() && tyk(g, tyi(g, pt2)) == check.k_byte() {
-        return v + ".a.subarray(" + v + ".off, " + v + ".off + " + v + ".len)"
-    }
-    return v
-}
-
 // extern returns already sit in oxl reps — the ffi boundary is
 // oxl-domain end to end (rt-node/rt-browser fill __oxl_ffi with
 // {u8,off,len} strs, {a,off,len,cap} slices, BigInt ints; js_of_s /
@@ -1236,7 +1232,7 @@ fn jcall(g: mut G, f: ref parser.Node, args: ref parser.NList) -> str {
         if tyk(g, t) == check.k_chan() {
             return "rt.rt_close(" + a0 + ")"
         }
-        return "globalThis.__oxl_ffi.close(" + a0 + ")"
+        return "globalThis.__oxl_ffi.rt_fd_close(" + a0 + ")"
     }
     if qn == "new" && args != nil {
         sn := check.callee_name(args.v)
@@ -2521,7 +2517,10 @@ fn jfstmt(g: mut G, s: ref parser.Node) {
             if len(g_call_susp(g, init)) > 0 {
                 jfsusp_go(g, init, 1, fd, "")
             } else {
-                v := jx(g, init)
+                v := jzero(g, t)
+                if init != nil {
+                    v = jx(g, init)
+                }
                 v = jconv_v(g, init, v, t)
                 wln(g, "    fr." + fd + " = " + v + ";")
             }
@@ -2533,7 +2532,10 @@ fn jfstmt(g: mut G, s: ref parser.Node) {
             if len(g_call_susp(g, init)) > 0 {
                 jfsusp_go(g, init, 1, fd, "")
             } else {
-                v := jx(g, init)
+                v := jzero(g, t)
+                if init != nil {
+                    v = jx(g, init)
+                }
                 v = jconv_v(g, init, v, t)
                 wln(g, "    fr." + fd + " = " + v + ";")
             }

@@ -68,7 +68,9 @@ tag (row index rides the event's aux), `scrolled`→`<div>` + overflow CSS. `Pro
 `P_PLACEHOLDER`→placeholder, `P_ROWS`→live child count (read-only;
 a `set_prop` is a contract violation). Events map `click`→clicked,
 `input`→text_changed, Enter-keydown→activated, row-`click`→
-row_activated with the row index in `EventData.Index`, and a
+row_activated with the row index in `EventData.Index` — a click
+whose target chain crosses a nested widget is that widget's event,
+not the row's — and a
 custom `oxl-close` event→close_requested — `change` is never used
 (blur-after-edit would submit without an Enter action).
 

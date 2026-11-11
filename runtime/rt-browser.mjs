@@ -76,6 +76,11 @@ export function install(api) {
     rt_set_sndtimo: trap21,
     rt_lookup_start: trap21,
     rt_lookup_release: () => 0n,
+    rt_sqlite_open: trap21,
+    rt_sqlite_exec: trap21,
+    rt_sqlite_query: trap21,
+    rt_sqlite_close: trap21,
+    rt_sqlite_exec_bind: trap21,
   }
   for (const k in I) F[k] = I[k]
 }

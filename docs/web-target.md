@@ -43,8 +43,11 @@ real vs headless by `typeof document`. Programs that never touch
 
 - **node**: `os`/`os/exec`/`filepath`/`log`/`flag` work — files
   via `fs`, argv via `process.argv`, exec via `child_process`.
-  `net` binds are present but trap code 21 — socket i/o has no
-  cooperative-fiber mapping yet.
+  `exec` calls block the cooperative VM for the child's duration
+  (spawn wakes have no susp-extern bridge yet — a W follow-up;
+  inside `gui.run` they freeze the pump). `net` and `sqlite`
+  binds are present but trap code 21 — socket i/o and the C-lib
+  dep have no cooperative-fiber/js mapping yet.
 - **browser**: every env name is bound — file/proc/net calls
   return `err` codes where the contract permits and trap code 21
   where it does not. Nothing is unbound; a missing shim is a

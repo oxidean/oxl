@@ -27,7 +27,7 @@ Two layout domains with different rules:
 | oxl type | IR type | notes |
 |---|---|---|
 | `int` / `err` | `i64` | wrap-on-overflow: `add`/`sub`/`mul` (plain, no nsw/nuw — C lane's unsigned-wrap semantics preserved); `sdiv`/`srem`; bitwise ops map to IR `and`/`or`/`xor` |
-| `byte` | `i8` | masked ops like the C lane's `uint8_t` |
+| `byte` | `i8` | unsigned throughout — masked ops, `icmp ult`/`zext` compares; `i8` never sign-extended |
 | `float` | `double` | identical IEEE-754 |
 | `bool` | `i32` | C `int` at every boundary (rt.h never takes bool, but struct fields and ret structs are C-shaped in the C lane; `i32` keeps the lane honest at extern edges) |
 | `str` | `%OxlStr = type { ptr, i64 }` | boundary — field-for-field `rt.h` |
@@ -166,14 +166,20 @@ define void @oxl_main() { … }
   union C emits `{ int tag; union {…} u; }`. IR has no union: the
   lane keeps `i32` tag at offset 0, one `[4 x i8]` pad, and a single
   payload field typed as the **largest variant** (`%o_s_<qn>.<V>`
-  with max size under the §6 model). The pad makes the payload
-  offset 8 unconditionally — matching C's union offset whenever any
-  variant carries an 8-aligned field (the common case) and diverging
-  harmlessly otherwise (lane-owned layout). Payload access is a
-  `getelementptr` to the payload field then `load`/`store` of *that
-  variant's* type through the opaque `ptr` — legal under opaque
-  pointers; declared `align` on the op is the variant's natural
-  align, which the slot satisfies by construction.
+  with max size under the §6 model); `<payloadTy>` is `i8` for
+  all-unit enums. Max *size* alone doesn't bound alignment — a
+  low-align largest variant would leave the slot under-aligned for
+  a sibling needing align 8 — so the enum's storage is emitted at
+  alignment 8 (an `i64` anchor/pad field or an explicit `align 8`
+  on the allocating op), which ≥ every variant's natural align
+  under §6. The pad makes the payload offset 8 unconditionally —
+  matching C's union offset whenever any variant carries an
+  8-aligned field (the common case) and diverging harmlessly
+  otherwise (lane-owned layout). Payload access is a
+  `getelementptr` to the payload field then `load`/`store` of
+  *that variant's* type through the opaque `ptr` — legal under
+  opaque pointers; declared `align` on the op is the variant's
+  natural align, which the align-8 slot satisfies.
 - Lane-owned types never cross the rt boundary — no `rt_*` or extern
   fn takes `o_s_*`/`o_en_*`/`o_ret_*` (extern sigs map only to the
   boundary types above; a user extern naming a struct type is as
@@ -205,7 +211,11 @@ The lane never declares `RtScope`'s layout:
   `add (i64 <fixed sizeof %o_frm_*>, mul (i64 <nscopes>, i64 %rtsz))`
   — `bytes` is already a runtime `i64` in the ABI, so the extra
   stride costs one load + multiply at spawn. `sc_i`'s address is
-  `getelementptr i8, ptr %fr, i64 (fixed_off + i*%rtsz)`. The tail
+  `getelementptr i8, ptr %fr, i64 (fixed_off + i*%rtsz)`, where
+  `fixed_off` is `align_up(prefix_size, 16)` — pad before the tail
+  so scope slots land on the `RtScope` alignment, matching the
+  alloca rule (`rt_scope_sizeof()` already returns a multiple of
+  `alignof(RtScope)`). The tail
   lives inside the same `rt_task_new` allocation — the frame-hold
   invariant `task_release_frame` relies on ("inner scopes are
   fields of the frame… a task that dies mid-block must not free()
@@ -282,12 +292,14 @@ exceeds a real alignment.
 - `int` arithmetic is unguarded exactly where C is: `mul`/`add`/
   `sub` wrap (the C lane's unsigned-mul UB dodge has no IR analog —
   plain ops wrap by definition); `sdiv`/`srem` emit unguarded —
-  division by zero is IR poison whose fault behavior is whatever
+  a zero divisor or `INT64_MIN / -1` is IR poison whose fault behavior is whatever
   the backend's `idiv` lowering produces (in practice the same
   SIGFPE-class fault the C lane's `/` gives). Making it a
   `rt_trap` would be an observable divergence, not a safety win. Byte-width ops keep the
   C lane's `& 0xff` result masking (`(uint8_t)(l op r)` →
-  `and i32 …, 255` then `trunc i8`).
+  `and i32 …, 255` then `trunc i8`). Byte comparisons are
+  unsigned (`icmp ult`, or `zext` to `i32` first); `i8` is never
+  sign-extended.
 - `usleep` stays a real block — inline `call void @rt_usleep(i64)`,
   no parking rewrite.
 

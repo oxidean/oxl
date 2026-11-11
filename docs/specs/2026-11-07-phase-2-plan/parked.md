@@ -5,9 +5,10 @@ firing moves the item into the milestone map via a new work item.
 
 ## LLVM backend
 
-- **Status: trigger fired.** Milestone W landed a second emit lane
-  (`--target js`), so the `interfaces.md` codegen seam is proven
-  with a second consumer and a third is pattern work; clang-only
+- **Status: trigger fired.** Milestone W is in flight on
+  `feat/milestone-w` (PR #66) with a second emit lane
+  (`--target js`); the `interfaces.md` codegen seam has a second
+  consumer in flight and a third is pattern work; clang-only
   platform reach (wasm, target SDKs — the trigger's "platform
   target requires it" arm) is the standing justification. Spec:
   `docs/specs/2026-11-11-llvm-backend/` (milestone L, WI-0010).

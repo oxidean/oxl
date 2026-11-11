@@ -1,8 +1,9 @@
 # items/emit-seam.md — the codegen seam, third-lane registration
 
 The seam `docs/semantics/interfaces.md` reserved — "an LLVM backend
-drops in behind the same `TAST → object` seam" — is now a proven
-two-consumer pattern. This item pins what the shared front-end hands
+drops in behind the same `TAST → object` seam" — is now a
+two-consumer pattern in flight (the W lane is on `feat/milestone-w`,
+PR open). This item pins what the shared front-end hands
 a lane, how a lane registers, and what stays per-lane. The reference
 instance is `bootstrap/codegen/js.oxl` (milestone W); the LLVM lane
 follows it mechanically and diverges only where IR differs from an
@@ -93,7 +94,8 @@ required the lane emits dynamically-sized storage (contract in
 - non-frame `scope {}` → `alloca i8, i64 %rtsz, align 16`,
   `%rtsz = call i64 @rt_scope_sizeof()`
 - frame `sc<i>` slots → `[0 x i8]` tail marker in `%o_frm_*`,
-  addressed `gep i8` at `fixed_off + i*%rtsz`; the slot space is
+  addressed `gep i8` at `fixed_off + i*%rtsz` with `fixed_off`
+  aligned up to 16 (matching the alloca rule); the slot space is
   added to `rt_task_new`'s `bytes` argument at spawn
 - named-scope handles were always `rt_scope_new()` heap `ptr`s —
   unaffected

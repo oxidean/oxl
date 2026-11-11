@@ -6,7 +6,7 @@ The parked LLVM backend from `docs/specs/2026-11-07-phase-2-plan/
 parked.md`, un-parked on the second-consumer trigger: milestone W's
 `--target js` emit lane — in flight on `feat/milestone-w` (PR #66),
 sequenced to merge before L starts — puts a second emitter behind the
-codegen seam, so the seam is proven: two sibling emitters consume
+codegen seam, so the seam has two consumers: sibling emitters consume
 `check.CkRes` (`bootstrap/codegen/codegen.oxl`,
 `bootstrap/codegen/js.oxl`). A third
 lane is no longer a hypothetical the seam was designed for; it is a
@@ -27,8 +27,8 @@ constraint, not a budget).
 
 - `docs/semantics/interfaces.md` designed the swap: "an LLVM backend
   drops in behind the same `TAST → object` seam" and `codegen/` is
-  the only cc-aware module. The W lane already proved a second
-  consumer drops in as a sibling file in `package codegen` exporting
+  the only cc-aware module. The W lane demonstrates a second
+  consumer dropping in as a sibling file in `package codegen` exporting
   its own `emit_*` — `cmd/oxl/main.oxl`'s `compile_res` picks the
   lane off `flag_value("--target")` (`codegen.emit` vs
   `codegen.emit_js`).

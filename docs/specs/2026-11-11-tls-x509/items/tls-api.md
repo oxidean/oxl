@@ -19,7 +19,7 @@ struct Config {
                            // Empty ⇒ SNI omitted AND match_hostname
                            // skipped — only legal alongside a
                            // non-nil verify, enforced at client().
-    roots: x509.Roots,     // empty Roots{} ⇒ load_system_roots()
+    roots: x509.Roots,     // Roots{cas: nil} ⇒ load_system_roots()
     alpn: []str,           // empty ⇒ no ALPN extension
     verify: Verifier,      // nil ⇒ x509.verify + match_hostname.
                            // Non-nil ⇒ replaces BOTH (chain AND
@@ -35,10 +35,20 @@ interface Verifier {
     // the same idiom as http.Handler and hash.Hash.
 }
 
-fn dial(host: str, port: int) -> [Conn, err]
-fn dial_timeout(host: str, port: int, tmo_ms: int) -> [Conn, err]
-    // = net.dial_timeout + client(); on handshake failure the inner
+fn dial(host: str, port: int, cfg: Config) -> [Conn, err]
+fn dial_timeout(host: str, port: int, tmo_ms: int, cfg: Config) ->
+    [Conn, err]
+    // tmo_ms bounds TCP connect; `client` then applies the same
+    // budget as the handshake-flight receive timeout (a peer that
+    // accepts TCP then stalls can't park the dial forever) — the
+    // caller's own set_*timo applies only after the handshake
+    // lands.
+    // = net.dial_timeout + client(c, cfg); on handshake failure the inner
     // socket is closed before returning the err — no half-open leak.
+
+fn default_cfg() -> Config
+    // roots: load_system_roots(), server_name/verify/alpn empty —
+    // the 4-field Config literal is easy to get wrong; start here.
 
 fn client(c: net.Conn, cfg: Config) -> [Conn, err]
     // handshake over an existing conn (the wrap API — proxy CONNECT
@@ -46,7 +56,9 @@ fn client(c: net.Conn, cfg: Config) -> [Conn, err]
     // is err_name — a caller who means "no name check" must say so
     // with a Verifier, never by accident.
 
-struct Conn { inner: net.Conn, st: shared, g: int }
+struct Conn { inner: net.Conn, st: shared, g: int, /* … */ }
+    // st/g are the close latch; the elided state box carries
+    // traffic keys, seq counters, and the transcript
     // st/g is the same close-latch discipline as net.Conn: copies
     // (struct value, iface box) share the cell; close wins once.
 
@@ -73,8 +85,9 @@ surface's answer is `verify` — a hook that says *what* trust means,
 not a boolean that says "don't." Tests and private PKI pin a CA
 through `roots` instead.
 
-**Dial-time defaults:** `dial*` sets `server_name = host` when host
-is a DNS name; ALPN comes only from `cfg.alpn` (tls doesn't guess —
+**Dial-time defaults:** `dial*` sets `server_name = host`
+verbatim, IP literals included — the iPAddress SAN check needs it
+(the SNI extension itself stays DNS-only inside `client`); ALPN comes only from `cfg.alpn` (tls doesn't guess —
 `http` supplies `["http/1.1"]`).
 
 ## `std/net/http` — the seam
@@ -86,15 +99,21 @@ struct Url { host: str, port: int, path: str, secure: int }
 // userinfo/query handling is untouched — this spec adds a scheme.
 
 struct Client { tmo: int, tlscfg: tls.Config }
-// request(): u.secure ⇒ tls.dial_timeout(u.host, u.port, cl.tmo)
-// with cfg = cl.tlscfg, cfg.server_name defaulted to u.host when
+// request(): u.secure ⇒ tls.dial_timeout(u.host, u.port, cl.tmo,
+// cl.tlscfg) — cfg.server_name defaulted to u.host when
 // empty, cfg.alpn defaulted to ["http/1.1"] when empty;
 // else ⇒ net.dial_timeout (unchanged path).
 ```
 
 `serve` is untouched — TLS server is a parked trigger, not a stage.
-The `host:` header, `connection: close`, read-until-EOF body loop,
-and `Resp` shape all carry over byte-for-byte: from `request`'s
+The `host:` header appends `:port` only when the port differs
+from the scheme default (443 secure, 80 else) — no spurious
+`:443`. `connection: close`, read-until-EOF body loop,
+and `Resp` shape all carry over byte-for-byte, with one deliberate
+divergence: a TLS peer that closes TCP without `close_notify`
+surfaces `err_eof` — fail-loud on truncation where permissive
+HTTP/1.1 handling would have returned the partial body. From
+`request`'s
 view a `tls.Conn` is just the `io` plumbing `net.Conn` already was.
 
 ## Error taxonomy (what callers see)

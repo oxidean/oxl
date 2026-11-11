@@ -13,14 +13,17 @@ package x509    // std/crypto/x509
 struct Cert {                       // a parsed certificate; fields
     raw: own []byte,                //  are populated lazily at parse —
     version: int, serial: own []byte,
-    issuer: str, subject: str,      //  RDN → printable form (CN=…,O=…)
+    issuer: str, subject: str,      //  RDN → printable form — display
+    //  only; path linking compares DER, never these strings
+    issuer_der: own []byte, subject_der: own []byte,
+    //  the raw Name encodings sliced from `raw`
     not_before: int, not_after: int,//  epoch seconds (UTCTime/GenTime)
-    dns_names: []str,               //  SAN dNSName entries, lowercased
-    ip_addrs: []str,                //  SAN iPAddress entries, dotted
+    dns_names: own []str,           //  SAN dNSName entries, lowercased
+    ip_addrs: own []str,            //  SAN iPAddress entries, dotted
     is_ca: int,                     //  BasicConstraints cA
     max_path: int,                  //  pathLenConstraint, -1 = unset
     ku: int,                        //  KeyUsage bitmask, -1 = absent
-    eku: []str,                     //  EKU OID strings, empty = absent
+    eku: own []str,                 //  EKU OID strings, empty = absent
     sig_alg: int,                   //  signatureAlgorithm (enum below)
     spki_alg: int,                  //  subjectPublicKeyInfo alg
     spki: own []byte,               //  the raw SPKI (verify input)
@@ -70,7 +73,8 @@ OID) yields `err_alg` at verify. `SPKI_*`: `rsa`, `ec_p256`,
 
 1. **Build.** Candidate issuers: `untrusted` intermediates (the
    server's Certificate flight) then `roots`. Link rule: child
-   `issuer` == parent `subject` byte-equal, tightened to
+   parent `subject_der` == candidate `issuer_der`
+   (DER byte-equal — the printable forms are display-only), tightened to
    `akid`==`skid` when both present. Loops cap at 8 links —
    `err_path` beyond. First path that verifies wins; alternatives
    are tried (cross-signed roots).
@@ -89,14 +93,21 @@ OID) yields `err_alg` at verify. `SPKI_*`: `rsa`, `ec_p256`,
    serverAuth → pass; otherwise `err_eku`. `ku` present → must
    carry digitalSignature (TLS 1.3 auth is always a signature).
 5. **Trust anchor.** The terminal issuer must be a `roots` member
-   (self-signed roots compare `raw`-equal after the sig check —
-   the anchor is a store entry, not any self-signed cert the wire
-   offered) → else `err_root`. The returned path includes the
+   (`raw`-equal) → else `err_root`. Anchors are trusted by store
+   membership, so the anchor's own self-signature is never verified
+   and the sig-alg check (step 2's SHA-1/MD5 hard-fail) does not
+   reach it — a SHA-1 self-signed anchor in the store validates,
+   matching real trust stores. The returned path includes the
    anchor.
 
-NameConstraints extensions are not processed — parked with the
-revocation/name-constraint trigger; a constrained enterprise root
-validates as an ordinary root (documented in docs/tls.md).
+NameConstraints is not processed — parked with the
+revocation/name-constraint trigger. One floor rule: the
+processed critical set is {basicConstraints, keyUsage,
+extKeyUsage, SAN, SKID, AKID} — any *critical* extension outside
+it fails `err_der` (a critical nameConstraints we can't honor
+must not validate as an ordinary root); a non-critical
+nameConstraints is ignored per RFC 5280. Deliberate divergence
+from a full PKIX stack, documented in docs/tls.md.
 
 `untrusted` is treated as attacker-controlled throughout: it may
 omit intermediates (chain fails `err_root`), reorder (harmless —
@@ -187,6 +198,9 @@ a caller can layer its own check today without a std change.
 
 `err_der`, `err_alg`, `err_sig`, `err_expired`, `err_notyet`,
 `err_ca`, `err_eku`, `err_path`, `err_root`, `err_name`,
-`err_roots` — package-level `err` values via `errors.new`,
-`errors.is`-compatible so callers branch on category, never on
+`err_roots` — package-level sentinel `err` values. Detail text
+(cert subject, offending name) rides via `errors.wrap(sentinel,
+detail)` — `errors.new` interns by message text, so wrapping is
+what keeps `errors.is(e, err_expired)` matching when the message
+carries the cert's name. Callers branch on category, never on
 message text.

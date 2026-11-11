@@ -10,9 +10,10 @@ implementation must not improvise.
 | field | value |
 |---|---|
 | `legacy_version` | 0x0303 (TLS 1.2 encoding position; 1.3 rides `supported_versions`) |
+| `legacy_session_id` | 32 bytes of fresh `rt_csrand` — compat mode §4.1.2; the ServerHello must echo it verbatim (`legacy_session_id_echo` check, `unexpected_message` else) |
 | `supported_versions` | 0x0304 only |
 | `cipher_suites` | `TLS_AES_128_GCM_SHA256` (0x1301), `TLS_CHACHA20_POLY1305_SHA256` (0x1303), `TLS_AES_256_GCM_SHA384` (0x1302) — in that order |
-| `supported_groups` | `x25519` (0x001d), `secp256r1` (0x0017); `secp384r1` (0x0018) acceptable via HRR only |
+| `supported_groups` | `x25519` (0x001d), `secp256r1` (0x0017), `secp384r1` (0x0018) — all three advertised; a server may only pick an advertised group |
 | `key_share` | shares for x25519 and secp256r1 (two shares dodge the common HRR) |
 | `signature_algorithms` | `ecdsa_secp256r1_sha256` (0x0403), `ecdsa_secp384r1_sha384` (0x0503), `ed25519` (0x0807), `rsa_pss_rsae_sha256/384/512` (0x0804/0x0805/0x0806), `rsa_pkcs1_sha256/384/512` (0x0401/0x0501/0x0601) |
 | `server_name` | the DNS name being dialed; omitted for IP literals |
@@ -32,15 +33,32 @@ negotiation.
 
 ```
 ClientHello
-  → [HelloRetryRequest — at most once; rebuild CH with the
-     demanded group if it's secp384r1/x25519/secp256r1, alert else;
-     transcript carries the HRR message_hash]
-  → ServerHello        — suite/group echoes must ∈ offered, else alert
-  → EncryptedExtensions — ALPN echo must ∈ offered list when sent
-  → Certificate         — each cert_parse'd; leaf + untrusted chain
+  → [HelloRetryRequest — at most once; echo any `cookie`
+     extension verbatim (§4.2.2), rebuild CH with a key_share for
+     the demanded group if it's x25519/secp256r1/secp384r1
+     (illegal_parameter else); transcript carries the HRR
+     message_hash]
+  → ServerHello        — suite/group echoes must ∈ offered, any
+                          extension we didn't offer →
+                          illegal_parameter; else alert
+  → EncryptedExtensions — ALPN echo must ∈ offered list when sent;
+                          any unoffered extension →
+                          illegal_parameter
+  → [CertificateRequest mid-flight — client auth is out of scope:
+     unexpected_message alert]
+  → Certificate         — each cert_parse'd; leaf + untrusted chain;
+                          per-entry extensions (OCSP staples, SCTs)
+                          parsed over, ignored
   → CertificateVerify   — signature over the running transcript;
-                          alg must ∈ signature_algorithms and be a
-                          CV-legal alg (see below) — else alert
+                          signed content is 0x20×64 +
+                          "TLS 1.3, server CertificateVerify" + 0x00
+                          + transcript (§4.4.3); alg must ∈
+                          signature_algorithms and be a CV-legal
+                          alg (see below) — else alert. A local
+                          verify/chain failure answers with an
+                          alert — bad_certificate for sig/parse,
+                          certificate_expired for validity — not a
+                          bare close
   → Finished            — verify_data == HMAC(finished_key, transcript)
   → [client Finished]   — handshake complete; app traffic keys live
 ```

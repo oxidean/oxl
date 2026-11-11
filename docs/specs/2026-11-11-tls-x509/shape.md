@@ -84,8 +84,9 @@ lane (sockets already trap under node; `tls` inherits net's path).
 3. **Cipher floor: two suites + one free rider.** Offer
    `TLS_AES_128_GCM_SHA256` and `TLS_CHACHA20_POLY1305_SHA256`, plus
    `TLS_AES_256_GCM_SHA384` since SHA-384 exists anyway for the
-   signature set. Key shares: `x25519` and `secp256r1`; HRR may pick
-   `secp384r1` and is honored (the field code exists for ECDSA
+   signature set. Key shares: `x25519` and `secp256r1`; `secp384r1` is
+   advertised in `supported_groups` (no share sent up front) so
+   an HRR demanding it is honored (the field code exists for ECDSA
    regardless). No FFDHE, no 0-RTT, no early data.
 4. **Verify-only asymmetric crypto.** Certificates need signature
    *verification* — never signing, encryption, or decryption — so the

@@ -13,7 +13,10 @@ last fix commit.
       artifacts, ADR-0012 for the spec-level forks.
 - [ ] **X1 — entropy + hash ground.** `rt_csrand` in rt.c
       (getrandom/`arc4random_buf`/`BCryptGenRandom`, built under
-      `-DOXL_CRYPTO` — driver `needs_crypto` scan on `rt_csrand`
+      `-DOXL_CRYPTO` — `needs_crypto` scan on `rt_csrand` in all
+      three sites: `oxl/src/main.rs` (seed driver),
+      `bootstrap/cmd/oxl/main.oxl` (self-hosted driver), and the
+      mirrored grep in `tests/run.sh`
       + `-lbcrypt` on Windows only; TLS itself is pure .oxl and
       needs no rt symbols, so the gate names the entropy feature); `std/crypto/rand` (`bytes(n)
       -> [own []byte, err]`, `fill(b) -> err`); `std/crypto/sha512`
@@ -27,7 +30,7 @@ last fix commit.
       vectors), `tests/hkdf_test.oxl` (test_hkdf — RFC 5869 cases
       1–3 incl. the expand_label unit against a computed-by-hand
       vector). Wired into `tests/run.sh` as `== oxl test: tls
-      ground (l1) ==`.
+      ground (x1) ==`.
       Exit: vectors green on all three CI legs; `bcrypt` link only
       when emitted text names the extern.
 - [ ] **X2 — AEAD ciphers.** `std/crypto/aes` (AES-128/192/256 key
@@ -43,7 +46,7 @@ last fix commit.
       vectors + a wrong-tag reject). Perf gate: seal/open
       of a 4 MiB buffer sustains ≥ 5 MiB/s (loose bound, asserted
       by wall clock).
-      Wired `== oxl test: aead (l2) ==`. *Parallel-ok with X1.*
+      Wired `== oxl test: aead (x2) ==`. *Parallel-ok with X1.*
 - [ ] **X3 — `bignum` + `rsa` verify.** `std/crypto/bignum`
       (unsigned-magnitude over i64 limbs, base ≤2^26 so schoolbook
       products + accumulators stay < 2^63; `mod`/`modmul`/
@@ -59,21 +62,22 @@ last fix commit.
       (test_rsav15/test_rsapss — checked-in signatures minted by
       `scripts/gen_tls_fixtures.sh` incl. bad-padding rejects).
       Perf gate: RSA-4096 verify < 250 ms on the slowest CI leg.
-      Wired `== oxl test: bignum+rsa (l3) ==`. *Depends on X1
+      Wired `== oxl test: bignum+rsa (x3) ==`. *Depends on X1
       (sha512 for sha384/512 sigs).*
 - [ ] **X4 — curves.** `std/crypto/x25519` (RFC 7748 Montgomery
       ladder; ref10-style 10-limb i64 field, `scalarmult(sk,pk)`
       public surface only), `std/crypto/nistec` covering P-256 *and*
       P-384 (prime-field ops on X3's bignum, scalar-mul ECDH,
       ECDSA verify, SEC1 uncompressed-point decode), `std/crypto/
-      ed25519` (RFC 8032 verify-only — shares the 25519 field with
-      x25519, Edwards point ops, SHA-512 from X1).
+      ed25519` (RFC 8032 verify-only — Edwards point ops, SHA-512
+      from X1; it carries its own copy of the 25519 field ops so
+      x25519's public surface stays `scalarmult`-only).
       `tests/x25519_test.oxl` (test_x25519 — RFC 7748 §5.2 vectors
       + ECDH symmetry), `tests/nistec_test.oxl` (test_ecdh_p256/
       p384, test_ecdsa — known-answer verify + tamper reject),
       `tests/ed25519_test.oxl` (test_ed25519 — RFC 8032 test 1–3).
       Perf gate: x25519 < 50 ms, ECDSA-P256 verify < 150 ms per op.
-      Wired `== oxl test: curves (l4) ==`. *Depends on X1, X3.*
+      Wired `== oxl test: curves (x4) ==`. *Depends on X1, X3.*
 - [ ] **X5 — `std/crypto/x509`.** Contract `items/x509-trust.md`:
       DER reader (unexported), `parse_cert`, `Cert` struct, chain
       build + verify (`verify(leaf, untrusted, roots, name, at)`),
@@ -93,7 +97,7 @@ last fix commit.
       fixture bundle and with a bogus path asserting `err_roots`
       (env beats store is the pinned order, so the assertions hold
       on every leg regardless of the host's roots). Wired
-      `== oxl test: x509 (l5) ==`.
+      `== oxl test: x509 (x5) ==`.
       *Depends on X1, X3, X4.*
       Exit: every fixture asserts its pinned verdict; env-override
       precedence proven in-suite.
@@ -110,7 +114,12 @@ last fix commit.
       values; test_record — AEAD round-trip with fixed keys).
       `tests/tls_handshake_test.oxl` (test_handshake_replay —
       checked-in server flight fixture → Finished verifies and the
-      Conn reads the fixture's encrypted app data).
+      Conn reads the fixture's encrypted app data). The flight
+      fixture is captured once by a `flight` subcommand added to
+      `scripts/gen_tls_fixtures.sh` (openssl s_server + s_client
+      against a generated CA; capture script, CA key, and openssl
+      version ride in tests/tls/ so the fixture is reproducible,
+      not magic).
       `== tls interop ==` lane behind `command -v openssl`:
       `openssl s_server` + generated CA → `tls.dial` with the CA in
       `roots` performs a real handshake, http GET round-trips; a
@@ -131,8 +140,10 @@ last fix commit.
       their triggers); `parked-stdlib.md`/`parked.md` drop the
       `crypto/tls`/`x509`/asymmetric rows and record what moved to
       live triggers (TLS server, resumption, revocation, constant-
-      time pass); `http.oxl` header's "HTTPS stays parked" line
-      updated; plan markers `[done]`; WI-0009 → shipped.
+      time pass); `docs/product/roadmap.md`'s TLS/x509 parked row
+      → shipped (the `— SHIPPED` pattern); `http.oxl` header's
+      "HTTPS stays parked" line updated; plan markers `[done]`;
+      WI-0009 → shipped.
 
 ## Sequencing
 

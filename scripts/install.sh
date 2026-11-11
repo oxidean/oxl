@@ -19,8 +19,12 @@ die() {
 }
 
 OXL_HOME="${OXL_HOME:-$HOME/.oxl}"
-# absolute-canonicalize — a relative OXL_HOME would resolve pin-file
-# lookups against whatever cwd the shim runs from
+# absolute only — see the shim copy: a relative OXL_HOME would
+# resolve pin-file lookups against whatever cwd runs later
+case "$OXL_HOME" in
+    /*) ;;
+    *) die "OXL_HOME must be an absolute path: $OXL_HOME" ;;
+esac
 [ -d "$OXL_HOME" ] && OXL_HOME=$(cd "$OXL_HOME" && pwd -P)
 BASE="${OXL_RELEASE_BASE:-https://github.com/oxidean/oxl/releases}"
 BASE="${BASE%/}"
@@ -87,23 +91,25 @@ write_shim() {
 set -eu
 
 die() {
-    echo "install.sh: $*" >&2; exit 1
+    code=1
+    case "$1" in ''|*[!0-9]*) ;; *) code="$1"; shift ;; esac
+    echo "oxl: $*" >&2; exit "$code"
 }
 
 OXL_HOME="${OXL_HOME:-$HOME/.oxl}"
-# absolute-canonicalize — a relative OXL_HOME would resolve pin-file
-# lookups against whatever cwd the shim runs from
+# absolute only — a relative OXL_HOME resolves pin-file lookups against
+# whatever cwd the shim runs from, so installs "succeed" into ./rel
+# while later invocations resolve nothing
+case "$OXL_HOME" in
+    /*) ;;
+    *) die "OXL_HOME must be an absolute path: $OXL_HOME" ;;
+esac
+# canonicalize when the dir exists (install creates it otherwise)
 [ -d "$OXL_HOME" ] && OXL_HOME=$(cd "$OXL_HOME" && pwd -P)
 VERS="$OXL_HOME/versions"
 BASE="${OXL_RELEASE_BASE:-https://github.com/oxidean/oxl/releases}"
 BASE="${BASE%/}"
 TAB=$(printf '\t')
-
-die() {
-    code=1
-    case "$1" in ''|*[!0-9]*) ;; *) code="$1"; shift ;; esac
-    echo "oxl: $*" >&2; exit "$code"
-}
 
 norm() { case "$1" in v*) printf '%s\n' "$1" ;; *) printf 'v%s\n' "${1#v}" ;; esac; }
 
@@ -153,6 +159,16 @@ fetch() { # url out  — download url to file out
     curl -fsSL --connect-timeout 15 --max-time 300 "$1" -o "$2"
 }
 
+# a GitHub release's expanded_assets partial lists its assets — releases
+# cut without a toolchain build (do_tool=false lanes: extras-only and
+# docs-manifest bumps) carry none, and `latest` must skip them rather
+# than resolve a tag that dies at the asset fetch
+tag_has_toolchain() { # tag -> 0 when the release lists an oxl-toolchain asset
+    have curl || return 1
+    curl -fsSL --connect-timeout 15 --max-time 60 \
+        "$BASE/expanded_assets/$1" 2>/dev/null | grep -q 'oxl-toolchain-'
+}
+
 # newest toolchain tag on the release feed, or nothing — paged because a
 # single page can be all extras/docs-manifest entries. Kept out of
 # latest_tag's case arms: bash 3.2's case parser cannot handle `done)`
@@ -180,7 +196,11 @@ latest_feed_tag() {
                  | sed 's|releases/tag/||'); do
             # prereleases pass vtag but "latest" means a stable tag
             case "$c" in *-*) continue ;; esac
-            vtag "$c" >/dev/null 2>&1 && { hit=$c; break; }
+            vtag "$c" >/dev/null 2>&1 || continue
+            # skip asset-less releases (extras/docs lanes) — one extra
+            # fetch per stable candidate, bounded by the feed scan
+            tag_has_toolchain "$c" || continue
+            hit=$c; break
         done
         set +f
         [ -n "$hit" ] && { printf '%s\n' "$hit"; return; }
@@ -203,15 +223,22 @@ latest_tag() {
     esac
     case "$lt" in
         v[0-9]*) ;;
-        *) # an extras-lane tag (extra/vX.Y.Z) can hold "latest" — page the
-           # release feed newest-first until a toolchain tag validates;
-           # page one alone can be all extras/docs-manifest entries, so a
-           # first-page miss must not fail the lookup. The scan lives in
-           # latest_feed_tag — a case arm cannot hold a command
-           # substitution containing `done` under bash 3.2 (macOS /bin/sh):
-           # its parser treats `done)` as the pattern close.
-           lt=$(latest_feed_tag) ;;
+        *) lt="" ;;
     esac
+    # the redirect target can itself be an asset-less release (extras or
+    # docs-manifest lane holding "latest") — fall through to the feed
+    # scan, which filters on toolchain assets
+    if [ -n "$lt" ] && ! tag_has_toolchain "$lt"; then lt=""; fi
+    if [ -z "$lt" ]; then
+        # an extras-lane tag (extra/vX.Y.Z) can hold "latest" — page the
+        # release feed newest-first until a toolchain tag validates;
+        # page one alone can be all extras/docs-manifest entries, so a
+        # first-page miss must not fail the lookup. The scan lives in
+        # latest_feed_tag — a case arm cannot hold a command
+        # substitution containing `done` under bash 3.2 (macOS /bin/sh):
+        # its parser treats `done)` as the pattern close.
+        lt=$(latest_feed_tag)
+    fi
     [ -n "$lt" ] \
         || die "no toolchain release tag found — pass one: oxl toolchain install vX.Y.Z"
     vtag "$lt" 2>/dev/null \
@@ -290,7 +317,10 @@ tc_install() { # tag|latest
     if [ -e "$VERS/$tag" ] && [ ! -d "$VERS/$tag" ]; then
         die "$VERS/$tag exists and is not a directory — remove it and retry"
     fi
-    if [ -d "$VERS/$tag" ] && [ ! -x "$(exe_for "$tag")" ]; then
+    exe=$(exe_for "$tag")
+    # -x alone passes on a directory — require a regular executable file,
+    # else a dir at the exe path reads as "installed" but dispatch 127s
+    if [ -d "$VERS/$tag" ] && { [ ! -f "$exe" ] || [ ! -x "$exe" ]; }; then
         echo "oxl: clearing partial install at $VERS/$tag" >&2
         rm -rf "$VERS/$tag"
     fi
@@ -401,9 +431,9 @@ tc_use() {
     tag=$(vtag "$raw") || die "invalid toolchain tag: $raw"
     [ -d "$VERS/$tag" ] || die "$tag is not installed — \`oxl toolchain install $tag\` first"
     if [ "$local_tag" ]; then
+        [ ! -d .oxl-version ] || die ".oxl-version is a directory"
         df=$(mktemp "./.oxl-version.XXXXXX") || die "cannot write .oxl-version"
         echo "$tag" > "$df" || die "cannot write .oxl-version"
-        [ ! -d .oxl-version ] || die ".oxl-version is a directory"
         chmod 644 "$df"
         mv "$df" .oxl-version || die "cannot write .oxl-version"
         echo "oxl: pinned $tag in ./.oxl-version"

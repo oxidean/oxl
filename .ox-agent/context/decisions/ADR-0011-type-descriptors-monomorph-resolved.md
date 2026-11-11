@@ -5,7 +5,7 @@ Status: accepted (WI-0006) — 2026-11-11
 ## Decision
 
 Milestone R emits a `TypeDesc` table per program (name, kind, size,
-align, fields `{name, off, td, tag}`, elem/key) and resolves
+align, fields `{name, off, td, tag, ptr}`, elem/key) and resolves
 `tdesc(T)` at **monomorph time**: inside an instantiated generic
 body the bound `T` is concrete, so the intrinsic folds to a static
 descriptor index. `std/reflect` exposes `type_of`/`value_of`/
@@ -24,7 +24,8 @@ Spec-level forks resolved:
    for.
 2. **Descriptors describe layout only** — no method tables (ifaces
    carry vtables), no value payloads (those live behind
-   `reflect.Value{td, addr}`).
+   `reflect.Value{td, addr, w}` — field-opaque outside
+   `std/reflect`, per the spec's fabrication rules).
 3. **One `unsafe` seam, confined to `std/reflect`** — `Value` reads
    via `rt_field_*` externs; `value_of` is a compiler-lowered
    intrinsic and `Value` a scope-bound type (same escape rules as

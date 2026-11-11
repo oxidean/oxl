@@ -28,7 +28,10 @@ you want verdicted, and again after the last fix commit.
       only while check.oxl also bans `Ret::Pair`; the `type_of`
       builtin special form (type operand, `mkslice`
       precedent — NOT a callable generic, params bind only from
-      args); `rt_desc_*` descriptor accessors (the lazy read lane
+      args); the `--target js` diagnostic for all five
+      intrinsics + the rt externs (native-lane only, per the
+      contract's target gating); `rt_desc_*` descriptor accessors
+      (the lazy read lane
       `Type`/`Field` methods wrap, incl. `rt_desc_v_base` for the
       codegen-pinned union-blob offset — never a fixed +8), the
       `rt_field_*` extern read AND `rt_field_set_*` write helpers in
@@ -41,8 +44,9 @@ you want verdicted, and again after the last fix commit.
       Exit: table emits on tdesc-reach, intrinsics resolve, offsets
       match C layout on both drivers.
 - [ ] **R2 — `std/reflect` lite + `fmt %v` (closes #28).**
-      `std/reflect` (`Type`/`Field`/`Value`, `type_of`, `value_of`,
-      kind-checked reads); `std/fmt`: `sprintv`/`printv`/`vfmt`
+      `std/reflect` (`Type`/`Field`/`Variant`/`Value`, `type_of`,
+      `value_of`/`value_of_mut`, kind-checked reads incl. `vfield`
+      enum-payload access); `std/fmt`: `sprintv`/`printv`/`vfmt`
       verbs `%v` `%+v` `%T` `%#v` — `%v` prints Go's default forms
       (`{v1 v2}` for structs, `&{…}` for ptrs, scalar forms per
       kind, variant name for enums), `%+v` adds field names
@@ -64,7 +68,7 @@ you want verdicted, and again after the last fix commit.
       shallow copy would alias `own` handles, a borrow can't be
       expressed); `as` walks the `unwrap` chain like Go's As —
       first descriptor match wins;
-      `docs/semantics/errors.md` gains a section recording the
+      `docs/semantics/errors.md` — created in R3 — records the
       box lane.
       `tests/errors_as.oxl`: box → as round-trip incl. no-match
       and wrapped-chain cases, wired into `tests/run.sh`.

@@ -523,15 +523,10 @@ fn parseerr(raw: str, e: err) -> err {
 /// relative; mirrors Go's url.Parse (fragment cut first, then
 /// scheme, query, authority, path).
 fn parse(rawurl: str) -> [own URL, err] {
-    i := 0
-    for i < len(rawurl) {
-        c := byteat(rawurl, i)
-        if c < 32 || c == 127 {
-            return nil, errors.new("net/url: invalid control character in URL")
-        }
-        i = i + 1
-    }
-    // fragment is cut before everything else
+    // fragment is cut before everything else — including the ctl
+    // check: Go validates only the pre-fragment window, so a raw
+    // ctl byte inside #… parses clean (its unescape handling is
+    // separate)
     rest := rawurl
     frag := ""
     hasfrag := false
@@ -540,6 +535,14 @@ fn parse(rawurl: str) -> [own URL, err] {
         frag = substr(rest, fi + 1, len(rest))
         rest = substr(rest, 0, fi)
         hasfrag = true
+    }
+    i := 0
+    for i < len(rest) {
+        c := byteat(rest, i)
+        if c < 32 || c == 127 {
+            return nil, errors.new("net/url: invalid control character in URL")
+        }
+        i = i + 1
     }
     [u, e] = parse_nofrag(rest)
     if e != nil {

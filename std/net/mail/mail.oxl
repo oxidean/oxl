@@ -62,7 +62,10 @@ fn consumecomment(p: mut P) -> [str, err] {
         if c == 92 && p.pos + 1 < len(p.s) {
             p.pos = p.pos + 1 // drop '\', keep the byte it guarded
             c = ppeek(p)
-        } else if c == 40 {
+        }
+        // the guarded byte still counts for depth — Go's shared
+        // switch sees it either way
+        if c == 40 {
             depth = depth + 1
         } else if c == 41 {
             depth = depth - 1
@@ -287,7 +290,7 @@ fn decode2047(w: str) -> [own DWord, err] {
     charset := lwr(substr(w, 2, i))
     enc := lwr(substr(w, i + 1, j))
     text := substr(w, j + 1, len(w) - 2)
-    if charset != "utf-8" && charset != "us-ascii" {
+    if charset != "utf-8" && charset != "us-ascii" && charset != "iso-8859-1" {
         return dword(w, true), errors.new("charset not supported: \"" + charset + "\"")
     }
     if enc == "b" {
@@ -295,12 +298,34 @@ fn decode2047(w: str) -> [own DWord, err] {
         if e != nil {
             return dword(w, false), nil
         }
-        return dword(d as str, true), nil
+        return dword(wordtext(d as str, charset), true), nil
     }
     if enc == "q" {
-        return dword(qdecode(text), true), nil
+        return dword(wordtext(qdecode(text), charset), true), nil
     }
     return dword(w, false), nil
+}
+
+// wordtext expands decoded bytes per charset — iso-8859-1 maps
+// byte-for-byte onto codepoints 0–255, so each high byte becomes a
+// two-byte UTF-8 sequence. utf-8/us-ascii pass through.
+fn wordtext(d: str, charset: str) -> str {
+    if charset != "iso-8859-1" {
+        return d
+    }
+    out := mkslice(byte, 0)
+    i := 0
+    for i < len(d) {
+        c := byteat(d, i)
+        if c < 128 {
+            out = push(out, c)
+        } else {
+            out = push(out, 192 + c / 64)
+            out = push(out, 128 + c % 64)
+        }
+        i = i + 1
+    }
+    return out as str
 }
 
 // qdecode — RFC 2047 Q-encoding: '_' space, =XX byte, rest literal
@@ -705,7 +730,19 @@ fn (a ref Address) string() -> str {
     if quotelocal {
         local = quotestring(local)
     }
-    s := "<" + local + "@" + domain + ">"
+    // a caller-built Address can smuggle header bytes through the
+    // domain (Go splices raw — the wart stays closed here): strip
+    // ctl/space/angle bytes before splicing
+    dom := ""
+    di := 0
+    for di < len(domain) {
+        c := byteat(domain, di)
+        if c > 32 && c != 127 && c != 60 && c != 62 {
+            dom = dom + substr(domain, di, di + 1)
+        }
+        di = di + 1
+    }
+    s := "<" + local + "@" + dom + ">"
     if len(a.name) == 0 {
         return s
     }
@@ -725,7 +762,59 @@ fn (a ref Address) string() -> str {
     // encoded-words can't carry quotes/parens in the display name —
     // base64 hides them entirely (Go's rule)
     if find_from(a.name, "\"", 0) >= 0 || find_from(a.name, "#", 0) >= 0 || find_from(a.name, "$", 0) >= 0 || find_from(a.name, "%", 0) >= 0 || find_from(a.name, "&", 0) >= 0 || find_from(a.name, "'", 0) >= 0 || find_from(a.name, "(", 0) >= 0 || find_from(a.name, ")", 0) >= 0 || find_from(a.name, ",", 0) >= 0 || find_from(a.name, ".", 0) >= 0 || find_from(a.name, ":", 0) >= 0 || find_from(a.name, ";", 0) >= 0 || find_from(a.name, "<", 0) >= 0 || find_from(a.name, ">", 0) >= 0 || find_from(a.name, "@", 0) >= 0 || find_from(a.name, "[", 0) >= 0 || find_from(a.name, "]", 0) >= 0 || find_from(a.name, "^", 0) >= 0 || find_from(a.name, "`", 0) >= 0 || find_from(a.name, "{", 0) >= 0 || find_from(a.name, "|", 0) >= 0 || find_from(a.name, "}", 0) >= 0 || find_from(a.name, "~", 0) >= 0 {
-        return "=?UTF-8?B?" + base64.encode(a.name as []byte) + "?= " + s
+        return ewords_b(a.name) + " " + s
     }
-    return "=?UTF-8?Q?" + qencode_word(a.name) + "?= " + s
+    return ewords_q(a.name) + " " + s
+}
+
+// RFC 2047 caps an encoded-word at 75 chars — the "=?UTF-8?E?"
+// prefix + "?=" closer take 12, leaving 63 for the payload. Long
+// names split into space-joined words, each independently
+// decodable; adjacent-word display text concatenates per the RFC.
+
+// ewords_b base64s each 45-byte chunk separately — 45 raw bytes
+// produce exactly 60 payload chars, the largest 4-aligned payload
+// under the cap. Chunks may split a multi-byte char; concatenated
+// decode restores the byte stream.
+fn ewords_b(name: str) -> str {
+    b := name as []byte
+    out := ""
+    i := 0
+    for i < len(b) {
+        n := len(b) - i
+        if n > 45 {
+            n = 45
+        }
+        if len(out) > 0 {
+            out = out + " "
+        }
+        out = out + "=?UTF-8?B?" + base64.encode(b[i:i + n]) + "?="
+        i = i + n
+    }
+    return out
+}
+
+// ewords_q cuts the Q-encoded payload on token boundaries — a
+// literal char or a whole =XX triple — so no =XX escapes mid-word.
+fn ewords_q(name: str) -> str {
+    p := qencode_word(name)
+    out := ""
+    cur := ""
+    i := 0
+    for i < len(p) {
+        tk := 1
+        if byteat(p, i) == 61 && i + 2 < len(p) {
+            tk = 3
+        }
+        if len(cur) + tk > 63 {
+            out = out + "=?UTF-8?Q?" + cur + "?= "
+            cur = ""
+        }
+        cur = cur + substr(p, i, i + tk)
+        i = i + tk
+    }
+    if len(cur) > 0 {
+        out = out + "=?UTF-8?Q?" + cur + "?="
+    }
+    return out
 }

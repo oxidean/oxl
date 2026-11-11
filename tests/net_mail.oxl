@@ -116,4 +116,30 @@ fn test_string() {
     [cm, e3] = mail.parseaddress("gf@example.com (Gogh Fir)")
     ck(e3, "comment parse")
     testing.expect_streq(cm.string(), "\"Gogh Fir\" <gf@example.com>", "comment to string")
+    // escaped parens still count for comment depth (Go's shared
+    // switch sees them either way) — the backslash drops, the paren
+    // stays and holds the comment open
+    [xp, e4] = mail.parseaddress("gf@example.com (a \\(b\\) c)")
+    ck(e4, "escaped-paren comment")
+    testing.expect_streq(xp.name, "a (b) c", "escaped-paren name")
+    // iso-8859-1 encoded word decodes byte-for-byte onto codepoints
+    [lw, e5] = mail.parseaddress("=?iso-8859-1?Q?Andr=E9?= <a@e.com>")
+    ck(e5, "latin-1 word")
+    testing.expect_streq(lw.name, "André", "latin-1 decode")
+    // RFC 2047 caps an encoded-word at 75 chars — a long name splits
+    // into space-joined words, each independently decodable
+    bigname := ""
+    bi := 0
+    for bi < 25 {
+        bigname = bigname + "é"
+        bi = bi + 1
+    }
+    big := new(mail.Address)
+    big.name = bigname
+    big.address = "g@e.com"
+    bs := big.string()
+    testing.expect(find(bs, "?= =?UTF-8?Q?") >= 0, "long name splits into words")
+    [bb, e6] = mail.parseaddress(bs)
+    ck(e6, "split word round-trip")
+    testing.expect_streq(bb.name, bigname, "split decode joins")
 }

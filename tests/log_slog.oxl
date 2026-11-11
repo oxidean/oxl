@@ -42,6 +42,10 @@ fn test_handlers() {
     // text handler — lines land on stderr for run.sh to grep
     l := slog.text_handler(slog.lvl_info())
     l2 := l.with(slog.str_("app", "demo"))
+    // with() clones the bound chain — the receiver is never mutated
+    l4 := l2.with(slog.str_("v", "2"))
+    testing.expect(l2.bound.next == nil, "with keeps receiver chain")
+    testing.expect(l4.bound.next != nil, "with appends on clone")
     l3 := l2.with_group("req")
     l3.info("started", slog.chain(slog.str_("method", "GET"), slog.int_("status", 200)))
     // below-threshold record drops silently
@@ -56,6 +60,8 @@ fn test_json() {
     j3 := j2.with_group("http")
     j3.error("failed", slog.chain(slog.group("hdr", slog.str_("ct", "json")), slog.bool_("retry", true)))
     j3.debug("dbg", slog.str_("k", "v"))
+    // an empty group emits nothing — no "empty":{} (Go's rule)
+    j3.info("grp", slog.group("empty", nil))
     testing.expect(true, "json emits did not crash")
 }
 

@@ -83,6 +83,11 @@ fn test_parsemediatype() {
     testing.expect(m5 != nil, "duplicate param errors")
     [_, m6] = mime.parsemediatype("text/html; =v")
     testing.expect(m6 != nil, "empty attr errors")
+    // empty extended value decodes to "" without dropping (Go's
+    // decode2231Enc("") yields ("", true))
+    [mt9, e9] = mime.parsemediatype("attachment; filename*=utf-8''")
+    ck(e9, "empty * param")
+    testing.expect_streq(mime.pget(mt9.params, "filename"), "", "empty * value")
 }
 
 fn test_formatmediatype() {

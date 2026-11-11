@@ -256,6 +256,10 @@ grep -q 'level=INFO msg=started app=demo req.method=GET req.status=200' <<<"$out
 grep -q 'req.note="has space"' <<<"$out" || { echo "FAIL slog text quoting: $out"; exit 1; }
 grep -q '"level":"ERROR","msg":"failed","pid":42,"http":{"hdr":{"ct":"json"},"retry":true}' <<<"$out" || { echo "FAIL slog json shape: $out"; exit 1; }
 grep -q '"msg":"default-json","src":"set_default"' <<<"$out" || { echo "FAIL slog set_default: $out"; exit 1; }
+grep -q '"msg":"grp"' <<<"$out" || { echo "FAIL slog grp marker: $out"; exit 1; }
+grep -q 'msg=hidden' <<<"$out" && { echo "FAIL slog level drop: $out"; exit 1; }
+grep -q '"empty"' <<<"$out" && { echo "FAIL slog empty group: $out"; exit 1; }
+true
 
 echo "== oxl test: regexp (s5) =="
 out=$("$OXL" test tests/regexp_test.oxl)

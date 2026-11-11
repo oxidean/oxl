@@ -125,8 +125,6 @@ fn rr(base: ref url.URL, r: ref url.URL) -> str {
 
 fn test_resolve() {
     base := ckparse("http://a/b/c/d;p?q", "base")
-    // RFC 3986 §5.4.2 abnormal cases Go resolves identically
-    cases := "g;h|g;x/y|..g|http://a/g"
     r1 := ckparse("g", "r1")
     testing.expect_streq(rr(base, r1), "http://a/b/c/g", "resolve g")
     r2 := ckparse("./g", "r2")
@@ -149,4 +147,26 @@ fn test_resolve() {
     testing.expect_streq(rr(base, r10), "https://x/y", "absolute wins")
     r11 := ckparse("g:h", "r11")
     testing.expect_streq(rr(base, r11), "g:h", "scheme letter path wins")
+    // RFC 3986 §5.4.2 abnormal cases — Go resolves them identically
+    a1 := ckparse("g;h", "a1")
+    testing.expect_streq(rr(base, a1), "http://a/b/c/g;h", "resolve g;h")
+    a2 := ckparse("g;x/y", "a2")
+    testing.expect_streq(rr(base, a2), "http://a/b/c/g;x/y", "resolve g;x/y")
+    a3 := ckparse("..g", "a3")
+    testing.expect_streq(rr(base, a3), "http://a/b/c/..g", "resolve ..g")
+    a4 := ckparse("..", "a4")
+    testing.expect_streq(rr(base, a4), "http://a/b/", "resolve ..")
+    a5 := ckparse(".", "a5")
+    testing.expect_streq(rr(base, a5), "http://a/b/c/", "resolve .")
+    a6 := ckparse("", "a6")
+    testing.expect_streq(rr(base, a6), "http://a/b/c/d;p?q", "resolve empty")
+    a7 := ckparse("g?y", "a7")
+    testing.expect_streq(rr(base, a7), "http://a/b/c/g?y", "resolve g?y")
+    // a raw ctl byte inside a fragment parses clean — Go validates
+    // only the pre-fragment window
+    cb := mkslice(byte, 0)
+    cb = push(cb, 35)
+    cb = push(cb, 1)
+    [_, ce] = url.parse("http://x/" + cb as str)
+    testing.expect(ce == nil, "ctl byte inside fragment parses")
 }

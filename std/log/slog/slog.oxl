@@ -107,9 +107,12 @@ fn levelname(l: int) -> str {
 }
 
 /// tstr is the record timestamp — rt_timestr's "Y-m-d H:M:S" with a
-/// 'T' separator, RFC 3339 shaped.
+/// 'T' separator. No zone suffix: the rt clock is localtime and the
+/// format is a shape match for RFC 3339, not a claim of UTC. One
+/// call — two could splice a date/time pair across midnight.
 fn tstr() -> str {
-    return substr(rt_timestr(), 0, 10) + "T" + substr(rt_timestr(), 11, 19)
+    t := rt_timestr()
+    return substr(t, 0, 10) + "T" + substr(t, 11, 19)
 }
 
 fn mkattr(k: str, kind: int) -> own Attr {
@@ -237,7 +240,9 @@ fn (l mut Logger) set_level(v: int) {
 }
 
 /// with returns a logger whose every record carries the attrs —
-/// Go's Logger.With. The receiver keeps its own bound list.
+/// Go's Logger.With. The receiver keeps its own bound list — the
+/// bound chain is cloned, so later with() calls never mutate a
+/// logger another task already holds.
 fn (l ref Logger) with(a: own Attr) -> own Logger {
     n := new(Logger)
     n.lvl = l.lvl
@@ -386,6 +391,9 @@ fn jval(a: ref Attr) -> own json.Json {
 // object and add it under the group's key.
 fn jattr(parent: mut json.Json, a: ref Attr) {
     if a.kind == k_group {
+        if a.kids == nil {
+            return // Go omits empty groups in both handlers
+        }
         sub := json.jobj()
         kid := a.kids
         for kid != nil {
@@ -488,7 +496,8 @@ fn default_logger() -> own Logger {
 }
 
 /// set_default installs l as the package-level logger — Go's
-/// slog.SetDefault.
+/// slog.SetDefault. Install once before tasks start: g_default is a
+/// plain cell, not synchronized (Go's is atomic).
 fn set_default(l: own Logger) {
     g_default = l
 }

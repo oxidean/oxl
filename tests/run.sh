@@ -1842,6 +1842,13 @@ out=$(OXL_HOME="$tch" "$SHIM" toolchain uninstall "v0.1.0/../../../$scratch/keep
 # oxl.mod pin the traversal checks left behind
 rm -f "$tcw/oxl.mod"
 
+# file:// release bases hit the same Windows wall as the fetch fixture:
+# native curl can't open MSYS-style paths (curl 37), so the install
+# pipeline is POSIX-gated — the shim's resolution verbs above are
+# offline and already cover the Windows leg.
+case "$(uname -s)" in
+MINGW*|MSYS*|CYGWIN*) ;;
+*)
 echo "== i60 install pipeline — file:// release fixture =="
 # end-to-end: download -> sha256 verify -> stage -> atomic mv -> verbs.
 # OXL_RELEASE_BASE takes file:// so the whole pipeline runs offline.
@@ -1934,5 +1941,7 @@ out=$(OXL_HOME="$tch2" OXL_RELEASE_BASE="file://$reldir" \
 [ "$rc" != 0 ] && grep -q "not a directory" <<<"$out" || {
     echo "FAIL nondir guard: rc=$rc $out"; exit 1; }
 rm "$tch2/versions/v9.9.9"
+;;
+esac
 
 echo "ALL TESTS PASSED"

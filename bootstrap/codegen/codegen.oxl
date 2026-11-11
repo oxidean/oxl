@@ -2026,7 +2026,7 @@ fn garm(g: mut G, pat: ref parser.Node, acc: str, st: int) -> GArm {
     if k == 46 { // bare ident binds whole
         match pat {
             parser.Node.PatBind{name} => {
-                r.binds = gbnd(name, "_ms", st, nil)
+                r.binds = gbnd(name, acc, st, nil)
             }
             _ => {
             }
@@ -2144,6 +2144,8 @@ fn gmatch(g: mut G, scrut: ref parser.Node, arms: ref parser.NList) -> str {
                     if !first {
                         o = o + "else if (" + ga.cond + ") { "
                     }
+                } else if first {
+                    o = o + "if (true) { "
                 } else {
                     o = o + "else { "
                 }
@@ -4206,6 +4208,8 @@ fn gfmatch(g: mut G, scrut: ref parser.Node, arms: ref parser.NList) {
                     if !first {
                         wln(g, "    else if (" + ga.cond + ") {")
                     }
+                } else if first {
+                    wln(g, "    if (true) {")
                 } else {
                     wln(g, "    else {")
                 }

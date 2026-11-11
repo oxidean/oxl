@@ -68,6 +68,24 @@ fn binds(e: ExprKind) -> int {
     return 0
 }
 
+// susp context — recv parks the frame; the match scrutinee lives in
+// a frame slot across the suspension boundary
+fn susp_bind() -> int {
+    c := mkchan(1)
+    send(c, 42)
+    n := recv(c)
+    out := 0
+    match n {
+        v => {
+            out = v * 2
+        }
+        _ => {
+            out = -1
+        }
+    }
+    return out
+}
+
 fn main() {
     l := new(Box)
     l.v = 10
@@ -90,6 +108,37 @@ fn main() {
     assert(blocks(ExprKind.Nil) == -9)
 
     binds(ExprKind.Int(77))
+
+    // statement match whose FIRST arm is a whole-scrutinee catch-all —
+    // the emitters used to open a bare `else` with no `if`
+    out := 0
+    match 41 {
+        v => {
+            out = v + 1
+        }
+        _ => {
+            out = -1
+        }
+    }
+    assert(out == 42)
+
+    // whole-scrutinee bind inside a susp frame — the arm accessor is
+    // a frame slot, not the stmt temp; a hardcoded accessor misses it
+    assert(susp_bind() == 84)
+
+    // nested stmt matches — inner accessor must not collide with the
+    // outer scrutinee temp
+    nest := 0
+    match 2 {
+        v => {
+            match 5 {
+                w => {
+                    nest = v * 10 + w
+                }
+            }
+        }
+    }
+    assert(nest == 25)
 
     // expression position + own scrutinee
     let on: own ExprKind = new(ExprKind.Str("s"))

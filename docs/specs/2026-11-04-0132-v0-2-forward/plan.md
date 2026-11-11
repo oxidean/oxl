@@ -123,7 +123,8 @@ structural interfaces, no trait solving).
 (shape stenciling — share code per memory layout, not per type).
 Full monomorphization works today; this is a compile-time/binary-size
 optimization. Slipped per spec: measured 2026-11-05 — 3 generic defs,
-~0 instantiations in-corpus; win is nil at v0 scale (see item doc).
+~0 instantiations in-corpus; win is nil at v0 scale. Re-measured
+2026-11-11 on the grown corpus — still parked (see item doc).
 
 ### Task D5: module qualification [done]
 

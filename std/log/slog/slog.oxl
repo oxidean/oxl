@@ -1,0 +1,756 @@
+package slog
+
+// std/log/slog — structured leveled logging, shaped after Go's
+// log/slog on top of std/log's emit path (timestamped records to
+// stderr):
+//
+//     l := slog.json_handler(slog.lvl_info())
+//     l.info("started", slog.str_("port", "8080"))
+//     // {"time":"...T...","level":"INFO","msg":"started","port":"8080"}
+//
+// A Logger carries a handler (text or json), a level threshold, and
+// bound attrs — with()/with_group() return new loggers with the same
+// handler configuration; they are independent copies, so set_level on
+// one does not propagate (Go's With/WithGroup shape).
+import "std/errors"
+
+import "std/os"
+
+import "std/encoding/json"
+
+import "std/unicode/utf8"
+
+extern fn rt_timestr() -> str
+
+// attr payloads — one kind tag picks which field a node carries
+let k_str: int = 0
+
+let k_int: int = 1
+
+let k_float: int = 2
+
+let k_bool: int = 3
+
+let k_err: int = 4
+
+let k_group: int = 5
+
+// k_mark is a with_group marker in a bound list — it opens a group
+// scope for every attr that follows it
+let k_mark: int = 6
+
+// handler kinds
+let h_text: int = 1
+
+let h_json: int = 2
+
+/// Attr is one key=value log attribute — a linked node (chain attrs
+/// with `next`), or a group when built by group() with kids.
+struct Attr {
+    k: str,
+    kind: int,
+    s: str,
+    i: int,
+    f: float,
+    b: bool,
+    kids: own Attr,
+    next: own Attr,
+}
+
+/// Logger is a handler + threshold + bound attrs — Go's slog.Logger.
+struct Logger { lvl: int, kind: int, bound: own Attr }
+
+/// lvl_debug is the debug record level (Go's slog.LevelDebug).
+fn lvl_debug() -> int {
+    return -4
+}
+
+/// lvl_info is the info record level.
+fn lvl_info() -> int {
+    return 0
+}
+
+/// lvl_warn is the warn record level.
+fn lvl_warn() -> int {
+    return 4
+}
+
+/// lvl_error is the error record level.
+fn lvl_error() -> int {
+    return 8
+}
+
+// levelname — Go's Level.String: base name plus +/- offset.
+fn levelname(l: int) -> str {
+    if l == -4 {
+        return "DEBUG"
+    }
+    if l == 0 {
+        return "INFO"
+    }
+    if l == 4 {
+        return "WARN"
+    }
+    if l == 8 {
+        return "ERROR"
+    }
+    if l < -4 {
+        return "DEBUG" + itoa(l + 4)
+    }
+    if l < 0 {
+        return "DEBUG+" + itoa(l + 4)
+    }
+    if l < 4 {
+        return "INFO+" + itoa(l)
+    }
+    if l < 8 {
+        return "WARN+" + itoa(l - 4)
+    }
+    return "ERROR+" + itoa(l - 8)
+}
+
+/// tstr is the record timestamp — rt_timestr's "Y-m-d H:M:S" with a
+/// 'T' separator. No zone suffix: the rt clock is localtime and the
+/// format is a shape match for RFC 3339, not a claim of UTC. One
+/// call — two could splice a date/time pair across midnight.
+fn tstr() -> str {
+    t := rt_timestr()
+    return substr(t, 0, 10) + "T" + substr(t, 11, 19)
+}
+
+fn mkattr(k: str, kind: int) -> own Attr {
+    a := new(Attr)
+    a.k = k
+    a.kind = kind
+    a.s = ""
+    a.i = 0
+    a.f = 0.0
+    a.b = false
+    a.kids = nil
+    a.next = nil
+    return a
+}
+
+/// str_ builds a string attr — the `_` keeps it off `str` collisions.
+fn str_(k: str, v: str) -> own Attr {
+    a := mkattr(k, k_str)
+    a.s = v
+    return a
+}
+
+/// int_ builds an int attr.
+fn int_(k: str, v: int) -> own Attr {
+    a := mkattr(k, k_int)
+    a.i = v
+    return a
+}
+
+/// float_ builds a float attr.
+fn float_(k: str, v: float) -> own Attr {
+    a := mkattr(k, k_float)
+    a.f = v
+    return a
+}
+
+/// bool_ builds a bool attr.
+fn bool_(k: str, v: bool) -> own Attr {
+    a := mkattr(k, k_bool)
+    a.b = v
+    return a
+}
+
+/// err_ builds an attr from an error value — logged under its msg.
+fn err_(k: str, v: err) -> own Attr {
+    a := mkattr(k, k_err)
+    a.s = errors.msg(v)
+    return a
+}
+
+/// group builds a group attr — kids nest under the group's key:
+/// text emits `g.k=v`, json emits `"g":{"k":v}`.
+fn group(k: str, kids: own Attr) -> own Attr {
+    a := mkattr(k, k_group)
+    a.kids = kids
+    return a
+}
+
+/// chain appends attr list t onto h's tail — build multi-attr args:
+///
+///     l.info("ok", slog.chain(slog.str_("a", "1"), slog.int_("b", 2)))
+fn chain(h: own Attr, t: own Attr) -> own Attr {
+    if h == nil {
+        return t
+    }
+    tail := h
+    for tail.next != nil {
+        tail = tail.next
+    }
+    tail.next = t
+    return h
+}
+
+// appendto clones list h and links t at the end — used by with()
+// so the receiver's bound list is never mutated.
+fn appendto(h: own Attr, t: own Attr) -> own Attr {
+    out := clone(h)
+    if out == nil {
+        return t
+    }
+    tail := out
+    for tail.next != nil {
+        tail = tail.next
+    }
+    tail.next = t
+    return out
+}
+
+// clone deep-copies an attr list (kids included)
+fn clone(a: own Attr) -> own Attr {
+    if a == nil {
+        return nil
+    }
+    c := mkattr(a.k, a.kind)
+    c.s = a.s
+    c.i = a.i
+    c.f = a.f
+    c.b = a.b
+    c.kids = clone(a.kids)
+    c.next = clone(a.next)
+    return c
+}
+
+/// text_handler builds a handler emitting `k=v` text records.
+fn text_handler(lvl: int) -> own Logger {
+    l := new(Logger)
+    l.lvl = lvl
+    l.kind = h_text
+    l.bound = nil
+    return l
+}
+
+/// json_handler builds a handler emitting one JSON object per record.
+fn json_handler(lvl: int) -> own Logger {
+    l := new(Logger)
+    l.lvl = lvl
+    l.kind = h_json
+    l.bound = nil
+    return l
+}
+
+/// set_level changes the handler's minimum level.
+fn (l mut Logger) set_level(v: int) {
+    l.lvl = v
+}
+
+/// with returns a logger whose every record carries the attrs —
+/// Go's Logger.With. The receiver keeps its own bound list — the
+/// bound chain is cloned, so later with() calls never mutate a
+/// logger another task already holds.
+fn (l ref Logger) with(a: own Attr) -> own Logger {
+    n := new(Logger)
+    n.lvl = l.lvl
+    n.kind = l.kind
+    n.bound = appendto(l.bound, a)
+    return n
+}
+
+/// with_group returns a logger that nests later attrs under name —
+/// Go's Logger.WithGroup (empty names are ignored, like Go's).
+fn (l ref Logger) with_group(name: str) -> own Logger {
+    n := new(Logger)
+    n.lvl = l.lvl
+    n.kind = l.kind
+    if len(name) == 0 {
+        n.bound = clone(l.bound)
+        return n
+    }
+    m := mkattr(name, k_mark)
+    n.bound = appendto(l.bound, m)
+    return n
+}
+
+// ---------- render ----------
+
+// utf8seq returns the byte length of a valid UTF-8 sequence at i,
+// or 0 when the bytes can't form one — quotetxt needs it to decide
+// whether a high byte passes through raw or escapes as \ufffd.
+fn utf8seq(s: str, i: int) -> int {
+    c := byteat(s, i)
+    if c < 128 {
+        return 1
+    }
+    n := 0
+    if c >= 194 && c <= 223 {
+        n = 2
+    } else if c >= 224 && c <= 239 {
+        n = 3
+    } else if c >= 240 && c <= 244 {
+        n = 4
+    } else {
+        return 0
+    }
+    if i + n > len(s) {
+        return 0
+    }
+    c1 := byteat(s, i + 1)
+    if c1 < 128 || c1 > 191 {
+        return 0
+    }
+    // overlong leads + surrogates + >U+10FFFF
+    if c == 224 && c1 < 160 || c == 237 && c1 > 159 || c == 240 && c1 < 144 || c == 244 && c1 > 143 {
+        return 0
+    }
+    k := 2
+    for k < n {
+        ck := byteat(s, i + k)
+        if ck < 128 || ck > 191 {
+            return 0
+        }
+        k = k + 1
+    }
+    return n
+}
+
+// runeprint approximates unicode.IsPrint for the quote decision:
+// graphic runes pass; Unicode space separators, format controls,
+// private-use, and noncharacters quote. Covers the assigned non-print
+// set — unassigned codepoints (Cn) pass through, a documented
+// approximation; exact parity needs the full category tables.
+fn runeprint(r: int) -> bool {
+    if r >= 128 && r <= 159 {
+        return false // C1 controls
+    }
+    // Cf format controls (scattered singles + ranges)
+    if r == 173 || r == 1564 || r == 1757 || r == 1807 || r == 2274 || r == 6158 || r == 69821 || r == 69837 || r == 65279 || r == 917505 {
+        return false
+    }
+    if r >= 1536 && r <= 1541 || r >= 8203 && r <= 8207 || r >= 8234 && r <= 8238 || r >= 8288 && r <= 8292 || r >= 8294 && r <= 8303 || r >= 65529 && r <= 65531 || r >= 917536 && r <= 917631 || r >= 113696 && r <= 113699 || r >= 119155 && r <= 119162 || r >= 78896 && r <= 78904 {
+        return false
+    }
+    // Zs/Zl/Zp — Unicode space separators beyond ASCII space
+    if r == 160 || r == 5760 || r >= 8192 && r <= 8202 || r == 8232 || r == 8233 || r == 8239 || r == 8287 || r == 12288 {
+        return false
+    }
+    // Co private use
+    if r >= 57344 && r <= 63743 || r >= 983040 && r <= 1048573 || r >= 1048576 && r <= 1114109 {
+        return false
+    }
+    // noncharacters: U+FDD0–FDEF and xFFFE/xFFFF on every plane
+    if r >= 64976 && r <= 65007 || r >= 65534 && r <= 1114111 && (r % 65536 == 65534 || r % 65536 == 65535) {
+        return false
+    }
+    return true
+}
+
+// uescape renders r as \uXXXX (BMP) or \UXXXXXXXX — strconv.Quote's
+// non-printable non-ASCII shape.
+fn uescape(r: int) -> str {
+    digs := mkslice(byte, 0)
+    tmp := r
+    for tmp > 0 {
+        digs = push(digs, byteat("0123456789abcdef", tmp % 16))
+        tmp = tmp / 16
+    }
+    w := 4
+    pre := "\\u"
+    if r > 65535 {
+        w = 8
+        pre = "\\U"
+    }
+    for len(digs) < w {
+        digs = push(digs, byteat("0123456789abcdef", 0))
+    }
+    out := pre
+    i := len(digs) - 1
+    for i >= 0 {
+        out = out + substr(digs as str, i, i + 1)
+        i = i - 1
+    }
+    return out
+}
+
+// needsquote — text values quote on empty or runes outside the
+// printable set (Unicode space/non-printables, ASCII space,
+// controls, ", =).
+fn needsquote(s: str) -> bool {
+    if len(s) == 0 {
+        return true
+    }
+    i := 0
+    for i < len(s) {
+        c := byteat(s, i)
+        if c < 128 {
+            if c <= 32 || c == 127 || c == 34 || c == 61 {
+                return true
+            }
+            i = i + 1
+            continue
+        }
+        d := utf8.decode(s, i)
+        // RuneError (malformed input or a real U+FFFD) quotes via
+        // the \ufffd path in quotetxt, matching Go's needsQuoting
+        if d.r == 65533 {
+            return true
+        }
+        if !runeprint(d.r) {
+            return true
+        }
+        i = i + d.n
+    }
+    return false
+}
+
+// quotetxt — Go's strconv.Quote shape: \" \\ \n \t \r, other
+// controls as \xNN.
+fn quotetxt(s: str) -> str {
+    out := "\""
+    i := 0
+    for i < len(s) {
+        c := byteat(s, i)
+        if c == 34 {
+            out = out + "\\\""
+        } else if c == 92 {
+            out = out + "\\\\"
+        } else if c == 10 {
+            out = out + "\\n"
+        } else if c == 13 {
+            out = out + "\\r"
+        } else if c == 9 {
+            out = out + "\\t"
+        } else if c == 7 {
+            out = out + "\\a"
+        } else if c == 8 {
+            out = out + "\\b"
+        } else if c == 11 {
+            out = out + "\\v"
+        } else if c == 12 {
+            out = out + "\\f"
+        } else if c < 32 || c == 127 {
+            out = out + "\\x" + substr("0123456789abcdef", c / 16, c / 16 + 1) + substr("0123456789abcdef", c % 16, c % 16 + 1)
+        } else if c >= 128 {
+            d := utf8.decode(s, i)
+            if d.r == 65533 {
+                // RuneError escapes as the literal � marker;
+                // advance d.n so a real U+FFFD (n=3) is consumed
+                // whole, malformed bytes take n=1 (Go's strconv shape)
+                out = out + "\\ufffd"
+                i = i + d.n
+                continue
+            }
+            if !runeprint(d.r) {
+                // non-printable non-ASCII escapes \uXXXX / \UXXXXXXXX
+                out = out + uescape(d.r)
+                i = i + d.n
+                continue
+            }
+            // printable non-ASCII passes through as its original bytes
+            j := i
+            for j < i + d.n {
+                out = out + substr(s, j, j + 1)
+                j = j + 1
+            }
+            i = i + d.n
+            continue
+        } else {
+            out = out + substr(s, i, i + 1)
+        }
+        i = i + 1
+    }
+    return out + "\""
+}
+
+fn textval(s: str) -> str {
+    if needsquote(s) {
+        return quotetxt(s)
+    }
+    return s
+}
+
+// aval renders one attr's value for the text handler
+fn aval(a: ref Attr) -> str {
+    if a.kind == k_str {
+        return textval(a.s)
+    }
+    if a.kind == k_int {
+        return itoa(a.i)
+    }
+    if a.kind == k_float {
+        return ftoa(a.f)
+    }
+    if a.kind == k_bool {
+        if a.b {
+            return "true"
+        }
+        return "false"
+    }
+    return textval(a.s) // k_err
+}
+
+// textattr renders one attr (groups recurse with the key prefix).
+fn qkey(k: str) -> str {
+    if needsquote(k) {
+        return quotetxt(k)
+    }
+    return k
+}
+
+// textattr renders one attr (groups recurse with the RAW dotted key
+// prefix; an empty group key inlines its kids, per the Go handler
+// contract). Quoting happens once on the joined key — Go's text
+// handler emits "a b.c d"=v, not "a b"."c d"=v.
+fn textattr(prefix: str, a: ref Attr) -> str {
+    if a.kind == k_group {
+        out := ""
+        kp := prefix
+        if len(a.k) > 0 {
+            kp = prefix + a.k + "."
+        }
+        kid := a.kids
+        for kid != nil {
+            out = out + textattr(kp, kid)
+            kid = kid.next
+        }
+        return out
+    }
+    return " " + qkey(prefix + a.k) + "=" + aval(a)
+}
+
+fn render_text(l: ref Logger, lvl: int, msg: str, a: own Attr) -> str {
+    line := "time=" + tstr() + " level=" + levelname(lvl) + " msg=" + textval(msg)
+    prefix := ""
+    b := l.bound
+    for b != nil {
+        if b.kind == k_mark {
+            if len(b.k) > 0 {
+                prefix = prefix + b.k + "."
+            }
+            b = b.next
+            continue
+        }
+        line = line + textattr(prefix, b)
+        b = b.next
+    }
+    for a != nil {
+        line = line + textattr(prefix, a)
+        a = a.next
+    }
+    return line + "\n"
+}
+
+// jval — one attr's Json value
+fn jval(a: ref Attr) -> own json.Json {
+    if a.kind == k_int {
+        return json.jint(a.i)
+    }
+    if a.kind == k_float {
+        return json.jfloat(a.f)
+    }
+    if a.kind == k_bool {
+        return json.jbool(a.b)
+    }
+    return json.jstr(a.s) // k_str, k_err
+}
+
+// renders reports whether an attr emits anything — a group renders
+// only when some descendant is a real leaf, so all-empty nesting
+// elides the whole chain, not just the leaves
+fn renders(a: ref Attr) -> bool {
+    if a.kind != k_group {
+        return true
+    }
+    kid := a.kids
+    for kid != nil {
+        if renders(kid) {
+            return true
+        }
+        kid = kid.next
+    }
+    return false
+}
+
+// jattr writes one attr into a Json object — groups build a nested
+// object and add it under the group's key.
+fn jattr(parent: mut json.Json, a: ref Attr) {
+    if a.kind == k_group {
+        if !renders(a) {
+            return // Go omits empty groups in both handlers
+        }
+        if len(a.k) == 0 {
+            // empty key inlines the kids into the parent object
+            kid := a.kids
+            for kid != nil {
+                jattr(parent, kid)
+                kid = kid.next
+            }
+            return
+        }
+        sub := json.jobj()
+        kid := a.kids
+        for kid != nil {
+            jattr(sub, kid)
+            kid = kid.next
+        }
+        json.jadd(parent, a.k, sub)
+        return
+    }
+    json.jadd(parent, a.k, jval(a))
+}
+
+// lastchild — the node jadd just linked at a obj's tail
+fn lastchild(p: ref json.Json) -> own json.Json {
+    c := p.child
+    for c != nil && c.next != nil {
+        c = c.next
+    }
+    return c
+}
+
+fn render_json(l: ref Logger, lvl: int, msg: str, a: own Attr) -> str {
+    root := json.jobj()
+    json.jadd(root, "time", json.jstr(tstr()))
+    json.jadd(root, "level", json.jstr(levelname(lvl)))
+    json.jadd(root, "msg", json.jstr(msg))
+    parent := root
+    // group markers materialize lazily — an open group that never
+    // gains an attr emits no object at all, like Go's handler
+    pending := mkslice(str, 0)
+    b := l.bound
+    for b != nil {
+        if b.kind == k_mark {
+            pending = push(pending, b.k)
+            b = b.next
+            continue
+        }
+        // bound group of nothing elides like Go — only an attr that
+        // actually renders materializes the marks pending before it
+        if renders(b) {
+            for len(pending) > 0 {
+                gk := pending[0]
+                pending = pending[1:len(pending)]
+                if len(gk) == 0 {
+                    continue
+                }
+                g := json.jobj()
+                json.jadd(parent, gk, g)
+                parent = lastchild(parent)
+            }
+        }
+        jattr(parent, b)
+        b = b.next
+    }
+    // call-site attrs land under the currently-open group — pending
+    // marks materialize only when an attr that actually renders
+    // follows them (a group of nothing emits nothing)
+    anyrender := false
+    c := a
+    for c != nil {
+        if renders(c) {
+            anyrender = true
+            break
+        }
+        c = c.next
+    }
+    if anyrender {
+        for len(pending) > 0 {
+            gk := pending[0]
+            pending = pending[1:len(pending)]
+            if len(gk) == 0 {
+                continue
+            }
+            g := json.jobj()
+            json.jadd(parent, gk, g)
+            parent = lastchild(parent)
+        }
+    }
+    for a != nil {
+        jattr(parent, a)
+        a = a.next
+    }
+    return json.tojson(root) + "\n"
+}
+
+// emit — std/log's emit path: one write to stderr, exit(1) when even
+// that fails.
+fn emit(line: str) {
+    f := os.stderr()
+    [_, e] = f.write(line as []byte)
+    if e != nil {
+        exit(1) // nowhere left to report the write failing
+    }
+}
+
+/// log emits one record when lvl meets the logger's threshold —
+/// Go's Logger.Log.
+fn (l mut Logger) log(lvl: int, msg: str, a: own Attr) {
+    if lvl < l.lvl {
+        return
+    }
+    if l.kind == h_json {
+        emit(render_json(l, lvl, msg, a))
+        return
+    }
+    emit(render_text(l, lvl, msg, a))
+}
+
+/// debug emits a debug-level record.
+fn (l mut Logger) debug(msg: str, a: own Attr) {
+    l.log(-4, msg, a)
+}
+
+/// info emits an info-level record.
+fn (l mut Logger) info(msg: str, a: own Attr) {
+    l.log(0, msg, a)
+}
+
+/// warn emits a warn-level record.
+fn (l mut Logger) warn(msg: str, a: own Attr) {
+    l.log(4, msg, a)
+}
+
+/// error emits an error-level record.
+fn (l mut Logger) error(msg: str, a: own Attr) {
+    l.log(8, msg, a)
+}
+
+// ---------- default logger ----------
+let g_default: own Logger = nil
+
+/// default_logger is the process-wide logger the package fns use —
+/// a text handler at info until set_default replaces it.
+fn default_logger() -> own Logger {
+    if g_default == nil {
+        g_default = text_handler(0)
+    }
+    return g_default
+}
+
+/// set_default installs l as the package-level logger — Go's
+/// slog.SetDefault. Install once before tasks start: g_default is a
+/// plain cell, not synchronized (Go's is atomic).
+fn set_default(l: own Logger) {
+    g_default = l
+}
+
+/// debug logs to the default logger at debug level.
+fn debug(msg: str, a: own Attr) {
+    l := default_logger()
+    l.log(-4, msg, a)
+}
+
+/// info logs to the default logger at info level.
+fn info(msg: str, a: own Attr) {
+    l := default_logger()
+    l.log(0, msg, a)
+}
+
+/// warn logs to the default logger at warn level.
+fn warn(msg: str, a: own Attr) {
+    l := default_logger()
+    l.log(4, msg, a)
+}
+
+/// error logs to the default logger at error level.
+fn error(msg: str, a: own Attr) {
+    l := default_logger()
+    l.log(8, msg, a)
+}

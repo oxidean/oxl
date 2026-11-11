@@ -1,0 +1,368 @@
+package ring
+
+// span — handle modulus, 2^20: handles pack gen*span() + idx and the
+// arena bound is the same value. A fn, not a let — package members are
+// assignable across packages, and rewriting the modulus would mis-decode
+// every live handle.
+fn span() -> int {
+    return 1048576
+}
+
+// std/container/ring — Go's container/ring: a circular list.
+//
+// A Ring owns an arena of nodes; element handles are ints into it
+// (ref/mut can't sit in heap objects, so a cycle of pointers can't
+// form — indices are the v0 equivalent) and -1 plays nil. Handles
+// double as cursors: Go's `r.Next()` returns the neighboring
+// *Ring, ours returns the neighboring handle.
+//
+// link/unlink move elements between arenas rather than aliasing
+// them — Go's shared-cycle pointer semantics have no `own`
+// equivalent, so the moved elements' values splice across and the
+// consumed ring dies with its handle; self-linking a ring into
+// itself is unrepresentable for the same reason. Removed nodes
+// recycle through a freelist like std/container/list's.
+//
+// Payloads are int only in v0 (see std/collections for the same call).
+//
+// Dead-handle convention matches std/container/list: reads return
+// -1/0 and mutators no-op, rather than either package erring.
+//
+//   r := ring.newring(3)
+//   i := r.head()
+//   k := 0
+//   for k < r.len() {
+//       r.setval(i, k)
+//       i = r.next(i)
+//       k = k + 1
+//   }
+
+// RNode is a ring cell: v the payload, prev/next arena indices,
+// live marks the cell linked (0 = on the freelist), gen the
+// live-interval tag handles pack (bumped on every freelist push).
+struct RNode { v: int, prev: int, next: int, live: int, gen: int }
+
+/// Ring is a circular list; create with newring. `root` is any one
+/// live element kept as the entry point (link/unlink maintain it);
+//  -1 only on a ring nothing was ever linked into.
+// ns is `own`-boxed for the same reason list's arena is: a plain
+// slice's backing binds to whichever scope grew it — a ring
+// created outside but first grown inside a nested scope would
+// dangle after join. own-domain backing survives for the ring's
+// own lifetime.
+struct Ring { ns: own []RNode, root: int, free: int, n: int, water: int }
+
+/// newring creates a ring of n elements — ring.New. nil for n <= 0.
+fn newring(n: int) -> own Ring {
+    if n <= 0 {
+        return nil
+    }
+    // span() bound — a slot index >= 2^20 would mis-decode its
+    // own handle (gen*span() + idx unpacks to the wrong slot)
+    assert(n <= span())
+    r := new(Ring)
+    r.ns = new(mkslice(RNode, n))
+    i := 0
+    for i < n {
+        r.ns[i].v = 0
+        r.ns[i].live = 1
+        r.ns[i].gen = 1
+        r.ns[i].prev = (i + n - 1) % n
+        r.ns[i].next = (i + 1) % n
+        i = i + 1
+    }
+    r.root = 0
+    r.free = -1
+    r.n = n
+    r.water = n
+    return r
+}
+
+/// len returns the element count — Ring.Len. Note this is O(1)
+/// here; Go's walks the cycle.
+fn (r ref Ring) len() -> int {
+    return r.n
+}
+
+/// head returns the ring's entry handle — where newring/link/unlink
+/// leave a cursor so callers don't have to remember one. -1 only
+/// when the ring holds nothing (impossible once newring ran).
+fn (r ref Ring) head() -> int {
+    return r.mkh(r.root)
+}
+
+// mkh packs an arena index into a handle: gen*span() + idx, -1
+// stays -1. span() = 2^20 bounds the arena.
+fn (r ref Ring) mkh(i: int) -> int {
+    if i < 0 || r.ns == nil || i >= len(r.ns) {
+        return -1
+    }
+    return r.ns[i].gen * span() + i
+}
+
+// ok reports whether i names a live element of this ring. The
+// generation tag makes staleness permanent: a slot's gen bumps on
+// every freelist push, so a handle minted before its slot was
+// recycled never matches again. Handles minted by a DIFFERENT
+// Ring can still alias a live slot by chance — don't mix handles
+// across rings.
+fn (r ref Ring) ok(i: int) -> bool {
+    if i < 0 {
+        return false
+    }
+    idx := i % span()
+    return r.ns != nil && idx < len(r.ns) && r.ns[idx].live == 1 && r.ns[idx].gen == i / span()
+}
+
+/// next returns the handle after i in the cycle — Ring.Next.
+/// A dead handle reads -1.
+fn (r ref Ring) next(i: int) -> int {
+    if !r.ok(i) {
+        return -1
+    }
+    return r.mkh(r.ns[i % span()].next)
+}
+
+/// prev returns the handle before i in the cycle — Ring.Prev.
+fn (r ref Ring) prev(i: int) -> int {
+    if !r.ok(i) {
+        return -1
+    }
+    return r.mkh(r.ns[i % span()].prev)
+}
+
+/// move returns the handle n positions forward from i — Ring.Move.
+/// n < 0 walks backward; the step count wraps modulo len.
+fn (r ref Ring) move(i: int, n: int) -> int {
+    if !r.ok(i) {
+        return -1
+    }
+    p := i % span()
+    // reduce first: m keeps |m| < r.n, so `0 - m` can't overflow —
+    // (0 - n) directly would wrap at n = INT_MIN
+    m := n % r.n
+    if m < 0 {
+        k := 0 - m
+        for k > 0 {
+            p = r.ns[p].prev
+            k = k - 1
+        }
+    } else {
+        k := m
+        for k > 0 {
+            p = r.ns[p].next
+            k = k - 1
+        }
+    }
+    return r.mkh(p)
+}
+
+/// val returns element i's payload — Ring.Value. A dead handle
+/// reads 0.
+fn (r ref Ring) val(i: int) -> int {
+    if !r.ok(i) {
+        return 0
+    }
+    return r.ns[i % span()].v
+}
+
+/// setval writes element i's payload; a dead handle is a no-op.
+fn (r mut Ring) setval(i: int, v: int) {
+    if !r.ok(i) {
+        return
+    }
+    r.ns[i % span()].v = v
+}
+
+// alloc recycles a freelist node before growing the arena.
+fn (r mut Ring) alloc(v: int) -> int {
+    // a zero Ring (new(ring.Ring)) has a nil arena — materialize
+    // before len() derefs the nil box
+    if r.ns == nil {
+        r.ns = new(mkslice(RNode, 0))
+    }
+    if r.n == 0 && len(r.ns) == 0 && r.root == 0 {
+        // re-arm a zero-value Ring like list's alloc does — the
+        // sentinels a used ring keeps can't collide with this
+        // triple (armed rings hold -1s or live entries)
+        r.free = -1
+        r.root = -1
+    }
+    i := r.free
+    if i != -1 {
+        r.free = r.ns[i].next
+    } else {
+        assert(r.water < span())
+        if r.water >= len(r.ns) {
+            r.grow()
+        }
+        i = r.water
+        r.water = r.water + 1
+    }
+    r.ns[i].v = v
+    r.ns[i].prev = -1
+    r.ns[i].next = -1
+    r.ns[i].live = 1
+    return r.ns[i].gen * span() + i
+}
+
+// grow doubles the arena into a fresh own slice — see list.grow:
+// push() can't take an own slice, and a plain backing would bind
+// to whichever scope ran the grow.
+fn (r mut Ring) grow() {
+    ncap := 4
+    if len(r.ns) > 0 {
+        ncap = len(r.ns) * 2
+    }
+    if ncap > span() {
+        ncap = span()
+    }
+    n2 := new(mkslice(RNode, ncap))
+    j := 0
+    for j < r.water {
+        n2[j] = r.ns[j]
+        j = j + 1
+    }
+    // fresh slots mint at gen 1 — a gen-0 slot would collide with
+    // the bare index and resurrect as a handle
+    for j < ncap {
+        n2[j].gen = 1
+        j = j + 1
+    }
+    r.ns = n2
+}
+
+/// link splices all of ring s into this ring right after element i
+/// — Ring.Link. s is consumed (`own` moves it in); its elements
+/// migrate into r's arena in order. Returns i's original next — the
+/// element now behind the inserted block, so it heads the remainder
+/// just like Go's result. link(i, nil) is a no-op returning i.next.
+/// A dead i returns -1 and still consumes s — `own` can't be handed
+/// back, so the failed call destroys the ring.
+///
+/// An EMPTY ring (r.n == 0 — a zero-value ring)
+/// has no anchor to splice behind, so link adopts s's cycle
+/// wholesale and returns the adopted head. Go's `var r Ring;
+/// r.Link(s)` lazy-inits r to a self-singleton and splices s after
+/// it — an empty oxl Ring holds no anchor cell, so it takes s's
+/// elements directly instead.
+fn (r mut Ring) link(i: int, s: own Ring) -> int {
+    if r.n == 0 {
+        if s == nil || s.n == 0 {
+            return -1
+        }
+        // adopt: migrate s's cycle in order — first element becomes
+        // the root self-loop, each next inserts immediately before
+        // root (appends at the cycle tail)
+        p := s.root
+        k := 0
+        for k < s.n {
+            j := r.alloc(s.ns[p].v) % span()
+            if k == 0 {
+                r.root = j
+                r.ns[j].prev = j
+                r.ns[j].next = j
+            } else {
+                r.ns[j].prev = r.ns[r.root].prev
+                r.ns[j].next = r.root
+                r.ns[r.ns[r.root].prev].next = j
+                r.ns[r.root].prev = j
+            }
+            p = s.ns[p].next
+            k = k + 1
+        }
+        r.n = s.n
+        return r.mkh(r.root)
+    }
+    if !r.ok(i) {
+        return -1
+    }
+    i = i % span()
+    if s == nil || s.n == 0 {
+        return r.mkh(r.ns[i].next)
+    }
+    n := r.ns[i].next
+    // splice s's cycle, walking it once from s.root
+    p := s.root
+    k := 0
+    for k < s.n {
+        j := r.alloc(s.ns[p].v) % span()
+        // slot j between the splice point and n — n's prev is the
+        // last element inserted so far (i itself on the first pass),
+        // so consecutive inserts keep s's order
+        r.ns[j].prev = r.ns[n].prev
+        r.ns[j].next = n
+        r.ns[r.ns[n].prev].next = j
+        r.ns[n].prev = j
+        p = s.ns[p].next
+        k = k + 1
+    }
+    r.n = r.n + s.n
+    return r.mkh(n)
+}
+
+/// unlink removes the n elements starting at i.next — Ring.Unlink —
+/// and returns them as a new ring whose head is the first removed
+/// element. Removing nothing yields nil: n <= 0 or n % len == 0
+/// (Go returns nil for n <= 0 and r.Next() for n % len == 0 —
+/// `own` forces nil in both cases since the
+/// unchanged ring can't be returned without consuming the receiver).
+fn (r mut Ring) unlink(i: int, n: int) -> own Ring {
+    if !r.ok(i) || n <= 0 {
+        return nil
+    }
+    i = i % span()
+    k := n % r.n
+    if k == 0 {
+        return nil
+    }
+    out := newring(k)
+    // copy the removed range's values out in order — p ends on the
+    // survivor after the range
+    p := r.ns[i].next
+    first := p
+    j := 0
+    for j < k {
+        out.ns[j].v = r.ns[p].v
+        p = r.ns[p].next
+        j = j + 1
+    }
+    // cut the range out of the cycle
+    r.ns[i].next = p
+    r.ns[p].prev = i
+    // recycle the removed nodes onto the freelist
+    j = 0
+    for j < k {
+        nx := r.ns[first].next
+        r.ns[first].live = 0
+        r.ns[first].gen = r.ns[first].gen + 1
+        r.ns[first].prev = -1
+        r.ns[first].next = r.free
+        r.free = first
+        first = nx
+        j = j + 1
+    }
+    r.n = r.n - k
+    // root is a raw arena index, not a handle — liveness reads the
+    // node flag, not ok() (ok takes packed handles).
+    if r.root >= 0 && r.ns[r.root].live == 0 {
+        r.root = i
+    }
+    return out
+}
+
+/// do calls f on each element's payload in forward order starting
+/// at i — Ring.Do. f must not mutate the ring (Go's caveat too).
+fn (r ref Ring) do(i: int, f: fn(int)) {
+    if !r.ok(i) {
+        return
+    }
+    p := i % span()
+    for true {
+        f(r.ns[p].v)
+        p = r.ns[p].next
+        if p == i % span() {
+            break
+        }
+    }
+}

@@ -835,7 +835,7 @@ fn cmd_list() {
 
 fn main() {
     if argc() < 2 {
-        eprintln("oxl — one toolchain binary\n\n  oxl build [<pkg dir>|<file.oxl>...] [-o out] [--target js] [--html]\n  oxl run [<pkg dir>|<file.oxl>...] [--target js]\n  oxl test [<pkg dir>|<file.oxl>...] [--target js]\n  oxl fmt <file.oxl>...\n  oxl doc <file.oxl>\n  oxl get <path>@<query>\n  oxl publish v<semver>\n  oxl mod <init|tidy|verify|list> ...\n  oxl list -m all\n  oxl lsp")
+        eprintln("oxl — one toolchain binary\n\n  oxl build [<pkg dir>|<file.oxl>...] [-o out] [--target js] [--html]\n  oxl run [<pkg dir>|<file.oxl>...] [--target js]\n  oxl test [<pkg dir>|<file.oxl>...] [--target js]\n  oxl fmt <file.oxl>...\n  oxl doc <file.oxl>\n  oxl get <path>@<query>\n  oxl publish v<semver>\n  oxl mod <init|tidy|verify|list> ...\n  oxl list -m all\n  oxl version\n  oxl lsp")
         exit(2)
     }
     c := argv(1)
@@ -863,6 +863,18 @@ fn main() {
         cmd_publish()
     } else if c == "mod" {
         cmd_mod()
+    } else if c == "version" {
+        // the release tarball ships a RELEASE file beside the binary
+        // carrying its tag; a source-built driver without one is dev
+        rel := "dev"
+        exe := rt_exepath()
+        if len(exe) > 0 {
+            t := strings.trim(readfile(check.dir_of(exe) + "/RELEASE"))
+            if len(t) > 0 {
+                rel = strings.split(t, "\n").v
+            }
+        }
+        println("oxl " + rel + " (language " + check.tool_ver() + ")")
     } else if c == "lsp" {
         cmd_lsp()
     } else {

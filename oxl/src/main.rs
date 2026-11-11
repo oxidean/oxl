@@ -27,7 +27,7 @@ fn main() {
         return;
     }
     if args.len() < 2 {
-        eprintln!("oxl — one toolchain binary\n\n  oxl build [<pkg dir>|<file.oxl>...] [-o out]\n  oxl run [<pkg dir>|<file.oxl>...]\n  oxl test [<pkg dir>|<file.oxl>...]\n  oxl fmt <file.oxl>...\n  oxl doc <file.oxl>\n  oxl get <path>@<query>\n  oxl publish v<semver>\n  oxl mod <init|tidy|verify|list> ...\n  oxl list -m all\n  oxl lsp");
+        eprintln!("oxl — one toolchain binary\n\n  oxl build [<pkg dir>|<file.oxl>...] [-o out]\n  oxl run [<pkg dir>|<file.oxl>...]\n  oxl test [<pkg dir>|<file.oxl>...]\n  oxl fmt <file.oxl>...\n  oxl doc <file.oxl>\n  oxl get <path>@<query>\n  oxl publish v<semver>\n  oxl mod <init|tidy|verify|list> ...\n  oxl list -m all\n  oxl version\n  oxl lsp");
         exit(2);
     }
     match args[1].as_str() {
@@ -40,6 +40,7 @@ fn main() {
         "publish" => cmd_publish(&args),
         "mod" => cmd_mod(&args),
         "list" => cmd_list(&args),
+        "version" => cmd_version(),
         "lsp" => cmd_lsp(),
         other => {
             eprintln!("unknown command `{other}`");
@@ -147,9 +148,6 @@ fn modcache_dir() -> PathBuf {
     modcache::cache_dir()
 }
 
-/// parse oxl.mod text -> (module path, `oxl` floor as written,
-/// requires, replaces). Errors come back ready to print:
-/// `oxl.mod:<line>: <msg>` — display stays hermetic (the manifest is
 /// manifest comment rule: `//` opens a comment only at line start or
 /// after whitespace — a `//` glued inside a token (`file://`, `https://`)
 /// is part of the path, the same constraint the modfile lexer applies
@@ -166,12 +164,26 @@ fn strip_comment(raw: &str) -> &str {
     raw
 }
 
-/// always AT the module root, so the bare name locates it).
+/// parse oxl.mod text -> (module path, `oxl` floor as written,
+/// toolchain pin, requires, replaces). Errors come back ready to
+/// print: `oxl.mod:<line>: <msg>` — display stays hermetic (the
+/// manifest is always AT the module root, so the bare name locates
+/// it).
 fn parse_manifest(
     src: &str,
-) -> Result<(String, Option<String>, Vec<(String, String)>, Vec<(String, Option<String>, PathBuf)>), String> {
+) -> Result<
+    (
+        String,
+        Option<String>,
+        Vec<(String, String)>,
+        Vec<(String, Option<String>, PathBuf)>,
+        Option<String>,
+    ),
+    String,
+> {
     let mut module = String::new();
     let mut floor: Option<String> = None;
+    let mut toolchain: Option<String> = None;
     let mut requires: Vec<(String, String)> = Vec::new();
     let mut replaces: Vec<(String, Option<String>, PathBuf)> = Vec::new();
     let mut lines = src.lines().enumerate().peekable();
@@ -201,6 +213,25 @@ fn parse_manifest(
                     return Err(err("expected version".into()));
                 }
                 floor = Some(toks[1].to_string());
+            }
+            "toolchain" => {
+                if toolchain.is_some() {
+                    return Err(err("duplicate directive \"toolchain\"".into()));
+                }
+                if toks.len() != 2 {
+                    return Err(err("expected `vX.Y.Z`".into()));
+                }
+                // `v` prefix optional — validate a normalized copy; the
+                // pin is stored as written
+                let pin = if toks[1].starts_with('v') {
+                    toks[1].to_string()
+                } else {
+                    format!("v{}", toks[1])
+                };
+                if semver::parse(&pin).is_none() {
+                    return Err(err("expected `vX.Y.Z`".into()));
+                }
+                toolchain = Some(toks[1].to_string());
             }
             "require" | "replace" => {
                 let kw = toks[0];
@@ -264,7 +295,7 @@ fn parse_manifest(
     if module.is_empty() {
         return Err("oxl.mod: missing module directive".into());
     }
-    Ok((module, floor, requires, replaces))
+    Ok((module, floor, requires, replaces, toolchain))
 }
 
 /// parse oxl.work text -> (`oxlwork` floor as written, [(line, use
@@ -379,7 +410,7 @@ fn load_work(ctx: &mut ModCtx, wr: &Path) -> Result<(), String> {
             Err(e) => {
                 return Err(format!("oxl.work:{lineno}: use dir \"{arg}\": {e}"));
             }
-            Ok((mp, _, _, _)) => {
+            Ok((mp, _, _, _, _)) => {
                 // `use ./` at the main module's own root — same
                 // tree, nothing to add
                 if canon == root_canon {
@@ -412,7 +443,7 @@ fn mod_ctx(start: &Path, loud: bool) -> Result<Option<ModCtx>, ()> {
             return Err(());
         }
     };
-    let (path, floor, requires, replaces) = match parse_manifest(&text) {
+    let (path, floor, requires, replaces, _toolchain) = match parse_manifest(&text) {
         Ok(m) => m,
         Err(e) => {
             if loud {
@@ -561,7 +592,7 @@ fn build_list(ctx: &ModCtx) -> Vec<(String, String)> {
         let Ok(text) = std::fs::read_to_string(udir.join("oxl.mod")) else {
             continue;
         };
-        let Ok((_, _, reqs, _)) = parse_manifest(&text) else {
+        let Ok((_, _, reqs, _, _)) = parse_manifest(&text) else {
             continue;
         };
         for (mp, mv) in reqs {
@@ -578,7 +609,7 @@ fn build_list(ctx: &ModCtx) -> Vec<(String, String)> {
         let Ok(text) = std::fs::read_to_string(dir.join("oxl.mod")) else {
             continue;
         };
-        let Ok((_, _, reqs, _)) = parse_manifest(&text) else {
+        let Ok((_, _, reqs, _, _)) = parse_manifest(&text) else {
             continue;
         };
         for (rp, rv) in reqs {
@@ -2125,7 +2156,7 @@ fn fetch_mod(mp: &str, query: &str) -> Result<fetch::Fetched, String> {
         };
         let declared = std::str::from_utf8(&f.manifest)
             .map_err(|e| e.to_string())
-            .and_then(|t| parse_manifest(t).map(|(p, _, _, _)| p))
+            .and_then(|t| parse_manifest(t).map(|(p, _, _, _, _)| p))
             .map_err(|e| format!("{mp}@{}: parsing oxl.mod: {e}", f.ver));
         match declared {
             Ok(d) if d == mp => return Ok(f),
@@ -2185,7 +2216,7 @@ fn try_index_get(mp: &str, query: &str) -> Result<Option<fetch::Fetched>, String
         .map_err(|x| format!("{mp}@{}: {x}", e.version))?;
     let declared = std::str::from_utf8(&f.manifest)
         .map_err(|x| x.to_string())
-        .and_then(|t| parse_manifest(t).map(|(p, _, _, _)| p))
+        .and_then(|t| parse_manifest(t).map(|(p, _, _, _, _)| p))
         .map_err(|x| format!("{mp}@{}: parsing oxl.mod: {x}", e.version))?;
     if declared != mp {
         if let index::Root::Cloned(t) = &root {
@@ -2305,7 +2336,7 @@ fn publish(ver: &str) -> Result<(), String> {
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
     let root = find_root(&cwd).ok_or("no oxl.mod in current directory or any parent")?;
     let mtext = std::fs::read_to_string(root.join("oxl.mod")).map_err(|e| e.to_string())?;
-    let (mp, _, _, _) = parse_manifest(&mtext).map_err(|e| format!("parsing oxl.mod: {e}"))?;
+    let (mp, _, _, _, _) = parse_manifest(&mtext).map_err(|e| format!("parsing oxl.mod: {e}"))?;
     let key = index::key(&mp).ok_or_else(|| format!("module path {mp} is not index-eligible"))?;
     let iroot = index::root()?.ok_or("OXLMODINDEX is not set — nothing to publish to")?;
     let idx = iroot.path().to_path_buf();
@@ -2674,7 +2705,7 @@ fn mod_init(args: &[String], cwd: &Path) {
 /// ModCtx built from in-memory manifest state (tidy rewrites before
 /// it writes) — same normalization mod_ctx applies to disk state
 fn mk_ctx(root: &Path, mtext: &str, sums: Vec<modcache::SumLine>) -> Result<ModCtx, String> {
-    let (path, floor, requires, replaces) = parse_manifest(mtext)?;
+    let (path, floor, requires, replaces, _toolchain) = parse_manifest(mtext)?;
     if let Some(fv) = floor {
         let cur = ver_tuple(OXL_VERSION).unwrap_or((0, 0, 0));
         if ver_tuple(&fv).map_or(false, |f| f > cur) {
@@ -2942,7 +2973,7 @@ fn tidy_satisfy(
     // (MVS picks the max if several deps ask)
     if let Some(dr) = dep_root {
         if let Ok(text) = std::fs::read_to_string(dr.join("oxl.mod")) {
-            if let Ok((_, _, dreq, _)) = parse_manifest(&text) {
+            if let Ok((_, _, dreq, _, _)) = parse_manifest(&text) {
                 let mut best: Option<&(String, String)> = None;
                 for r in &dreq {
                     if (imp == r.0 || imp.starts_with(&format!("{}/", r.0)))
@@ -3835,6 +3866,21 @@ fn index_at<'a>(a: &'a Analysis, file: &str, off: u32) -> Option<&'a check::UseR
 }
 
 // --- stdio LSP: diagnostics + hover/definition over the position index ---
+/// release tag from the `RELEASE` file the tarball ships beside the
+/// binary, else `dev` — the version manager reads this to confirm the
+/// dispatched toolchain's tag
+fn cmd_version() {
+    let rel = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(|p| p.join("RELEASE")))
+        .and_then(|f| std::fs::read_to_string(f).ok())
+        // first line only — parity with the .oxl driver's RELEASE read
+        .and_then(|t| t.lines().next().map(|l| l.trim().to_string()))
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| "dev".into());
+    println!("oxl {rel} (language {})", tool_ver());
+}
+
 fn cmd_lsp() {
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();

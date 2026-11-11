@@ -31,16 +31,16 @@ retires it.
 | **R** | package registry | central index + `oxl publish`/`oxl get` against it |
 | **P** | polish | small tracked debt, pulled opportunistically |
 
-Parked: LLVM backend, web target, D4 shape-generics, the parked-stdlib
-list — see `parked.md`.
+Parked: LLVM backend, D4 shape-generics, pin primitive, the
+parked-stdlib list — see `parked.md`.
 
 ## Sequencing rationale
 
 1. **T first.** Largest dogfooding payoff — every later milestone is
    built with the toolchain it ships. Also the only milestone whose
    absence falsifies "oxl is written in oxl".
-2. **G second.** Charter path; gates the parked web target via the
-   DOM-map guardrail.
+2. **G second.** Charter path; gated the web target via the
+   DOM-map guardrail — that gating later became milestone W.
 3. **R third.** The module system shipped; a registry is an infra
    service, not a language change — it can wait until there's
    something worth publishing.

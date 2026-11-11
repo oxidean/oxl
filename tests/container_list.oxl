@@ -1,0 +1,253 @@
+package main
+
+// container/list — doubly-linked list: traversal both directions,
+// inserts around marks, removes returning payloads, in-place moves,
+// whole-list splices; removed handles go inert.
+//
+// `l.remove(l.front())`-style nesting is a borrow-aliasing trap
+// (the front() borrow is live for the whole remove() call), so mut
+// calls get their handles hoisted — same rule everywhere `own` args
+// meet ref/mut params.
+import "std/container/list"
+
+fn main() {
+    l := list.newlist()
+    assert(l.len() == 0)
+    assert(l.front() == -1 && l.back() == -1)
+
+    a := l.pushback(1)
+    b := l.pushback(3)
+    l.pushfront(0)
+    c := l.pushback(5)
+    // insert 2 before b, 4 after b -> [0,1,2,3,4,5]
+    [i2, e2] = l.insertbefore(2, b)
+    assert(e2 == nil)
+    [i4, e4] = l.insertafter(4, b)
+    assert(e4 == nil)
+    assert(l.len() == 6)
+    assert(l.val(l.front()) == 0)
+    assert(l.val(l.back()) == 5)
+
+    // forward walk
+    i := l.front()
+    want := 0
+    for i != -1 {
+        assert(l.val(i) == want)
+        want = want + 1
+        i = l.next(i)
+    }
+    assert(want == 6)
+
+    // backward walk
+    i = l.back()
+    want = 5
+    for i != -1 {
+        assert(l.val(i) == want)
+        want = want - 1
+        i = l.prev(i)
+    }
+    assert(want == -1)
+
+    // the walk ends past both ends, like Go's nil *Element
+    assert(l.prev(l.front()) == -1)
+    assert(l.next(l.back()) == -1)
+
+    // payload write/read through the handle
+    l.setval(i2, 20)
+    assert(l.val(i2) == 20)
+    l.setval(i2, 2)
+
+    // remove head, tail — returns payloads, len tracks
+    f := l.front()
+    [v0, e0] = l.remove(f)
+    assert(e0 == nil && v0 == 0)
+    [v5, e5] = l.remove(c)
+    assert(e5 == nil && v5 == 5)
+    assert(l.len() == 4)
+    // list now [1,2,3,4]
+    assert(l.val(l.front()) == 1)
+    assert(l.val(l.back()) == 4)
+
+    // a removed handle is dead: reads -1/0, re-remove errs
+    [_, e5b] = l.remove(c)
+    assert(e5b != nil)
+    assert(l.next(c) == -1)
+    assert(l.prev(c) == -1)
+    assert(l.val(c) == 0)
+    l.setval(c, 99) // no-op on a dead handle
+    // move* no-op on dead handles too — reads don't resurrect them
+    l.movetofront(c)
+    l.movetoback(c)
+    l.movebefore(c, a)
+    l.moveafter(c, a)
+    assert(l.val(l.front()) == 1 && l.val(l.back()) == 4)
+    // splicing an empty other is a no-op both directions
+    el := list.newlist()
+    l.pushbacklist(el)
+    ef := list.newlist()
+    l.pushfrontlist(ef)
+    assert(l.len() == 4)
+
+    // moveto* reorder in place — list is [1,2,3,4]
+    l.movetofront(i4) // [4,1,2,3]
+    assert(l.val(l.front()) == 4)
+    l.movetoback(i4) // [1,2,3,4]
+    assert(l.val(l.back()) == 4)
+    l.movebefore(i4, a) // [4,1,2,3]
+    assert(l.val(l.front()) == 4 && l.prev(a) == i4)
+    l.moveafter(i4, b) // [1,2,3,4]
+    assert(l.next(b) == i4 && l.val(l.back()) == 4)
+    l.moveafter(i4, i4) // self move is a no-op
+    assert(l.next(b) == i4)
+
+    // remove middle -> [1,3,4]
+    [v2, e2b] = l.remove(i2)
+    assert(e2b == nil && v2 == 2)
+    assert(l.next(a) == b)
+    assert(l.prev(b) == a)
+
+    // whole-list splices — PushBackList/PushFrontList
+    m := list.newlist()
+    m.pushback(10)
+    m.pushback(11)
+    l.pushbacklist(m) // [1,3,4,10,11]
+    assert(l.len() == 5)
+    assert(l.val(l.back()) == 11)
+    n := list.newlist()
+    n.pushback(-1)
+    n.pushback(-2)
+    l.pushfrontlist(n) // [-1,-2,1,3,4,10,11]
+    assert(l.len() == 7)
+    assert(l.val(l.front()) == -1)
+    assert(l.val(l.next(l.front())) == -2)
+
+    // drain everything off the head
+    for l.front() != -1 {
+        h := l.front()
+        [_, de] = l.remove(h)
+        assert(de == nil)
+    }
+    assert(l.len() == 0)
+    assert(l.front() == -1 && l.back() == -1)
+
+    // inserts at a dead mark err instead of corrupting
+    [_, ie] = l.insertbefore(9, i2)
+    assert(ie != nil)
+    [_, ie2] = l.insertafter(9, i2)
+    assert(ie2 != nil)
+
+    // churn reuses nodes: 2000 push/remove cycles keep the arena
+    // bounded at the high-water mark, not one slot per op
+    i = 0
+    for i < 2000 {
+        h2 := l.pushback(i)
+        if i % 3 == 0 {
+            [_, re] = l.remove(h2)
+            assert(re == nil)
+        }
+        i = i + 1
+    }
+    for l.front() != -1 {
+        h3 := l.front()
+        [_, de2] = l.remove(h3)
+        assert(de2 == nil)
+    }
+    assert(l.len() == 0)
+
+    // inserts at the boundaries — before front, after back
+    b2 := list.newlist()
+    bf := b2.pushback(7)
+    b2.pushback(9)
+    [ihb, ieb] = b2.insertbefore(5, bf) // before front -> new front
+    assert(ieb == nil)
+    assert(b2.val(b2.front()) == 5 && b2.next(ihb) == bf)
+    bb := b2.back()
+    [iha, iea] = b2.insertafter(11, bb) // after back -> new back
+    assert(iea == nil)
+    assert(b2.val(b2.back()) == 11 && b2.prev(iha) == bb)
+    assert(b2.len() == 4)
+
+    // movetofront(front) / movetoback(back) hit the inert early
+    // returns — position and length are unchanged
+    ml := list.newlist()
+    mf1 := ml.pushback(1)
+    ml.pushback(2)
+    mb3 := ml.pushback(3)
+    ml.movetofront(mf1)
+    assert(ml.front() == mf1 && ml.val(mf1) == 1)
+    ml.movetoback(mb3)
+    assert(ml.back() == mb3 && ml.val(mb3) == 3)
+    assert(ml.len() == 3)
+
+    // init() resets in place — handles minted before die with the
+    // generation bump, the arena clears, fresh handles mint gen 1
+    il := list.newlist()
+    il.pushback(7)
+    il.pushback(8)
+    il.pushback(9)
+    assert(il.len() == 3)
+    il.init()
+    assert(il.len() == 0)
+    assert(il.front() == -1 && il.back() == -1)
+    il.pushback(42)
+    assert(il.len() == 1 && il.val(il.front()) == 42)
+
+    // zero-value reads: a bare List{} fronts/backs -1, no trap —
+    // and splicing a zero other's arena is a no-op
+    zl := new(list.List)
+    assert(zl.front() == -1 && zl.back() == -1 && zl.len() == 0)
+    l2 := list.newlist()
+    l2.pushback(1)
+    l2.pushbacklist(zl)
+    assert(l2.len() == 1)
+
+    // zero-value writes: pushback on a bare List re-arms the
+    // sentinels and stores — the zero arm in alloc is reachable
+    zl2 := new(list.List)
+    zh := zl2.pushback(1)
+    assert(zh != -1 && zl2.len() == 1)
+    assert(zl2.val(zl2.front()) == 1 && zl2.val(zl2.back()) == 1)
+
+    // a stale handle stays dead after its slot recycles — remove
+    // frees the node (gen bumps), the next push re-arms it fresh
+    sl := list.newlist()
+    h1 := sl.pushback(1)
+    [v1r, e1r] = sl.remove(h1)
+    assert(e1r == nil && v1r == 1)
+    h2 := sl.pushback(2)
+    assert(h2 != -1 && sl.val(h2) == 2)
+    assert(sl.val(h1) == 0 && sl.next(h1) == -1 && sl.prev(h1) == -1)
+
+    // a stale handle stays dead across init() — the drain bumps
+    // every gen, so h can't resurrect on its recycled slot
+    il2 := list.newlist()
+    ih2 := il2.pushback(7)
+    il2.init()
+    assert(il2.len() == 0 && il2.front() == -1 && il2.back() == -1)
+    il2.pushback(9)
+    assert(il2.val(il2.front()) == 9)
+    assert(il2.val(ih2) == 0 && il2.next(ih2) == -1 && il2.prev(ih2) == -1)
+    // bare gen-0 indices never name live slots — minted handles
+    // carry gen >= 1, so slot 0's raw index reads dead too
+    assert(il2.val(0) == 0 && il2.next(0) == -1)
+
+    // arena survives a nested growth scope: a list created outside
+    // but first grown inside scope{} keeps backing after join —
+    // the own-domain arena binds to the list, not the grow site
+    sl2 := list.newlist()
+    scope {
+        sl2.pushback(11)
+        sl2.pushback(22)
+    }
+    assert(sl2.len() == 2)
+    assert(sl2.val(sl2.front()) == 11 && sl2.val(sl2.back()) == 22)
+    assert(sl2.val(sl2.next(sl2.front())) == 22)
+    // and a bare zero List grown inside a scope survives too
+    zl3 := new(list.List)
+    scope {
+        zl3.pushback(7)
+    }
+    assert(zl3.len() == 1 && zl3.val(zl3.front()) == 7)
+
+    println("list ok")
+}

@@ -1,0 +1,710 @@
+package mime
+
+// std/mime — MIME media types, modeled on Go's mime: a small built-in
+// extension table plus RFC 2045 media-type parse/format with quoted
+// values and RFC 2231 *-encoded / continued parameters.
+//
+//     [mt, e] = mime.parsemediatype(`text/html; charset="utf-8"`)
+//     println(mt.typ)                         // text/html
+//     println(mime.pget(mt.params, "charset")) // utf-8
+import "std/errors"
+
+// explicit release for `own ?` buffers (mkbuf) — scope arenas don't
+// reclaim them, so a temporary scratch must be freed by hand
+extern fn rt_free(p: own void)
+
+/// Param is one `; key=value` media parameter — nodes chain via next;
+/// walk it or use pget.
+struct Param { k: str, v: str, next: own Param }
+
+/// MediaType is parsemediatype's result — the lowercased type/subtype
+/// plus the parameter list in reverse parse order (pset prepends;
+/// continuations merged). pget/format are order-insensitive.
+struct MediaType { typ: str, params: own Param }
+
+// ---------- extension table ----------
+// linked rows — addrow prepends, so the calls run descending and
+// the head-to-tail walk comes out ascending. A builtin table keeps
+// this deterministic across platforms (Go's reads /etc/mime.types
+// too; this is the portable subset)
+
+/// MimeRow is one extension->type table entry.
+struct MimeRow { ext: str, typ: str, next: own MimeRow }
+
+let g_rows: own MimeRow = nil
+
+fn addrow(ext: str, typ: str) {
+    r := new(MimeRow)
+    r.ext = ext
+    r.typ = typ
+    r.next = g_rows
+    g_rows = r
+}
+
+fn rows() -> own MimeRow {
+    if g_rows == nil {
+        addrow(".zip", "application/zip")
+        addrow(".xml", "text/xml; charset=utf-8")
+        addrow(".woff2", "font/woff2")
+        addrow(".woff", "font/woff")
+        addrow(".webp", "image/webp")
+        addrow(".webm", "video/webm")
+        addrow(".wasm", "application/wasm")
+        addrow(".txt", "text/plain; charset=utf-8")
+        addrow(".ttf", "font/ttf")
+        addrow(".tiff", "image/tiff")
+        addrow(".tif", "image/tiff")
+        addrow(".tar", "application/x-tar")
+        addrow(".svg", "image/svg+xml")
+        addrow(".rtf", "application/rtf")
+        addrow(".png", "image/png")
+        addrow(".pdf", "application/pdf")
+        addrow(".otf", "font/otf")
+        addrow(".mp4", "video/mp4")
+        addrow(".mp3", "audio/mpeg")
+        addrow(".mov", "video/quicktime")
+        addrow(".mjs", "text/javascript; charset=utf-8")
+        addrow(".md", "text/markdown; charset=utf-8")
+        addrow(".json", "application/json")
+        addrow(".jpg", "image/jpeg")
+        addrow(".jpeg", "image/jpeg")
+        addrow(".js", "text/javascript; charset=utf-8")
+        addrow(".ico", "image/vnd.microsoft.icon")
+        addrow(".html", "text/html; charset=utf-8")
+        addrow(".htm", "text/html; charset=utf-8")
+        addrow(".gz", "application/gzip")
+        addrow(".gif", "image/gif")
+        addrow(".csv", "text/csv; charset=utf-8")
+        addrow(".css", "text/css; charset=utf-8")
+        addrow(".bmp", "image/bmp")
+        addrow(".avif", "image/avif")
+    }
+    return g_rows
+}
+
+fn lwr(s: str) -> str {
+    b := s as []byte
+    out := mkslice(byte, len(s))
+    i := 0
+    for i < len(s) {
+        c := b[i]
+        if c >= 65 && c <= 90 {
+            c = c + 32
+        }
+        out[i] = c
+        i = i + 1
+    }
+    return out as str
+}
+
+// trimplain — ASCII space/tab/cr/lf off both ends
+fn trimplain(s: str) -> str {
+    // Go's unicode.IsSpace set: space, tab, LF, CR, VT, FF
+    a := 0
+    b := len(s)
+    for a < b {
+        c := byteat(s, a)
+        if c != 32 && c != 9 && c != 10 && c != 13 && c != 11 && c != 12 {
+            break
+        }
+        a = a + 1
+    }
+    for b > a {
+        c := byteat(s, b - 1)
+        if c != 32 && c != 9 && c != 10 && c != 13 && c != 11 && c != 12 {
+            break
+        }
+        b = b - 1
+    }
+    return substr(s, a, b)
+}
+
+fn trimleft(s: str) -> str {
+    a := 0
+    for a < len(s) {
+        c := byteat(s, a)
+        if c != 32 && c != 9 && c != 10 && c != 13 && c != 11 && c != 12 {
+            break
+        }
+        a = a + 1
+    }
+    return substr(s, a, len(s))
+}
+
+/// typebyextension returns the media type for a file extension like
+/// ".html" — "" when unknown. Go's TypeByExtension (builtin table
+/// only, case-insensitive).
+fn typebyextension(ext: str) -> str {
+    e := lwr(ext)
+    r := rows()
+    for r != nil {
+        if r.ext == e {
+            return r.typ
+        }
+        r = r.next
+    }
+    return ""
+}
+
+// sortstrs — insertion sort for the small extension lists
+fn sortstrs(v: []str) {
+    i := 1
+    for i < len(v) {
+        x := v[i]
+        j := i - 1
+        for j >= 0 && v[j] > x {
+            v[j + 1] = v[j]
+            j = j - 1
+        }
+        v[j + 1] = x
+        i = i + 1
+    }
+}
+
+/// extensionsbytype returns the extensions registered for a media
+/// type, sorted — Go's ExtensionsByType. The media type may carry
+/// parameters; a bare "text/html" also matches rows typed
+/// "text/html; charset=..." (Go's prefix rule).
+fn extensionsbytype(t: str) -> [own []str, err] {
+    [mt, e] = parsemediatype(t)
+    if e != nil {
+        return nil, e
+    }
+    just := mt.typ
+    out := mkslice(str, 0)
+    r := rows()
+    for r != nil {
+        if r.typ == just || len(r.typ) > len(just) && substr(r.typ, 0, len(just) + 1) == just + ";" {
+            out = push(out, r.ext)
+        }
+        r = r.next
+    }
+    sortstrs(out)
+    return new(out), nil
+}
+
+// ---------- parsemediatype ----------
+
+// istspecial — RFC 2045 tspecials: ( ) < > @ , ; : \ " / [ ] ? =
+fn istspecial(c: int) -> bool {
+    return c == 40 || c == 41 || c == 60 || c == 62 || c == 64 || c == 44 || c == 59 || c == 58 || c == 92 || c == 34 || c == 47 || c == 91 || c == 93 || c == 63 || c == 61
+}
+
+// istokenchar — printable ASCII minus space/CTLs/tspecials
+fn istokenchar(c: int) -> bool {
+    return c > 32 && c < 127 && !istspecial(c)
+}
+
+// consumetoken reads the longest token-char prefix — [token, rest]
+// packed in TC since pairs can't be a bare return type.
+struct TC { a: str, rest: str }
+
+fn tc(a: str, rest: str) -> own TC {
+    t := new(TC)
+    t.a = a
+    t.rest = rest
+    return t
+}
+
+fn consumetoken(v: str) -> own TC {
+    i := 0
+    for i < len(v) && istokenchar(byteat(v, i)) {
+        i = i + 1
+    }
+    return tc(substr(v, 0, i), substr(v, i, len(v)))
+}
+
+// consumevalue reads a token or quoted-string. The MSIE quirk Go
+// keeps: \ only escapes a tspecial; otherwise it stays literal.
+fn consumevalue(v: str) -> own TC {
+    if len(v) == 0 {
+        return tc("", "")
+    }
+    if byteat(v, 0) != 34 {
+        return consumetoken(v)
+    }
+    out := ""
+    i := 1
+    for i < len(v) {
+        c := byteat(v, i)
+        if c == 34 {
+            return tc(out, substr(v, i + 1, len(v)))
+        }
+        if c == 92 && i + 1 < len(v) && istspecial(byteat(v, i + 1)) {
+            out = out + substr(v, i + 1, i + 2)
+            i = i + 2
+            continue
+        }
+        if c == 13 || c == 10 {
+            return tc("", v)
+        }
+        out = out + substr(v, i, i + 1)
+        i = i + 1
+    }
+    return tc("", v)
+}
+
+// consumemediaparam reads `; key=value` — param name lowercased.
+// Failure returns an empty key like Go's consumeMediaParam.
+fn consumemediaparam(v: str) -> own TC {
+    rest := trimleft(v)
+    if len(rest) == 0 || byteat(rest, 0) != 59 {
+        return tc("", v)
+    }
+    rest = trimleft(substr(rest, 1, len(rest)))
+    tk := consumetoken(rest)
+    param := lwr(tk.a)
+    rest = tk.rest
+    if len(param) == 0 {
+        return tc("", v)
+    }
+    rest = trimleft(rest)
+    if len(rest) == 0 || byteat(rest, 0) != 61 {
+        return tc("", v)
+    }
+    rest = trimleft(substr(rest, 1, len(rest)))
+    val := consumevalue(rest)
+    if len(val.a) == 0 && val.rest == rest {
+        return tc("", v)
+    }
+    return tc(param + "=" + val.a, val.rest)
+}
+
+// checkmt — Go's checkMediaTypeDisposition.
+fn checkmt(s: str) -> err {
+    tk := consumetoken(s)
+    typ := tk.a
+    rest := tk.rest
+    if len(typ) == 0 {
+        return errors.new("mime: no media type")
+    }
+    if len(rest) == 0 {
+        return nil
+    }
+    if byteat(rest, 0) != 47 {
+        return errors.new("mime: expected slash after first token")
+    }
+    tk2 := consumetoken(substr(rest, 1, len(rest)))
+    if len(tk2.a) == 0 {
+        return errors.new("mime: expected token after slash")
+    }
+    if len(tk2.rest) > 0 {
+        return errors.new("mime: unexpected content after media subtype")
+    }
+    return nil
+}
+
+fn ishex(c: int) -> bool {
+    return c >= 48 && c <= 57 || c >= 97 && c <= 102 || c >= 65 && c <= 70
+}
+
+fn unhex(c: int) -> int {
+    if c >= 48 && c <= 57 {
+        return c - 48
+    }
+    if c >= 97 && c <= 102 {
+        return c - 87
+    }
+    if c >= 65 && c <= 70 {
+        return c - 55
+    }
+    return 0
+}
+
+// pctunescape — strict %XX decode; Go's percentHexUnescape error text.
+fn pctunescape(s: str) -> [str, err] {
+    i := 0
+    for i < len(s) {
+        c := byteat(s, i)
+        if c != 37 {
+            i = i + 1
+            continue
+        }
+        if i + 2 >= len(s) || !ishex(byteat(s, i + 1)) || !ishex(byteat(s, i + 2)) {
+            bad := substr(s, i, len(s))
+            if len(bad) > 3 {
+                bad = substr(bad, 0, 3)
+            }
+            return "", errors.new("mime: bogus characters after %: \"" + bad + "\"")
+        }
+        i = i + 3
+    }
+    buf := mkbuf(len(s))
+    j := 0
+    i = 0
+    for i < len(s) {
+        c := byteat(s, i)
+        if c == 37 {
+            poke8(buf, j, unhex(byteat(s, i + 1)) * 16 + unhex(byteat(s, i + 2)))
+            j = j + 1
+            i = i + 3
+        } else {
+            poke8(buf, j, c)
+            j = j + 1
+            i = i + 1
+        }
+    }
+    out := bufstr(buf, j)
+    rt_free(buf)
+    return out, nil
+}
+
+// decode2231 — charset'lang'pct-encoded — us-ascii/utf-8 only, like Go.
+struct D31 { ok: bool, v: str }
+
+fn decode2231(v: str) -> own D31 {
+    d := new(D31)
+    d.ok = false
+    d.v = ""
+    // an empty value isn't a valid 'charset'lang'text triple —
+    // Go's decode2231Enc drops the param entirely
+    if len(v) == 0 {
+        return d
+    }
+    // charset ' lang ' text — two splits
+    i := find(v, "'")
+    if i < 0 {
+        return d
+    }
+    j := find(substr(v, i + 1, len(v)), "'")
+    if j < 0 {
+        return d
+    }
+    j = j + i + 1
+    charset := lwr(substr(v, 0, i))
+    if len(charset) == 0 {
+        return d
+    }
+    if charset != "us-ascii" && charset != "utf-8" {
+        return d
+    }
+    [enc, e] = pctunescape(substr(v, j + 1, len(v)))
+    if e != nil {
+        return d
+    }
+    d.ok = true
+    d.v = enc
+    return d
+}
+
+// Cont is one RFC 2231 continuation member — base is the name before
+// the first '*', key the whole attribute (name*0, name*1*, name*).
+struct Cont { base: str, k: str, v: str, next: own Cont }
+
+/// KV is a found-check plus value — how find helpers return without
+/// handing back an owned node (a borrow can't leave as own).
+struct KV { found: bool, v: str }
+
+fn kv(found: bool, v: str) -> own KV {
+    r := new(KV)
+    r.found = found
+    r.v = v
+    return r
+}
+
+fn contfindv(c: ref Cont, k: str) -> own KV {
+    for c != nil {
+        if c.k == k {
+            return kv(true, c.v)
+        }
+        c = c.next
+    }
+    return kv(false, "")
+}
+
+fn contbase(c: ref Cont, base: str) -> bool {
+    for c != nil {
+        if c.base == base {
+            return true
+        }
+        c = c.next
+    }
+    return false
+}
+
+fn pfindv(p: ref Param, k: str) -> own KV {
+    for p != nil {
+        if p.k == k {
+            return kv(true, p.v)
+        }
+        p = p.next
+    }
+    return kv(false, "")
+}
+
+// psetv replaces an existing param's value; false = absent
+fn psetv(p: mut Param, k: str, v: str) -> bool {
+    for p != nil {
+        if p.k == k {
+            p.v = v
+            return true
+        }
+        p = p.next
+    }
+    return false
+}
+
+fn pset(h: own Param, k: str, v: str) -> own Param {
+    if psetv(h, k, v) {
+        return h
+    }
+    n := new(Param)
+    n.k = k
+    n.v = v
+    n.next = h
+    return n
+}
+
+/// parsemediatype parses a Content-Type/Content-Disposition value —
+/// Go's mime.ParseMediaType: lowercased type/subtype, parameter names
+/// lowercased (values keep case), quoted-string and RFC 2231
+/// `name*=` / `name*N=` / `name*N*=` handling.
+fn parsemediatype(v: str) -> [own MediaType, err] {
+    base := v
+    semi := find(v, ";")
+    if semi >= 0 {
+        base = substr(v, 0, semi)
+    }
+    mt := lwr(trimplain(base))
+    ce := checkmt(mt)
+    if ce != nil {
+        return nil, ce
+    }
+    out := new(MediaType)
+    out.typ = mt
+    out.params = nil
+    let cont: own Cont = nil
+    rest := substr(v, len(base), len(v))
+    for len(rest) > 0 {
+        rest = trimleft(rest)
+        if len(rest) == 0 {
+            break
+        }
+        kv := consumemediaparam(rest)
+        if len(kv.a) == 0 {
+            if trimplain(rest) == ";" {
+                break // trailing semicolons are not an error
+            }
+            out.params = nil
+            return out, errors.new("mime: invalid media parameter")
+        }
+        eq := find(kv.a, "=")
+        key := substr(kv.a, 0, eq)
+        value := substr(kv.a, eq + 1, len(kv.a))
+        if find(key, "*") >= 0 {
+            basename := substr(key, 0, find(key, "*"))
+            lb := lwr(basename)
+            // multipart/ and the RFC 2045 charset/boundary params
+            // never take RFC 2231 continuations — skip them like Go
+            if find(mt, "multipart/") == 0 || lb == "charset" || lb == "boundary" {
+                rest = kv.rest
+                continue
+            }
+            // Go-parity: only CONFLICTING continuation repeats error;
+            // an identical repeat is a no-op (no extra Cont node)
+            m := contfindv(cont, key)
+            if m.found {
+                if m.v == value {
+                    rest = kv.rest
+                    continue
+                }
+                return nil, errors.new("mime: duplicate parameter name")
+            }
+            c := new(Cont)
+            c.base = basename
+            c.k = key
+            c.v = value
+            c.next = cont
+            cont = c
+        } else {
+            m := pfindv(out.params, key)
+            // Go's ParseMediaType rejects only CONFLICTING duplicates —
+            // an identical repeat is a no-op
+            if m.found && m.v != value {
+                return nil, errors.new("mime: duplicate parameter name")
+            }
+            out.params = pset(out.params, key, value)
+        }
+        rest = kv.rest
+    }
+    // stitch RFC 2231 continuations into real params
+    bases := mkslice(str, 0)
+    c := cont
+    for c != nil {
+        if !contbase_seen(bases, c.base) {
+            bases = push(bases, c.base)
+        }
+        c = c.next
+    }
+    bi := 0
+    for bi < len(bases) {
+        b := bases[bi]
+        bi = bi + 1
+        single := contfindv(cont, b + "*")
+        if single.found {
+            d := decode2231(single.v)
+            if d.ok {
+                out.params = pset(out.params, b, d.v)
+            }
+            continue
+        }
+        buf := ""
+        valid := false
+        n := 0
+        for true {
+            simple := contfindv(cont, b + "*" + itoa(n))
+            if simple.found {
+                valid = true
+                buf = buf + simple.v
+                n = n + 1
+                continue
+            }
+            enc := contfindv(cont, b + "*" + itoa(n) + "*")
+            if !enc.found {
+                break
+            }
+            valid = true
+            if n == 0 {
+                d := decode2231(enc.v)
+                if d.ok {
+                    buf = buf + d.v
+                }
+            } else {
+                [dv, e2] = pctunescape(enc.v)
+                if e2 == nil {
+                    buf = buf + dv
+                }
+            }
+            n = n + 1
+        }
+        if valid {
+            out.params = pset(out.params, b, buf)
+        }
+    }
+    return out, nil
+}
+
+fn contbase_seen(v: []str, base: str) -> bool {
+    i := 0
+    for i < len(v) {
+        if v[i] == base {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+/// pget returns param k's value, "" when absent.
+fn pget(p: ref Param, k: str) -> str {
+    for p != nil {
+        if p.k == k {
+            return p.v
+        }
+        p = p.next
+    }
+    return ""
+}
+
+/// formatmediatype serializes type + params per RFC 2045 — Go's
+/// mime.FormatMediaType: lowercased type and attribute names sorted,
+/// non-token values RFC 2231 `name*=` encoded. Returns "" when the
+/// type or an attribute name isn't a valid token.
+fn formatmediatype(t: str, params: ref Param) -> str {
+    buf := ""
+    slash := find(t, "/")
+    if slash < 0 {
+        if !istoken(t) {
+            return ""
+        }
+        buf = buf + lwr(t)
+    } else {
+        major := substr(t, 0, slash)
+        sub := substr(t, slash + 1, len(t))
+        if !istoken(major) || !istoken(sub) {
+            return ""
+        }
+        buf = buf + lwr(major) + "/" + lwr(sub)
+    }
+    // attrs sorted — collect distinct keys
+    keys := mkslice(str, 0)
+    p := params
+    for p != nil {
+        if !contbase_seen(keys, p.k) {
+            keys = push(keys, p.k)
+        }
+        p = p.next
+    }
+    sortstrs(keys)
+    i := 0
+    for i < len(keys) {
+        a := keys[i]
+        i = i + 1
+        buf = buf + "; "
+        if !istoken(a) {
+            return ""
+        }
+        buf = buf + lwr(a)
+        value := pget(params, a)
+        // Go's needsEncoding: only controls (except tab) and
+        // non-ASCII force RFC 2231 — printable non-token chars like
+        // space or ';' take the ordinary quoted-string path below
+        needenc := false
+        j := 0
+        for j < len(value) {
+            c := byteat(value, j)
+            if c < 32 && c != 9 || c > 126 {
+                needenc = true
+                break
+            }
+            j = j + 1
+        }
+        if needenc {
+            buf = buf + "*="
+            buf = buf + "utf-8''"
+            j = 0
+            for j < len(value) {
+                c := byteat(value, j)
+                // attribute-char excludes space/CTLs/*'/ %/tspecials
+                if c <= 32 || c >= 127 || c == 42 || c == 39 || c == 37 || istspecial(c) {
+                    buf = buf + "%" + substr("0123456789ABCDEF", c / 16, c / 16 + 1) + substr("0123456789ABCDEF", c % 16, c % 16 + 1)
+                } else {
+                    buf = buf + substr(value, j, j + 1)
+                }
+                j = j + 1
+            }
+            continue
+        }
+        buf = buf + "="
+        if istoken(value) {
+            buf = buf + value
+            continue
+        }
+        buf = buf + "\""
+        j = 0
+        for j < len(value) {
+            c := byteat(value, j)
+            if c == 34 || c == 92 {
+                buf = buf + "\\"
+            }
+            buf = buf + substr(value, j, j + 1)
+            j = j + 1
+        }
+        buf = buf + "\""
+    }
+    return buf
+}
+
+fn istoken(s: str) -> bool {
+    if len(s) == 0 {
+        return false
+    }
+    i := 0
+    for i < len(s) {
+        if !istokenchar(byteat(s, i)) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}

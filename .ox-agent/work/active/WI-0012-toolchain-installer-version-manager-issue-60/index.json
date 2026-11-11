@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "id": "WI-0012",
+  "title": "toolchain installer + version manager (issue #60)",
+  "state": "implementing",
+  "profile": "normal",
+  "current_stage": "implementation",
+  "created_at": "2026-11-10T11:08:53Z",
+  "updated_at": "2026-11-10T11:12:22Z"
+}

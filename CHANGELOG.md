@@ -27,7 +27,8 @@ the standard library.
   `time`, `sync`, `testing`, `sort`, `slices`, `maps`, `cmp`, `math`,
   `math/rand`, `unicode/utf8`, `flag`, `log`, `encoding/base64`,
   `encoding/hex`, `encoding/csv`, `encoding/binary`, `hash`, `crypto/md5`,
-  `crypto/sha256`, `crypto/hmac`, `regexp`
+  `crypto/sha256`, `crypto/hmac`, `regexp`, `container/heap`,
+  `container/list`, `container/ring`
 - **`byte` / `[]byte`**: a distinct `u8` type with char-literal sugar and
   `as` conversions
 - **`err` messages**: interned message registry so errors carry text —

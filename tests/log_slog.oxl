@@ -1,0 +1,121 @@
+package main
+
+// std acceptance: log/slog — leveled structured records on std/log's
+// emit path: text k=v handler, JSON handler, bound attrs, groups.
+// Emitted lines go to stderr (timestamps vary); these tests assert
+// the API shapes and let run.sh grep the stderr line shapes.
+import "std/log/slog"
+
+import "std/testing"
+
+import "std/errors"
+
+fn test_levels() {
+    testing.expect_eq(slog.lvl_debug(), -4, "lvl_debug")
+    testing.expect_eq(slog.lvl_info(), 0, "lvl_info")
+    testing.expect_eq(slog.lvl_warn(), 4, "lvl_warn")
+    testing.expect_eq(slog.lvl_error(), 8, "lvl_error")
+    testing.expect(slog.lvl_debug() < slog.lvl_info(), "debug < info")
+    testing.expect(slog.lvl_warn() < slog.lvl_error(), "warn < error")
+}
+
+fn test_attrs() {
+    a := slog.str_("name", "oxl")
+    a.next = slog.int_("n", 7)
+    testing.expect_streq(a.k, "name", "str key")
+    testing.expect_streq(a.s, "oxl", "str value")
+    testing.expect_eq(a.next.i, 7, "chained int")
+    b := slog.bool_("ok", true)
+    testing.expect(b.b, "bool attr")
+    e := slog.err_("e", errors.new("boom"))
+    testing.expect_streq(e.s, "boom", "err attr msg")
+    g := slog.group("inner", slog.str_("x", "y"))
+    testing.expect_streq(g.k, "inner", "group key")
+    testing.expect_streq(g.kids.s, "y", "group kid")
+    // chain links lists tail-to-tail
+    c := slog.chain(slog.str_("a", "1"), slog.chain(slog.int_("b", 2), slog.float_("c", 1.5)))
+    testing.expect_eq(c.next.next.kind, 2, "chain order") // float kind
+    testing.expect_streq(c.next.k, "b", "chain mid key")
+}
+
+fn test_handlers() {
+    // text handler — lines land on stderr for run.sh to grep
+    l := slog.text_handler(slog.lvl_info())
+    l2 := l.with(slog.str_("app", "demo"))
+    // with() clones the bound chain — the receiver is never mutated
+    l4 := l2.with(slog.str_("v", "2"))
+    testing.expect(l2.bound.next == nil, "with keeps receiver chain")
+    testing.expect(l4.bound.next != nil, "with appends on clone")
+    l3 := l2.with_group("req")
+    l3.info("started", slog.chain(slog.str_("method", "GET"), slog.int_("status", 200)))
+    // below-threshold record drops silently
+    l3.debug("hidden", nil)
+    l3.warn("quoted", slog.str_("note", "has space"))
+    testing.expect(true, "text emits did not crash")
+}
+
+fn test_json() {
+    j := slog.json_handler(slog.lvl_debug())
+    j2 := j.with(slog.int_("pid", 42))
+    j3 := j2.with_group("http")
+    j3.error("failed", slog.chain(slog.group("hdr", slog.str_("ct", "json")), slog.bool_("retry", true)))
+    j3.debug("dbg", slog.str_("k", "v"))
+    // an empty group emits nothing — no "empty":{} (Go's rule)
+    j3.info("grp", slog.group("empty", nil))
+    // a BOUND empty group elides too — it must not materialize the
+    // "http" parent marks as "http":{}
+    j3b := j3.with(slog.group("gone", nil))
+    j3b.info("bound", slog.str_("k", "v"))
+    testing.expect(true, "json emits did not crash")
+}
+
+fn test_default() {
+    d := slog.default_logger()
+    testing.expect(d != nil, "default logger exists")
+    d2 := slog.default_logger()
+    testing.expect(d == d2, "default is stable")
+    // set_default swaps the package-level logger
+    slog.set_default(slog.json_handler(slog.lvl_warn()))
+    slog.info("dropped", nil) // below warn — silent
+    slog.error("default-json", slog.str_("src", "set_default"))
+    slog.set_default(d) // restore
+    testing.expect(true, "set_default round-trip")
+}
+
+fn test_quoting() {
+    // invalid UTF-8 quotes via \ufffd (Go's needsQuoting on
+    // utf8.RuneError); DEL escapes as \x7f — both asserted
+    // against the emitted text/json shapes by the suite greps
+    b := mkslice(byte, 0)
+    b = push(b, 255)
+    v := b as str
+    slog.error("quote-check", slog.str_("bad", v))
+    b2 := mkslice(byte, 0)
+    b2 = push(b2, 127)
+    slog.error("quote-check", slog.str_("del", b2 as str))
+    // Unicode non-printables take the \u escape path — NBSP (U+00A0)
+    // and ZWSP (U+200B) both quote under runeprint
+    b3 := mkslice(byte, 0)
+    b3 = push(b3, 194)
+    b3 = push(b3, 160)
+    slog.error("quote-check", slog.str_("nbsp", b3 as str))
+    b4 := mkslice(byte, 0)
+    b4 = push(b4, 226)
+    b4 = push(b4, 128)
+    b4 = push(b4, 139)
+    slog.error("quote-check", slog.str_("zwsp", b4 as str))
+    // short escapes \a \b \v \f and a VALID U+FFFD (EF BF BD)
+    // — both take the \ufffd/\xNN-free paths Go's strconv uses
+    b5 := mkslice(byte, 0)
+    b5 = push(b5, 7)
+    b5 = push(b5, 8)
+    b5 = push(b5, 11)
+    b5 = push(b5, 12)
+    slog.error("quote-check", slog.str_("esc", b5 as str))
+    b6 := mkslice(byte, 0)
+    b6 = push(b6, 239)
+    b6 = push(b6, 191)
+    b6 = push(b6, 189)
+    slog.error("quote-check", slog.str_("ufffd", b6 as str))
+    testing.expect(true, "quoting emits did not crash")
+}

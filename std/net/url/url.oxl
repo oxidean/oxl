@@ -1,0 +1,1221 @@
+package url
+
+// std/net/url — RFC 3986 URLs, modeled on Go's net/url. A parsed URL
+// keeps decoded text in its fields plus the encoded originals where a
+// byte-exact round-trip needs them (rawpath/rawfragment/rawquery):
+//
+//     [u, e] = url.parse("https://me@host:8080/p?q=1#f")
+//     println(u.host)                 // host:8080
+//     println(u.string())             // the same URL, reassembled
+//     println(url.queryescape("a b")) // a+b
+import "std/errors"
+
+import "std/net"
+
+// explicit release for `own ?` buffers (mkbuf) — scope arenas don't
+// reclaim them, so a temporary scratch must be freed by hand
+extern fn rt_free(p: own void)
+
+// encoding modes — which shouldEscape table a component uses. Same
+// numbering as Go's encoding enum.
+let ENC_PATH = 1
+
+let ENC_SEG = 2
+
+let ENC_HOST = 3
+
+let ENC_ZONE = 4
+
+let ENC_USER = 5
+
+let ENC_QUERY = 6
+
+let ENC_FRAG = 7
+
+/// URL is a parsed RFC 3986 reference. user/password hold the decoded
+/// userinfo halves (hasuser/haspass mark presence); host is host or
+/// host:port, decoded; path/fragment are decoded; rawpath/rawfragment
+/// keep an encoded original only when it differs from the default
+/// escaping — exactly like Go's RawPath/RawFragment hint fields.
+struct URL {
+    scheme: str,
+    opaque: str,
+    user: str,
+    password: str,
+    hasuser: bool,
+    haspass: bool,
+    host: str,
+    path: str,
+    rawpath: str,
+    forcequery: bool,
+    rawquery: str,
+    fragment: str,
+    rawfragment: str,
+    omithost: bool,
+}
+
+/// Values is a str->[]str multimap — query/form parameters.
+/// Keys are case-sensitive; value lists preserve insertion order.
+struct Values { head: own VPair, tail: own VPair, free: own VPair, n: int }
+
+/// VPair is one key=value binding inside a Values list.
+struct VPair { k: str, v: str, next: own VPair }
+
+fn ishex(c: int) -> bool {
+    return c >= 48 && c <= 57 || c >= 97 && c <= 102 || c >= 65 && c <= 70
+}
+
+fn unhex(c: int) -> int {
+    if c >= 48 && c <= 57 {
+        return c - 48
+    }
+    if c >= 97 && c <= 102 {
+        return c - 87
+    }
+    if c >= 65 && c <= 70 {
+        return c - 55
+    }
+    return 0
+}
+
+// shouldEscape reports whether byte c must be %XX-escaped in mode —
+// the same table Go uses: unreserved plus the marks each RFC section
+// lets through.
+fn shouldescape(c: int, mode: int) -> bool {
+    if c >= 97 && c <= 122 || c >= 65 && c <= 90 || c >= 48 && c <= 57 {
+        return false
+    }
+    if mode == ENC_HOST || mode == ENC_ZONE {
+        // host: sub-delims are legal in reg-name; : keeps host:port
+        // whole, [ ] keep [ipv6]:port, < > " round out what Parse can
+        // still reject in its unescaped form
+        if c == 33 || c == 36 || c == 38 || c == 39 || c == 40 || c == 41 || c == 42 || c == 43 || c == 44 || c == 59 || c == 61 || c == 58 || c == 91 || c == 93 || c == 60 || c == 62 || c == 34 {
+            return false
+        }
+    }
+    if c == 45 || c == 95 || c == 46 || c == 126 {
+        return false
+    }
+    if c == 36 || c == 38 || c == 43 || c == 44 || c == 47 || c == 58 || c == 59 || c == 61 || c == 63 || c == 64 {
+        // $ & + , / : ; = ? @ — a few reserved chars stay literal in a
+        // few modes (whole-path keeps everything but ?)
+        if mode == ENC_PATH {
+            return c == 63
+        }
+        if mode == ENC_SEG {
+            return c == 47 || c == 59 || c == 44 || c == 63
+        }
+        if mode == ENC_USER {
+            return c == 64 || c == 47 || c == 63 || c == 58
+        }
+        if mode == ENC_QUERY {
+            return true
+        }
+        if mode == ENC_FRAG {
+            return false
+        }
+    }
+    if mode == ENC_FRAG {
+        // fragment keeps ! ( ) * unescaped too
+        if c == 33 || c == 40 || c == 41 || c == 42 {
+            return false
+        }
+    }
+    return true
+}
+
+// escape percent-encodes s under mode; space becomes '+' only for
+// query components (everywhere else %20).
+fn escape(s: str, mode: int) -> str {
+    hexn := 0
+    i := 0
+    for i < len(s) {
+        c := byteat(s, i)
+        if shouldescape(c, mode) && !(c == 32 && mode == ENC_QUERY) {
+            hexn = hexn + 1
+        }
+        i = i + 1
+    }
+    if hexn == 0 {
+        // still has to flip spaces in query mode
+        if mode != ENC_QUERY {
+            return s
+        }
+        if find(s, " ") < 0 {
+            return s
+        }
+    }
+    buf := mkbuf(len(s) + 2 * hexn)
+    j := 0
+    i = 0
+    for i < len(s) {
+        c := byteat(s, i)
+        if c == 32 && mode == ENC_QUERY {
+            poke8(buf, j, 43)
+            j = j + 1
+        } else if shouldescape(c, mode) {
+            poke8(buf, j, 37)
+            poke8(buf, j + 1, byteat("0123456789ABCDEF", c / 16))
+            poke8(buf, j + 2, byteat("0123456789ABCDEF", c % 16))
+            j = j + 3
+        } else {
+            poke8(buf, j, c)
+            j = j + 1
+        }
+        i = i + 1
+    }
+    out := bufstr(buf, j)
+    rt_free(buf)
+    return out
+}
+
+// unescape decodes %XX in s under mode; '+' is a space only in query
+// components. Mode-specific rejects mirror Go: hosts can't %-encode
+// ASCII bytes, and zones only get escapes a host could carry (plus
+// %25 and space).
+fn unescape(s: str, mode: int) -> [str, err] {
+    // first pass: count escapes, verify well-formedness
+    i := 0
+    for i < len(s) {
+        c := byteat(s, i)
+        if c == 37 {
+            if i + 2 >= len(s) || !ishex(byteat(s, i + 1)) || !ishex(byteat(s, i + 2)) {
+                bad := substr(s, i, len(s))
+                if len(bad) > 3 {
+                    bad = substr(bad, 0, 3)
+                }
+                return "", errors.new("invalid URL escape \"" + bad + "\"")
+            }
+            if mode == ENC_HOST {
+                // host may only %-encode non-ASCII bytes — the first
+                // hex nibble < 8 means the decoded byte is ASCII
+                if unhex(byteat(s, i + 1)) < 8 && substr(s, i, i + 3) != "%25" {
+                    return "", errors.new("invalid URL escape \"" + substr(s, i, i + 3) + "\"")
+                }
+            }
+            if mode == ENC_ZONE {
+                v := unhex(byteat(s, i + 1)) * 16 + unhex(byteat(s, i + 2))
+                if substr(s, i, i + 3) != "%25" && v != 32 && shouldescape(v, ENC_HOST) {
+                    return "", errors.new("invalid URL escape \"" + substr(s, i, i + 3) + "\"")
+                }
+            }
+            i = i + 3
+            continue
+        }
+        if c == 43 && mode == ENC_QUERY {
+            // '+' decodes as a space — hasPlus only matters for the
+            // no-change fast path, which the decode pass handles anyway
+        }
+        if (mode == ENC_HOST || mode == ENC_ZONE) && c < 128 && shouldescape(c, mode) {
+            return "", errors.new("invalid character \"" + substr(s, i, i + 1) + "\" in host name")
+        }
+        i = i + 1
+    }
+    // second pass: build decoded bytes
+    buf := mkbuf(len(s) + 1)
+    j := 0
+    i = 0
+    for i < len(s) {
+        c := byteat(s, i)
+        if c == 37 {
+            poke8(buf, j, unhex(byteat(s, i + 1)) * 16 + unhex(byteat(s, i + 2)))
+            j = j + 1
+            i = i + 3
+            continue
+        }
+        if c == 43 && mode == ENC_QUERY {
+            poke8(buf, j, 32)
+            j = j + 1
+            i = i + 1
+            continue
+        }
+        poke8(buf, j, c)
+        j = j + 1
+        i = i + 1
+    }
+    out := bufstr(buf, j)
+    rt_free(buf)
+    return out, nil
+}
+
+/// queryescape escapes s for a query key or value — Go's
+/// url.QueryEscape (space becomes '+').
+fn queryescape(s: str) -> str {
+    return escape(s, ENC_QUERY)
+}
+
+/// queryunescape decodes a query-component string — Go's
+/// url.QueryUnescape ('+' becomes space).
+fn queryunescape(s: str) -> [str, err] {
+    return unescape(s, ENC_QUERY)
+}
+
+/// pathescape escapes s for one path segment — Go's url.PathEscape.
+/// '+' stays literal here (it has no space meaning in a path).
+fn pathescape(s: str) -> str {
+    return escape(s, ENC_SEG)
+}
+
+/// pathunescape decodes a path-segment string — Go's
+/// url.PathUnescape ('+' stays literal).
+fn pathunescape(s: str) -> [str, err] {
+    return unescape(s, ENC_SEG)
+}
+
+// validEncoded reports whether every byte of s is legal in its
+// encoded form under mode (pchars + % + [ ] pass unchecked).
+fn validencoded(s: str, mode: int) -> bool {
+    i := 0
+    for i < len(s) {
+        c := byteat(s, i)
+        // ! $ & ' ( ) * + , ; = : @  and  [ ]  and  % — always ok
+        if c == 33 || c == 36 || c == 38 || c == 39 || c == 40 || c == 41 || c == 42 || c == 43 || c == 44 || c == 59 || c == 61 || c == 58 || c == 64 || c == 91 || c == 93 || c == 37 {
+            i = i + 1
+            continue
+        }
+        if shouldescape(c, mode) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn rfind_ch(s: str, c: int) -> int {
+    i := len(s) - 1
+    for i >= 0 {
+        if byteat(s, i) == c {
+            return i
+        }
+        i = i - 1
+    }
+    return -1
+}
+
+fn lwr(s: str) -> str {
+    i := 0
+    for i < len(s) {
+        c := byteat(s, i)
+        if c >= 65 && c <= 90 {
+            b := s as []byte
+            out := mkslice(byte, len(s))
+            j := 0
+            for j < len(s) {
+                out[j] = b[j]
+                j = j + 1
+            }
+            j = 0
+            for j < len(s) {
+                if out[j] >= 65 && out[j] <= 90 {
+                    out[j] = out[j] + 32
+                }
+                j = j + 1
+            }
+            return out as str
+        }
+        i = i + 1
+    }
+    return s
+}
+
+/// SC is getscheme's result — the scheme cut off raw plus the rest.
+struct SC { scheme: str, rest: str }
+
+// getScheme splits a leading `scheme:` off rawurl —
+// [A-Za-z][a-zA-Z0-9+.-]* must precede the colon; a digit/dot-first
+// or ':'-first string has no scheme. The result is lowercased (Go
+// does the same).
+fn getscheme(raw: str) -> [own SC, err] {
+    out := new(SC)
+    out.scheme = ""
+    out.rest = raw
+    i := 0
+    for i < len(raw) {
+        c := byteat(raw, i)
+        if c >= 97 && c <= 122 || c >= 65 && c <= 90 {
+            i = i + 1
+            continue
+        }
+        if c >= 48 && c <= 57 || c == 43 || c == 45 || c == 46 {
+            if i == 0 {
+                return out, nil
+            }
+            i = i + 1
+            continue
+        }
+        if c == 58 {
+            if i == 0 {
+                return nil, errors.new("missing protocol scheme")
+            }
+            out.scheme = lwr(substr(raw, 0, i))
+            out.rest = substr(raw, i + 1, len(raw))
+            return out, nil
+        }
+        break // anything else: no valid scheme — out.rest keeps raw
+    }
+    return out, nil
+}
+
+// validOptionalPort — "" or ":" digits only.
+fn validport(p: str) -> bool {
+    if len(p) == 0 {
+        return true
+    }
+    if byteat(p, 0) != 58 {
+        return false
+    }
+    i := 1
+    for i < len(p) {
+        c := byteat(p, i)
+        if c < 48 || c > 57 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// validUserinfo — the char set Go accepts inside raw userinfo.
+fn validuserinfo(s: str) -> bool {
+    i := 0
+    for i < len(s) {
+        c := byteat(s, i)
+        if c >= 97 && c <= 122 || c >= 65 && c <= 90 || c >= 48 && c <= 57 {
+            i = i + 1
+            continue
+        }
+        // - . _ : ~ ! $ & ' ( ) * + , ; = % @
+        if c == 45 || c == 46 || c == 95 || c == 126 || c == 58 || c == 33 || c == 36 || c == 38 || c == 39 || c == 40 || c == 41 || c == 42 || c == 43 || c == 44 || c == 59 || c == 61 || c == 37 || c == 64 {
+            i = i + 1
+            continue
+        }
+        return false
+    }
+    return true
+}
+
+// parseHost handles host[:port] including [ipv6%25zone]:port —
+// Go's parseHost split across the zone-aware unescapes.
+fn parsehost(u: mut URL, host: str) -> err {
+    ob := rfind_ch(host, 91)
+    if ob > 0 {
+        // a '[' anywhere but the front can't open an IP-literal.
+        // Stricter than Go — encodeHost passes stray brackets in
+        // reg-name hosts through raw; we reject (deliberate
+        // divergence: a bracket that isn't an IP-literal opener is
+        // far more likely a malformed URL than intentional dtext).
+        return errors.new("invalid IP-literal")
+    }
+    if ob == 0 {
+        i := rfind_ch(host, 93)
+        if i < 0 {
+            return errors.new("missing ']' in host")
+        }
+        colonport := substr(host, i + 1, len(host))
+        if !validport(colonport) {
+            return errors.new("invalid port \"" + colonport + "\" after host")
+        }
+        hostname := substr(host, 1, i)
+        un := ""
+        zone := find(hostname, "%25")
+        if zone >= 0 {
+            // RFC 6874: %25 starts the zone id — the zone may carry
+            // escapes the bare host can't
+            [h1, e1] = unescape(substr(hostname, 0, zone), ENC_HOST)
+            if e1 != nil {
+                return e1
+            }
+            [h2, e2] = unescape(substr(hostname, zone, len(hostname)), ENC_ZONE)
+            if e2 != nil {
+                return e2
+            }
+            un = h1 + h2
+        } else {
+            [h3, e3] = unescape(hostname, ENC_HOST)
+            if e3 != nil {
+                return e3
+            }
+            un = h3
+        }
+        // only a real IPv6 literal may sit in brackets — this rules
+        // out "[1.2.3.4]" and non-IP junk. Deliberate divergence:
+        // Go's net/url accepts any bracketed host verbatim.
+        if !net.isip6(un) {
+            return errors.new("invalid IP-literal")
+        }
+        u.host = "[" + un + "]" + colonport
+        return nil
+    }
+    ci := find(host, ":")
+    if ci >= 0 {
+        i := ci
+        lc := rfind_ch(host, 58)
+        if lc != ci && !(u.scheme == "http" || u.scheme == "https") {
+            // postgres-style multi-host lists keep last-colon port
+            // splitting; http/https enforce strict colons —
+            // rejecting multi-colon hosts is a deliberate
+            // divergence from Go's last-colon parse
+            i = lc
+        }
+        colonport := substr(host, i, len(host))
+        if !validport(colonport) {
+            return errors.new("invalid port \"" + colonport + "\" after host")
+        }
+    }
+    [h, e] = unescape(host, ENC_HOST)
+    if e != nil {
+        return e
+    }
+    u.host = h
+    return nil
+}
+
+// parseAuthority splits [userinfo@]host at the LAST '@', validates
+// and decodes both sides — Go's parseAuthority.
+fn parseauthority(u: mut URL, auth: str) -> err {
+    i := rfind_ch(auth, 64)
+    hostpart := auth
+    if i >= 0 {
+        hostpart = substr(auth, i + 1, len(auth))
+    }
+    he := parsehost(u, hostpart)
+    if he != nil {
+        return he
+    }
+    if i < 0 {
+        return nil
+    }
+    info := substr(auth, 0, i)
+    if !validuserinfo(info) {
+        return errors.new("net/url: invalid userinfo")
+    }
+    u.hasuser = true
+    c := find(info, ":")
+    if c < 0 {
+        [du, e] = unescape(info, ENC_USER)
+        if e != nil {
+            return e
+        }
+        u.user = du
+        return nil
+    }
+    [du, e] = unescape(substr(info, 0, c), ENC_USER)
+    if e != nil {
+        return e
+    }
+    u.user = du
+    [dp, e2] = unescape(substr(info, c + 1, len(info)), ENC_USER)
+    if e2 != nil {
+        return e2
+    }
+    u.password = dp
+    u.haspass = true
+    return nil
+}
+
+// setpath decodes p into u.path and keeps p as rawpath only when the
+// default re-escape wouldn't reproduce it — Go's setPath invariant.
+fn setpath(u: mut URL, p: str) -> err {
+    [d, e] = unescape(p, ENC_PATH)
+    if e != nil {
+        return e
+    }
+    u.path = d
+    if escape(d, ENC_PATH) == p {
+        u.rawpath = ""
+    } else {
+        u.rawpath = p
+    }
+    return nil
+}
+
+// setfragment — same invariant for the fragment component.
+fn setfragment(u: mut URL, f: str) -> err {
+    [d, e] = unescape(f, ENC_FRAG)
+    if e != nil {
+        return e
+    }
+    u.fragment = d
+    if escape(d, ENC_FRAG) == f {
+        u.rawfragment = ""
+    } else {
+        u.rawfragment = f
+    }
+    return nil
+}
+
+// parseerr wraps the inner error the way Go's url.Error reports:
+// parse "rawurl": message.
+fn parseerr(raw: str, e: err) -> err {
+    // wrap keeps the inner error reachable through errors.is/unwrap —
+    // Go's *url.Error.Unwrap parity
+    return errors.wrap("parse \"" + raw + "\": " + errors.msg(e), e)
+}
+
+/// parse reads rawurl into a URL — absolute, protocol-relative or
+/// relative; mirrors Go's url.Parse (fragment cut first, then
+/// scheme, query, authority, path).
+fn parse(rawurl: str) -> [own URL, err] {
+    // fragment is cut before everything else — including the ctl
+    // check: Go validates only the pre-fragment window, so a raw
+    // ctl byte inside #… parses clean (its unescape handling is
+    // separate)
+    rest := rawurl
+    frag := ""
+    hasfrag := false
+    fi := find(rest, "#")
+    if fi >= 0 {
+        frag = substr(rest, fi + 1, len(rest))
+        rest = substr(rest, 0, fi)
+        hasfrag = true
+    }
+    i := 0
+    for i < len(rest) {
+        c := byteat(rest, i)
+        if c < 32 || c == 127 {
+            return nil, errors.new("net/url: invalid control character in URL")
+        }
+        i = i + 1
+    }
+    [u, e] = parse_nofrag(rest)
+    if e != nil {
+        return nil, parseerr(rest, e)
+    }
+    if hasfrag {
+        fe := setfragment(u, frag)
+        if fe != nil {
+            return nil, parseerr(rawurl, fe)
+        }
+    }
+    return u, nil
+}
+
+// parse_nofrag is Go's parse(rawURL, false) minus the fragment pass
+// (parse() cuts '#' first so '#' never reaches here).
+fn parse_nofrag(rawurl: str) -> [own URL, err] {
+    u := new(URL)
+    u.scheme = ""
+    u.opaque = ""
+    u.user = ""
+    u.password = ""
+    u.hasuser = false
+    u.haspass = false
+    u.host = ""
+    u.path = ""
+    u.rawpath = ""
+    u.forcequery = false
+    u.rawquery = ""
+    u.fragment = ""
+    u.rawfragment = ""
+    u.omithost = false
+    if rawurl == "*" {
+        u.path = "*"
+        return u, nil
+    }
+    [cut, se] = getscheme(rawurl)
+    if se != nil {
+        return nil, se
+    }
+    u.scheme = cut.scheme
+    rest := cut.rest
+    // a lone trailing '?' marks an empty query (ForceQuery)
+    n := len(rest)
+    if n > 0 && byteat(rest, n - 1) == 63 && count(rest, "?") == 1 {
+        u.forcequery = true
+        rest = substr(rest, 0, n - 1)
+    } else {
+        q := find(rest, "?")
+        if q >= 0 {
+            u.rawquery = substr(rest, q + 1, len(rest))
+            rest = substr(rest, 0, q)
+        }
+    }
+    if len(rest) == 0 || byteat(rest, 0) != 47 {
+        if len(u.scheme) > 0 {
+            // rootless paths under a scheme are opaque
+            u.opaque = rest
+            return u, nil
+        }
+        // relative-path references may not carry ':' in the first
+        // segment — it would read as a scheme (RFC 3986 §4.2)
+        seg := rest
+        sl := find(rest, "/")
+        if sl >= 0 {
+            seg = substr(rest, 0, sl)
+        }
+        if find(seg, ":") >= 0 {
+            return nil, errors.new("first path segment in URL cannot contain colon")
+        }
+    }
+    // authority only when rest starts "//" — and never for "///"
+    // under a scheme-less ref
+    hasauth := false
+    if len(rest) >= 2 && substr(rest, 0, 2) == "//" {
+        if len(u.scheme) > 0 || !(len(rest) >= 3 && substr(rest, 0, 3) == "///") {
+            hasauth = true
+        }
+    }
+    if hasauth {
+        rest = substr(rest, 2, len(rest))
+        auth := rest
+        rest = ""
+        sl := find(auth, "/")
+        if sl >= 0 {
+            rest = substr(auth, sl, len(auth))
+            auth = substr(auth, 0, sl)
+        }
+        ae := parseauthority(u, auth)
+        if ae != nil {
+            return nil, ae
+        }
+    } else if len(u.scheme) > 0 && len(rest) > 0 && byteat(rest, 0) == 47 {
+        // scheme:/path — the empty authority stays omitted
+        u.omithost = true
+    }
+    pe := setpath(u, rest)
+    if pe != nil {
+        return nil, pe
+    }
+    return u, nil
+}
+
+fn count(s: str, sub: str) -> int {
+    n := 0
+    pos := 0
+    for pos + len(sub) <= len(s) {
+        i := find(substr(s, pos, len(s)), sub)
+        if i < 0 {
+            return n
+        }
+        n = n + 1
+        pos = pos + i + len(sub)
+    }
+    return n
+}
+
+/// escapedpath is Go's EscapedPath — rawpath when it's still a valid
+/// encoding of path, else a fresh escape.
+fn (u ref URL) escapedpath() -> str {
+    if len(u.rawpath) > 0 && validencoded(u.rawpath, ENC_PATH) {
+        [d, e] = unescape(u.rawpath, ENC_PATH)
+        if e == nil && d == u.path {
+            return u.rawpath
+        }
+    }
+    if u.path == "*" {
+        return "*"
+    }
+    return escape(u.path, ENC_PATH)
+}
+
+/// escapedfragment — rawfragment when valid, else a fresh escape.
+fn (u ref URL) escapedfragment() -> str {
+    if len(u.rawfragment) > 0 && validencoded(u.rawfragment, ENC_FRAG) {
+        [d, e] = unescape(u.rawfragment, ENC_FRAG)
+        if e == nil && d == u.fragment {
+            return u.rawfragment
+        }
+    }
+    return escape(u.fragment, ENC_FRAG)
+}
+
+/// userinfo returns the encoded userinfo part "user[:password]" —
+/// Go's Userinfo.String.
+fn (u ref URL) userinfo() -> str {
+    s := escape(u.user, ENC_USER)
+    if u.haspass {
+        s = s + ":" + escape(u.password, ENC_USER)
+    }
+    return s
+}
+
+/// string reassembles u — Go's URL.String.
+fn (u ref URL) string() -> str {
+    buf := ""
+    if len(u.scheme) > 0 {
+        buf = buf + u.scheme + ":"
+    }
+    if len(u.opaque) > 0 {
+        buf = buf + u.opaque
+    } else {
+        if len(u.scheme) > 0 || len(u.host) > 0 || u.hasuser {
+            if u.omithost && len(u.host) == 0 && !u.hasuser {
+                // scheme:/path — no //
+            } else {
+                if len(u.host) > 0 || len(u.path) > 0 || u.hasuser {
+                    buf = buf + "//"
+                }
+                if u.hasuser {
+                    buf = buf + u.userinfo() + "@"
+                }
+                if len(u.host) > 0 {
+                    buf = buf + escape(u.host, ENC_HOST)
+                }
+            }
+        }
+        path := u.escapedpath()
+        if len(path) > 0 && byteat(path, 0) != 47 && len(u.host) > 0 {
+            buf = buf + "/"
+        }
+        if len(buf) == 0 {
+            // a ':' in the first segment would reparse as a scheme —
+            // pin it with ./ (RFC 3986 §4.2)
+            seg := path
+            sl := find(path, "/")
+            if sl >= 0 {
+                seg = substr(path, 0, sl)
+            }
+            if find(seg, ":") >= 0 {
+                buf = buf + "./"
+            }
+        }
+        buf = buf + path
+    }
+    if u.forcequery || len(u.rawquery) > 0 {
+        buf = buf + "?" + u.rawquery
+    }
+    if len(u.fragment) > 0 {
+        buf = buf + "#" + u.escapedfragment()
+    }
+    return buf
+}
+
+/// isabs reports whether u is absolute (has a scheme) — Go's IsAbs.
+fn (u ref URL) isabs() -> bool {
+    return len(u.scheme) > 0
+}
+
+/// request_uri returns the "path?query" form used on an HTTP request
+/// line — Go's RequestURI.
+fn (u ref URL) request_uri() -> str {
+    result := u.opaque
+    if len(result) == 0 {
+        result = u.escapedpath()
+        if len(result) == 0 {
+            result = "/"
+        }
+    } else if len(result) >= 2 && substr(result, 0, 2) == "//" {
+        result = u.scheme + ":" + result
+    }
+    if u.forcequery || len(u.rawquery) > 0 {
+        result = result + "?" + u.rawquery
+    }
+    return result
+}
+
+/// HostPort is splithostport's result — host without brackets or
+/// port, port without the colon.
+struct HostPort { host: str, port: str }
+
+// splithostport separates host and port — Go's splitHostPort: the
+// port is cut at the last ':' only when it's valid digits, and []
+// comes off literal IPv6 hosts.
+fn splithostport(hostport: str) -> own HostPort {
+    hp := new(HostPort)
+    host := hostport
+    port := ""
+    colon := rfind_ch(host, 58)
+    if colon >= 0 && validport(substr(host, colon, len(host))) {
+        port = substr(host, colon + 1, len(host))
+        host = substr(host, 0, colon)
+    }
+    if len(host) >= 2 && byteat(host, 0) == 91 && byteat(host, len(host) - 1) == 93 {
+        host = substr(host, 1, len(host) - 1)
+    }
+    hp.host = host
+    hp.port = port
+    return hp
+}
+
+/// hostname returns u.host minus any port — brackets come off IPv6
+/// literals. Go's Hostname.
+fn (u ref URL) hostname() -> str {
+    return splithostport(u.host).host
+}
+
+/// port returns the port of u.host without ':' — "" when absent.
+/// Go's Port.
+fn (u ref URL) port() -> str {
+    return splithostport(u.host).port
+}
+
+/// query parses u.rawquery into Values — [values, err].
+/// (Go drops the error in u.Query(); returning it stays honest about
+/// malformed pairs.)
+fn (u ref URL) query() -> [own Values, err] {
+    return parsequery(u.rawquery)
+}
+
+/// resolve_reference resolves r against base u per RFC 3986 §5.2 —
+/// Go's ResolveReference. A fresh URL always comes back.
+fn resolve_reference(u: ref URL, r: ref URL) -> own URL {
+    url := clone(r)
+    if len(r.scheme) == 0 {
+        url.scheme = u.scheme
+    }
+    if len(r.scheme) > 0 || len(r.host) > 0 || r.hasuser {
+        // absoluteURI / net_path — the base only lends its scheme
+        setpath(url, resolvepath(r.escapedpath(), ""))
+        return url
+    }
+    if len(r.opaque) > 0 {
+        url.hasuser = false
+        url.user = ""
+        url.password = ""
+        url.haspass = false
+        url.host = ""
+        url.path = ""
+        return url
+    }
+    if len(r.path) == 0 && !r.forcequery && len(r.rawquery) == 0 {
+        url.rawquery = u.rawquery
+        if len(r.fragment) == 0 {
+            url.fragment = u.fragment
+            url.rawfragment = u.rawfragment
+        }
+    }
+    if len(r.path) == 0 && len(u.opaque) > 0 {
+        // opaque base: a path-less reference inherits the opaque
+        // tail verbatim — host/user/path stay empty (Go 1.25)
+        url.opaque = u.opaque
+        url.hasuser = false
+        url.user = ""
+        url.password = ""
+        url.haspass = false
+        url.host = ""
+        url.path = ""
+        return url
+    }
+    // abs_path / rel_path
+    url.host = u.host
+    url.user = u.user
+    url.hasuser = u.hasuser
+    url.password = u.password
+    url.haspass = u.haspass
+    setpath(url, resolvepath(u.escapedpath(), r.escapedpath()))
+    return url
+}
+
+fn clone(r: ref URL) -> own URL {
+    url := new(URL)
+    url.scheme = r.scheme
+    url.opaque = r.opaque
+    url.user = r.user
+    url.password = r.password
+    url.hasuser = r.hasuser
+    url.haspass = r.haspass
+    url.host = r.host
+    url.path = r.path
+    url.rawpath = r.rawpath
+    url.forcequery = r.forcequery
+    url.rawquery = r.rawquery
+    url.fragment = r.fragment
+    url.rawfragment = r.rawfragment
+    url.omithost = r.omithost
+    return url
+}
+
+// resolvepath merges ref onto base's directory and removes dot
+// segments — Go's resolvePath verbatim: cut segments off `remaining`
+// and pop on "..".
+fn resolvepath(base: str, refp: str) -> str {
+    full := ""
+    if len(refp) == 0 {
+        full = base
+    } else if byteat(refp, 0) != 47 {
+        i := rfind_ch(base, 47)
+        full = substr(base, 0, i + 1) + refp
+    } else {
+        full = refp
+    }
+    if len(full) == 0 {
+        return ""
+    }
+    elem := ""
+    dst := "/"
+    first := true
+    remaining := full
+    found := true
+    for found {
+        i := find(remaining, "/")
+        if i < 0 {
+            elem = remaining
+            remaining = ""
+            found = false
+        } else {
+            elem = substr(remaining, 0, i)
+            remaining = substr(remaining, i + 1, len(remaining))
+        }
+        if elem == "." {
+            first = false
+            continue
+        }
+        if elem == ".." {
+            // pop the last written segment — ignore the leading /
+            s := substr(dst, 1, len(dst))
+            idx := rfind_ch(s, 47)
+            dst = "/"
+            if idx < 0 {
+                first = true
+            } else {
+                dst = dst + substr(s, 0, idx)
+            }
+        } else {
+            if !first {
+                dst = dst + "/"
+            }
+            dst = dst + elem
+            first = false
+        }
+    }
+    if elem == "." || elem == ".." {
+        dst = dst + "/"
+    }
+    if len(dst) > 1 && byteat(dst, 1) == 47 {
+        dst = substr(dst, 1, len(dst))
+    }
+    return dst
+}
+
+// ---------- Values ----------
+
+/// newvalues returns an empty Values map.
+fn newvalues() -> own Values {
+    vs := new(Values)
+    vs.head = nil
+    vs.tail = nil
+    vs.free = nil
+    vs.n = 0
+    return vs
+}
+
+/// vadd appends key=value — Values.Add.
+fn vadd(vs: mut Values, k: str, v: str) {
+    // recycle a del'd node — own nodes can't reach rt_free's boundary,
+    // so del churn reuses them (same deal as Map.free)
+    p := vs.free
+    if p == nil {
+        p = new(VPair)
+    } else {
+        vs.free = p.next
+    }
+    p.k = k
+    p.v = v
+    p.next = nil
+    if vs.tail == nil {
+        vs.head = p
+        vs.tail = vs.head
+    } else {
+        vs.tail.next = p
+        vs.tail = vs.tail.next
+    }
+    vs.n = vs.n + 1
+}
+
+/// vset replaces every value for key — Values.Set.
+fn vset(vs: mut Values, k: str, v: str) {
+    vdel(vs, k)
+    vadd(vs, k, v)
+}
+
+/// vdel removes every value for key — Values.Del.
+fn vdel(vs: mut Values, k: str) {
+    // strip the leading run first — after it p only ever trails n
+    for vs.head != nil && vs.head.k == k {
+        gone := vs.head
+        vs.head = gone.next
+        gone.next = vs.free
+        vs.free = gone
+        vs.n = vs.n - 1
+    }
+    p := vs.head
+    for p != nil {
+        n := p.next
+        if n == nil {
+            break
+        }
+        if n.k == k {
+            p.next = n.next
+            n.next = vs.free
+            vs.free = n
+            vs.n = vs.n - 1
+        } else {
+            p = n
+        }
+    }
+    // tail may sit on a recycled node — walk to the end
+    t := vs.head
+    if t != nil {
+        for t.next != nil {
+            t = t.next
+        }
+    }
+    vs.tail = t
+}
+
+/// vget returns the first value for key, "" when absent — Values.Get.
+fn vget(vs: ref Values, k: str) -> str {
+    p := vs.head
+    for p != nil {
+        if p.k == k {
+            return p.v
+        }
+        p = p.next
+    }
+    return ""
+}
+
+/// vhas reports whether key is present — Values.Has.
+fn vhas(vs: ref Values, k: str) -> bool {
+    p := vs.head
+    for p != nil {
+        if p.k == k {
+            return true
+        }
+        p = p.next
+    }
+    return false
+}
+
+/// vgetall returns every value for key in order.
+fn vgetall(vs: ref Values, k: str) -> own []str {
+    n := 0
+    p := vs.head
+    for p != nil {
+        if p.k == k {
+            n = n + 1
+        }
+        p = p.next
+    }
+    out := new(mkslice(str, n))
+    i := 0
+    p = vs.head
+    for p != nil {
+        if p.k == k {
+            out[i] = p.v
+            i = i + 1
+        }
+        p = p.next
+    }
+    return out
+}
+
+/// vlen returns the number of key=value pairs.
+fn vlen(vs: ref Values) -> int {
+    return vs.n
+}
+
+// sortstrs — insertion sort; Values keys are small sets.
+fn sortstrs(v: []str) {
+    i := 1
+    for i < len(v) {
+        x := v[i]
+        j := i - 1
+        for j >= 0 && v[j] > x {
+            v[j + 1] = v[j]
+            j = j - 1
+        }
+        v[j + 1] = x
+        i = i + 1
+    }
+}
+
+fn vhas_keys(v: []str, k: str) -> bool {
+    i := 0
+    for i < len(v) {
+        if v[i] == k {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+/// vkeys returns the distinct keys, sorted.
+fn vkeys(vs: ref Values) -> own []str {
+    out := mkslice(str, 0)
+    p := vs.head
+    for p != nil {
+        if !vhas_keys(out, p.k) {
+            out = push(out, p.k)
+        }
+        p = p.next
+    }
+    sortstrs(out)
+    return new(out)
+}
+
+/// vencode renders the map as `k=v&k2=v2` — keys sorted, pairs
+/// query-escaped. Values.Encode.
+fn vencode(vs: ref Values) -> str {
+    keys := vkeys(vs)
+    buf := ""
+    i := 0
+    for i < len(keys) {
+        ke := queryescape(keys[i])
+        p := vs.head
+        for p != nil {
+            if p.k == keys[i] {
+                if len(buf) > 0 {
+                    buf = buf + "&"
+                }
+                buf = buf + ke + "=" + queryescape(p.v)
+            }
+            p = p.next
+        }
+        i = i + 1
+    }
+    return buf
+}
+
+/// parsequery parses a URL-encoded query string into Values —
+/// Go's url.ParseQuery. '&' separates settings; a setting without
+/// '=' decodes as an empty value; a stray ';' is an error (as is a
+/// bad % escape) — the first error is returned with the pairs that
+/// did parse, exactly like Go.
+fn parsequery(query: str) -> [own Values, err] {
+    vs := newvalues()
+    rest := query
+    let first_err: err = nil
+    for len(rest) > 0 {
+        key := rest
+        amp := find(rest, "&")
+        if amp >= 0 {
+            key = substr(rest, 0, amp)
+            rest = substr(rest, amp + 1, len(rest))
+        } else {
+            rest = ""
+        }
+        if find(key, ";") >= 0 {
+            if first_err == nil {
+                first_err = errors.new("invalid semicolon separator in query")
+            }
+            continue
+        }
+        if len(key) == 0 {
+            continue
+        }
+        val := ""
+        eq := find(key, "=")
+        if eq >= 0 {
+            val = substr(key, eq + 1, len(key))
+            key = substr(key, 0, eq)
+        }
+        [dk, e1] = queryunescape(key)
+        if e1 != nil {
+            if first_err == nil {
+                first_err = e1
+            }
+            continue
+        }
+        [dv, e2] = queryunescape(val)
+        if e2 != nil {
+            if first_err == nil {
+                first_err = e2
+            }
+            continue
+        }
+        vadd(vs, dk, dv)
+    }
+    return vs, first_err
+}

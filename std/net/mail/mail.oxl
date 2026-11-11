@@ -1,0 +1,1022 @@
+package mail
+
+// std/net/mail — RFC 5322 address parsing and formatting, modeled on
+// Go's net/mail:
+//
+//     [a, e] = mail.parseaddress("Gogh Fir <gf@example.com>")
+//     println(a.name)                    // Gogh Fir
+//     println(a.string())                // "Gogh Fir" <gf@example.com>
+//
+// The parser follows Go's addrParser: addr-spec tried first, then
+// display-name + angle-addr, groups flatten into lists, CFWS comments
+// are skipped (and read as display names after an addr-spec), and
+// =?utf-8?q|b?...?= encoded words decode in names.
+import "std/errors"
+
+import "std/encoding/base64"
+
+import "std/net"
+
+/// Address is one mailbox — display name plus addr-spec. Same field
+/// names as Go's mail.Address.
+struct Address { name: str, address: str }
+
+// P is the parser cursor — Go's addrParser shrinks its string; a pos
+// cursor does the same without reslicing.
+struct P { s: str, pos: int }
+
+fn pempty(p: ref P) -> bool {
+    return p.pos >= len(p.s)
+}
+
+fn ppeek(p: ref P) -> int {
+    if p.pos >= len(p.s) {
+        return -1
+    }
+    return byteat(p.s, p.pos)
+}
+
+fn pconsume(p: mut P, c: int) -> bool {
+    if ppeek(p) == c {
+        p.pos = p.pos + 1
+        return true
+    }
+    return false
+}
+
+fn skipspace(p: mut P) {
+    for p.pos < len(p.s) {
+        c := byteat(p.s, p.pos)
+        if c != 32 && c != 9 {
+            return
+        }
+        p.pos = p.pos + 1
+    }
+}
+
+// consumecomment swallows a (nested) comment — '(' already consumed.
+// Escaped bytes lose their backslash. err = unclosed comment.
+fn consumecomment(p: mut P) -> [str, err] {
+    depth := 1
+    comment := ""
+    for !pempty(p) && depth != 0 {
+        c := ppeek(p)
+        if c == 92 && p.pos + 1 < len(p.s) {
+            // drop '\', keep the guarded byte verbatim — it never
+            // reaches the depth checks (Go's else-if shape)
+            p.pos = p.pos + 1
+            comment = comment + substr(p.s, p.pos, p.pos + 1)
+            p.pos = p.pos + 1
+            continue
+        }
+        if c == 40 {
+            depth = depth + 1
+        } else if c == 41 {
+            depth = depth - 1
+        }
+        if depth > 0 {
+            comment = comment + substr(p.s, p.pos, p.pos + 1)
+        }
+        p.pos = p.pos + 1
+    }
+    if depth != 0 {
+        return "", errors.new("mail: unclosed comment")
+    }
+    return comment, nil
+}
+
+// skipcfws skips whitespace plus any number of comments — the CFWS
+// element of RFC 5322.
+fn skipcfws(p: mut P) -> bool {
+    skipspace(p)
+    for pconsume(p, 40) {
+        [_, e] = consumecomment(p)
+        if e != nil {
+            return false
+        }
+        skipspace(p)
+    }
+    return true
+}
+
+// iswsp — space or tab
+fn iswsp(c: int) -> bool {
+    return c == 32 || c == 9
+}
+
+// isvchar — printable ASCII or a UTF-8 continuation byte (RFC 6532's
+// multibyte rune reads as one vchar here since we work byte-wise)
+fn isvchar(c: int) -> bool {
+    return c >= 33 && c <= 126 || c >= 128
+}
+
+// utf8seq returns the byte length of a valid UTF-8 sequence at i, or
+// 0 when the bytes can't form one — the rune-level reject Go's mail
+// parser applies (RuneError is not a vchar).
+fn utf8seq(s: str, i: int) -> int {
+    c := byteat(s, i)
+    if c < 128 {
+        return 1
+    }
+    n := 0
+    if c >= 194 && c <= 223 {
+        n = 2
+    } else if c >= 224 && c <= 239 {
+        n = 3
+    } else if c >= 240 && c <= 244 {
+        n = 4
+    } else {
+        return 0
+    }
+    if i + n > len(s) {
+        return 0
+    }
+    c1 := byteat(s, i + 1)
+    if c1 < 128 || c1 > 191 {
+        return 0
+    }
+    // overlong leads + surrogates + >U+10FFFF
+    if c == 224 && c1 < 160 || c == 237 && c1 > 159 || c == 240 && c1 < 144 || c == 244 && c1 > 143 {
+        return 0
+    }
+    k := 2
+    for k < n {
+        ck := byteat(s, i + k)
+        if ck < 128 || ck > 191 {
+            return 0
+        }
+        k = k + 1
+    }
+    return n
+}
+
+// isatext — atom characters; dot=true admits '.' (dot-atom)
+fn isatext(c: int, dot: bool) -> bool {
+    if c == 46 {
+        return dot
+    }
+    // specials: ( ) < > [ ] : ; @ \ , "
+    if c == 40 || c == 41 || c == 60 || c == 62 || c == 91 || c == 93 || c == 58 || c == 59 || c == 64 || c == 92 || c == 44 || c == 34 {
+        return false
+    }
+    return isvchar(c)
+}
+
+// isqtext — printable minus " and backslash
+fn isqtext(c: int) -> bool {
+    if c == 92 || c == 34 {
+        return false
+    }
+    return isvchar(c)
+}
+
+fn find_from(s: str, needle: str, from: int) -> int {
+    last := len(s) - len(needle)
+    i := from
+    for i <= last {
+        j := 0
+        for j < len(needle) && byteat(s, i + j) == byteat(needle, j) {
+            j = j + 1
+        }
+        if j == len(needle) {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+fn lwr(s: str) -> str {
+    b := s as []byte
+    out := mkslice(byte, len(s))
+    i := 0
+    for i < len(s) {
+        c := b[i]
+        if c >= 65 && c <= 90 {
+            c = c + 32
+        }
+        out[i] = c
+        i = i + 1
+    }
+    return out as str
+}
+
+// consumeatom reads one atom (dot-atom when dot) — permissive skips
+// the leading/trailing/double-dot checks, matching Go's phrase atoms.
+fn consumeatom(p: mut P, dot: bool, permissive: bool) -> [str, err] {
+    start := p.pos
+    for p.pos < len(p.s) {
+        c := byteat(p.s, p.pos)
+        if c >= 128 {
+            n := utf8seq(p.s, p.pos)
+            if n == 0 {
+                return "", errors.new("mail: invalid utf-8 in address")
+            }
+            p.pos = p.pos + n
+            continue
+        }
+        if !isatext(c, dot) {
+            break
+        }
+        p.pos = p.pos + 1
+    }
+    atom := substr(p.s, start, p.pos)
+    if len(atom) == 0 {
+        return "", errors.new("mail: invalid string")
+    }
+    if !permissive {
+        if byteat(atom, 0) == 46 {
+            return "", errors.new("mail: leading dot in atom")
+        }
+        if find(atom, "..") >= 0 {
+            return "", errors.new("mail: double dot in atom")
+        }
+        if byteat(atom, len(atom) - 1) == 46 {
+            return "", errors.new("mail: trailing dot in atom")
+        }
+    }
+    return atom, nil
+}
+
+// consumeqstring reads a "..." quoted-string — backslash escapes a
+// vchar or wsp byte.
+fn consumeqstring(p: mut P) -> [str, err] {
+    i := p.pos + 1
+    out := ""
+    escaped := false
+    for true {
+        if i >= len(p.s) {
+            return "", errors.new("mail: unclosed quoted-string")
+        }
+        c := byteat(p.s, i)
+        if escaped {
+            if c >= 128 {
+                n := utf8seq(p.s, i)
+                if n == 0 {
+                    return "", errors.new("mail: invalid utf-8 in quoted-string")
+                }
+                out = out + substr(p.s, i, i + n)
+                i = i + n - 1
+            } else if !isvchar(c) && !iswsp(c) {
+                return "", errors.new("mail: bad character in quoted-string")
+            } else {
+                out = out + substr(p.s, i, i + 1)
+            }
+            escaped = false
+        } else if c >= 128 {
+            n := utf8seq(p.s, i)
+            if n == 0 {
+                return "", errors.new("mail: invalid utf-8 in quoted-string")
+            }
+            out = out + substr(p.s, i, i + n)
+            i = i + n - 1
+        } else if isqtext(c) || iswsp(c) {
+            out = out + substr(p.s, i, i + 1)
+        } else if c == 34 {
+            p.pos = i + 1
+            return out, nil
+        } else if c == 92 {
+            escaped = true
+        } else {
+            return "", errors.new("mail: bad character in quoted-string")
+        }
+        i = i + 1
+    }
+    return "", nil
+}
+
+// try_addrspec does the addr-spec parse; consumeaddrspec wraps it so
+// a failure rewinds the cursor for the name-addr retry (Go's defer).
+fn try_addrspec(p: mut P) -> [str, err] {
+    skipspace(p)
+    if pempty(p) {
+        return "", errors.new("mail: no addr-spec")
+    }
+    local := ""
+    if ppeek(p) == 34 {
+        [q, e] = consumeqstring(p)
+        if e != nil {
+            return "", e
+        }
+        if len(q) == 0 {
+            return "", errors.new("mail: empty quoted string in addr-spec")
+        }
+        local = q
+    } else {
+        [a, e] = consumeatom(p, true, false)
+        if e != nil {
+            return "", e
+        }
+        local = a
+    }
+    if !pconsume(p, 64) {
+        return "", errors.new("mail: missing @ in addr-spec")
+    }
+    skipspace(p)
+    if pempty(p) {
+        return "", errors.new("mail: no domain in addr-spec")
+    }
+    if ppeek(p) == 91 {
+        [dl, e2] = consumedomainliteral(p)
+        if e2 != nil {
+            return "", e2
+        }
+        return local + "@" + dl, nil
+    }
+    [dom, e2] = consumeatom(p, true, false)
+    if e2 != nil {
+        return "", e2
+    }
+    return local + "@" + dom, nil
+}
+
+// consumedomainliteral reads `[...]` — domain literals:
+// `[127.0.0.1]` (IPv4 dotted quad) or `[IPv6:...]` tagged
+// literals whose tag parses as an IP — IPv6 or IPv4, so
+// `[IPv6:1.2.3.4]` is accepted. A bare `[::1]` is rejected,
+// matching Go's mail. Validated by net.isip4/isip6.
+// Other bracket contents fail — a literal that can't route is
+// worse than no literal.
+fn consumedomainliteral(p: mut P) -> [str, err] {
+    p.pos = p.pos + 1 // consume '['
+    start := p.pos
+    for !pempty(p) && ppeek(p) != 93 {
+        c := ppeek(p)
+        // dtext: printable ASCII except [ ] \ and controls
+        if c <= 32 || c == 91 || c == 92 || c == 127 {
+            return "", errors.new("mail: bad character in domain literal")
+        }
+        p.pos = p.pos + 1
+    }
+    if pempty(p) {
+        return "", errors.new("mail: unclosed domain literal")
+    }
+    inner := substr(p.s, start, p.pos)
+    p.pos = p.pos + 1 // consume ']'
+    if len(inner) == 0 {
+        return "", errors.new("mail: empty domain literal")
+    }
+    if substr(inner, 0, 5) == "IPv6:" {
+        tag := substr(inner, 5, len(inner))
+        // isip6 admits a %zone suffix (RFC 6874, needed by url
+        // brackets) where Go's ParseIP rejects it in domain
+        // literals — a deliberate ultra-edge divergence
+        if !(net.isip6(tag) || net.isip4(tag)) {
+            return "", errors.new("mail: invalid IPv6 domain literal")
+        }
+        return "[" + inner + "]", nil
+    }
+    // bare bracketed IPv6 ("[::1]") is rejected like Go — only
+    // dotted quads pass the untagged path
+    if !net.isip4(inner) {
+        return "", errors.new("mail: invalid IPv4 domain literal")
+    }
+    return "[" + inner + "]", nil
+}
+
+fn consumeaddrspec(p: mut P) -> [str, err] {
+    orig := p.pos
+    [spec, e] = try_addrspec(p)
+    if e != nil {
+        p.pos = orig
+    }
+    return spec, e
+}
+
+/// DWord is decode2047's result — the word plus whether it was a
+/// real encoded-word (malformed ones pass back marked false).
+struct DWord { w: str, enc: bool }
+
+fn dword(w: str, enc: bool) -> own DWord {
+    d := new(DWord)
+    d.w = w
+    d.enc = enc
+    return d
+}
+
+// decode2047 decodes one =?charset?enc?text?= word — malformed words
+// pass through unmarked (enc=false); an unknown charset passes
+// through WITH an error (Go's charsetReaderError behavior).
+fn decode2047(w: str) -> [own DWord, err] {
+    if len(w) < 8 || substr(w, 0, 2) != "=?" {
+        return dword(w, false), nil
+    }
+    // exactly four '?' delimit the shape — a text-side '?' breaks it
+    qc := 0
+    qi := 0
+    for qi < len(w) {
+        if byteat(w, qi) == 63 {
+            qc = qc + 1
+        }
+        qi = qi + 1
+    }
+    if qc != 4 {
+        return dword(w, false), nil
+    }
+    i := find_from(w, "?", 2)
+    if i < 0 {
+        return dword(w, false), nil
+    }
+    j := find_from(w, "?", i + 1)
+    if j < 0 || j + 2 > len(w) || substr(w, len(w) - 2, len(w)) != "?=" {
+        return dword(w, false), nil
+    }
+    charset := lwr(substr(w, 2, i))
+    enc := lwr(substr(w, i + 1, j))
+    text := substr(w, j + 1, len(w) - 2)
+    if len(charset) == 0 {
+        return dword(w, false), nil
+    }
+    // Go dispatches the encoding first — a decode failure yields the
+    // literal word; only a decode success reaches the charset check
+    dtext := ""
+    if enc == "b" {
+        [d, e] = base64.decode(text)
+        if e != nil {
+            return dword(w, false), nil
+        }
+        dtext = d as str
+    } else if enc == "q" {
+        [dq, qe] = qdecode(text)
+        if qe != nil {
+            return dword(w, false), nil
+        }
+        dtext = dq
+    } else {
+        return dword(w, false), nil
+    }
+    if charset != "utf-8" && charset != "us-ascii" && charset != "iso-8859-1" {
+        return dword(w, true), errors.new("charset not supported: \"" + charset + "\"")
+    }
+    return dword(wordtext(dtext, charset), true), nil
+}
+
+// wordtext expands decoded bytes per charset — iso-8859-1 maps
+// byte-for-byte onto codepoints 0–255, so each high byte becomes a
+// two-byte UTF-8 sequence; utf-8 needs no transcoding, so its bytes
+// pass through unchanged (Go's WordDecoder does the same — invalid
+// UTF-8 lands raw, not as U+FFFD); us-ascii passes through.
+fn wordtext(d: str, charset: str) -> str {
+    out := mkslice(byte, 0)
+    if charset == "utf-8" {
+        return d
+    }
+    i := 0
+    for i < len(d) {
+        c := byteat(d, i)
+        if c < 128 {
+            out = push(out, c)
+        } else if charset == "us-ascii" {
+            // out-of-charset byte -> U+FFFD, matching Go's reader
+            out = push(out, 239)
+            out = push(out, 191)
+            out = push(out, 189)
+        } else {
+            out = push(out, 192 + c / 64)
+            out = push(out, 128 + c % 64)
+        }
+        i = i + 1
+    }
+    return out as str
+}
+
+// qdecode — RFC 2047 Q-encoding: '_' space, =XX byte, rest literal.
+// A malformed =XX or an out-of-range byte is a decode error like
+// Go's qDecode — decode2047 falls back to the literal word on it.
+fn qdecode(t: str) -> [str, err] {
+    b := mkslice(byte, 0)
+    i := 0
+    for i < len(t) {
+        c := byteat(t, i)
+        if c == 95 {
+            b = push(b, 32)
+            i = i + 1
+            continue
+        }
+        if c == 61 {
+            if i + 2 >= len(t) {
+                return "", errors.new("mail: truncated =XX in q-encoding")
+            }
+            h := byteat(t, i + 1)
+            l := byteat(t, i + 2)
+            if !ishex(h) || !ishex(l) {
+                return "", errors.new("mail: bad =XX in q-encoding")
+            }
+            b = push(b, unhex(h) * 16 + unhex(l))
+            i = i + 3
+            continue
+        }
+        // printable ASCII plus the whitespace controls Go accepts;
+        // Go's qDecode errors on unescaped bytes >126
+        if c <= 32 && c != 9 && c != 10 && c != 13 || c > 126 {
+            return "", errors.new("mail: bad character in q-encoding")
+        }
+        b = push(b, c)
+        i = i + 1
+    }
+    return b as str, nil
+}
+
+fn ishex(c: int) -> bool {
+    return c >= 48 && c <= 57 || c >= 97 && c <= 102 || c >= 65 && c <= 70
+}
+
+fn unhex(c: int) -> int {
+    if c >= 48 && c <= 57 {
+        return c - 48
+    }
+    if c >= 97 && c <= 102 {
+        return c - 87
+    }
+    if c >= 65 && c <= 70 {
+        return c - 55
+    }
+    return 0
+}
+
+// consumephrase reads the display name — a run of atoms/quoted-strings
+// joined by single spaces, with adjacent encoded-words merging.
+fn consumephrase(p: mut P) -> [str, err] {
+    words := mkslice(str, 0)
+    prevenc := false
+    lasterr := errors.new("mail: missing word in phrase")
+    for true {
+        if len(words) > 0 {
+            if !skipcfws(p) {
+                return "", errors.new("mail: misformatted parenthetical comment")
+            }
+        }
+        skipspace(p)
+        if pempty(p) {
+            break
+        }
+        word := ""
+        isenc := false
+        failed := false
+        if ppeek(p) == 34 {
+            [w, e] = consumeqstring(p)
+            if e != nil {
+                lasterr = e
+                failed = true
+            } else {
+                word = w
+            }
+        } else {
+            [w, e] = consumeatom(p, true, true)
+            if e != nil {
+                lasterr = e
+                failed = true
+            } else {
+                [dw, e2] = decode2047(w)
+                if e2 != nil {
+                    lasterr = e2
+                    failed = true
+                } else {
+                    word = dw.w
+                    isenc = dw.enc
+                }
+            }
+        }
+        if failed {
+            break
+        }
+        if prevenc && isenc {
+            words[len(words) - 1] = words[len(words) - 1] + word
+        } else {
+            words = push(words, word)
+        }
+        prevenc = isenc
+    }
+    if len(words) == 0 {
+        return "", lasterr
+    }
+    // join with single spaces
+    out := words[0]
+    i := 1
+    for i < len(words) {
+        out = out + " " + words[i]
+        i = i + 1
+    }
+    return out, nil
+}
+
+// consumedisplaycomment reads "(name)" following an addr-spec — the
+// comment doubles as the display name (old-form addresses).
+fn consumedisplaycomment(p: mut P) -> [str, err] {
+    if !pconsume(p, 40) {
+        return "", errors.new("mail: comment does not start with (")
+    }
+    [comment, e] = consumecomment(p)
+    if e != nil {
+        return "", errors.new("mail: misformatted parenthetical comment")
+    }
+    // split on space/tab, decode each word; control bytes can't
+    // survive a serialize anyway (name is quoted/2047-encoded) so a
+    // raw CR/LF landing here would smuggle header bytes into .name
+    clean := ""
+    j := 0
+    for j < len(comment) {
+        cc := byteat(comment, j)
+        if cc == 9 || cc >= 32 && cc != 127 {
+            // tab survives — the splitter below uses it as a
+            // separator; CR/LF/DEL strip
+            clean = clean + substr(comment, j, j + 1)
+        }
+        j = j + 1
+    }
+    comment = clean
+    out := ""
+    word := ""
+    i := 0
+    for i <= len(comment) {
+        c := -1
+        if i < len(comment) {
+            c = byteat(comment, i)
+        }
+        if c == 32 || c == 9 || i == len(comment) {
+            if len(word) > 0 {
+                [dw, e] = decode2047(word)
+                if e != nil {
+                    return "", e
+                }
+                if dw.enc {
+                    word = dw.w
+                }
+                if len(out) > 0 {
+                    out = out + " "
+                }
+                out = out + word
+            }
+            word = ""
+        } else {
+            word = word + substr(comment, i, i + 1)
+        }
+        i = i + 1
+    }
+    return out, nil
+}
+
+// consumegrouplist reads "a@x, B <b@y> ;" members after a
+// `Name:` marker — the flattened list Go returns.
+fn consumegrouplist(p: mut P) -> [own []Address, err] {
+    group := mkslice(Address, 0)
+    skipspace(p)
+    if pconsume(p, 59) {
+        if !skipcfws(p) {
+            return nil, errors.new("mail: misformatted parenthetical comment")
+        }
+        return new(group), nil
+    }
+    for true {
+        skipspace(p)
+        [addrs, e] = parseaddr(p, false)
+        if e != nil {
+            return nil, e
+        }
+        i := 0
+        for i < len(addrs) {
+            group = push(group, addrs[i])
+            i = i + 1
+        }
+        if !skipcfws(p) {
+            return nil, errors.new("mail: misformatted parenthetical comment")
+        }
+        if pconsume(p, 59) {
+            if !skipcfws(p) {
+                return nil, errors.new("mail: misformatted parenthetical comment")
+            }
+            break
+        }
+        if !pconsume(p, 44) {
+            return nil, errors.new("mail: expected comma")
+        }
+    }
+    return new(group), nil
+}
+
+// parseaddr parses one mailbox (or a group when handlegroup) at the
+// cursor — Go's parseAddress.
+fn parseaddr(p: mut P, handlegroup: bool) -> [own []Address, err] {
+    skipspace(p)
+    if pempty(p) {
+        return nil, errors.new("mail: no address")
+    }
+    // addr-spec first — it has the tighter grammar
+    [spec, e] = consumeaddrspec(p)
+    if e == nil {
+        name := ""
+        skipspace(p)
+        if !pempty(p) && ppeek(p) == 40 {
+            [nm, e2] = consumedisplaycomment(p)
+            if e2 != nil {
+                return nil, e2
+            }
+            name = nm
+        }
+        out := new(mkslice(Address, 1))
+        out[0] = Address{name: name, address: spec}
+        return out, nil
+    }
+    // name-addr: display-name then <addr-spec>
+    name := ""
+    if ppeek(p) != 60 {
+        [nm, e3] = consumephrase(p)
+        if e3 != nil {
+            return nil, e3
+        }
+        name = nm
+    }
+    skipspace(p)
+    if handlegroup {
+        if pconsume(p, 58) {
+            return consumegrouplist(p)
+        }
+    }
+    if !pconsume(p, 60) {
+        atext := true
+        i := 0
+        for i < len(name) {
+            if !isatext(byteat(name, i), true) {
+                atext = false
+                break
+            }
+            i = i + 1
+        }
+        if atext {
+            // "foo.bar" — probably meant foo.bar@dom or foo.bar <x>
+            return nil, errors.new("mail: missing '@' or angle-addr")
+        }
+        // "Full Name" — meant to be Full Name <x@y>
+        return nil, errors.new("mail: no angle-addr")
+    }
+    [spec2, e4] = consumeaddrspec(p)
+    if e4 != nil {
+        return nil, e4
+    }
+    if !pconsume(p, 62) {
+        return nil, errors.new("mail: unclosed angle-addr")
+    }
+    out := new(mkslice(Address, 1))
+    out[0] = Address{name: name, address: spec2}
+    return out, nil
+}
+
+/// parseaddress parses one RFC 5322 mailbox — Go's mail.ParseAddress.
+fn parseaddress(s: str) -> [own Address, err] {
+    p := new(P)
+    p.s = s
+    p.pos = 0
+    [addrs, e] = parseaddr(p, true)
+    if e != nil {
+        return nil, e
+    }
+    if !skipcfws(p) {
+        return nil, errors.new("mail: misformatted parenthetical comment")
+    }
+    if !pempty(p) {
+        return nil, errors.new("mail: expected single address, got \"" + substr(p.s, p.pos, len(p.s)) + "\"")
+    }
+    if len(addrs) == 0 {
+        return nil, errors.new("mail: empty group")
+    }
+    if len(addrs) > 1 {
+        return nil, errors.new("mail: group with multiple addresses")
+    }
+    a := new(Address)
+    a.name = addrs[0].name
+    a.address = addrs[0].address
+    return a, nil
+}
+
+/// parseaddresslist parses a comma-separated list — Go's
+/// mail.ParseAddressList (groups flatten into the list).
+fn parseaddresslist(s: str) -> [own []Address, err] {
+    p := new(P)
+    p.s = s
+    p.pos = 0
+    list := mkslice(Address, 0)
+    for true {
+        skipspace(p)
+        if pconsume(p, 44) {
+            continue // obs-addr-list tolerates empty entries
+        }
+        [addrs, e] = parseaddr(p, true)
+        if e != nil {
+            return nil, e
+        }
+        i := 0
+        for i < len(addrs) {
+            list = push(list, addrs[i])
+            i = i + 1
+        }
+        if !skipcfws(p) {
+            return nil, errors.new("mail: misformatted parenthetical comment")
+        }
+        if pempty(p) {
+            break
+        }
+        if ppeek(p) != 44 {
+            return nil, errors.new("mail: expected comma")
+        }
+        for pconsume(p, 44) {
+            skipspace(p)
+        }
+        if pempty(p) {
+            break
+        }
+    }
+    return new(list), nil
+}
+
+// quotestring renders s as an RFC 5322 quoted-string — vchar gets a
+// backslash guard, qtext/wsp pass through, the rest drop out.
+fn quotestring(s: str) -> str {
+    out := "\""
+    i := 0
+    for i < len(s) {
+        c := byteat(s, i)
+        if isqtext(c) || iswsp(c) {
+            out = out + substr(s, i, i + 1)
+        } else if isvchar(c) {
+            out = out + "\\" + substr(s, i, i + 1)
+        }
+        i = i + 1
+    }
+    return out + "\""
+}
+
+// qencode_word — the =?UTF-8?Q?...?= payload: '_' space, printable
+// ASCII except = ? _ literal, everything else =XX.
+fn qencode_word(s: str) -> str {
+    out := ""
+    i := 0
+    for i < len(s) {
+        c := byteat(s, i)
+        if c == 32 {
+            out = out + "_"
+        } else if c >= 33 && c <= 126 && c != 61 && c != 63 && c != 95 {
+            out = out + substr(s, i, i + 1)
+        } else {
+            out = out + "="
+            out = out + substr("0123456789ABCDEF", c / 16, c / 16 + 1)
+            out = out + substr("0123456789ABCDEF", c % 16, c % 16 + 1)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+/// string formats the address per RFC 5322 — Go's Address.String:
+/// <addr> bare, or "Name" <addr>, with the name RFC 2047-encoded
+/// when it isn't printable ASCII.
+fn (a ref Address) string() -> str {
+    at := -1
+    i := len(a.address) - 1
+    for i >= 0 {
+        if byteat(a.address, i) == 64 {
+            at = i
+            break
+        }
+        i = i - 1
+    }
+    local := a.address
+    domain := ""
+    if at >= 0 {
+        local = substr(a.address, 0, at)
+        domain = substr(a.address, at + 1, len(a.address))
+    }
+    // local part needs quoting when it isn't dot-atom shaped
+    quotelocal := false
+    i = 0
+    for i < len(local) {
+        c := byteat(local, i)
+        if isatext(c, false) {
+            i = i + 1
+            continue
+        }
+        if c == 46 {
+            if i > 0 && byteat(local, i - 1) != 46 && i < len(local) - 1 {
+                i = i + 1
+                continue
+            }
+        }
+        quotelocal = true
+        break
+    }
+    if quotelocal {
+        local = quotestring(local)
+    }
+    // a caller-built Address can smuggle header bytes through the
+    // domain (Go splices raw — the wart stays closed here): strip
+    // ctl/space/angle bytes before splicing
+    dom := ""
+    di := 0
+    for di < len(domain) {
+        c := byteat(domain, di)
+        if c > 32 && c != 127 && c != 60 && c != 62 {
+            dom = dom + substr(domain, di, di + 1)
+        }
+        di = di + 1
+    }
+    s := "<" + local + "@" + dom + ">"
+    if len(a.name) == 0 {
+        return s
+    }
+    printable := true
+    i = 0
+    for i < len(a.name) {
+        c := byteat(a.name, i)
+        if !isvchar(c) && !iswsp(c) || c >= 128 {
+            printable = false
+            break
+        }
+        i = i + 1
+    }
+    if printable {
+        return quotestring(a.name) + " " + s
+    }
+    // encoded-words can't carry quotes/parens in the display name —
+    // base64 hides them entirely (Go's rule)
+    if find_from(a.name, "\"", 0) >= 0 || find_from(a.name, "#", 0) >= 0 || find_from(a.name, "$", 0) >= 0 || find_from(a.name, "%", 0) >= 0 || find_from(a.name, "&", 0) >= 0 || find_from(a.name, "'", 0) >= 0 || find_from(a.name, "(", 0) >= 0 || find_from(a.name, ")", 0) >= 0 || find_from(a.name, ",", 0) >= 0 || find_from(a.name, ".", 0) >= 0 || find_from(a.name, ":", 0) >= 0 || find_from(a.name, ";", 0) >= 0 || find_from(a.name, "<", 0) >= 0 || find_from(a.name, ">", 0) >= 0 || find_from(a.name, "@", 0) >= 0 || find_from(a.name, "[", 0) >= 0 || find_from(a.name, "]", 0) >= 0 || find_from(a.name, "^", 0) >= 0 || find_from(a.name, "`", 0) >= 0 || find_from(a.name, "{", 0) >= 0 || find_from(a.name, "|", 0) >= 0 || find_from(a.name, "}", 0) >= 0 || find_from(a.name, "~", 0) >= 0 || find_from(a.name, "\\", 0) >= 0 {
+        return ewords_b(a.name) + " " + s
+    }
+    return ewords_q(a.name) + " " + s
+}
+
+// RFC 2047 caps an encoded-word at 75 chars — the "=?UTF-8?E?"
+// prefix + "?=" closer take 12, leaving 63 for the payload. Long
+// names split into space-joined words, each independently
+// decodable; adjacent-word display text concatenates per the RFC.
+
+// ewords_b base64s each 45-byte chunk separately — 45 raw bytes
+// produce exactly 60 payload chars, the largest 4-aligned payload
+// under the cap. Chunks are rune-aligned — a multi-byte char is
+// never split across word boundaries.
+fn ewords_b(name: str) -> str {
+    b := name as []byte
+    out := ""
+    i := 0
+    for i < len(b) {
+        // grow the chunk to the largest rune-aligned span <= 45 —
+        // splitting a codepoint across words mojibakes per-word decoders
+        n := 0
+        for i + n < len(b) {
+            l := utf8seq(name, i + n)
+            if l == 0 {
+                l = 1
+            }
+            if n + l > 45 {
+                break
+            }
+            n = n + l
+        }
+        if n == 0 {
+            n = 1
+        }
+        if len(out) > 0 {
+            out = out + " "
+        }
+        out = out + "=?UTF-8?B?" + base64.encode(b[i:i + n]) + "?="
+        i = i + n
+    }
+    return out
+}
+
+// ewords_q accumulates raw characters by their encoded cost (1 for a
+// literal/'_' space, 3 per byte for =XX escapes) so a word boundary
+// never lands inside one codepoint — per-word decoders stay happy.
+fn ewords_q(name: str) -> str {
+    out := ""
+    cur := ""
+    cost := 0
+    i := 0
+    for i < len(name) {
+        n := utf8seq(name, i)
+        if n == 0 {
+            n = 1
+        }
+        // encoded cost of this character
+        c := byteat(name, i)
+        ec := 0
+        if n == 1 && c == 32 {
+            ec = 1 // '_'
+        } else if n == 1 && c >= 33 && c <= 126 && c != 61 && c != 63 && c != 95 {
+            ec = 1
+        } else {
+            ec = 3 * n
+        }
+        if cost + ec > 63 && len(cur) > 0 {
+            out = out + "=?UTF-8?Q?" + cur + "?= "
+            cur = ""
+            cost = 0
+        }
+        // one codepoint's encoding is exactly ec chars
+        cur = cur + qencode_word(substr(name, i, i + n))
+        cost = cost + ec
+        i = i + n
+    }
+    if len(cur) > 0 {
+        out = out + "=?UTF-8?Q?" + cur + "?="
+    }
+    return out
+}

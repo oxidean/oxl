@@ -426,6 +426,7 @@ struct Ck {
     mod_path: str, // declared module path
     mod_root: str, // dir holding oxl.mod
     mod_floor: str, // `oxl` directive as written
+    mod_toolchain: str, // `toolchain` directive pin (dispatch hint for the version manager)
     mod_reqs: own ModEnt, // require path -> version
     mod_reps: own ModEnt, // replace path(+ver) -> resolved local dir
     mod_sel: own ModEnt, // MVS build list: module path -> selected version
@@ -2557,7 +2558,7 @@ fn reg_fn(ck: mut Ck, mod: str, ex: bool, name: str, recv: ref parser.Node, typa
     // the seed qualifies every non-main package — its BUILTINS probe only
     // ever sees bare names for `package main` decls. Root items stay
     // unqualified here (mod == ""), so gate on the root clause.
-    if !ex && len(mod) == 0 && ck.root_pkg == "main" && is_builtin(name) {
+    if !ex && recv == nil && len(mod) == 0 && ck.root_pkg == "main" && is_builtin(name) {
         diag(ck, "check", "`" + name + "` is a builtin and cannot be redefined")
     }
     tl2 := tp
@@ -6064,6 +6065,7 @@ struct ManRes {
     errt: str,
     path: str,
     floor: str,
+    toolchain: str,
     reqs: own ModEnt,
     reps: own ModEnt,
 }
@@ -6201,6 +6203,28 @@ fn parse_manifest_to(root: str, text: str) -> own ManRes {
                 return out
             }
             out.floor = sl_at(toks, 1)
+        } else if kw == "toolchain" {
+            if len(out.toolchain) > 0 {
+                out.errt = mstr(lineno, "duplicate directive \"toolchain\"")
+                return out
+            }
+            if n != 2 {
+                out.errt = mstr(lineno, "expected `vX.Y.Z`")
+                return out
+            }
+            // `v` is optional on toolchain pins — validate a normalized
+            // copy so sver_parse keeps its v-required contract for other
+            // callers; the pin is stored as written
+            tv := sl_at(toks, 1)
+            tvn := tv
+            if strings.startswith(tvn, "v") == false {
+                tvn = "v" + tvn
+            }
+            if sver_parse(tvn).ok == 0 {
+                out.errt = mstr(lineno, "expected `vX.Y.Z`")
+                return out
+            }
+            out.toolchain = tv
         } else if kw == "require" || kw == "replace" {
             if n == 2 && sl_at(toks, 1) == "(" {
                 block = kw
@@ -6238,6 +6262,7 @@ fn parse_manifest(ck: mut Ck, text: str) -> int {
     }
     ck.mod_path = out.path
     ck.mod_floor = out.floor
+    ck.mod_toolchain = out.toolchain
     ck.mod_reqs = out.reqs
     ck.mod_reps = out.reps
     return 1
@@ -6292,6 +6317,7 @@ fn dep_manifest_reqs(text: str) -> own ModEnt {
     let kwl: own ModEnt = nil
     have_module := 0
     have_oxl := 0
+    have_toolchain := 0
     bad := 0
     lines := strings.split(text, "\n")
     block := ""
@@ -6324,6 +6350,22 @@ fn dep_manifest_reqs(text: str) -> own ModEnt {
                 bad = 1
             } else {
                 have_oxl = 1
+            }
+        } else if kw == "toolchain" {
+            // carries no require edge — validate shape only so a
+            // pinned dep still resolves (parse_manifest_to parity)
+            if have_toolchain == 1 || n != 2 {
+                bad = 1
+            } else {
+                tvn := sl_at(toks, 1)
+                if strings.startswith(tvn, "v") == false {
+                    tvn = "v" + tvn
+                }
+                if sver_parse(tvn).ok == 0 {
+                    bad = 1
+                } else {
+                    have_toolchain = 1
+                }
             }
         } else if kw == "require" || kw == "replace" {
             if n == 2 && sl_at(toks, 1) == "(" {
@@ -7518,6 +7560,7 @@ fn ck_new() -> own Ck {
     ck.mod_path = ""
     ck.mod_root = ""
     ck.mod_floor = ""
+    ck.mod_toolchain = ""
     ck.mod_reqs = nil
     ck.mod_reps = nil
     ck.modcache = ""

@@ -3870,7 +3870,8 @@ fn cmd_version() {
         .ok()
         .and_then(|e| e.parent().map(|p| p.join("RELEASE")))
         .and_then(|f| std::fs::read_to_string(f).ok())
-        .map(|t| t.trim().to_string())
+        // first line only — parity with the .oxl driver's RELEASE read
+        .and_then(|t| t.lines().next().map(|l| l.trim().to_string()))
         .filter(|t| !t.is_empty())
         .unwrap_or_else(|| "dev".into());
     println!("oxl {rel} (language {})", tool_ver());

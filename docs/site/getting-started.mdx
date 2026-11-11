@@ -29,7 +29,8 @@ build from source. See the
    example out of that one toolchain:
 
    ```bash
-   tag=$(oxl toolchain current | cut -f1) || exit 1
+   cur=$(oxl toolchain current) || exit 1
+   tag=${cur%%	*}
    oxl run "${OXL_HOME:-$HOME/.oxl}/versions/$tag/oxl-toolchain/examples/hello.oxl"
    ```
 

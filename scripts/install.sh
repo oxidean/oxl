@@ -19,6 +19,9 @@ die() {
 }
 
 OXL_HOME="${OXL_HOME:-$HOME/.oxl}"
+# absolute-canonicalize — a relative OXL_HOME would resolve pin-file
+# lookups against whatever cwd the shim runs from
+[ -d "$OXL_HOME" ] && OXL_HOME=$(cd "$OXL_HOME" && pwd -P)
 BASE="${OXL_RELEASE_BASE:-https://github.com/oxidean/oxl/releases}"
 BASE="${BASE%/}"
 
@@ -58,6 +61,8 @@ done
 [ "$seen_tag" = 0 ] && [ "${OXL_VERSION:-}" ] && want="$OXL_VERSION" || true
 [ "$shim_only" = 1 ] && [ "$set_default" = 1 ] \
     && { echo "install.sh: --default has no effect with --shim-only" >&2; exit 2; }
+[ "$shim_only" = 1 ] && [ "${OXL_VERSION:-}" ] \
+    && { echo "install.sh: OXL_VERSION has no effect with --shim-only" >&2; exit 2; }
 [ "$shim_only" = 1 ] && [ "$seen_tag" = 1 ] \
     && { echo "install.sh: a version tag has no effect with --shim-only" >&2; exit 2; }
 [ "$want" != latest ] && case "$want" in v*) : ;; *) want="v$want" ;; esac
@@ -66,6 +71,7 @@ done
 write_shim() {
     mkdir -p "$OXL_HOME/bin" "$OXL_HOME/versions"
     tmpf=$(mktemp "$OXL_HOME/bin/.oxl.tmp.XXXXXX") || exit 1
+    trap 'rm -f "$tmpf"' EXIT
     trap 'rm -f "$tmpf"' EXIT
     cat > "$tmpf" <<'SHIM_EOF'
 #!/bin/sh
@@ -86,6 +92,9 @@ die() {
 }
 
 OXL_HOME="${OXL_HOME:-$HOME/.oxl}"
+# absolute-canonicalize — a relative OXL_HOME would resolve pin-file
+# lookups against whatever cwd the shim runs from
+[ -d "$OXL_HOME" ] && OXL_HOME=$(cd "$OXL_HOME" && pwd -P)
 VERS="$OXL_HOME/versions"
 BASE="${OXL_RELEASE_BASE:-https://github.com/oxidean/oxl/releases}"
 BASE="${BASE%/}"
@@ -177,6 +186,9 @@ latest_tag() {
                         | grep -o 'releases/tag/v[0-9][^"<]*' \
                         | while IFS= read -r m; do
                               c=${m#releases/tag/}
+                              # prereleases pass vtag but "latest" should
+                              # mean a stable tag — skip them
+                              case "$c" in *-*) continue ;; esac
                               vtag "$c" >/dev/null 2>&1 && { printf '%s\n' "$c"; break; }
                           done) || :
                    [ -n "$hit" ] && { printf '%s\n' "$hit"; break; }
@@ -215,10 +227,11 @@ resolve() { # echoes "tag<TAB>source" or nothing
             # appear at most once — a duplicate, extra-token, or bare
             # form is an error, not a silent skip
             pa=$(awk '
+                { sub(/\r+$/, "") }
                 { sub(/(^|[[:space:]])\/\/.*/, "") }
-                /^[ \t]*(require|replace)[ \t]*\([ \t]*$/ { depth++ }
-                /^[ \t]*\)/ { if (depth > 0) depth-- }
-                depth == 0 && /^[ \t]*toolchain([ \t]|$)/ {
+                /^[ \t\r]*(require|replace)[ \t\r]*\([ \t\r]*$/ { depth++ }
+                /^[ \t\r]*\)/ { if (depth > 0) depth-- }
+                depth == 0 && /^[ \t\r]*toolchain([ \t\r]|$)/ {
                     n++
                     r = $0
                     sub(/^[ \t]*toolchain[ \t]*/, "", r)
@@ -311,9 +324,9 @@ tc_install() { # tag|latest
     else
         die "checksum fetch failed for $asset (http ${sha_code:-none}) — refusing unverified install"
     fi
-    tar xzf "$tmp/$asset" -C "$stage" \
+    tar --no-same-owner -xzf "$tmp/$asset" -C "$stage" \
         || die "corrupt tarball for $tag"
-    [ -x "$stage/oxl-toolchain/oxl" ] \
+    [ -f "$stage/oxl-toolchain/oxl" ] && [ -x "$stage/oxl-toolchain/oxl" ] \
         || die "tarball for $tag has no oxl-toolchain/oxl"
     # same-filesystem rename — a partial extract can never read as
     # installed; .stage.* is hidden so `tc_list`'s "$VERS"/*/ glob skips it
@@ -326,15 +339,16 @@ tc_install() { # tag|latest
         rm -rf "$VERS/$tag"/.stage.*
         die "$tag install raced — a same-tag dir appeared; retry"
     fi
-    [ -x "$VERS/$tag/oxl-toolchain/oxl" ] \
+    [ -f "$VERS/$tag/oxl-toolchain/oxl" ] && [ -x "$VERS/$tag/oxl-toolchain/oxl" ] \
         || die "$tag install raced — a same-tag dir appeared; retry"
     rm -rf "$tmp"; trap - EXIT
     echo "oxl: installed $tag -> $VERS/$tag"
     # tmp+rename — a concurrent `resolve` must never read a torn file
-    [ -f "$OXL_HOME/default-version" ] || {
+    [ -s "$OXL_HOME/default-version" ] || {
         df=$(mktemp "$OXL_HOME/.default-version.XXXXXX") || die "cannot write $OXL_HOME/default-version"
         echo "$tag" > "$df" || die "cannot write $OXL_HOME/default-version"
         [ ! -d "$OXL_HOME/default-version" ] || die "$OXL_HOME/default-version is a directory"
+        chmod 644 "$df"
         mv "$df" "$OXL_HOME/default-version" || die "cannot write $OXL_HOME/default-version"
     }
 }
@@ -373,6 +387,7 @@ tc_use() {
         df=$(mktemp "./.oxl-version.XXXXXX") || die "cannot write .oxl-version"
         echo "$tag" > "$df" || die "cannot write .oxl-version"
         [ ! -d .oxl-version ] || die ".oxl-version is a directory"
+        chmod 644 "$df"
         mv "$df" .oxl-version || die "cannot write .oxl-version"
         echo "oxl: pinned $tag in ./.oxl-version"
     else
@@ -431,11 +446,12 @@ or run the installer:  curl -fsSL https://raw.githubusercontent.com/oxidean/oxl/
 fi
 tag=${r%%$TAB*}; src=${r#*$TAB}
 exe=$(exe_for "$tag")
-[ -x "$exe" ] || die 127 "toolchain $tag (from $src) is not installed —
+{ [ -f "$exe" ] && [ -x "$exe" ]; } || die 127 "toolchain $tag (from $src) is not installed —
 install it with:  oxl toolchain install $tag"
 exec "$exe" "$@"
 SHIM_EOF
-    chmod +x "$tmpf" \
+    [ -d "$OXL_HOME/bin/oxl" ] && die "$OXL_HOME/bin/oxl is a directory"
+    chmod 755 "$tmpf" \
         && mv "$tmpf" "$OXL_HOME/bin/oxl" \
         || die "cannot write $OXL_HOME/bin/oxl"
     trap - EXIT
@@ -457,9 +473,10 @@ case "$tag" in
     *) echo "install.sh: install succeeded but no tag resolved (got \`$tag\`)" \
         "— set the default manually: oxl toolchain use <tag>" >&2; exit 1 ;;
 esac
-if [ ! -f "$OXL_HOME/default-version" ] || [ "$set_default" = 1 ]; then
+if [ ! -s "$OXL_HOME/default-version" ] || [ "$set_default" = 1 ]; then
     df=$(mktemp "$OXL_HOME/.default-version.XXXXXX") || die "cannot write $OXL_HOME/default-version"
     echo "$tag" > "$df" || die "cannot write $OXL_HOME/default-version"
+    chmod 644 "$df"
     mv "$df" "$OXL_HOME/default-version" || die "cannot write $OXL_HOME/default-version"
 fi
 

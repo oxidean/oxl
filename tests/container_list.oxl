@@ -201,5 +201,22 @@ fn main() {
     l2.pushbacklist(zl)
     assert(l2.len() == 1)
 
+    // zero-value writes: pushback on a bare List re-arms the
+    // sentinels and stores — the zero arm in alloc is reachable
+    zl2 := new(list.List)
+    zh := zl2.pushback(1)
+    assert(zh != -1 && zl2.len() == 1)
+    assert(zl2.val(zl2.front()) == 1 && zl2.val(zl2.back()) == 1)
+
+    // a stale handle stays dead after its slot recycles — remove
+    // frees the node (gen bumps), the next push re-arms it fresh
+    sl := list.newlist()
+    h1 := sl.pushback(1)
+    [v1r, e1r] = sl.remove(h1)
+    assert(e1r == nil && v1r == 1)
+    h2 := sl.pushback(2)
+    assert(h2 != -1 && sl.val(h2) == 2)
+    assert(sl.val(h1) == 0 && sl.next(h1) == -1 && sl.prev(h1) == -1)
+
     println("list ok")
 }

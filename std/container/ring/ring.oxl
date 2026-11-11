@@ -187,7 +187,41 @@ fn (r mut Ring) alloc(v: int) -> int {
 /// just like Go's result. link(i, nil) is a no-op returning i.next.
 /// A dead i returns -1 and still consumes s — `own` can't be handed
 /// back, so the failed call destroys the ring.
+///
+/// An EMPTY ring (r.n == 0 — a zero-value or fully drained one)
+/// has no anchor to splice behind, so link adopts s's cycle
+/// wholesale and returns the adopted head. Go's `var r Ring;
+/// r.Link(s)` lazy-inits r to a self-singleton and splices s after
+/// it — an empty oxl Ring holds no anchor cell, so it takes s's
+/// elements directly instead.
 fn (r mut Ring) link(i: int, s: own Ring) -> int {
+    if r.n == 0 {
+        if s == nil || s.n == 0 {
+            return -1
+        }
+        // adopt: migrate s's cycle in order — first element becomes
+        // the root self-loop, each next inserts immediately before
+        // root (appends at the cycle tail)
+        p := s.root
+        k := 0
+        for k < s.n {
+            j := r.alloc(s.ns[p].v) % 1048576
+            if k == 0 {
+                r.root = j
+                r.ns[j].prev = j
+                r.ns[j].next = j
+            } else {
+                r.ns[j].prev = r.ns[r.root].prev
+                r.ns[j].next = r.root
+                r.ns[r.ns[r.root].prev].next = j
+                r.ns[r.root].prev = j
+            }
+            p = s.ns[p].next
+            k = k + 1
+        }
+        r.n = s.n
+        return r.mkh(r.root)
+    }
     if !r.ok(i) {
         return -1
     }

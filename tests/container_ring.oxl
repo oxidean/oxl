@@ -204,5 +204,51 @@ fn main() {
     solo.do(sh, acc)
     assert(walkn == 1 && walkacc == 4)
 
+    // zero-value ring adopts via link — the r.n==0 path migrates
+    // s's cycle wholesale in order; head leads the adopted cycle
+    zr := new(ring.Ring)
+    assert(zr.len() == 0 && zr.head() == -1)
+    src := ring.newring(3)
+    sh2 := src.head()
+    src.setval(sh2, 7)
+    sn2 := src.next(sh2)
+    src.setval(sn2, 8)
+    sn3 := src.next(sn2)
+    src.setval(sn3, 9)
+    zhd := zr.head()
+    ah := zr.link(zhd, src)
+    assert(ah != -1 && zr.len() == 3)
+    assert(ah == zr.head())
+    assert(zr.val(zr.head()) == 7)
+    assert(zr.val(zr.next(zr.head())) == 8)
+    assert(zr.val(zr.next(zr.next(zr.head()))) == 9)
+    assert(zr.next(zr.next(zr.next(zr.head()))) == zr.head())
+    // empty + nil stays empty; non-empty + empty returns i.next
+    zr2 := new(ring.Ring)
+    z2h := zr2.head()
+    assert(zr2.link(z2h, nil) == -1 && zr2.len() == 0)
+    en := ring.newring(1)
+    enh := en.head()
+    enn := en.next(enh)
+    esrc := new(ring.Ring)
+    assert(en.link(enh, esrc) == enn)
+
+    // a stale handle stays dead after its slot recycles — unlink
+    // frees the node (gen bumps), a later link re-arms it fresh
+    cr := ring.newring(3)
+    crh := cr.head()
+    cr.setval(crh, 1)
+    victim := cr.next(crh)
+    cr.setval(victim, 2)
+    uout := cr.unlink(crh, 1) // removes victim's element
+    assert(uout != nil)
+    assert(cr.val(victim) == 0 && cr.next(victim) == -1)
+    fresh := ring.newring(1)
+    fh := fresh.head()
+    fresh.setval(fh, 99)
+    cr.link(crh, fresh)
+    assert(cr.val(victim) == 0 && cr.next(victim) == -1)
+    assert(cr.len() == 3)
+
     println("ring ok")
 }

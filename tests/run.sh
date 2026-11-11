@@ -1846,8 +1846,11 @@ echo "== i60 install pipeline — file:// release fixture =="
 # end-to-end: download -> sha256 verify -> stage -> atomic mv -> verbs.
 # OXL_RELEASE_BASE takes file:// so the whole pipeline runs offline.
 reldir="$scratch/relfix"; mkdir -p "$reldir/download/v9.9.9" "$reldir/download/v9.9.8"
-case "$(uname -s)" in Linux) tch_os=linux ;; Darwin) tch_os=darwin ;; *) tch_os=windows ;; esac
-case "$(uname -m)" in x86_64) tch_arch=x86_64 ;; arm64|aarch64) tch_arch=arm64 ;; *) tch_arch=x86_64 ;; esac
+# mirror asset_os_arch() in scripts/install.sh so the fixture name always matches the request
+tch_os=$(uname -s | tr '[:upper:]' '[:lower:]')
+case "$tch_os" in mingw*|msys*|cygwin*|windows*) tch_os=windows ;; esac
+tch_arch=$(uname -m)
+case "$tch_arch" in x86_64|amd64) tch_arch=x86_64 ;; arm64|aarch64) tch_arch=arm64 ;; esac
 tch_asset="oxl-toolchain-$tch_os-$tch_arch.tar.gz"
 mkdir -p "$reldir/work/oxl-toolchain"
 printf '#!/bin/sh\necho "FAKE 9.9.9 $@"\n' > "$reldir/work/oxl-toolchain/oxl"

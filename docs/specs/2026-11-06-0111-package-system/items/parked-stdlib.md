@@ -7,9 +7,13 @@ machinery they need.
 
 ## Needs reflection / `any` runtime values — the language lacks it
 
-**Un-parked → milestone R** (`docs/specs/2026-11-11-type-descriptors/`):
-compiler-emitted type descriptors land the machinery these packages
-waited on; they return to the active milestone under R2–R6.
+**Partially un-parked → milestone R**
+(`docs/specs/2026-11-11-type-descriptors/`): compiler-emitted type
+descriptors land the machinery most of these packages waited on.
+Returning under R2–R6: `fmt` `%v`, `reflect` lite, `encoding/gob`,
+`encoding/xml`, `text/template`, and `database/sql`'s `scan[T]`
+half. Staying parked: `html/template` (out of R's scope) and
+`database/sql`'s driver-registry half (R6 ships the lite scan only).
 
 - `fmt` `%v`-anything, `reflect`, `encoding/gob`, `encoding/xml`
   (tagged-field driven), `database/sql` (driver-registry + `Scan(any)`)

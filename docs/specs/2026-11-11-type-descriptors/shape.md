@@ -14,8 +14,8 @@ Not this spec: an `any` type or boxed values, variadic call forms,
 runtime type-id tags on every allocation, interface-dispatch
 reflection (iface-typed `T` describes as IFACE and stops — no path
 to the concrete payload), `unsafe` pointer arithmetic as a language
-feature (existing `unsafe` is an ownership opt-out block, kept that
-way), `runtime/pprof`-class introspection, and the `--target js`
+feature (`unsafe` is a scoping-block marker today — it silences
+no checks; R adds no opt-out either), `runtime/pprof`-class introspection, and the `--target js`
 emit lane: `addr:int` arithmetic and C `rt_field_*` loads don't
 port to JS, so R is native-lane only — js-lane descriptors/`%v`
 defer to their own trigger.
@@ -63,10 +63,13 @@ defer to their own trigger.
    type: the checker applies the same escape rules as borrowed
    `ref`s (no return, no heap store, no spawn escape), so a `Value`
    provably cannot outlive its source. The read path is a small set
-   of extern helpers (`rt_field_*`) confined to `std/reflect`
-   internals behind `unsafe`; user code sees typed `Value` methods
-   (`v.int()`, `v.str()`, `v.field(i)`, `v.len()`/`v.index(i)`),
-   never raw addresses.
+   of extern helpers (`rt_field_*`, `rt_desc_*`) called inside
+   `std/reflect`'s `unsafe` blocks; user code sees typed `Value`
+   methods (`v.int()`, `v.str()`, `v.field(i)`, `v.len()`/
+   `v.index(i)`), never raw addresses. The externs are not private
+   — any module may redeclare them — so confinement is social; the
+   *enforced* guarantee is `Value`'s scope-bound escape rule, which
+   holds regardless of who calls the externs.
 4. **`errors.As` gets a typed box, `err` stays int64.** Go's As
    matches a *dynamic* type; int64 codes have none. `box(v)` mints
    a fresh int64 code and stores `{tdesc(T), payload}` in the rt
@@ -92,19 +95,57 @@ resolved per monomorphized instantiation.**
 
 ```oxl
 // std/reflect — public surface (v1)
-struct Field { name: str, off: int, td: int, tag: str } // tag = "" when absent
-struct Type  { name: str, kind: int, size: int,
-               fields: []Field, elem: int }        // elem: slice/ptr/chan
-struct Value { td: int, addr: int }               // opaque; scope-bound
+// Type and Field are descriptor-table HANDLES, not materialized
+// records — reads go through rt_desc_* externs lazily, so no slice
+// or str backing has to be fabricated in-callee.
+struct Type  { td: int }                       // descriptor idx
+struct Field { td: int, i: int }               // descriptor + field idx
+struct Value { td: int, addr: int }            // opaque; scope-bound
 
-fn type_of[T any]() -> Type                 // tdesc(T) resolved at mono time
-fn value_of[T any](v: ref T) -> Value        // intrinsic → {tdesc, addr-of-v}
-fn (v Value) field(i: int) -> Value          // addr + fields[i].off
-fn (v Value) len() -> int                    // SLICE only (RtSlice.len)
-fn (v Value) index(i: int) -> Value          // SLICE only, scope-bound
-fn (v Value) int() -> int                    // kind-checked read
-fn (v Value) str() -> str                    // kind-checked read
+fn type_of(t) -> Type                        // builtin special form —
+                                             // takes a TYPE operand
+                                             // (mkslice precedent):
+                                             // type_of(Point), or
+                                             // type_of(T) inside a
+                                             // generic body; folds at
+                                             // mono time, not a
+                                             // callable fn
+fn value_of[T any](v: ref T) -> Value        // intrinsic → {tdesc(base(T)),
+                                             //  pointee addr — qualified T
+                                             //  derefs the handle once}
+fn (v Value) field(i: int) -> [Value, err]   // addr + f_off(i); td ← f_td(i)
+fn (v Value) len() -> [int, err]             // SLICE only (RtSlice.len)
+fn (v Value) index(i: int) -> [Value, err]   // SLICE only, scope-bound
+fn (v Value) int() -> [int, err]             // kind-checked read
+fn (v Value) f64() -> [float, err]           // kind-checked read
+fn (v Value) str() -> [str, err]             // kind-checked read
+fn (v Value) set_int(x: int) -> err          // kind-checked write
+fn (v Value) set_f64(x: float) -> err        // kind-checked write
+fn (v Value) set_str(x: str) -> err          // kind-checked write
+fn (t Type) name() -> str                    // rt_desc_name
+fn (t Type) kind() -> int                    // rt_desc_kind
+fn (t Type) size() -> int                    // rt_desc_size
+fn (t Type) nfields() -> int                 // rt_desc_nfields
+fn (t Type) field(i: int) -> Field           // {td, i}
+fn (t Type) elem() -> Type                   // rt_desc_elem
+fn (t Type) nvars() -> int                   // rt_desc_nvars
+fn (t Type) varname(i: int) -> str           // rt_desc_var
+fn (f Field) name() -> str                   // rt_desc_f_name
+fn (f Field) off() -> int                    // rt_desc_f_off
+fn (f Field) typ() -> Type                   // {rt_desc_f_td}
+fn (f Field) tag() -> str                    // rt_desc_f_tag; "" absent
+fn (v Value) typ() -> Type                   // {v.td}
 ```
+
+`type_of` is NOT a generic fn — type parameters bind only from call
+arguments (`check.rs`), so `type_of[T any]()` could never be
+invoked; it takes a type operand as a builtin special form, the
+same parsing precedent `mkslice(byte, n)` set. Inside a
+monomorphized body `type_of(T)` folds with `tdesc(T)`; elsewhere it
+takes any concrete type operand. Kind mismatches return the
+`reflect.err_kind` err code through the `[v, err]` lanes — the
+read contract's err channel is deliverable because the surface is
+shaped as pairs from the start.
 
 `fmt` grows `sprintv[T any](v: T) -> str` / `printv[T any]` +
 `vfmt[T](f: str, v: T)` covering `%v`/`%+v`/`%T`/`%#v` for a single
@@ -119,3 +160,13 @@ Consumers walk: `gob.encode[T]` → field-wise binary per descriptor;
 `xml` → tag-named fields; `template` → `{{.Field}}` lookup by
 descriptor name; `sql` row `scan[T]` → column order onto fields.
 Each is generic over T; no value is ever boxed.
+
+Qualified-`T` handling is pinned at `value_of`: for `own`/`ref`/
+`mut`-qualified `T` the reference lands on the *handle slot*, not
+the layout — `value_of` loads the handle once at construction so
+`v.addr` always addresses the described layout (`tdesc` resolves
+qualified `T` to the wrapped desc per the contract). Decode paths
+(`gob` decode, `xml` unmarshal, `sql.scan[T]`'s `out`) write
+through `field(i).set_*` on `mut`-derived `Value`s — the same
+scope-bound rule applies, so a writable `Value` provably cannot
+outlive the buffer it mutates.

@@ -15,9 +15,15 @@ you want verdicted, and again after the last fix commit.
       into the binary's static data by `codegen.rs` AND
       `codegen.oxl`; `tdesc(T)` intrinsic folded at instantiation
       (yields the descriptor index); `value_of` intrinsic +
-      scope-bound-`Value` escape rules in both checkers;
-      `rt_field_*` extern read helpers (kind-checked byte-load from
-      `addr+off`); parity test `tests/desc_parity.oxl` asserting
+      scope-bound-`Value` escape rules in both checkers; the
+      `type_of` builtin special form (type operand, `mkslice`
+      precedent — NOT a callable generic, params bind only from
+      args); `rt_desc_*` descriptor accessors (the lazy read lane
+      `Type`/`Field` methods wrap), `rt_field_*` extern read AND
+      `rt_field_set_*` write helpers (kind-checked byte access at
+      `addr+off` — the write half is specced up front because
+      R4–R6 decode through it); parity test
+      `tests/desc_parity.oxl` asserting
       name/kind/size/fields/offsets/variants for fixture struct and
       enum types under both drivers, wired into `tests/run.sh`.
       Exit: table emits on tdesc-reach, intrinsics resolve, offsets
@@ -33,7 +39,8 @@ you want verdicted, and again after the last fix commit.
       `tests/fmt_v.oxl` + `tests/reflect.oxl` gate every kind,
       wired into `tests/run.sh`.
 - [ ] **R3 — typed error payloads (completes #27).** `std/errors`:
-      `box(v)` minting int64 codes backed by the rt err registry
+      `box[T any](v: T)` minting int64 codes backed by the rt err
+      registry (binds T from `v` — that is what `tdesc(T)` needs)
       (`{tdesc, payload}` stored out-of-band — a box IS an `err`),
       `as[T](e, out: mut T)`, interop with `wrap`/`unwrap`/`is`;
       `docs/semantics/errors.md` records the box lane.
@@ -49,8 +56,9 @@ you want verdicted, and again after the last fix commit.
       `tests/run.sh`.
 - [ ] **R5 — `encoding/xml` + `text/template`.** `xml` marshal/
       unmarshal with `xml:"name"` field tags read from descriptor
-      field metadata (tags need a descriptor extension — string
-      table slot per field, spec'd in the contract); `template`
+      field metadata — the `tag` slot is emitted in R1 per the
+      contract (with parser/checker/emitter threading if tag syntax
+      doesn't exist yet); `template`
       `{{.Field}}`/`{{range}}`/`{{if}}` against descriptor names.
       `tests/enc_xml.oxl`, `tests/text_template.oxl`; wired into
       `tests/run.sh`.

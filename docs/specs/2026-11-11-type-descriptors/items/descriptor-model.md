@@ -4,7 +4,7 @@
 
 Each driver's codegen emits one `TypeDesc` record per type that is
 *reachable through a `tdesc` reference* — the named type plus,
-transitively, every type its descriptor points at (`elem`, `key`,
+transitively, every type its descriptor points at (`elem`,
 `fields[].td`). Emission is demand-driven, not per instantiation:
 `hello.oxl` names no `tdesc` and stays table-free, matching the
 repo's dead-code/size discipline. Records are deduplicated by type
@@ -39,17 +39,17 @@ element-desc slot for ptr and chan shapes.
 
 | `Ty`                                    | `kind`  | notes                          |
 |-----------------------------------------|---------|--------------------------------|
-| int/f32/f64/bool/str/byte               | INT/FLOAT/BOOL/STR/BYTE |                     |
+| int/float/bool/str/byte                 | INT/FLOAT/BOOL/STR/BYTE | one `float` (C `double`) — no f32/f64 split |
 | struct                                  | STRUCT  | fields per decl order          |
 | `[]T`                                   | SLICE   | `elem` → T's desc              |
-| `*T` / `own ?`/`ref`/`mut T` qualifiers | PTR     | ownership qualifiers don't change layout — `own/ref/mut T` name the wrapped T's desc, not PTR |
+| `own T` / `ref T` / `mut T` qualifiers  | (wrapped) | ownership qualifiers don't change layout — `tdesc(own T)` resolves to the wrapped T's desc, so no PTR row is produced for them |
 | `chan T`                                | CHAN    | `elem` → T's desc; reads opaque |
 | iface                                   | IFACE   | reads opaque — no path to the concrete payload (RtIface carries no td); `sprintv`/`gob` on an iface-typed T see only IFACE |
 | `fn`                                    | FN      | reads opaque                   |
 | `err`                                   | ERR     | int64 code                     |
 | enum                                    | ENUM    | `{tag:int, union blob}` layout; `vars` names variants for `%v` |
-| `cstr`                                  | PTR     | raw `char*`                    |
-| `Scope`, `Shared[T]`                    | VOID    | emitted as opaque rows so `tdesc` stays total; reads rejected |
+| `cstr`                                  | PTR     | raw `char*` — the only PTR row v1 produces |
+| `Scope`, bare `shared`                  | VOID    | emitted as opaque rows so `tdesc` stays total; reads rejected (`shared` is a non-generic atomic cell, not a `Shared[T]` parametric) |
 
 `tag` holds the field-tag string (`xml:"name"`, `gob:"-"`) — NULL
 when absent; needed by R5's xml and R4's gob name overrides. R1 emits
@@ -68,11 +68,17 @@ only type-checks the operand — the substitution lives in
 context `tdesc` takes a concrete type operand identically.
 
 Non-generic code can also name it: `tdesc(int)` is legal anywhere a
-constant int is. This keeps `std/reflect.type_of[T]` a one-liner:
+constant int is.
 
-```oxl
-fn type_of[T any]() -> Type { return reflect_from_desc(tdesc(T)) }
-```
+`type_of` on the public surface is a **builtin special form**, not a
+callable fn — generic type parameters bind only from call
+arguments, so `type_of[T any]()` would be uncallable; the
+`mkslice(byte, n)` parsing precedent applies: `type_of(Point)` takes
+a type operand and folds to `Type{tdesc(Point)}`. Inside a generic
+body `type_of(T)` resolves per instantiation identically. `Type`
+and `Field` are table handles — `std/reflect` wraps `rt_desc_*`
+accessors in methods rather than materializing `[]Field`/`str`
+backing that could never be returned from a callee.
 
 ## Value reads — the one unsafe seam
 
@@ -84,15 +90,47 @@ str/byte/int/enum-only, and generic externs are not a surface R
 opens). Field walks add `off` to `addr`; reads go through externs
 that interpret `addr` per the desc's kind:
 
+Field reads — trivial C loads interpreting `addr` per the desc's kind:
+
 ```
 extern fn rt_field_i64(addr: int) -> int
-extern fn rt_field_f64(addr: int) -> f64
+extern fn rt_field_f64(addr: int) -> float
 extern fn rt_field_str(addr: int) -> str       // borrow — same lifetime as v
 extern fn rt_field_ptr(addr: int) -> int       // raw field address
 ```
 
-All four are trivial C loads; the ONLY unsafe surface is inside
-`std/reflect` (`unsafe` blocks around the addr arithmetic).
+Field writes — the decode lane (`gob`/`xml`/`sql.scan` all assign
+through `mut`-derived `Value`s):
+
+```
+extern fn rt_field_set_i64(addr: int, v: int)
+extern fn rt_field_set_f64(addr: int, v: float)
+extern fn rt_field_set_str(addr: int, v: str)
+extern fn rt_field_set_ptr(addr: int, v: int)
+```
+
+Descriptor reads — what `Type`/`Field` methods wrap; each is a
+table index + read + (for strs) an rt-str build over the stored
+cstr:
+
+```
+extern fn rt_desc_name(td: int) -> str
+extern fn rt_desc_kind(td: int) -> int
+extern fn rt_desc_size(td: int) -> int
+extern fn rt_desc_nfields(td: int) -> int
+extern fn rt_desc_elem(td: int) -> int          // -1 when absent
+extern fn rt_desc_nvars(td: int) -> int
+extern fn rt_desc_var(td: int, i: int) -> str
+extern fn rt_desc_f_name(td: int, i: int) -> str
+extern fn rt_desc_f_off(td: int, i: int) -> int
+extern fn rt_desc_f_td(td: int, i: int) -> int
+extern fn rt_desc_f_tag(td: int, i: int) -> str // "" when absent
+```
+
+All are trivial C; the ONLY unsafe surface is inside `std/reflect`
+(`unsafe` blocks around the addr arithmetic). The emitted `align`
+field is consumed only by the C helpers' own address math — no
+oxl-side accessor is needed.
 
 **`Value` lifetime is enforced, not conventional.** Two ints carry
 no borrow marker, so the checker can't rely on the `ref` rules

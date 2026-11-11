@@ -27,7 +27,13 @@ struct Huf { count: []int, sym: []int, left: int }
 // lazy shared tables need either a torn-read flag or a lock under
 // concurrent first use; ~140 constant ints cost microseconds to build
 // per Reader, which removes the shared state entirely.
-struct Tabs { lbase: own []int, lext: own []int, dbase: own []int, dext: own []int, clord: own []int }
+struct Tabs {
+    lbase: own []int,
+    lext: own []int,
+    dbase: own []int,
+    dext: own []int,
+    clord: own []int,
+}
 
 /// Reader is a DEFLATE decompressor — an io.Reader of plain text.
 struct Reader {

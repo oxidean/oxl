@@ -962,7 +962,9 @@ fn qualify_block(
                 if let Some(t) = ty {
                     qualify_ty(t, renames, aliases, used);
                 }
-                qualify_expr(init, renames, aliases, locals, used);
+                if let Some(i) = init {
+                    qualify_expr(i, renames, aliases, locals, used);
+                }
                 locals.last_mut().unwrap().insert(name.clone());
             }
             ast::Stmt::Let2 { a, b, call, .. } => {
@@ -1543,7 +1545,9 @@ fn qualify_item(
                 qualify_ty(t, renames, aliases, used);
             }
             let mut locals: Locals = vec![std::collections::HashSet::new()];
-            qualify_expr(&mut g.init, renames, aliases, &mut locals, used);
+            if let Some(i) = &mut g.init {
+                qualify_expr(i, renames, aliases, &mut locals, used);
+            }
         }
         ast::Item::Extern(f) => {
             for p in &mut f.params {

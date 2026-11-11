@@ -327,7 +327,8 @@ pub fn generate_mode(c: &Crate, test_mode: bool, susp: &HashSet<String>) -> Stri
             Item::Global(gl) => {
                 let t = match &gl.ty {
                     Some(tr) => g.ty_of_ref(tr),
-                    None => g.expr_ty(&gl.init),
+                    None => gl.init.as_ref().map(|i| g.expr_ty(i))
+                        .unwrap_or(Ty::Unknown),
                 };
                 g.globals.insert(gl.name.clone(), t.clone());
                 g.env[0].insert(gl.name.clone(), t);
@@ -468,7 +469,8 @@ pub fn generate_mode(c: &Crate, test_mode: bool, susp: &HashSet<String>) -> Stri
     // fn-bodies-then-inits order, ahead of the inst drain
     for (uidx, gl) in gpend {
         let gt = g.globals.get(&gl.name).cloned().unwrap_or(Ty::Unknown);
-        let v = g.conv(&gl.init, &gt);
+        let v = gl.init.as_ref().map(|i| g.conv(i, &gt))
+            .unwrap_or_else(|| format!("({}){{0}}", g.cty(&gt)));
         let mut u = std::mem::take(&mut units[uidx]);
         u.init = std::mem::take(&mut g.out);
         let _ = writeln!(u.init, "    o_g_{} = {v};", cname(&gl.name));
@@ -731,9 +733,11 @@ fn defer_caps(g: &Gen, call: &Expr) -> Vec<(String, Ty)> {
                         MatchBody::Expr(be) => walk(be, g, out),
                         MatchBody::Block(b) => {
                             for s in &b.stmts {
-                                if let Stmt::Expr(e) | Stmt::Let { init: e, .. }
-                                | Stmt::Assign { val: e, .. } = s
+                                if let Stmt::Expr(e) | Stmt::Assign { val: e, .. } = s
                                 {
+                                    walk(e, g, out);
+                                }
+                                if let Stmt::Let { init: Some(e), .. } = s {
                                     walk(e, g, out);
                                 }
                             }
@@ -1559,10 +1563,14 @@ impl<'a> Gen<'a> {
             Stmt::Let { name, ty, init, .. } => {
                 let t = match ty {
                     Some(tr) => self.ty_of_ref(tr),
-                    None => self.expr_ty(init),
+                    None => init.as_ref().map(|i| self.expr_ty(i))
+                        .unwrap_or(Ty::Unknown),
                 };
                 let ct = self.cty(&t);
-                let v = self.conv(init, &t);
+                // bare `let` zero-inits: the compound literal is the
+                // typed zero for scalars and structs alike
+                let v = init.as_ref().map(|i| self.conv(i, &t))
+                    .unwrap_or_else(|| format!("({ct}){{0}}"));
                 let _ = writeln!(self.out, "    {ct} {name} = {v};");
                 self.env.last_mut().unwrap().insert(name.clone(), t);
             }
@@ -2145,7 +2153,19 @@ impl<'a> Gen<'a> {
                         }
                     }
                 }
-                Stmt::Expr(e) | Stmt::Let { init: e, .. } => {
+                Stmt::Expr(e) => {
+                    if let ExprKind::Match { arms, .. } = &e.kind {
+                        for a in arms {
+                            if let MatchBody::Block(b) = &a.body {
+                                let t = self.closure_ret_ty(b);
+                                if t != Ty::Void {
+                                    return t;
+                                }
+                            }
+                        }
+                    }
+                }
+                Stmt::Let { init: Some(e), .. } => {
                     if let ExprKind::Match { arms, .. } = &e.kind {
                         for a in arms {
                             if let MatchBody::Block(b) = &a.body {
@@ -3313,7 +3333,7 @@ impl<'a> Gen<'a> {
                     pre.push(Stmt::Let {
                         name: tmp.clone(),
                         ty: None,
-                        init: call,
+                        init: Some(call),
                         span: e.span,
                     });
                     Self::eident(&tmp, e.span)
@@ -3328,7 +3348,7 @@ impl<'a> Gen<'a> {
                     pre.push(Stmt::Let {
                         name: b.clone(),
                         ty: None,
-                        init: l2,
+                        init: Some(l2),
                         span: e.span,
                     });
                     let mut inner = Vec::new();
@@ -3463,13 +3483,14 @@ impl<'a> Gen<'a> {
         match s {
             Stmt::Let { name, ty, init, span } => {
                 let mut pre = Vec::new();
-                let i2 = self.hoist_expr(init, &mut pre);
+                let i2 = init.as_ref().map(|i| self.hoist_expr(i, &mut pre));
                 out.append(&mut pre);
                 // bind as we walk — fstmt does the same at emit; hoist
                 // needs it earlier for `name.m()` callee resolution
                 let bt = match ty {
                     Some(tr) => self.ty_of_ref(tr),
-                    None => self.expr_ty(&i2),
+                    None => i2.as_ref().map(|i| self.expr_ty(i))
+                        .unwrap_or(Ty::Unknown),
                 };
                 self.env.last_mut().unwrap().insert(name.clone(), bt);
                 out.push(Stmt::Let {
@@ -3928,7 +3949,8 @@ impl<'a> Gen<'a> {
     fn fstmt(&mut self, s: &Stmt) {
         match s {
             Stmt::Let { name, ty, init, .. } => {
-                if self.call_is_susp(init) {
+                if init.as_ref().map(|i| self.call_is_susp(i)).unwrap_or(false) {
+                    let init = init.as_ref().unwrap();
                     let t = match ty {
                         Some(tr) => self.ty_of_ref(tr),
                         None => self.expr_ty(init),
@@ -3949,13 +3971,22 @@ impl<'a> Gen<'a> {
                 } else {
                     let t = match ty {
                         Some(tr) => self.ty_of_ref(tr),
-                        None => self.expr_ty(init),
+                        None => init.as_ref().map(|i| self.expr_ty(i))
+                            .unwrap_or(Ty::Unknown),
                     };
                     let ct = self.cty(&t);
-                    let v = self.expr(init);
                     let fd = self.fslot(name, &ct);
                     self.env.last_mut().unwrap().insert(name.clone(), t);
-                    let _ = writeln!(self.out, "    fr->{fd} = {v};");
+                    match init {
+                        Some(i) => {
+                            let v = self.expr(i);
+                            let _ = writeln!(self.out, "    fr->{fd} = {v};");
+                        }
+                        // bare `let` in a susp fn: typed zero for the slot
+                        None => {
+                            let _ = writeln!(self.out, "    fr->{fd} = ({ct}){{0}};");
+                        }
+                    }
                 }
             }
             Stmt::Let2 { a, b, call, .. } => {

@@ -586,8 +586,13 @@ impl<'a> Checker<'a> {
                 }
                 Item::Import(_) => {} // resolved by the driver before checking
                 Item::Global(g) => {
+                    if g.init.is_none() && g.ty.is_none() {
+                        self.diags.push(Diag::err(g.span, "check",
+                            "`let` requires a type or an initializer"));
+                    }
                     let mut env = Env::new();
-                    let it = self.expr(&g.init, &mut env);
+                    let it = g.init.as_ref().map(|i| self.expr(i, &mut env))
+                        .unwrap_or(Ty::Unknown);
                     let t = if let Some(tr) = &g.ty {
                         let want = self.resolve(tr);
                         self.assignable(&want, &it, g.span);
@@ -693,7 +698,12 @@ impl<'a> Checker<'a> {
         match s {
             Stmt::ExitBoundary { .. } => unreachable!("codegen-internal marker"),
             Stmt::Let { name, ty, init, span } => {
-                let it = self.expr(init, env);
+                if init.is_none() && ty.is_none() {
+                    self.diags.push(Diag::err(*span, "check",
+                        "`let` requires a type or an initializer"));
+                }
+                let it = init.as_ref().map(|e| self.expr(e, env))
+                    .unwrap_or(Ty::Unknown);
                 let t = if let Some(tr) = ty {
                     let want = self.resolve(tr);
                     self.assignable(&want, &it, *span);
@@ -2586,9 +2596,10 @@ impl<'a> Checker<'a> {
                 // spawn doesn't suspend the caller — but its args might
                 Stmt::Spawn { call, .. } => expr_susp(call),
                 Stmt::Defer { call, .. } => expr_susp(call),
-                Stmt::Expr(e) | Stmt::Assign { val: e, .. } | Stmt::Let { init: e, .. } => {
+                Stmt::Expr(e) | Stmt::Assign { val: e, .. } => {
                     expr_susp(e)
                 }
+                Stmt::Let { init, .. } => init.as_ref().map(expr_susp).unwrap_or(false),
                 Stmt::Let2 { call, .. } => expr_susp(call),
                 Stmt::Select { .. } => true, // always a suspend point
                 Stmt::Return { vals, .. } => vals.iter().any(expr_susp),
@@ -2713,9 +2724,12 @@ impl<'a> Checker<'a> {
             b.stmts.iter().any(|s| match s {
                 Stmt::ExitBoundary { .. } => false,
                 Stmt::Scope { .. } | Stmt::Select { .. } => true,
-                Stmt::Expr(e) | Stmt::Assign { val: e, .. } | Stmt::Let { init: e, .. }
+                Stmt::Expr(e) | Stmt::Assign { val: e, .. }
                 | Stmt::Defer { call: e, .. } | Stmt::Spawn { call: e, .. } => {
                     expr_has_susp(e, susp)
+                }
+                Stmt::Let { init, .. } => {
+                    init.as_ref().map(|e| expr_has_susp(e, susp)).unwrap_or(false)
                 }
                 Stmt::Let2 { call, .. } => expr_has_susp(call, susp),
                 Stmt::Return { vals, .. } => vals.iter().any(|v| expr_has_susp(v, susp)),
@@ -2815,8 +2829,11 @@ impl<'a> Checker<'a> {
                         scan_match(call, susp, diags, false);
                     }
                     Stmt::Expr(e) => scan_match(e, susp, diags, true),
-                    Stmt::Let { init, .. } | Stmt::Assign { val: init, .. } => {
+                    Stmt::Assign { val: init, .. } => {
                         scan_match(init, susp, diags, false)
+                    }
+                    Stmt::Let { init, .. } => {
+                        if let Some(i2) = init { scan_match(i2, susp, diags, false) }
                     }
                     Stmt::Let2 { call, .. } => scan_match(call, susp, diags, false),
                     Stmt::Spawn { call, scope, span, .. } => {
@@ -2880,7 +2897,7 @@ impl<'a> Checker<'a> {
                     }
                 }
                 Item::Global(g) => {
-                    if expr_has_susp(&g.init, susp) {
+                    if g.init.as_ref().map(|i| expr_has_susp(i, susp)).unwrap_or(false) {
                         self.diags.push(Diag::err(g.span, "check",
                             "global initializer cannot suspend — move it into fn main"));
                     }
@@ -2956,7 +2973,7 @@ fn scan_stmt(st: &Stmt, s: &mut BodyScan) {
         Stmt::ExitBoundary { .. } => unreachable!("codegen-internal marker"),
         Stmt::Let { name, init, .. } => {
             s.binds.insert(name.clone());
-            scan_expr(init, s);
+            if let Some(i2) = init { scan_expr(i2, s) }
         }
         Stmt::Let2 { a, b, call, .. } => {
             for bd in [a, b] {

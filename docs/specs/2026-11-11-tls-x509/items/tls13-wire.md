@@ -44,8 +44,11 @@ ClientHello
   → EncryptedExtensions — ALPN echo must ∈ offered list when sent;
                           any unoffered extension →
                           illegal_parameter
-  → [CertificateRequest mid-flight — client auth is out of scope:
-     unexpected_message alert]
+  → [CertificateRequest mid-flight — answered with an empty
+     Certificate message (certificate_list len 0, §4.4.2.4 —
+     the RFC-mandated answer; a server requiring client auth
+     then alerts `certificate_required`). mTLS itself stays
+     out of scope.]
   → Certificate         — each cert_parse'd; leaf + untrusted chain;
                           per-entry extensions (OCSP staples, SCTs)
                           parsed over, ignored
@@ -76,9 +79,10 @@ Post-handshake, consume quietly:
 - **KeyUpdate** — `update_requested` → apply peer keys and answer
   `update_not_requested`; `update_not_requested` → apply only.
   Never initiated by us.
-- Any other handshake-type post-handshake (e.g.
-  CertificateRequest — client auth is out of scope) →
-  `unexpected_message` alert.
+- CertificateRequest post-handshake — same answer as
+  mid-flight: an empty Certificate message, then the server's
+  own call (usually `certificate_required`). Any other
+  handshake-type post-handshake → `unexpected_message` alert.
 
 ## Key schedule
 

@@ -36,6 +36,7 @@ interface Verifier {
 }
 
 fn dial(host: str, port: int, cfg: Config) -> [Conn, err]
+    // = dial_timeout(host, port, 30000, cfg) — net.dial's budget.
 fn dial_timeout(host: str, port: int, tmo_ms: int, cfg: Config) ->
     [Conn, err]
     // tmo_ms bounds TCP connect; `client` then applies the same
@@ -47,8 +48,11 @@ fn dial_timeout(host: str, port: int, tmo_ms: int, cfg: Config) ->
     // socket is closed before returning the err — no half-open leak.
 
 fn default_cfg() -> Config
-    // roots: load_system_roots(), server_name/verify/alpn empty —
-    // the 4-field Config literal is easy to get wrong; start here.
+    // roots: Roots{cas: nil} (lazy system-store load at first
+    // handshake — a store that fails to load surfaces as the
+    // handshake's err, never a Config-construction surprise),
+    // server_name/verify/alpn empty — the 4-field Config literal
+    // is easy to get wrong; start here.
 
 fn client(c: net.Conn, cfg: Config) -> [Conn, err]
     // handshake over an existing conn (the wrap API — proxy CONNECT

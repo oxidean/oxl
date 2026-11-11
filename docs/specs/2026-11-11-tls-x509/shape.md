@@ -3,7 +3,7 @@
 ## Scope
 
 Milestone X (x509’s letter — fresh; R was reclaimed by the descriptor
-spec, T/G/E/W are taken, and L went to the LLVM lane spec) un-parks the `crypto/tls` + `x509` row from
+spec, T/G/E/W are taken, and L went to the LLVM lane spec, `docs/specs/2026-11-11-llvm-backend/`) un-parks the `crypto/tls` + `x509` row from
 `docs/specs/2026-11-07-phase-2-plan/parked.md` and
 `docs/specs/2026-11-06-0111-package-system/items/parked-stdlib.md`.
 The trigger fired: `std/net/http`'s client is the first consumer
@@ -111,7 +111,9 @@ lane (sockets already trap under node; `tls` inherits net's path).
    fallback* — a SAN-less cert fails `err_name` even when its CN
    matches (public CAs have issued SANs for a decade; CN matching is
    deprecated practice that hides misissuance). SHA-1/MD5 signatures
-   hard-fail at parse-and-verify regardless of position in the chain.
+   hard-fail at parse-and-verify at every link — the one exception is
+   the trust anchor's own self-signature, which is never verified
+   (store membership is the trust decision), matching x509-trust.md.
 7. **Expiry is hard-checked; revocation is parked.** notBefore/
    notAfter validated against wall clock — no tolerance window.
    CRL/OCSP (incl. stapling) is a documented non-goal with the same
@@ -136,7 +138,7 @@ lane (sockets already trap under node; `tls` inherits net's path).
    checked-in x509 fixtures (generator script in `scripts/`) gate
    the trust story; `openssl s_server` end-to-end interop runs in a
    `command -v openssl`–gated lane, never the sole gate.
-10. **js-lane inherits net's answer.** `rt.mjs` sockets trap21; TLS
+10. **js-lane inherits net's answer.** `runtime/rt-node.mjs`/`rt-browser.mjs` sockets trap21; TLS
     needs sockets, so `--target js` gains nothing here — the
     packages compile (pure .oxl) and their socket use fails the same
     documented way. A fetch-backed transport is its own trigger.
@@ -199,8 +201,8 @@ interface Verifier {                    // override hook — an iface,
 }                                       // not a fn field: oxl's nil
                                         // is Ty::Err — assignable to
                                         // ifaces, never to fn
-fn dial(host: str, port: int) -> [Conn, err]
-fn dial_timeout(host: str, port: int, tmo_ms: int) -> [Conn, err]
+fn dial(host: str, port: int, cfg: Config) -> [Conn, err]
+fn dial_timeout(host: str, port: int, tmo_ms: int, cfg: Config) -> [Conn, err]
 fn client(c: net.Conn, cfg: Config) -> [Conn, err]   // wrap any net.Conn
 struct Conn { inner: net.Conn, st: shared, g: int }  // io.R/W/Closer
 fn (c mut Conn) read/write/close — record layer; close sends

@@ -19,7 +19,9 @@ struct Cert {                       // a parsed certificate; fields
     //  the raw Name encodings sliced from `raw`
     not_before: int, not_after: int,//  epoch seconds (UTCTime/GenTime)
     dns_names: own []str,           //  SAN dNSName entries, lowercased
-    ip_addrs: own []str,            //  SAN iPAddress entries, dotted
+    ip_addrs: own []str,            //  SAN iPAddress entries —
+                                   //  v4 dotted quad, v6 RFC 5952
+                                   //  canonical (lowercase, ::)
     is_ca: int,                     //  BasicConstraints cA
     max_path: int,                  //  pathLenConstraint, -1 = unset
     ku: int,                        //  KeyUsage bitmask, -1 = absent
@@ -39,7 +41,12 @@ fn (r mut Roots) append(c: Cert)
 fn load_system_roots() -> [Roots, err]
 fn verify(leaf: Cert, untrusted: []Cert, roots: Roots,
           name: str, at: int) -> [own []Cert, err]   // returns the path
+          // name non-empty ⇒ match_hostname runs inside verify
+          // after the path verifies; name "" skips it (the
+          // Config.verify escape hatch decides its own policy)
 fn match_hostname(c: Cert, name: str) -> err
+          // exported separately so a custom Verifier can reuse
+          // exactly this rule
 ```
 
 `SIG_*` consts: `rsa_pkcs1_sha256|384|512`, `rsa_pss_sha256|384|512`,
@@ -56,14 +63,20 @@ OID) yields `err_alg` at verify. `SPKI_*`: `rsa`, `ec_p256`,
   BIT STRING (unused-bits byte must be 0), OCTET STRING, NULL, OID,
   PrintableString, UTF8String, IA5String, BMPString (decoded for
   display only — never matched), UTCTime, GeneralizedTime, explicit
-  context tags `[0]`/`[3]` per RFC 5280.
+  context tags `[0]`/`[3]` per RFC 5280. String tags outside that
+  set (T61String/TeletexString and friends — live in older real-world
+  certs) are skipped, not `err_der`: issuer/subject strings are
+  display-only, DER bytes are what's matched. UTCTime's 2-digit
+  year follows RFC 5280: YY < 50 ⇒ 20YY, else 19YY.
 - Rejects, all `err_der`: length over remaining bytes, 64-bit
   overflow lengths, negative INTEGERs, non-minimal length encodings
   (long form where short suffices), trailing garbage after the top
   SEQUENCE.
-- PEM is `-----BEGIN CERTIFICATE-----` blocks →
-  `encoding/base64.decode`; non-certificate blocks are skipped, so a
-  mixed bundle file parses clean.
+- PEM is `-----BEGIN CERTIFICATE-----` blocks → block framing
+  strips the 64-col line wrapping, then `encoding/base64.decode`
+  (strict alphabet + %4 padding — decode never sees the newlines);
+  non-certificate blocks are skipped, so a mixed bundle file parses
+  clean.
 - `Cert` keeps `tbs` verbatim — signature verification covers the
   raw TBSCertificate bytes exactly as transmitted, never a re-encode.
 
@@ -72,8 +85,8 @@ OID) yields `err_alg` at verify. `SPKI_*`: `rsa`, `ec_p256`,
 `verify` builds a path leaf→root and checks it:
 
 1. **Build.** Candidate issuers: `untrusted` intermediates (the
-   server's Certificate flight) then `roots`. Link rule: child
-   parent `subject_der` == candidate `issuer_der`
+   server's Certificate flight) then `roots`. Link rule:
+   `child.issuer_der` byte-equals `candidate.subject_der`
    (DER byte-equal — the printable forms are display-only), tightened to
    `akid`==`skid` when both present. Loops cap at 8 links —
    `err_path` beyond. First path that verifies wins; alternatives
@@ -88,7 +101,10 @@ OID) yields `err_alg` at verify. `SPKI_*`: `rsa`, `ec_p256`,
    v1.5/PSS, ECDSA P-256/P-384, Ed25519 — through X3/X4.
 3. **CA checks on every issuer link.** `is_ca` → else
    `err_ca`. `ku` present → must carry keyCertSign. `max_path` ≥
-   subordinate-CA count below it → else `err_path`.
+   subordinate-CA count below it → else `err_path`. An
+   intermediate carrying EKU that contains neither serverAuth
+   nor anyEKU fails `err_eku` — an EKU-restricted CA can't
+   vouch usages it isn't authorized for.
 4. **Leaf checks.** EKU absent, anyEKU, or containing
    serverAuth → pass; otherwise `err_eku`. `ku` present → must
    carry digitalSignature (TLS 1.3 auth is always a signature).
@@ -138,8 +154,10 @@ only source of trust.
      `/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem`,
      `/etc/ssl/cert.pem` (Alpine, macOS, *BSD).
    - macOS: if no file matched, exec
-     `security find-certificate -a -p` against the System Roots
-     keychain via `os/exec` and parse the PEM output — live
+     `security find-certificate -a -p
+     /System/Library/Keychains/SystemRootCertificates.keychain`
+     (explicit keychain path — the bare invocation reads the
+     user's keychains, not the System Roots store) via `os/exec` and parse the PEM output — live
      store, no framework link needed.
    - Windows: exec `powershell.exe -NoProfile -Command`
      emitting each `Cert:\LocalMachine\Root` and
@@ -151,7 +169,9 @@ only source of trust.
    pool (an empty pool would make every chain `err_root` with a
    misleading smell).
 
-`Config.roots` empty (`cas` nil) ⇒ `client` calls `load_system_roots()` once
+`cas` nil (vs a non-nil-but-empty `cas`, which is a deliberate
+pin to *zero* anchors — everything verifies `err_root`) ⇒
+`Config.roots` empty ⇒ `client` calls `load_system_roots()` once
 per handshake (cheap on POSIX; the exec paths amortize to one
 spawn — callers that care hold a `Roots` and reuse it). A
 non-empty `roots` short-circuits all of the above — that's the
@@ -199,8 +219,9 @@ a caller can layer its own check today without a std change.
 `err_der`, `err_alg`, `err_sig`, `err_expired`, `err_notyet`,
 `err_ca`, `err_eku`, `err_path`, `err_root`, `err_name`,
 `err_roots` — package-level sentinel `err` values. Detail text
-(cert subject, offending name) rides via `errors.wrap(sentinel,
-detail)` — `errors.new` interns by message text, so wrapping is
+(cert subject, offending name) is the message and the sentinel
+rides as the cause — `errors.wrap(detail, sentinel)`.
+`errors.new` interns by message text, so wrapping is
 what keeps `errors.is(e, err_expired)` matching when the message
 carries the cert's name. Callers branch on category, never on
 message text.

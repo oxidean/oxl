@@ -15,7 +15,7 @@ last fix commit.
       (getrandom/`arc4random_buf`/`BCryptGenRandom`, built under
       `-DOXL_CRYPTO` — `needs_crypto` scan on `rt_csrand` in all
       three sites: `oxl/src/main.rs` (seed driver),
-      `bootstrap/cmd/oxl/main.oxl` (self-hosted driver), and the
+      `cmd/oxl/main.oxl` (self-hosted driver), and the
       mirrored grep in `tests/run.sh`
       + `-lbcrypt` on Windows only; TLS itself is pure .oxl and
       needs no rt symbols, so the gate names the entropy feature); `std/crypto/rand` (`bytes(n)
@@ -136,8 +136,9 @@ last fix commit.
       s_server; test_https_bad_cert — root not trusted → err;
       test_https_wrong_name; parse-level: test_url_https). Docs:
       `docs/tls.md` (surface, trust-root resolution order, err
-      taxonomy, side-channel posture per shape §Risk, non-goals +
-      their triggers); `parked-stdlib.md`/`parked.md` drop the
+      taxonomy, the close_notify/truncation fail-loud divergence
+      vs permissive HTTP/1.1 stacks, side-channel posture per
+      shape §Risk, non-goals + their triggers); `parked-stdlib.md`/`parked.md` drop the
       `crypto/tls`/`x509`/asymmetric rows and record what moved to
       live triggers (TLS server, resumption, revocation, constant-
       time pass); `docs/product/roadmap.md`'s TLS/x509 parked row

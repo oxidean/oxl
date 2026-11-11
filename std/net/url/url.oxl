@@ -399,7 +399,11 @@ fn validuserinfo(s: str) -> bool {
 fn parsehost(u: mut URL, host: str) -> err {
     ob := rfind_ch(host, 91)
     if ob > 0 {
-        // a '[' anywhere but the front can't open an IP-literal
+        // a '[' anywhere but the front can't open an IP-literal.
+        // Stricter than Go — encodeHost passes stray brackets in
+        // reg-name hosts through raw; we reject (deliberate
+        // divergence: a bracket that isn't an IP-literal opener is
+        // far more likely a malformed URL than intentional dtext).
         return errors.new("invalid IP-literal")
     }
     if ob == 0 {

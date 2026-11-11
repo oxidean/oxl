@@ -259,6 +259,7 @@ grep -q '"msg":"default-json","src":"set_default"' <<<"$out" || { echo "FAIL slo
 grep -q '"msg":"grp"' <<<"$out" || { echo "FAIL slog grp marker: $out"; exit 1; }
 grep -q 'msg=hidden' <<<"$out" && { echo "FAIL slog level drop: $out"; exit 1; }
 grep -q '"empty"' <<<"$out" && { echo "FAIL slog empty group: $out"; exit 1; }
+grep -q '"gone"' <<<"$out" && { echo "FAIL slog bound empty group: $out"; exit 1; }
 true
 
 echo "== oxl test: regexp (s5) =="

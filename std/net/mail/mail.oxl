@@ -15,6 +15,8 @@ import "std/errors"
 
 import "std/encoding/base64"
 
+import "std/net"
+
 /// Address is one mailbox — display name plus addr-spec. Same field
 /// names as Go's mail.Address.
 struct Address { name: str, address: str }
@@ -314,11 +316,54 @@ fn try_addrspec(p: mut P) -> [str, err] {
     if pempty(p) {
         return "", errors.new("mail: no domain in addr-spec")
     }
+    if ppeek(p) == 91 {
+        [dl, e2] = consumedomainliteral(p)
+        if e2 != nil {
+            return "", e2
+        }
+        return local + "@" + dl, nil
+    }
     [dom, e2] = consumeatom(p, true, false)
     if e2 != nil {
         return "", e2
     }
     return local + "@" + dom, nil
+}
+
+// consumedomainliteral reads `[...]` — RFC 5321 domain literals:
+// `[127.0.0.1]` (IPv4 dotted quad) or `[IPv6:::1]` (tagged IPv6),
+// validated by net.isip4/isip6 like Go's consumeDomainLiteral +
+// netip check. Other bracket contents fail — a literal that can't
+// route is worse than no literal.
+fn consumedomainliteral(p: mut P) -> [str, err] {
+    p.pos = p.pos + 1 // consume '['
+    start := p.pos
+    for !pempty(p) && ppeek(p) != 93 {
+        c := ppeek(p)
+        // dtext: printable ASCII except [ ] \ and controls
+        if c <= 32 || c == 91 || c == 92 || c == 127 {
+            return "", errors.new("mail: bad character in domain literal")
+        }
+        p.pos = p.pos + 1
+    }
+    if pempty(p) {
+        return "", errors.new("mail: unclosed domain literal")
+    }
+    inner := substr(p.s, start, p.pos)
+    p.pos = p.pos + 1 // consume ']'
+    if len(inner) == 0 {
+        return "", errors.new("mail: empty domain literal")
+    }
+    if substr(inner, 0, 5) == "IPv6:" {
+        if !net.isip6(substr(inner, 5, len(inner))) {
+            return "", errors.new("mail: invalid IPv6 domain literal")
+        }
+        return "[" + inner + "]", nil
+    }
+    if !net.isip4(inner) {
+        return "", errors.new("mail: invalid IPv4 domain literal")
+    }
+    return "[" + inner + "]", nil
 }
 
 fn consumeaddrspec(p: mut P) -> [str, err] {
@@ -402,10 +447,29 @@ fn decode2047(w: str) -> [own DWord, err] {
 // byte-for-byte onto codepoints 0–255, so each high byte becomes a
 // two-byte UTF-8 sequence. utf-8/us-ascii pass through.
 fn wordtext(d: str, charset: str) -> str {
-    if charset == "utf-8" {
-        return d
-    }
     out := mkslice(byte, 0)
+    if charset == "utf-8" {
+        // Go substitutes U+FFFD for invalid sequences rather than
+        // letting mojibake land raw in the name
+        i := 0
+        for i < len(d) {
+            n := utf8seq(d, i)
+            if n == 0 {
+                out = push(out, 239)
+                out = push(out, 191)
+                out = push(out, 189)
+                i = i + 1
+                continue
+            }
+            j := i
+            for j < i + n {
+                out = push(out, byteat(d, j))
+                j = j + 1
+            }
+            i = i + n
+        }
+        return out as str
+    }
     i := 0
     for i < len(d) {
         c := byteat(d, i)
@@ -451,8 +515,9 @@ fn qdecode(t: str) -> [str, err] {
             i = i + 3
             continue
         }
-        // printable ASCII plus the whitespace controls Go accepts
-        if (c <= 32 || c > 126) && c != 9 && c != 10 && c != 13 {
+        // printable ASCII plus the whitespace controls Go accepts;
+        // bytes >126 pass through raw, matching Go's qDecode
+        if c <= 32 && c != 9 && c != 10 && c != 13 {
             return "", errors.new("mail: bad character in q-encoding")
         }
         b = push(b, c)
@@ -532,7 +597,7 @@ fn consumephrase(p: mut P) -> [str, err] {
         prevenc = isenc
     }
     if len(words) == 0 {
-        return "", errors.new("mail: missing word in phrase: " + errors.msg(lasterr))
+        return "", lasterr
     }
     // join with single spaces
     out := words[0]
@@ -554,7 +619,19 @@ fn consumedisplaycomment(p: mut P) -> [str, err] {
     if e != nil {
         return "", errors.new("mail: misformatted parenthetical comment")
     }
-    // split on space/tab, decode each word
+    // split on space/tab, decode each word; control bytes can't
+    // survive a serialize anyway (name is quoted/2047-encoded) so a
+    // raw CR/LF landing here would smuggle header bytes into .name
+    clean := ""
+    j := 0
+    for j < len(comment) {
+        cc := byteat(comment, j)
+        if cc >= 32 && cc != 127 {
+            clean = clean + substr(comment, j, j + 1)
+        }
+        j = j + 1
+    }
+    comment = clean
     out := ""
     word := ""
     i := 0
@@ -890,10 +967,13 @@ fn ewords_b(name: str) -> str {
         // grow the chunk to the largest rune-aligned span <= 45 —
         // splitting a codepoint across words mojibakes per-word decoders
         n := 0
-        for i + n < len(b) && n + utf8seq(name, i + n) <= 45 {
+        for i + n < len(b) {
             l := utf8seq(name, i + n)
             if l == 0 {
                 l = 1
+            }
+            if n + l > 45 {
+                break
             }
             n = n + l
         }

@@ -18,7 +18,8 @@ extern fn rt_free(p: own void)
 struct Param { k: str, v: str, next: own Param }
 
 /// MediaType is parsemediatype's result — the lowercased type/subtype
-/// plus the parameter list in parse order (continuations merged).
+/// plus the parameter list in reverse parse order (pset prepends;
+/// continuations merged). pget/format are order-insensitive.
 struct MediaType { typ: str, params: own Param }
 
 // ---------- extension table ----------
@@ -492,9 +493,9 @@ fn parsemediatype(v: str) -> [own MediaType, err] {
         value := substr(kv.a, eq + 1, len(kv.a))
         if find(key, "*") >= 0 {
             basename := substr(key, 0, find(key, "*"))
-            // same member twice with a different value is a dup
+            // any repeated continuation member is a dup, Go-parity
             m := contfindv(cont, key)
-            if m.found && m.v != value {
+            if m.found {
                 return nil, errors.new("mime: duplicate parameter name")
             }
             if !m.found {
@@ -507,7 +508,7 @@ fn parsemediatype(v: str) -> [own MediaType, err] {
             }
         } else {
             m := pfindv(out.params, key)
-            if m.found && m.v != value {
+            if m.found {
                 return nil, errors.new("mime: duplicate parameter name")
             }
             out.params = pset(out.params, key, value)

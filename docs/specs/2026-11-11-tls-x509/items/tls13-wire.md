@@ -68,8 +68,10 @@ ClientHello
      the RFC-mandated answer; a server requiring client auth
      then alerts `certificate_required`) placed immediately
      before our CertificateVerify/Finished flight, echoing the
-     request's certificate_request_context verbatim. mTLS
-     itself stays out of scope.]
+     request's certificate_request_context verbatim — an empty
+     Certificate is followed by Finished with NO
+     CertificateVerify (RFC 8446 forbids CV without a non-empty
+     Certificate). mTLS itself stays out of scope.]
   → Certificate         — each cert_parse'd; leaf + untrusted chain;
                           per-entry extensions (OCSP staples, SCTs)
                           parsed over, ignored
@@ -101,8 +103,10 @@ Post-handshake, consume quietly:
   sends it).
 - **KeyUpdate** — `update_requested` → apply peer keys and answer
   `update_not_requested`; `update_not_requested` → apply only.
-  Never initiated by us — a sent KeyUpdate rotates the SENDER's
-  traffic secret, so our send keys never rotate in v1.
+  We never *initiate* KeyUpdate, but answering `update_requested`
+  requires sending one (RFC 8446 §4.6.3): the sender's traffic
+  secret rotates, so our write keys rotate on that path and the
+  write path selects the current send secret.
 - CertificateRequest post-handshake — protocol-illegal here
   (`post_handshake_auth` is never offered), so the strict read is
   `unexpected_message`. We answer leniently instead — the same

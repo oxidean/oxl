@@ -4,7 +4,7 @@ Lifecycle: spec work item — the spec docset *is* the deliverable;
 implementation rides `feat/milestone-x` stages per the spec's plan.
 
 1. Survey repo (done): spec format from 2026-11-10-web-target +
-   2026-11-10-runtime-type-descriptors; S4 crypto ethos; driver `needs_*`
+   2026-11-11-type-descriptors; S4 crypto ethos; driver `needs_*`
    link pattern; rt.c inventory (no entropy, no TLS); net.Conn/
    http seams; CI legs (ubuntu/macos/windows); WI + ADR numbering.
 2. Resolve forks (done — artifacts/brainstorm.md): pure-.oxl;

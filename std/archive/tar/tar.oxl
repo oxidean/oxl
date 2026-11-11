@@ -99,6 +99,16 @@ fn parnum(b: []byte) -> [int, err] {
         any = 1
         i = i + 1
     }
+    // everything after the digit run must be padding — Go's parseOctal
+    // errors on embedded junk ("123 456" is malformed, not 123) and a
+    // misparsed size mis-frames every member after it
+    for i < len(b) {
+        c := b[i]
+        if c != 0 && c != 32 {
+            return 0, errors.new("tar: invalid octal digit")
+        }
+        i = i + 1
+    }
     if any == 0 {
         // an all-padding field is 0 — some legacy writers emit blank
         // numerics and Go tolerates them; a blank checksum still
@@ -273,6 +283,11 @@ fn (t mut Reader) parse(b: []byte) -> [Header, err] {
         ssum = ssum + c
         i = i + 1
     }
+    // the checksum field is octal-only — Go rejects a base-256
+    // encoding here (parnum accepts it for numeric fields generally)
+    if b[148] >= 128 {
+        return h, errors.new("tar: bad checksum field")
+    }
     [ck, e0] = parnum(b[148:156])
     if e0 != nil {
         return h, errors.new("tar: bad checksum field")
@@ -316,15 +331,21 @@ fn (t mut Reader) parse(b: []byte) -> [Header, err] {
     if b[257] == 117 && b[258] == 115 && b[259] == 116 && b[260] == 97 && b[261] == 114 && (b[262] == 0 || b[262] == 32) {
         h.uname = nulstr(b[265:297])
         h.gname = nulstr(b[297:329])
-        [dmaj, _e6] = parnum(b[329:337])
+        [dmaj, e6] = parnum(b[329:337])
+        if e6 != nil {
+            return h, errors.new("tar: bad devmajor field")
+        }
         h.devmajor = dmaj
-        [dmin, _e7] = parnum(b[337:345])
+        [dmin, e7] = parnum(b[337:345])
+        if e7 != nil {
+            return h, errors.new("tar: bad devminor field")
+        }
         h.devminor = dmin
         pre := nulstr(b[345:500])
         if len(pre) > 0 {
-            // prefix(<=155) + '/' + name(<=100) can reach 256 —
-            // POSIX caps the reassembled name at 255
-            if len(pre) + 1 + len(h.name) > 255 {
+            // prefix(<=155) + '/' + name(<=100) — the format maximum
+            // is exactly 256; the writer emits up to it
+            if len(pre) + 1 + len(h.name) > 256 {
                 return h, errors.new("tar: name too long")
             }
             h.name = pre + "/" + h.name

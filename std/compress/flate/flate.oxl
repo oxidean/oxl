@@ -22,6 +22,13 @@ import "std/errors"
 /// subscribed, >0 = incomplete.
 struct Huf { count: []int, sym: []int, left: int }
 
+// Tabs holds the constant RFC 1951 tables: length/distance bases+extra
+// bits and the code-length-code order. Kept per-Reader, not global —
+// lazy shared tables need either a torn-read flag or a lock under
+// concurrent first use; ~140 constant ints cost microseconds to build
+// per Reader, which removes the shared state entirely.
+struct Tabs { lbase: own []int, lext: own []int, dbase: own []int, dext: own []int, clord: own []int }
+
 /// Reader is a DEFLATE decompressor — an io.Reader of plain text.
 struct Reader {
     src: io.Reader, // byte source
@@ -40,32 +47,18 @@ struct Reader {
     flit: Huf, // fixed literal/length table, built once
     fdt: Huf, // fixed distance table, built once
     fixed_ok: int, // fixed tables already built
+    tb: Tabs, // constant RFC 1951 tables (per-reader — see Tabs)
     derr: err, // terminal decode state (io.eof or a failure)
 }
 
 /// newreader decompresses the deflate stream on r.
 fn newreader(r: io.Reader) -> Reader {
-    tables()
-    return Reader{src: r, sbuf: mkslice(byte, 4096), si: 0, sn: 0, stuck: nil, bitbuf: 0, nbits: 0, out: mkslice(byte, 0), pos: 0, final: 0, block_open: 0, lit: Huf{count: nil, sym: nil, left: 0}, dt: Huf{count: nil, sym: nil, left: 0}, flit: Huf{count: nil, sym: nil, left: 0}, fdt: Huf{count: nil, sym: nil, left: 0}, fixed_ok: 0, derr: nil}
+    return Reader{src: r, sbuf: mkslice(byte, 4096), si: 0, sn: 0, stuck: nil, bitbuf: 0, nbits: 0, out: mkslice(byte, 0), pos: 0, final: 0, block_open: 0, lit: Huf{count: nil, sym: nil, left: 0}, dt: Huf{count: nil, sym: nil, left: 0}, flit: Huf{count: nil, sym: nil, left: 0}, fdt: Huf{count: nil, sym: nil, left: 0}, fixed_ok: 0, tb: tables(), derr: nil}
 }
 
-// ---- shared tables (lazy) ----
-let lbase_t: own []int = nil
-
-let lext_t: own []int = nil
-
-let dbase_t: own []int = nil
-
-let dext_t: own []int = nil
-
-let clord_t: own []int = nil
-
-// tables builds the constant RFC 1951 tables once: length/distance
-// bases+extra bits and the code-length-code order.
-fn tables() {
-    if lbase_t != nil {
-        return
-    }
+// tables builds the constant RFC 1951 tables.
+fn tables() -> Tabs {
+    tb := Tabs{lbase: nil, lext: nil, dbase: nil, dext: nil, clord: nil}
     lb := mkslice(int, 29)
     lb[0] = 3
     lb[1] = 4
@@ -96,7 +89,7 @@ fn tables() {
     lb[26] = 195
     lb[27] = 227
     lb[28] = 258
-    lbase_t = new(lb)
+    tb.lbase = new(lb)
 
     le := mkslice(int, 29)
     le[0] = 0
@@ -128,7 +121,7 @@ fn tables() {
     le[26] = 5
     le[27] = 5
     le[28] = 0
-    lext_t = new(le)
+    tb.lext = new(le)
 
     db := mkslice(int, 30)
     db[0] = 1
@@ -161,7 +154,7 @@ fn tables() {
     db[27] = 12289
     db[28] = 16385
     db[29] = 24577
-    dbase_t = new(db)
+    tb.dbase = new(db)
 
     de := mkslice(int, 30)
     de[0] = 0
@@ -194,7 +187,7 @@ fn tables() {
     de[27] = 12
     de[28] = 13
     de[29] = 13
-    dext_t = new(de)
+    tb.dext = new(de)
 
     co := mkslice(int, 19)
     co[0] = 16
@@ -216,7 +209,8 @@ fn tables() {
     co[16] = 14
     co[17] = 1
     co[18] = 15
-    clord_t = new(co)
+    tb.clord = new(co)
+    return tb
 }
 
 // p2 is 2**k — there is no shift operator; k stays under 60.
@@ -478,7 +472,6 @@ fn (d mut Reader) fixedtabs() {
 // the literal/length and distance code lengths (with the 16/17/18
 // repeat ops), then builds both decode tables.
 fn (d mut Reader) dyntabs() -> err {
-    tables()
     [hlit, e0] = d.take(5)
     if e0 != nil {
         return e0
@@ -504,7 +497,7 @@ fn (d mut Reader) dyntabs() -> err {
         if ev != nil {
             return ev
         }
-        cll[clord_t[i]] = v
+        cll[d.tb.clord[i]] = v
         i = i + 1
     }
     clh := construct(cll, 19)
@@ -643,8 +636,8 @@ fn (d mut Reader) huffsym() -> err {
         return corrupt("invalid literal/length code")
     }
     li := sym - 257
-    length := lbase_t[li]
-    le := lext_t[li]
+    length := d.tb.lbase[li]
+    le := d.tb.lext[li]
     if le > 0 {
         [x, ex] = d.take(le)
         if ex != nil {
@@ -659,8 +652,8 @@ fn (d mut Reader) huffsym() -> err {
     if ds > 29 {
         return corrupt("invalid distance code")
     }
-    distance := dbase_t[ds]
-    dx := dext_t[ds]
+    distance := d.tb.dbase[ds]
+    dx := d.tb.dext[ds]
     if dx > 0 {
         [x2, e3] = d.take(dx)
         if e3 != nil {
@@ -668,7 +661,9 @@ fn (d mut Reader) huffsym() -> err {
         }
         distance = distance + x2
     }
-    if distance > len(d.out) {
+    // RFC 1951: distances are bounded by the 32 KiB window AND by
+    // output produced so far — zlib/puff reject both violations
+    if distance > 32768 || distance > len(d.out) {
         return corrupt("distance too far back")
     }
     i := 0

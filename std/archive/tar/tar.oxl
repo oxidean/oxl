@@ -30,6 +30,8 @@ let TLONGNAME = 75
 /// Header is one archive member's metadata. size is the payload
 /// length in bytes for regular files (0 for links/dirs). typeflag is
 /// the T* constant above; NUL headers are normalised to TREG.
+/// name and linkname are verbatim archive bytes — sanitize them
+/// (reject absolute paths and "..") before they touch a filesystem.
 struct Header {
     name: str,
     mode: int,
@@ -258,26 +260,30 @@ fn (t mut Reader) parse(b: []byte) -> [Header, err] {
     }
     h.name = nulstr(b[0:100])
     [mo, e1] = parnum(b[100:108])
-    if e1 == nil {
-        h.mode = mo
+    if e1 != nil {
+        return h, errors.new("tar: bad mode field")
     }
+    h.mode = mo
     [ui, e2] = parnum(b[108:116])
-    if e2 == nil {
-        h.uid = ui
+    if e2 != nil {
+        return h, errors.new("tar: bad uid field")
     }
+    h.uid = ui
     [gi, e3] = parnum(b[116:124])
-    if e3 == nil {
-        h.gid = gi
+    if e3 != nil {
+        return h, errors.new("tar: bad gid field")
     }
+    h.gid = gi
     [sz, e4] = parnum(b[124:136])
     if e4 != nil {
         return h, errors.new("tar: bad size field")
     }
     h.size = sz
     [mt, e5] = parnum(b[136:148])
-    if e5 == nil {
-        h.mtime = mt
+    if e5 != nil {
+        return h, errors.new("tar: bad mtime field")
     }
+    h.mtime = mt
     h.typeflag = b[156]
     if h.typeflag == 0 {
         h.typeflag = TREG
@@ -317,6 +323,11 @@ fn paxname(rec: []byte, want: str) -> str {
         j := i
         v := 0
         for j < len(rec) && rec[j] >= 48 && rec[j] <= 57 {
+            // bail before the accumulator can wrap int64 — no
+            // conformant record length approaches 10 digits anyway
+            if j - i >= 10 {
+                return ""
+            }
             v = v * 10 + (rec[j] - 48)
             j = j + 1
         }

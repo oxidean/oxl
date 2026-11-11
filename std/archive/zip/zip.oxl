@@ -17,6 +17,8 @@ import "std/encoding/binary"
 /// File is one member's central-directory record. Sizes are
 /// compressed/uncompressed byte counts; meth is 0 (stored) or 8
 /// (deflate). lho/doff are archive offsets (local header / payload).
+/// name is verbatim archive bytes — sanitize it (reject absolute
+/// paths and "..") before it touches a filesystem.
 struct File {
     name: str,
     meth: int,
@@ -53,7 +55,10 @@ fn newreader(b: []byte) -> [Reader, err] {
     eocd := -1
     i := len(b) - 22
     for i >= lo {
-        if binary.le_u32(z.data, i) == 101010256 {
+        // a real EOCD's declared comment length reaches exactly EOF —
+        // a signature inside a *comment* fails that check and the
+        // scan keeps walking backwards
+        if binary.le_u32(z.data, i) == 101010256 && i + 22 + binary.le_u16(z.data, i + 20) == len(z.data) {
             eocd = i
             break
         }
@@ -67,6 +72,9 @@ fn newreader(b: []byte) -> [Reader, err] {
     }
     n := binary.le_u16(z.data, eocd + 10)
     cdoff := binary.le_u32(z.data, eocd + 16)
+    if n == 65535 || cdoff == 4294967295 {
+        return z, errors.new("zip: zip64 unsupported")
+    }
     clen := binary.le_u16(z.data, eocd + 20)
     if clen > 0 && eocd + 22 + clen <= len(z.data) {
         z.comment = z.data[eocd + 22:eocd + 22 + clen] as str

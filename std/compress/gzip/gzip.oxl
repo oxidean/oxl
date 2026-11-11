@@ -109,15 +109,21 @@ fn (g mut Reader) varhdr(flg: int) -> err {
     if (flg & 4) != 0 {
         xb := mkslice(byte, 2)
         e := g.xfull(xb)
-        if e != nil {
+        if e == io.eof() {
             return errors.new("gzip: unexpected EOF in extra field")
+        }
+        if e != nil {
+            return e
         }
         [_w, _we] = g.hcrc.write(xb)
         xl := binary.le_u16(xb, 0)
         xtra := mkslice(byte, xl)
         e2 := g.xfull(xtra)
-        if e2 != nil {
+        if e2 == io.eof() {
             return errors.new("gzip: unexpected EOF in extra field")
+        }
+        if e2 != nil {
+            return e2
         }
         [_w2, _we2] = g.hcrc.write(xtra)
     }
@@ -138,8 +144,11 @@ fn (g mut Reader) varhdr(flg: int) -> err {
     if (flg & 2) != 0 {
         hb := mkslice(byte, 2)
         e5 := g.xfull(hb)
-        if e5 != nil {
+        if e5 == io.eof() {
             return errors.new("gzip: unexpected EOF in header crc")
+        }
+        if e5 != nil {
+            return e5
         }
         sum := g.hcrc.sum(nil)
         if binary.be_u32(sum, 0) % 65536 != binary.le_u16(hb, 0) {
@@ -165,8 +174,11 @@ fn (g mut Reader) readcstr() -> [str, err] {
             }
             out = push(out, one[0])
         }
-        if e != nil {
+        if e == io.eof() {
             return "", errors.new("gzip: unexpected EOF in header string")
+        }
+        if e != nil {
+            return "", e
         }
         if n <= 0 {
             dry = dry + 1
@@ -185,8 +197,11 @@ fn (g mut Reader) readcstr() -> [str, err] {
 fn (g mut Reader) member_end() -> err {
     tr := mkslice(byte, 8)
     e := g.xfull(tr)
-    if e != nil {
+    if e == io.eof() {
         return errors.new("gzip: unexpected EOF in trailer")
+    }
+    if e != nil {
+        return e
     }
     sum := g.crc.sum(nil)
     if binary.le_u32(tr, 0) != binary.be_u32(sum, 0) {
@@ -205,8 +220,11 @@ fn (g mut Reader) member_end() -> err {
             h := mkslice(byte, 10)
             h[0] = one[0]
             e3 := g.xfull(h[1:10])
-            if e3 != nil {
+            if e3 == io.eof() {
                 return errors.new("gzip: truncated member header")
+            }
+            if e3 != nil {
+                return e3
             }
             g.hcrc = hash.new_crc32()
             [_w, _we] = g.hcrc.write(h)

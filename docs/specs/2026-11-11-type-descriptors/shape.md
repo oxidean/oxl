@@ -77,9 +77,12 @@ never silently emitted into a lane where they can't work.
    reuse of a borrow-provenance pass that doesn't exist: a
    function may return a `Value` only when it derives from one of
    that function's `ref`/`mut`/`Value` parameters; a `Value`
-   derived from a local `own` (the actually-dangerous case —
-   `c := new(v); return value_of(c)` returns an address whose
-   pointee dies at scope end) may not be returned. No `Value` of
+   derived from a local `own` — `c := new(v); return
+   value_of(c)` — may not be returned: `new` blocks are own-lane
+   mallocs outside the scope heap list, so the pointee is never
+   reclaimed when `c`'s handle dies (v1 emits no handle-death
+   reclamation) — the escape leaves an untracked leak whose owner
+   no longer exists. No `Value` of
    any provenance may be stored into a file-scope global, stored
    in heap shapes, captured into a closure or fn-value that
    outlives the source scope, or sent to `spawn` — param-derived
@@ -203,24 +206,55 @@ fn (v Value) alloc_slice(i: int, n: int) -> [Value, err]
                                              //  slice mint: rt_desc_alloc_
                                              //  slice(elem_td, n) builds a
                                              //  live RtSlice header + backing
-                                             //  (own-lane) and writes it into
-                                             //  the field's ptr slot; yields
-                                             //  the slice Value mut-set so
+                                             //  (own-lane); the header lands
+                                             //  per FieldDesc.ptr — ptr==1
+                                             //  (`own []T`) via
+                                             //  rt_field_set_ptr, ptr==0
+                                             //  (inline `[]T`, the common
+                                             //  `data []byte` case) via
+                                             //  rt_field_set_slice's
+                                             //  header copy; yields the
+                                             //  slice Value mut-set so
                                              //  index(j)/set_* fill it;
+                                             //  err_oob/err_kind as above
+fn (v Value) alloc_elem(i: int) -> [Value, err]
+                                             // SLICE only, elem_ptr==1
+                                             //  (`[]own T`) — the decode
+                                             //  lane's element mint: a nil
+                                             //  element slot gets a fresh
+                                             //  zeroed pointee
+                                             //  (rt_desc_alloc on elem's
+                                             //  td) stored through the
+                                             //  element pointer slot via
+                                             //  the same pointer-store
+                                             //  lane field writes use
+                                             //  (rt_field_set_ptr on the
+                                             //  slot address); a live slot
+                                             //  returns the existing
+                                             //  pointee mut-set
+                                             //  (idempotent re-entry);
                                              //  err_oob/err_kind as above
 fn (t Type) name() -> str                    // rt_desc_name
 fn (t Type) kind() -> int                    // rt_desc_kind — compares
                                              //  against the Kind* constants
                                              //  below (frozen order, never
                                              //  raw literals at call sites)
-fn KindInt() -> int                       // … plus KindByte/KindBool/
-                                             //  KindF64/KindStr/KindCstr/
-                                             //  KindSlice/KindStruct/KindEnum/
-                                             //  KindIface/KindFn/KindChan/
-                                             //  KindErr/KindVoid — declared
-                                             //  as fns returning the frozen
-                                             //  INT..VOID codes (no `const`
-                                             //  surface in v1)
+fn KindInt() -> int                       // one fn per frozen kind
+                                             //  constant, named for it:
+                                             //  KindInt→INT KindFloat→FLOAT
+                                             //  KindBool→BOOL KindStr→STR
+                                             //  KindByte→BYTE
+                                             //  KindSlice→SLICE KindMap→MAP
+                                             //  KindStruct→STRUCT
+                                             //  KindPtr→PTR KindChan→CHAN
+                                             //  KindIface→IFACE KindFn→FN
+                                             //  KindErr→ERR KindEnum→ENUM
+                                             //  KindVoid→VOID — declared as
+                                             //  fns returning the frozen
+                                             //  codes (no `const` surface
+                                             //  in v1); KindMap ships for
+                                             //  ABI completeness — no Ty
+                                             //  produces MAP
 fn (t Type) size() -> int                    // rt_desc_size
 fn (t Type) nfields() -> int                 // rt_desc_nfields
 fn (t Type) field(i: int) -> [Field, err]    // {td, i}; err_oob — the
@@ -354,7 +388,15 @@ by a sibling intrinsic `tqual(T) -> int` (0 unqualified, 1 `own`,
 generic binding of `T` carries the qualifier, so a
 `sprintv[own Point]` instantiation statically knows to print
 `&` — and so do `ref`/`mut` (`tqual` ≠ 0 → `&{…}`, matching Go's
-`*T` print for all pointer-lane qualifiers). (Caveat worth one line: a `v: T` param of `sprintv` itself receives the value — `own` args are *moved* into the callee by the
+`*T` print for all pointer-lane qualifiers). `%T` prints the
+static binding's descriptor name with the same qualifier prefix
+(`*Name` when `tqual` ≠ 0, bare `Name` otherwise — the qualified
+form, since oxl types are nominal and unqualified-name collisions
+across packages are legal). `%#v` prints the Go-syntax
+representation for the scalar kinds (INT/FLOAT/BOOL/STR/BYTE)
+and composite-literal form for STRUCT/ENUM/SLICE; opaque kinds
+(IFACE/FN/CHAN/ERR) and PTR fall back to their `%v` forms.
+(Caveat worth one line: a `v: T` param of `sprintv` itself receives the value — `own` args are *moved* into the callee by the
 usual rules.) `%v` on SLICE prints `[e1 e2 …]` via the `len`/`index`
 walk — pinned alongside the opaque forms. `%v` on opaque kinds
 (IFACE/FN/CHAN/ERR) prints a

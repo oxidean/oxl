@@ -79,13 +79,26 @@ you want verdicted, and again after the last fix commit.
       Rt change, named here because today's `RtErrEnt`
       (`{next, mlen, cause, msg}`) has no payload slots: extend the
       entry with `{td, pdata}` — a box IS an `err` end to end and
-      chains through `wrap`/`unwrap`/`is` untouched. Ownership pins:
+      chains through `wrap`/`unwrap`/`is` untouched. `pdata` is
+      ALWAYS a pointer: `box` accepts any `T` that has a descriptor
+      and heap-copies the payload into an own-lane `sizeof(T)`
+      block (`rt_alloc_own`) — multi-word types (`str`, `[]T`,
+      iface, `fn`, enums) can't ride a single int64 slot; an
+      `own T` arg instead moves its handle into `pdata` (no copy).
+      The box entry's other fields stay sentinel-pinned: `msg`
+      carries the boxed type's descriptor name (so `Error()` and
+      the unwrap chain stay readable), `next`/`cause` NULL.
+      Ownership pins:
       `box` CONSUMES its `v` (the registry adopts the payload —
-      call sites pass `own` values); `as[T](e, out: mut T)` MOVES
-      the payload out into `out` and clears the slot, so a given
-      box answers `as` exactly once — the only move-safe shape (a
-      shallow copy would alias `own` handles, a borrow can't be
-      expressed); `as` walks the `unwrap` chain like Go's As —
+      call sites pass `own` values, or by-value `T` which the box
+      copies then drops with its scope); `as[T](e, out: mut T)`
+      copies the payload back out of `pdata` into `out` (moving
+      the handle for `own` payloads) and clears the slot, so a
+      given box answers `as` exactly once — the only move-safe
+      shape (a shallow copy would alias `own` handles, a borrow
+      can't be expressed); when R3 lands, `box`/`as` fold sites
+      and their externs join the `--target js` diagnostic list
+      alongside the R1 surface; `as` walks the `unwrap` chain like Go's As —
       first descriptor match wins; matching is exact-descriptor —
       an iface-typed `out` matches only a box that stored that
       same iface descriptor (no implementability walk:

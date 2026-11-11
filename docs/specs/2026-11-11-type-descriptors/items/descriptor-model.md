@@ -221,6 +221,12 @@ extern fn rt_field_set_str(addr: int, v: str) // caller must pass
                                              //  into caller-owned storage
                                              //  dangles at scope leave
 extern fn rt_field_set_ptr(addr: int, v: int)
+extern fn rt_field_set_slice(addr: int, hdr: int)
+                                             // inline-slice decode lane:
+                                             //  copies the four-word
+                                             //  RtSlice header at `hdr`
+                                             //  into the inline slice
+                                             //  storage at `addr`
 ```
 
 Descriptor reads — what `Type`/`Field` methods wrap; each is a
@@ -280,9 +286,20 @@ extern fn rt_desc_alloc_slice(td: int, n: int) -> int
                                              // decode lane for SLICE fields:
                                              //  mints an RtSlice{ptr,len,cap,
                                              //  heap} header + n*elem-size
-                                             //  backing, own-lane; the header
-                                             //  addr writes through the
-                                             //  ptr-slot lane
+                                             //  backing, own-lane, and
+                                             //  returns the header addr.
+                                             //  alloc_slice writes it into
+                                             //  the field per FieldDesc.ptr:
+                                             //  ptr==1 (`own []T`) through
+                                             //  rt_field_set_ptr; ptr==0
+                                             //  (inline `[]T`) through
+                                             //  rt_field_set_slice, which
+                                             //  copies the four-word header
+                                             //  into the field's inline
+                                             //  storage — writing the header
+                                             //  ADDRESS into an inline slot
+                                             //  would overwrite .ptr and
+                                             //  corrupt the header
 field is emitted for ABI consumers only (parity checks,
 external tools) — the C helpers do no align math, but the accessor
 itself ships for the same consumers:
@@ -307,7 +324,7 @@ surface's own `-> [Value, err]` methods (check.oxl bans `ref`/
 `mut` under `Ret::Pair` too — under check.oxl `-> []T` itself is
 a plain slice return and is NOT banned; only the borrow-typed
 slots are. check.rs is stricter: it bans `[]T` returns under both
-ret shapes — check.rs:814-817/`825-828` — a real parity gap the
+ret shapes — check.rs:778/`805-807`/`815-819` — a real parity gap the
 R1 implementation must pick a side on).
 The pinned rule: `reflect.Value` is a **scope-bound type** — the
 flag attaches at the decl (the checker marks `std/reflect`'s
@@ -322,8 +339,11 @@ derived from a *local* `own` — `c := new(v); return value_of(c)` — or a
 *file-scope global* (global storage never dies, but v1 classifies
 `value_of(g)` like a local-`own` derivation: usable in-scope, not
 returnable — a future marker could exempt it)
-is the real dangling case, since `p`-derived Values address
-caller-owned storage — may not be returned, and no `Value` of
+is the real escape case — `new` blocks are own-lane mallocs
+outside the scope heap list, so the pointee is never reclaimed
+when the local handle dies (v1 emits no handle-death reclamation):
+the escape leaves an untracked leak whose owner no longer exists —
+may not be returned, and no `Value` of
 any provenance may be stored into a file-scope global, stored in
 `own`/heap shapes, captured into a closure or fn-value that
 outlives the source scope, or sent to `spawn` (param-derived
@@ -359,6 +379,10 @@ leave the slice's data window. The contract pins the emitted header layout
 read surface; both drivers already agree since they share the C
 layout. `CHAN`, `FN`, and `IFACE` kind values are read-opaque:
 `v.len()`/`v.index(i)`/typed reads on them return `err_kind`.
+`elem_ptr==1` slices (`[]own T`) additionally expose the decode
+lane's element mint — `v.alloc_elem(i)` (shape.md) stores a fresh
+`rt_desc_alloc` pointee through the element slot on nil and
+yields the live pointee mut-set otherwise.
 `PTR` is not opaque — `v.str()` reads it through `rt_field_cstr`;
 `ERR` reads its code through `v.int()` (the i64 lane).
 

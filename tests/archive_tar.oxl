@@ -382,7 +382,6 @@ fn test_signed_checksum() {
     ck(e, "signed checksum verifies")
 }
 
-
 /// foreign GNU archive — produced by python tarfile.GNU_FORMAT, not
 /// this reader's writer: 'L'/'K' longname+longlink records must route
 /// to name/linkname correctly

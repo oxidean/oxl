@@ -662,7 +662,7 @@ fn jxbin(g: mut G, op: str, l: ref parser.Node, r: ref parser.Node, e: ref parse
     }
     // a byte lhs with an int-domain result promotes through the same
     // helpers — rt_i* coerces the masked Number via BigInt()
-    if ltk == check.k_int() || ltk == check.k_err() || (ltk == check.k_byte() && rtk == check.k_int()) {
+    if ltk == check.k_int() || ltk == check.k_err() || ltk == check.k_byte() && rtk == check.k_int() {
         if op == "+" {
             return "rt.rt_iadd(" + lv + ", " + rv + ")"
         }

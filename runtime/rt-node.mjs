@@ -39,7 +39,10 @@ function err_stub(name) {
   return () => 0n // err-returning contract where possible
 }
 function trap21() {
-  throw { __oxl_trap: true, code: 21n }
+  // the real trap protocol — marks scopes, wakes parked peers, then
+  // throws; a bare __oxl_trap throw skips all of it and reads as a
+  // silent "ok" in susp lanes
+  return S.rt_trap(21n)
 }
 
 export function install(api) {

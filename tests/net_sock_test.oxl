@@ -124,6 +124,27 @@ fn test_closer() {
     c2.close()
 }
 
+fn test_refused() {
+    [c, e] = net.dial_timeout("127.0.0.1", 1, 500)
+    testing.expect(e != nil, "dial refused gives err")
+}
+
+fn test_resolve() {
+    // names resolve through getaddrinfo on the blocking pool —
+    // localhost via /etc/hosts is offline-safe; .invalid is a
+    // guaranteed NXDOMAIN per RFC 2606
+    [ip, e] = net.lookup_ipv4("localhost", 2000)
+    testing.expect(e == nil, "localhost resolves")
+    testing.expect(ip / 16777216 == 127, "localhost is in 127.0.0.0/8")
+    [ip3, e3] = net.lookup_ipv4("no-such-host.invalid.", 2000)
+    testing.expect(e3 != nil, "bogus host errors")
+}
+
+fn test_badip() {
+    [c, e] = net.dial("not-an-ip", 80)
+    testing.expect(e != nil, "dial bad host gives err")
+}
+
 fn main() {
     exit(0)
 }

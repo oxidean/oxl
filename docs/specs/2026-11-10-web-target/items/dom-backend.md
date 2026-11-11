@@ -3,7 +3,7 @@
 W6's deliverable: a `Backend` implementation rendering to the
 DOM. The iface is fixed (`docs/gui-backends.md`): `new`,
 `set_prop`, `attach`, `detach`, `destroy`, `pump`, `stop`,
-`wake` — the same eight methods, no schema changes.
+`wake` — the same thirteen methods — the five susp-pump additions ship in the W iface, no schema changes.
 
 ## Mapping
 

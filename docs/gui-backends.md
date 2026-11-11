@@ -13,6 +13,15 @@ proved, and where a third backend (a DOM-protocol target) stands.
         detach(parent: int, child: int),
         destroy(h: int),
         pump(events: mut EventBuf, cmds: mut CmdBuf),
+        // cooperative-scheduler driving (js lane): a backend that
+        // answers susp_pump()=1 cannot own a blocking loop — run
+        // drives bounded pump_iter passes and parks on pump_edge;
+        // stop/wake/event injection must post an edge there
+        susp_pump() -> int,
+        pump_iter(events: mut EventBuf, cmds: mut CmdBuf) -> int,
+        pump_edge() -> chan,
+        stopped() -> int,
+        pump_fin(),
         stop(),
         wake(),
     }

@@ -2184,7 +2184,7 @@ export async function __oxl_boot(main_entry) {
  * exit, and the rest of __oxl_ffi without re-importing (import cycles
  * would deadlock the module graph) */
 function rt_exports_api() {
-  return { env, F: globalThis.__oxl_ffi, rt_str, rt_str_cstr }
+  return { env, F: globalThis.__oxl_ffi, rt_str, rt_str_cstr, rt_trap }
 }
 
 /* ---------------- test entry ----------------

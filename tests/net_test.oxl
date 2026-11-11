@@ -1,9 +1,10 @@
 package main
 
-// S4 acceptance: refused dial returns err, dotted-literal short-
-// circuit, lookup resolve + NXDOMAIN err, bad-host dial err — the
-// socket-free half of the net coverage (runs in the js lane too;
-// socket tests live in net_sock_test.oxl).
+// S4 acceptance, socket-free half: dotted-literal short-circuit and
+// the pre-socket port validation — every path here resolves without
+// a socket/lookup extern, so the js lane (where those natives trap)
+// exercises real coverage. Socket-dependent tests live in
+// net_sock_test.oxl.
 import "std/net"
 
 import "std/testing"
@@ -14,27 +15,25 @@ fn ck(e: err, m: str) {
     testing.expect(e == nil, m + ": " + errors.msg(e))
 }
 
-fn test_refused() {
-    [c, e] = net.dial_timeout("127.0.0.1", 1, 500)
-    testing.expect(e != nil, "dial refused gives err")
+fn test_badport() {
+    // port validation precedes any socket extern — this err is
+    // reachable in the js lane where socket natives trap
+    [c, e] = net.dial_timeout("127.0.0.1", 70000, 500)
+    testing.expect(e != nil, "port >65535 gives err")
+    [c2, e2] = net.dial("127.0.0.1", 0)
+    testing.expect(e2 != nil, "port 0 gives err")
 }
 
 fn test_lookup() {
-    // e6 #29 — dotted literals short-circuit; names resolve through
-    // getaddrinfo on the blocking pool (localhost via /etc/hosts is
-    // offline-safe; .invalid is a guaranteed NXDOMAIN per RFC 2606)
-    [ip, e] = net.lookup_ipv4("localhost", 2000)
-    testing.expect(e == nil, "localhost resolves")
-    testing.expect(ip / 16777216 == 127, "localhost is in 127.0.0.0/8")
-    [ip2, e2] = net.lookup_ipv4("127.0.0.1", 2000)
-    testing.expect(e2 == nil && ip2 == 2130706433, "dotted literal short-circuits")
-    [ip3, e3] = net.lookup_ipv4("no-such-host.invalid.", 2000)
-    testing.expect(e3 != nil, "bogus host errors")
-}
-
-fn test_badip() {
-    [c, e] = net.dial("not-an-ip", 80)
-    testing.expect(e != nil, "dial bad host gives err")
+    // e6 #29 — dotted literals short-circuit the resolver entirely,
+    // so these paths never touch the lookup extern (the js lane runs
+    // this file; resolver+socket coverage lives in net_sock_test)
+    [ip, e] = net.lookup_ipv4("127.0.0.1", 2000)
+    testing.expect(e == nil && ip == 2130706433, "dotted literal short-circuits")
+    [ip2, e2] = net.lookup_ipv4("0.0.0.0", 2000)
+    testing.expect(e2 == nil && ip2 == 0, "zero literal")
+    [ip3, e3] = net.lookup_ipv4("1.2.3.4", 2000)
+    testing.expect(e3 == nil && ip3 == 16909060, "dotted quad value")
 }
 
 fn main() {

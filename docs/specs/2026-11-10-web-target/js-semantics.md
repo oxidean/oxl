@@ -277,7 +277,8 @@ Return mapping inverts the table; `{val, err}` for pair fns.
 
 - **Node flavor** (`rt-node.mjs`): `rt_open_write`→`fs.openSync`,
   `rt_readfile`→`fs.readFileSync`, `rt_proc_*`→`child_process`,
-  `rt_sock_*`→`net`+`dns` (lookup → shared cell callback),
+  `rt_sock_*`/`rt_lookup_*`→`rt_trap(21)` stubs (no single-thread
+  blocking-socket analogue; a net→shared-cell lane can reopen this),
   `rt_getenv`/`rt_argv`/`rt_exepath`/`rt_exit`→`process.*`,
   `rt_now*`→`Date.now`/`performance.now`, `rt_errstr`→string.
 - **Browser flavor** (`rt-browser.mjs`): every name present as

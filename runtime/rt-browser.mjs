@@ -10,7 +10,9 @@ const dec = new TextDecoder()
 const s_of_js = (js) => S.rt_str(js)
 const js_of_s = (s) => S.rt_str_cstr(s)
 const empty_slice = () => ({ a: [], off: 0, len: 0, cap: 0 })
-const trap21 = () => { throw { __oxl_trap: true, code: 21n } }
+// route through rt_trap (not a bare throw) so scopes get marked and
+// parked siblings wake — bare __oxl_trap objects are silent in susp lanes
+const trap21 = () => S.rt_trap(21n)
 
 export function install(api) {
   S = api

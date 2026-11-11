@@ -223,7 +223,7 @@ done
 out=$("$OXL" test tests/net_test.oxl)
 printf '%s
 ' "$out" >&2
-for t in test_refused test_lookup test_badip; do
+for t in test_badport test_lookup; do
     grep -q "$t ... ok" <<<"$out" || { echo "FAIL net: $out"; exit 1; }
 done
 # socket-dependent half — the js lane's socket natives are trap21
@@ -232,7 +232,7 @@ done
 out=$("$OXL" test tests/net_sock_test.oxl)
 printf '%s
 ' "$out" >&2
-for t in test_echo test_closer; do
+for t in test_echo test_closer test_refused test_resolve test_badip; do
     grep -q "$t ... ok" <<<"$out" || { echo "FAIL net-sock: $out"; exit 1; }
 done
 
@@ -1743,8 +1743,39 @@ echo "== w4 js driver lane =="
 if command -v node >/dev/null 2>&1; then
     # gui_* joined the lane in W5 — the susp-pump contract lets the
     # mock's cooperative pump drive the same gates single-threaded
+    # each file's last-line success marker is grepped — an err-path
+    # regression that prints + exits 0 (gui_dom's `run err:` shape)
+    # can't pass silently
     for f in conc_ping conc_scale select select_fair chan_own chanbuf chanbuf_close scope_exit orphan_join defer_order pairfwd match methods fnval d5_qual stdmods_test susp_closure zero_str gui_mock gui_lifecycle gui_overflow gui_select gui_stress gui_cancel gui_dom; do
+        case "$f" in
+            conc_ping)      marker='bounces=' ;;
+            conc_scale)     marker='done' ;;
+            select)         marker='select done' ;;
+            select_fair)    marker='select fair ok' ;;
+            chan_own)       marker='chan_own done' ;;
+            chanbuf)        marker='chanbuf done' ;;
+            chanbuf_close)  marker='chanbuf close ok' ;;
+            scope_exit)     marker='scope-exit ok' ;;
+            orphan_join)    marker='orphan-join ok' ;;
+            defer_order)    marker='defer order ok' ;;
+            pairfwd)        marker='pairfwd ok' ;;
+            match)          marker='other' ;;
+            methods)        marker='methods ok' ;;
+            fnval)          marker='fnval ok' ;;
+            d5_qual)        marker='d5 qual ok' ;;
+            stdmods_test)   marker='done' ;;
+            susp_closure)   marker='susp closure ok' ;;
+            zero_str)       marker='zero str ok' ;;
+            gui_mock)       marker='done' ;;
+            gui_lifecycle)  marker='lifecycle ok' ;;
+            gui_overflow)   marker='overflow ok' ;;
+            gui_select)     marker='done' ;;
+            gui_stress)     marker='done' ;;
+            gui_cancel)     marker='cancel ok' ;;
+            gui_dom)        marker='done' ;;
+        esac
         out=$(with_timeout 60 "$SELFOXL" run --target js "tests/$f.oxl" 2>&1) || { echo "FAIL js lane $f: $out"; exit 1; }
+        grep -q "$marker" <<<"$out" || { echo "FAIL js lane $f marker '$marker': $out"; exit 1; }
     done
     for f in enc_test hash_test regexp_test float_test util_test stdlib_test collections_test enum_test defer_test os_test exec_test net_test flaglog_test extra_testutil; do
         out=$(with_timeout 60 "$SELFOXL" test --target js "tests/$f.oxl" 2>&1) || { echo "FAIL js lane test $f: $out"; exit 1; }

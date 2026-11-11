@@ -263,7 +263,7 @@ fn write_text(path: str, data: str) -> int {
 // ancestors of the executable first (a shipped or in-repo binary),
 // then ancestors of the compiled package (a self driver run from a
 // scratch dir still finds the SOURCE tree).
-fn runtime_at(base: str) -> str {
+fn runtime_at(base: str, marker: str) -> str {
     d := base
     for len(d) > 0 {
         // "." is never a canonical ancestor — dir_of degrades a drive
@@ -271,7 +271,7 @@ fn runtime_at(base: str) -> str {
         if d == "." {
             break
         }
-        if os.exists(d + "/runtime/rt.c") {
+        if os.exists(d + marker) {
             return d
         }
         if d == "/" {
@@ -282,29 +282,29 @@ fn runtime_at(base: str) -> str {
     return ""
 }
 
-fn runtime_dir(entry: str) -> str {
+fn runtime_dir(entry: str, marker: str) -> str {
     // exe-dir probe first — a PATH-invoked oxl finds its shipped
     // runtime/. Skipped when exepath fails: dir_of("") is "." and
     // canon_or would silently anchor the probe at the cwd.
     d := ""
     exe := rt_exepath()
     if len(exe) > 0 {
-        d = runtime_at(check.canon_or(check.dir_of(exe)))
+        d = runtime_at(check.canon_or(check.dir_of(exe)), marker)
     }
     // bare argv(0) (PATH invocation) carries no dir component —
     // dir_of yields "." which canon_or turns into the cwd
     av := argv(0)
     if len(d) == 0 && strings.contains(av, "/") {
-        d = runtime_at(check.canon_or(check.dir_of(av)))
+        d = runtime_at(check.canon_or(check.dir_of(av)), marker)
     }
     if len(d) == 0 {
-        d = runtime_at(check.canon_or(entry))
+        d = runtime_at(check.canon_or(entry), marker)
     }
     if len(d) == 0 {
         // last resort: the invocation cwd — a seed-built driver run
         // from inside a checkout (scratch exe, out-of-tree sources)
         // still finds the checkout's runtime/
-        d = runtime_at(check.canon_or("."))
+        d = runtime_at(check.canon_or("."), marker)
     }
     return d
 }
@@ -412,7 +412,7 @@ fn emit_and_cc(csrc: str, out: str, entry: str) -> int {
         eprintln("cannot write " + cfile + ": " + rt_errstr(we))
         return 0
     }
-    rt := runtime_dir(entry)
+    rt := runtime_dir(entry, "/runtime/rt.c")
     if len(rt) == 0 {
         eprintln("cannot locate runtime/rt.c — no runtime/ tree above " + check.dir_of(argv(0)) + " or " + entry)
         return 0
@@ -535,7 +535,7 @@ fn emit_and_js(jssrc: str, out: str, entry: str) -> int {
         eprintln("cannot write " + out + ": " + rt_errstr(we))
         return 0
     }
-    rt := runtime_dir(entry)
+    rt := runtime_dir(entry, "/runtime/rt.mjs")
     if len(rt) == 0 {
         eprintln("cannot locate runtime/rt.mjs — no runtime/ tree above " + check.dir_of(argv(0)) + " or " + entry)
         return 0

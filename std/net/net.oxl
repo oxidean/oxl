@@ -105,6 +105,124 @@ fn parse_ipv4(host: str) -> [int, err] {
     return ip * 256 + oct, nil
 }
 
+// ishexdig — 0-9, a-f, A-F
+fn ishexdig(c: int) -> bool {
+    return c >= 48 && c <= 57 || c >= 97 && c <= 102 || c >= 65 && c <= 70
+}
+
+// isv6group — one IPv6 hextet: 1-4 hex digits
+fn isv6group(t: str) -> bool {
+    if len(t) == 0 || len(t) > 4 {
+        return false
+    }
+    i := 0
+    for i < len(t) {
+        if !ishexdig(byteat(t, i)) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+/// isip4 reports whether s is a strict dotted-quad IPv4 literal —
+/// four 0-255 octets, no leading zeros (netip strictness; parse_ipv4
+/// above stays lenient for the dial path).
+fn isip4(s: str) -> bool {
+    parts := 0
+    digits := 0
+    oct := 0
+    i := 0
+    for i <= len(s) {
+        if i == len(s) || byteat(s, i) == 46 {
+            if digits == 0 || oct > 255 {
+                return false
+            }
+            parts = parts + 1
+            digits = 0
+            oct = 0
+        } else {
+            c := byteat(s, i)
+            if c < 48 || c > 57 {
+                return false
+            }
+            if digits > 0 && oct == 0 {
+                return false // "01"-style leading zero
+            }
+            digits = digits + 1
+            if digits > 3 {
+                return false
+            }
+            oct = oct * 10 + (c - 48)
+        }
+        i = i + 1
+    }
+    return parts == 4
+}
+
+// v6side counts hextet-equivalents on one side of a "::" — each
+// colon-separated token must be a hextet; when tail is set the last
+// token may instead be a dotted IPv4 and counts as two. -1 = bad.
+fn v6side(s: str, tail: bool) -> int {
+    if len(s) == 0 {
+        return 0
+    }
+    n := 0
+    st := 0
+    i := 0
+    for i <= len(s) {
+        if i == len(s) || byteat(s, i) == 58 {
+            t := substr(s, st, i)
+            if isv6group(t) {
+                n = n + 1
+            } else if tail && i == len(s) && isip4(t) {
+                n = n + 2
+            } else {
+                return -1
+            }
+            st = i + 1
+        }
+        i = i + 1
+    }
+    return n
+}
+
+/// isip6 reports whether s parses as an IPv6 literal per
+/// netip.ParseAddr's accept set — hextets with at most one "::"
+/// compression, an optional dotted-IPv4 final group, and an optional
+/// %zone suffix. url gates bracketed IP-literals on it (only real
+/// IPv6 may sit in brackets); mail gates [IPv6:...] domain literals.
+fn isip6(s: str) -> bool {
+    zi := find(s, "%")
+    if zi >= 0 {
+        if zi == 0 || zi == len(s) - 1 {
+            return false
+        }
+        s = substr(s, 0, zi)
+    }
+    di := find(s, "::")
+    if di >= 0 {
+        if find(substr(s, di + 2, len(s)), "::") >= 0 {
+            return false
+        }
+        left := substr(s, 0, di)
+        right := substr(s, di + 2, len(s))
+        if len(right) > 0 && byteat(right, 0) == 58 {
+            return false
+        }
+        if len(left) > 0 && byteat(left, len(left) - 1) == 58 {
+            return false
+        }
+        ln := v6side(left, false)
+        rn := v6side(right, true)
+        if ln < 0 || rn < 0 {
+            return false
+        }
+        return ln + rn < 8
+    }
+    return v6side(s, true) == 8
+}
+
 // pending word for the lookup cell: one past every legal h32 — a real
 // result is 0..0xffffffff or a negative platform code, never 2^32
 let lkp_pending = 4294967296

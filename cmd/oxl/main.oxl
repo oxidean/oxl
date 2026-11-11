@@ -72,6 +72,37 @@ fn report_diags(diags: []check.DBox) {
 // .oxl files (the file-list rule); argi is where program args begin
 struct PkgArgs { fs: []str, argi: int }
 
+// driver-flag vocabulary shared by pkg_args and flag_bound — returns
+// tokens consumed, 0 when a is positional (the run-arg boundary)
+fn flag_toks(a: str) -> int {
+    if a == "--target" || a == "-o" {
+        return 2
+    }
+    if a == "--html" || strings.startswith(a, "--target=") {
+        return 1
+    }
+    return 0
+}
+
+// index of the first non-driver-flag arg (or `--`/argc) — `run` scopes
+// flag_value/has_flag/target_is_js to argv[2..bound) so the program's
+// own flags never hijack driver switches
+fn flag_bound() -> int {
+    i := 2
+    for i < argc() {
+        a := argv(i)
+        if a == "--" {
+            return i
+        }
+        n := flag_toks(a)
+        if n == 0 {
+            return i
+        }
+        i = i + n
+    }
+    return i
+}
+
 struct PkgSrc { dir: str, files: []str }
 
 fn pkg_args(start: int) -> PkgArgs {
@@ -79,16 +110,15 @@ fn pkg_args(start: int) -> PkgArgs {
     i := start
     for i < argc() && argv(i) != "--" {
         a := argv(i)
-        // driver flags interleave with sources — skip them (and a
-        // separate value where the flag takes one) so a flag placed
-        // before the file list doesn't end source collection
-        if a == "--target" || a == "-o" {
-            i = i + 2
-            continue
-        }
-        if a == "--html" || strings.startswith(a, "--target=") {
-            i = i + 1
-            continue
+        // driver flags interleave ahead of the sources — skip them
+        // (and a separate value where the flag takes one); once the
+        // source list has begun a flag-shaped arg is program argv
+        if len(fs) == 0 {
+            n := flag_toks(a)
+            if n > 0 {
+                i = i + n
+                continue
+            }
         }
         if len(fs) == 0 && os.isdir(a) {
             fs = push(fs, a)
@@ -104,10 +134,21 @@ fn pkg_args(start: int) -> PkgArgs {
     return PkgArgs{fs: fs, argi: i}
 }
 
+// argv index where program args begin — cmd_run scopes flag reads to
+// argv[2..g_bound); other commands leave -1 (scan to `--` as before)
+let g_bound = -1
+
+fn flag_upto() -> int {
+    if g_bound >= 0 && g_bound < argc() {
+        return g_bound
+    }
+    return argc()
+}
+
 // `--target <v>` / `--target=<v>`; "" when absent
 fn flag_value(name: str) -> str {
     i := 2
-    for i + 1 < argc() {
+    for i + 1 < flag_upto() {
         a := argv(i)
         if a == "--" {
             break
@@ -119,7 +160,7 @@ fn flag_value(name: str) -> str {
     }
     pfx := name + "="
     i = 2
-    for i < argc() {
+    for i < flag_upto() {
         a := argv(i)
         if a == "--" {
             break
@@ -134,7 +175,7 @@ fn flag_value(name: str) -> str {
 
 fn has_flag(name: str) -> int {
     i := 2
-    for i < argc() {
+    for i < flag_upto() {
         a := argv(i)
         if a == "--" {
             break
@@ -670,6 +711,7 @@ fn cmd_build() {
 }
 
 fn cmd_run() {
+    g_bound = flag_bound()
     pa := pkg_args(2)
     src := pkg_src(pa.fs)
     res := compile(src)

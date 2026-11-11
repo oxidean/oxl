@@ -1504,6 +1504,15 @@ impl<'a> Checker<'a> {
                             format!("closure captures `{n}` (`{}`) — borrowed refs may not be stored in heap objects (v0)", t.name())));
                     }
                 }
+                // method calls on captured receivers — `defer w.pause()`
+                // scans `w.pause`, but suspend holds `Worker.pause`
+                for (recv, m) in &scan.mcalls {
+                    if let Some(t) = env.get(recv) {
+                        if let MTarget::Fn(q) = self.method_target(&t, m) {
+                            scan.callees.insert(q);
+                        }
+                    }
+                }
                 self.closure_checks.push((e.span, scan.callees, scan.seeded, self.cur_file.clone()));
                 let saved = std::mem::replace(&mut self.closure_ret, Some(None));
                 env.push();
@@ -2959,6 +2968,10 @@ pub(crate) struct BodyScan {
     pub refs: HashSet<String>,
     pub binds: HashSet<String>,
     pub callees: HashSet<String>,
+    /// `recv.m(...)` shapes where recv is a plain identifier — the
+    /// closure arm resolves them to `Type.m` via env + method_target;
+    /// callees alone can't hold them pre-resolution
+    pub mcalls: HashSet<(String, String)>,
     pub seeded: bool,
 }
 
@@ -3045,6 +3058,11 @@ fn scan_expr(e: &Expr, s: &mut BodyScan) {
                     s.seeded = true;
                 }
             } else {
+                if let ExprKind::Field { obj, name } = &f.kind {
+                    if let ExprKind::Ident(n) = &obj.kind {
+                        s.mcalls.insert((n.clone(), name.clone()));
+                    }
+                }
                 scan_expr(f, s);
             }
             args.iter().for_each(|a| scan_expr(a, s));

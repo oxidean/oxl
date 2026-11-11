@@ -2026,7 +2026,9 @@ fn garm(g: mut G, pat: ref parser.Node, acc: str, st: int) -> GArm {
     if k == 46 { // bare ident binds whole
         match pat {
             parser.Node.PatBind{name} => {
-                r.binds = gbnd(name, acc, st, nil)
+                // `_ms` not `acc` — acc is `(*_ms)` under own/ref/mut,
+                // and an own-typed bind needs the pointer, not the pointee
+                r.binds = gbnd(name, "_ms", st, nil)
             }
             _ => {
             }

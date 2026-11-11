@@ -1581,6 +1581,14 @@ rc=0
 out=$(with_timeout 30 "$scratch/gui_lifecycle$EXE") || rc=$?
 [ "$rc" -eq 0 ] && [ "$(tail -1 <<<"$out")" = "lifecycle ok" ] || {
     echo "FAIL gui_lifecycle: rc=$rc: $out"; exit 1; }
+# delayed-reply drain (G1): stop fired mid-delay must let the reply
+# land or reconcile before pump_fin's sweep — never a dead reply.
+"$OXL" build tests/gui_delay_stop.oxl -o "$scratch/gui_delay_stop$EXE" || {
+    echo "FAIL gui_delay_stop: compile failed"; exit 1; }
+rc=0
+out=$(with_timeout 30 "$scratch/gui_delay_stop$EXE") || rc=$?
+[ "$rc" -eq 0 ] && [ "$(tail -1 <<<"$out")" = "delay stop ok" ] || {
+    echo "FAIL gui_delay_stop: rc=$rc: $out"; exit 1; }
 # parked select must unwedge on sibling trap — exits nonzero, not a hang.
 # 124 = with_timeout expiry = the hang this test exists to catch. Build
 # first so a compile error fails the check instead of passing as a
@@ -1746,7 +1754,7 @@ if command -v node >/dev/null 2>&1; then
     # each file's last-line success marker is grepped — an err-path
     # regression that prints + exits 0 (gui_dom's `run err:` shape)
     # can't pass silently
-    for f in conc_ping conc_scale select select_fair chan_own chanbuf chanbuf_close scope_exit orphan_join defer_order pairfwd match methods fnval d5_qual stdmods_test susp_closure zero_str gui_mock gui_lifecycle gui_overflow gui_select gui_stress gui_cancel gui_dom; do
+    for f in conc_ping conc_scale select select_fair chan_own chanbuf chanbuf_close scope_exit orphan_join defer_order pairfwd match methods fnval d5_qual stdmods_test susp_closure zero_str gui_mock gui_lifecycle gui_overflow gui_select gui_stress gui_cancel gui_dom gui_delay_stop; do
         case "$f" in
             conc_ping)      marker='bounces=' ;;
             conc_scale)     marker='done' ;;
@@ -1773,6 +1781,7 @@ if command -v node >/dev/null 2>&1; then
             gui_stress)     marker='stress ok' ;;
             gui_cancel)     marker='cancel ok' ;;
             gui_dom)        marker='activated' ;;
+            gui_delay_stop) marker='delay stop ok' ;;
         esac
         out=$(with_timeout 60 "$SELFOXL" run --target js "tests/$f.oxl" 2>&1) || { echo "FAIL js lane $f: $out"; exit 1; }
         grep -q "$marker" <<<"$out" || { echo "FAIL js lane $f marker '$marker': $out"; exit 1; }

@@ -3188,8 +3188,11 @@ fn jgenall(g: mut G) -> str {
                     [ui, uerr] = collections.map_get(uof, itoa(i))
                     if uerr == nil {
                         s := gusnap(g)
-                        v := jx(g, init)
-                        v = jconv_v(g, init, v, t)
+                        v := jzero(g, t)
+                        if init != nil {
+                            v = jx(g, init)
+                            v = jconv_v(g, init, v, t)
+                        }
                         g.ginit = push(g.ginit, "    o_g_" + cname(check.qname(g.its[i].mod, name)) + " = " + v + ";")
                         gudrain_init(g, ui, s)
                     }

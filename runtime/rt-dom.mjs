@@ -202,8 +202,11 @@ export function install(api) {
     if (k === D_ROWCLICK) {
       reg('click', (e) => {
         if (REAL && e && e.target) {
+          // a click nested under a widget that owns a D_CLICK listener
+          // is that widget's event — but a plain element (a row's label
+          // span carries __oxl_h with no listeners) must not swallow it
           for (let x = e.target; x && x !== el; x = x.parentNode) {
-            if (x.__oxl_h) return
+            if (x.__oxl_h && x.__oxl_lf && x.__oxl_lf.has(D_CLICK)) return
           }
         }
         const p = REAL ? el.parentNode : el.parent
@@ -276,6 +279,13 @@ export function install(api) {
   F.oxl_dom_kids = (h) => {
     const el = get(h)
     return el ? BigInt(el.children.length) : 0n
+  }
+  /* i-th child's handle (0 when absent) — subtree walks for destroy */
+  F.oxl_dom_kid = (h, i) => {
+    const el = get(h)
+    if (!el) return 0n
+    const k = el.children[Number(i)]
+    return k ? BigInt(k.__oxl_h) : 0n
   }
 }
 

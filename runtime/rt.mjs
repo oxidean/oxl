@@ -183,8 +183,15 @@ function borrow_push(obj, mode) {
   const t = tls_task
   const m = borrow_list(t)
   const have = m.get(obj)
-  if (have !== undefined && (mode === 2 || have === 2)) rt_trap(2n)
-  m.set(obj, mode)
+  // concurrent reads count; a mut borrow excludes everyone — a read
+  // upgrade past live readers traps exactly like rt.c's list pop
+  if (mode === 2) {
+    if (have !== undefined) rt_trap(2n)
+    m.set(obj, { mode: 2, n: 1 })
+    return
+  }
+  if (have !== undefined && have.mode === 2) rt_trap(2n)
+  m.set(obj, { mode: 1, n: (have ? have.n : 0) + 1 })
 }
 
 export function rt_borrow_read(obj) {
@@ -198,7 +205,12 @@ export function rt_borrow_mut(obj) {
 export function rt_unborrow(obj) {
   if (obj === null || obj === undefined) return
   const t = tls_task
-  borrow_list(t).delete(obj)
+  const m = borrow_list(t)
+  const e = m.get(obj)
+  if (e === undefined) return
+  e.n--
+  if (e.n <= 0) m.delete(obj)
+  else m.set(obj, e)
 }
 
 /* ---------------- scopes ----------------
@@ -1866,7 +1878,7 @@ export function rt_htons(v) {
 export function rt_htonl(v) {
   v = Number(v) >>> 0
   return BigInt(
-    ((v & 0xff) << 24) | ((v & 0xff00) << 8) | ((v >>> 8) & 0xff00) | (v >>> 24)
+    (((v & 0xff) << 24) | ((v & 0xff00) << 8) | ((v >>> 8) & 0xff00) | (v >>> 24)) >>> 0
   )
 }
 
@@ -1932,7 +1944,7 @@ export const rt_ixor = (a, b) => I64(BigInt(a) ^ BigInt(b))
 export const rt_inot = (a) => I64(~BigInt(a))
 export const rt_to_num = (i) => Number(i)
 export const rt_to_int = (n) =>
-  Number.isFinite(n) && n >= -(2 ** 63) && n < 2 ** 63 ? I64(BigInt(n)) : -(1n << 63n)
+  Number.isFinite(n) && n >= -(2 ** 63) && n < 2 ** 63 ? I64(BigInt(Math.trunc(n))) : -(1n << 63n)
 
 /* ---------------- err registry (RT_ERR_BASE FNV, verbatim) ---------------- */
 

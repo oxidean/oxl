@@ -49,6 +49,8 @@ let g_failed: shared = nil // inject a creation error when nonzero
 
 let g_delay: shared = nil // ms to sleep before replying (cancel tests)
 
+let g_pending: shared = nil // in-flight delayed replies — stopped() holds
+
 let g_pumped: shared = nil // once-flag: the "pump" ledger entry logs once
 
 let g_viol: shared = nil // dead-target protocol violations recorded
@@ -65,6 +67,7 @@ fn backend() -> Mock {
     g_edges = nil
     g_failed = mkshared(0)
     g_delay = mkshared(0)
+    g_pending = mkshared(0)
     g_pumped = mkshared(0)
     g_viol = mkshared(0)
     return m
@@ -351,11 +354,10 @@ fn (m Mock) exec(c: own gui.Cmd) {
             // exec runs under a vtable call and cannot suspend — the
             // delay rides a spawned task instead: same hold-the-reply
             // window, cancel-aware sleep, identical lost-reply path
+            sadd(g_pending, 1)
             spawn delayed_reply(m, c.reply, r2, h)
-        } else {
-            if !try_send(c.reply, r2) {
-                m.destroy(h)
-            }
+        } else if !try_send(c.reply, r2) {
+            m.destroy(h)
         }
         return
     }
@@ -483,7 +485,13 @@ fn (m Mock) pump_edge() -> chan {
 }
 
 fn (m Mock) stopped() -> int {
-    return sget(m.stopf)
+    if sget(m.stopf) == 0 {
+        return 0
+    }
+    if sget(g_pending) > 0 {
+        return 0
+    }
+    return 1
 }
 
 fn (m Mock) pump_fin() {
@@ -498,6 +506,7 @@ fn delayed_reply(m: Mock, reply: chan own gui.CmdResult, r2: own gui.CmdResult, 
     if !try_send(reply, r2) {
         m.destroy(h)
     }
+    sadd(g_pending, -1)
 }
 
 // live-handle sweep — pump does not return with live handles.

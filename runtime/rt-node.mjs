@@ -51,7 +51,11 @@ export function install(api) {
 
   // byte-exact stdout/stderr — fds 1/2 verbatim
   env.write = (fd, u8, off, len) => {
-    fs.writeSync(fd, u8.subarray(off, off + len))
+    // writeSync may write fewer bytes than asked on pipes — loop or
+    // the tail of a print to a captured stdout silently drops
+    let p = off
+    const end = off + len
+    while (p < end) p += fs.writeSync(fd, u8, p, end - p)
   }
   env.argv = process.argv.slice(1) // [script, ...args] — argv(0)=program
   env.setExitCode = (c) => {

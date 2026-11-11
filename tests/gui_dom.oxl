@@ -42,6 +42,36 @@ fn app_main(events: chan own gui.Event) {
         gui.stop()
         return
     }
+    // creation-time props must read back — the backend registers the
+    // handle before applying props or set_prop flags a dead target
+    [bp, be] = gui.read_prop(b.handle(), gui.P_TEXT)
+    bt := ""
+    match bp {
+        gui.PropVal.Text(s0) => {
+            bt = s0
+        }
+        _ => {
+        }
+    }
+    if be != nil || bt != "add" {
+        println("button creation text err")
+        gui.stop()
+        return
+    }
+    [lp, le] = gui.read_prop(lb.handle(), gui.P_TEXT)
+    lt := ""
+    match lp {
+        gui.PropVal.Text(s1) => {
+            lt = s1
+        }
+        _ => {
+        }
+    }
+    if le != nil || lt != "ready" {
+        println("label creation text err")
+        gui.stop()
+        return
+    }
     // text prop round-trip through the element store
     en.set_text("write tests")
     [t, te] = en.text()

@@ -386,7 +386,12 @@ struct DBox { kind: str, msg: str, file: str, off: int }
 // analyzes unsaved text (Rust `over` in load_pkg)
 struct OverEnt { path: str, text: str, next: own OverEnt }
 
-struct ClChk { callees: own SList, seeded: int, next: own ClChk }
+struct ClChk {
+    callees: own SList,
+    mcalls: own SList,
+    seeded: int,
+    next: own ClChk,
+}
 
 struct It { node: own parser.Node, mod: str, file: str }
 
@@ -4495,8 +4500,22 @@ fn ret_susp(ck: ref Ck, vals: ref parser.NList) -> bool {
 // check_closures because the susp set only exists post-fixpoint.
 fn closure_expr(ck: mut Ck, params: ref parser.NList, body: ref parser.Node, env: mut Env) -> int {
     // deferred susp scan — collect callees + seeded before checking body
-    cc := new(ClChk{callees: nil, seeded: 0, next: nil})
+    cc := new(ClChk{callees: nil, mcalls: nil, seeded: 0, next: nil})
     cl_scan_node(ck, body, cc)
+    ml := cc.mcalls
+    for ml != nil {
+        i := find(ml.v, ".")
+        if i > 0 {
+            t := env_get(ck, env, substr(ml.v, 0, i))
+            if t >= 0 {
+                mt := method_target(ck, t, substr(ml.v, i + 1, len(ml.v)))
+                if mt.k != 0 {
+                    cc.callees = scons(mt.q, cc.callees)
+                }
+            }
+        }
+        ml = ml.next
+    }
     cc.next = ck.clcks
     ck.clcks = cc
     let ps: own IList = nil
@@ -4558,6 +4577,19 @@ fn cl_scan_expr(ck: mut Ck, e: ref parser.Node, cc: mut ClChk) {
                 }
             } else {
                 cl_scan_expr(ck, f, cc)
+            }
+            match f {
+                parser.Node.Field{obj, name} => {
+                    match obj {
+                        parser.Node.Name{n} => {
+                            cc.mcalls = scons(n + "." + name, cc.mcalls)
+                        }
+                        _ => {
+                        }
+                    }
+                }
+                _ => {
+                }
             }
             al := args
             for al != nil {

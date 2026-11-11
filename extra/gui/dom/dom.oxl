@@ -54,6 +54,10 @@ extern fn oxl_dom_set_edge(c: chan)
 
 extern fn oxl_dom_tag(h: int) -> cstr
 
+extern fn oxl_dom_kids(h: int) -> int
+
+extern fn oxl_dom_kid(h: int, i: int) -> int
+
 extern fn oxl_dom_style(h: int, name: str, v: str)
 
 extern fn rt_str_free(s: str)
@@ -190,6 +194,7 @@ fn (d Dom) new(kind: gui.WidgetKind, props: own []gui.Prop) -> [int, err] {
     if h == 0 {
         return 0, errors.new("gui/dom: element create failed")
     }
+    al_add(h)
     if props != nil {
         i := 0
         for i < len(props) {
@@ -197,7 +202,6 @@ fn (d Dom) new(kind: gui.WidgetKind, props: own []gui.Prop) -> [int, err] {
             i = i + 1
         }
     }
-    al_add(h)
     // listeners per the kind contract — delivery still goes through
     // the event queue, so an unfired listener is inert
     match kind {
@@ -264,6 +268,19 @@ fn (d Dom) destroy(h: int) {
     if al_has(h) == 0 {
         sadd(g_viol, 1)
         return
+    }
+    d.destroy_tree(h)
+}
+
+// kid 0's index slides as each subtree detaches — one fresh lookup per
+// level keeps the walk simple under DOM-mutating destroys
+fn (d Dom) destroy_tree(h: int) {
+    for oxl_dom_kids(h) > 0 {
+        k := oxl_dom_kid(h, 0)
+        if k == 0 {
+            break
+        }
+        d.destroy_tree(k)
     }
     al_del(h)
     oxl_dom_destroy(h)

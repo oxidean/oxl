@@ -4,6 +4,9 @@ on:
   push:
     branches: [main]
   pull_request:
+    # edited re-fires the gate on title/body changes — otherwise a
+    # post-green metadata edit could land attribution unchecked.
+    types: [opened, synchronize, reopened, edited]
 
 permissions:
   contents: read

@@ -88,6 +88,9 @@ for why the abstraction doesn't foreclose one.
 
 ## R — package registry — FOLDED INTO E
 
+*(letter later reclaimed by the type-descriptors milestone —
+`docs/specs/2026-11-11-type-descriptors/`)*
+
 *2026-11-08:* rescoped to a **git-backed index** and folded into
 milestone E (stages E3–E5). `oxl get` consults the index via
 `OXLMODINDEX` with direct-git fallback; `oxl publish` appends index
@@ -120,6 +123,7 @@ scheduled.
 ## Sequence
 
 ```
-T (shipped) ──► E ──► G        (R, P absorbed into E)
+T (shipped) ──► E ──► G        (registry-R, P absorbed into E;
+                                R letter reused by type descriptors)
 └── LLVM, web, D4, stdlib-list: parked on triggers
 ```

@@ -20,9 +20,10 @@ you want verdicted, and again after the last fix commit.
       precedent — NOT a callable generic, params bind only from
       args); `rt_desc_*` descriptor accessors (the lazy read lane
       `Type`/`Field` methods wrap), `rt_field_*` extern read AND
-      `rt_field_set_*` write helpers (kind-checked byte access at
-      `addr+off` — the write half is specced up front because
-      R4–R6 decode through it); parity test
+      `rt_field_set_*` write helpers (raw typed access at
+      `addr+off` — the externs see no descriptors, so kind checking
+      lives in std/reflect's dispatch, R2; the write half is specced
+      up front because R4–R6 decode through it); parity test
       `tests/desc_parity.oxl` asserting
       name/kind/size/fields/offsets/variants for fixture struct and
       enum types under both drivers, wired into `tests/run.sh`.

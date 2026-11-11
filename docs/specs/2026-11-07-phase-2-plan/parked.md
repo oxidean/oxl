@@ -14,12 +14,11 @@ firing moves the item into the milestone map via a new work item.
 
 ## Web compilation target (JS/HTML/CSS)
 
-- **Why parked:** design doc defers it; shipping a JS target without a
-  DOM-shaped UI layer produces a second-class target.
-- **Reopen trigger:** milestone G lands and the widget tree is
-  DOM-mappable as required.
-- **Guardrail (active):** the GUI abstraction must not foreclose a DOM
-  backend — reviewed at G's spec time.
+- **Status: trigger fired.** Milestone G landed and the widget tree
+  proved DOM-mappable — implementation is in flight on the
+  milestone-W workstream (spec
+  `docs/specs/2026-11-10-web-target/`). The guardrail's job is done;
+  this section retires when W merges.
 
 ## D4 shape-based generics
 

@@ -48,6 +48,9 @@ Milestone map: [docs/specs/2026-11-07-phase-2-plan/](../specs/2026-11-07-phase-2
   `TypeDesc` table, `std/reflect` lite, `fmt %v` (#28), typed
   `errors.As` (#27), then `gob`/`xml`/`template`/`sql` — spec:
   `docs/specs/2026-11-11-type-descriptors/`
+- **W — web/JS compilation target**: in flight — `--target js`,
+  JS runtime + emitter, `extra/gui/dom` backend, `web-todo`
+  reference app; spec: `docs/specs/2026-11-10-web-target/`
 - Parked on triggers: LLVM backend (behind the `interfaces.md`
   codegen seam), D4 shape-generics, parked-stdlib list
 

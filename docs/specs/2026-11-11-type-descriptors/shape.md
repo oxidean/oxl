@@ -100,6 +100,7 @@ resolved per monomorphized instantiation.**
 // or str backing has to be fabricated in-callee.
 struct Type  { td: int }                       // descriptor idx
 struct Field { td: int, i: int }               // descriptor + field idx
+struct Variant { td: int, i: int }             // descriptor + variant idx
 struct Value { td: int, addr: int }            // opaque; scope-bound
 
 fn type_of(t) -> Type                        // builtin special form —
@@ -130,6 +131,18 @@ fn (t Type) field(i: int) -> Field           // {td, i}
 fn (t Type) elem() -> Type                   // rt_desc_elem
 fn (t Type) nvars() -> int                   // rt_desc_nvars
 fn (t Type) varname(i: int) -> str           // rt_desc_var
+fn (t Type) variant(i: int) -> Variant       // {td, i}
+fn (x Variant) name() -> str                 // rt_desc_var
+fn (x Variant) nfields() -> int              // rt_desc_v_nfields —
+                                             // positional payload slots
+fn (x Variant) ftyp(i: int) -> Type          // {rt_desc_v_f_td}
+fn (x Variant) foff(i: int) -> int           // rt_desc_v_f_off — relative
+                                             // to the union blob base
+fn (v Value) tag() -> [int, err]             // ENUM only — reads the tag
+                                             // slot; the union blob
+                                             // begins at addr + 8 (the
+                                             // i64 tag), and Variant
+                                             // foff()s index from there
 fn (f Field) name() -> str                   // rt_desc_f_name
 fn (f Field) off() -> int                    // rt_desc_f_off
 fn (f Field) typ() -> Type                   // {rt_desc_f_td}

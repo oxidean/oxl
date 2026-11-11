@@ -22,9 +22,23 @@ TypeDesc {
   nvars:  int           // enum variant count (0 elsewhere)
   vars:   VariantDesc*  // enums only; NULL elsewhere
 }
-VariantDesc { name: cstr }
-FieldDesc { name: cstr, off: int, td: int, tag: cstr }
+VariantDesc { name: cstr, nfields: int, fields: FieldDesc* }
+FieldDesc { name: cstr, off: int, td: int, tag: cstr, ptr: int }
 ```
+
+`VariantDesc.fields` describes a variant's positional payload
+slots as anonymous `FieldDesc` entries (`name` is `""`, `off` is
+relative to the union blob's base). Payload-carrying enums are
+walkable end to end: `%v` prints `circle(3.0)`, gob/XML round-trip
+them, and `reflect` exposes them — a name-only variant table would
+make every payload invisible to all three consumers.
+
+`FieldDesc.ptr` is `1` when the declared field type carries `own`
+(the only qualifier legal in field position — `ref`/`mut` can't be
+heap-stored): the slot then holds a pointer to `td`'s layout, so
+`field(i)` dereferences the slot once and yields the pointee
+`Value`. A nil `own` slot yields `err_nil` — never a read of a
+zeroed address. `ptr` is `0` everywhere else.
 
 `kind` values: `INT, FLOAT, BOOL, STR, BYTE, SLICE, MAP, STRUCT,
 PTR, CHAN, IFACE, FN, ERR, ENUM, VOID` — order frozen once R1 lands
@@ -42,7 +56,7 @@ element-desc slot for ptr and chan shapes.
 | int/float/bool/str/byte                 | INT/FLOAT/BOOL/STR/BYTE | one `float` (C `double`) — no f32/f64 split |
 | struct                                  | STRUCT  | fields per decl order          |
 | `[]T`                                   | SLICE   | `elem` → T's desc              |
-| `own T` / `ref T` / `mut T` qualifiers  | (wrapped) | ownership qualifiers don't change layout — `tdesc(own T)` resolves to the wrapped T's desc, so no PTR row is produced for them |
+| `own T` / `ref T` / `mut T` qualifiers  | (wrapped) | `tdesc(own T)` resolves to the wrapped T's desc — the VALUE is a T. Struct fields declared `own T` keep the wrapped desc too, but set `FieldDesc.ptr` so the walk dereferences the pointer slot once |
 | `chan T`                                | CHAN    | `elem` → T's desc; reads opaque |
 | iface                                   | IFACE   | reads opaque — no path to the concrete payload (RtIface carries no td); `sprintv`/`gob` on an iface-typed T see only IFACE |
 | `fn`                                    | FN      | reads opaque                   |
@@ -125,6 +139,10 @@ extern fn rt_desc_f_name(td: int, i: int) -> str
 extern fn rt_desc_f_off(td: int, i: int) -> int
 extern fn rt_desc_f_td(td: int, i: int) -> int
 extern fn rt_desc_f_tag(td: int, i: int) -> str // "" when absent
+extern fn rt_desc_f_ptr(td: int, i: int) -> int // 1: slot is a ptr
+extern fn rt_desc_v_nfields(td: int, vi: int) -> int   // enum payload
+extern fn rt_desc_v_f_td(td: int, vi: int, fi: int) -> int
+extern fn rt_desc_v_f_off(td: int, vi: int, fi: int) -> int
 ```
 
 All are trivial C; the ONLY unsafe surface is inside `std/reflect`
@@ -158,7 +176,9 @@ mismatches return a `reflect.err_kind` err code, never garbage.
 
 `SLICE` values are walkable: `v.len()` reads the slice header's
 `len`, `v.index(i)` yields a scope-bound `Value` at
-`data + i*elem.size`. The contract pins the emitted header layout
+`data + i*elem.size`. `index` rejects `i < 0 || i >= v.len()` with
+`err_oob` BEFORE the address math — the emitted address must never
+leave the slice's data window. The contract pins the emitted header layout
 — `RtSlice{ptr:int, len:int, cap:int, heap:int}` (`rt.h`) — as the
 read surface; both drivers already agree since they share the C
 layout. `CHAN`, `FN`, and `IFACE` kind values are read-opaque:

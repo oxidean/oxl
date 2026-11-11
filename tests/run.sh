@@ -72,8 +72,10 @@ with_timeout() {
 # dies even when a probe fails mid-suite
 scratch=$(mktemp -d)
 srv_pid=""
+relsrv=""
 cleanup() {
     if [ -n "$srv_pid" ]; then kill "$srv_pid" 2>/dev/null || true; fi
+    if [ -n "$relsrv" ]; then kill "$relsrv" 2>/dev/null || true; wait "$relsrv" 2>/dev/null || true; fi
     # v2's sealed module-cache slots are read-only — restore write
     # permission or rm leaves them behind
     chmod -R u+w "$scratch" 2>/dev/null
@@ -1864,7 +1866,7 @@ printf '#!/bin/sh\necho "FAKE 9.9.9 $@"\n' > "$reldir/work/oxl-toolchain/oxl"
 chmod +x "$reldir/work/oxl-toolchain/oxl"
 tar czf "$reldir/download/v9.9.9/$tch_asset" -C "$reldir/work" oxl-toolchain
 if have_sum=$(command -v sha256sum 2>/dev/null); then
-    (cd "$reldir/download/v9.9.9" && sha256sum "$tch_asset" > "$tch_asset.sha256")
+    (cd "$reldir/download/v9.9.9" && "$have_sum" "$tch_asset" > "$tch_asset.sha256")
 elif command -v shasum >/dev/null 2>&1; then
     (cd "$reldir/download/v9.9.9" && shasum -a 256 "$tch_asset" > "$tch_asset.sha256")
 fi
@@ -1914,7 +1916,7 @@ printf '#!/bin/sh\necho "FAKE 9.9.7 $@"\n' > "$reldir2/work/oxl-toolchain/oxl"
 chmod +x "$reldir2/work/oxl-toolchain/oxl"
 tar czf "$reldir2/download/v9.9.7/$tch_asset" -C "$reldir2/work" oxl-toolchain
 if have_sum=$(command -v sha256sum 2>/dev/null); then
-    (cd "$reldir2/download/v9.9.7" && sha256sum "$tch_asset" > "$tch_asset.sha256")
+    (cd "$reldir2/download/v9.9.7" && "$have_sum" "$tch_asset" > "$tch_asset.sha256")
 elif command -v shasum >/dev/null 2>&1; then
     (cd "$reldir2/download/v9.9.7" && shasum -a 256 "$tch_asset" > "$tch_asset.sha256")
 fi
@@ -1958,10 +1960,11 @@ PY
 relsrv=$!
 for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$scratch/relserve.port" ] && break; sleep 0.2; done
 relport=$(cat "$scratch/relserve.port")
+rc=0
 out=$(OXL_HOME="$tch2" OXL_RELEASE_BASE="http://127.0.0.1:$relport/releases" \
-    "$SHIM2" toolchain install latest 2>&1)
-rc=$?
+    "$SHIM2" toolchain install latest 2>&1) || rc=$?
 kill "$relsrv" 2>/dev/null || true; wait "$relsrv" 2>/dev/null || true
+relsrv=""
 [ "$rc" = 0 ] && grep -q "installed v9.9.7" <<<"$out" \
     && [ -x "$tch2/versions/v9.9.7/oxl-toolchain/oxl" ] || {
     echo "FAIL latest pagination: rc=$rc $out"; exit 1; }

@@ -101,12 +101,15 @@ fn newreader(b: []byte) -> [Reader, err] {
         nl := binary.le_u16(z.data, p + 28)
         el := binary.le_u16(z.data, p + 30)
         cl := binary.le_u16(z.data, p + 32)
-        if p + 46 + nl + el + cl > len(z.data) {
+        if p + 46 + nl + el + cl > cdoff + cdsize {
             return z, errors.new("zip: truncated central directory")
         }
         f := File{name: z.data[p + 46:p + 46 + nl] as str, meth: binary.le_u16(z.data, p + 10), flags: binary.le_u16(z.data, p + 8), crc: binary.le_u32(z.data, p + 16), csize: binary.le_u32(z.data, p + 20), usize: binary.le_u32(z.data, p + 24), mtime: binary.le_u16(z.data, p + 12), mdate: binary.le_u16(z.data, p + 14), lho: binary.le_u32(z.data, p + 42), dir: 0}
         if nl > 0 && z.data[p + 46 + nl - 1] == 47 {
             f.dir = 1
+        }
+        if f.csize == 4294967295 || f.usize == 4294967295 {
+            return z, errors.new("zip: zip64 member unsupported")
         }
         z.files = push(z.files, f)
         p = p + 46 + nl + el + cl
@@ -150,7 +153,7 @@ fn (z ref Reader) open(i: int) -> [own []byte, err] {
         return nil, errors.new("zip: bad member index")
     }
     f := z.files[i]
-    if (f.flags & 1) != 0 {
+    if (f.flags & 65) != 0 {
         return nil, errors.new("zip: encrypted member")
     }
     if f.meth != 0 && f.meth != 8 {

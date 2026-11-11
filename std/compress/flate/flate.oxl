@@ -750,7 +750,9 @@ fn (d mut Reader) read(b: []byte) -> [int, err] {
 /// here; without it those bytes would be stranded inside the pump.
 /// Only meaningful once read() has reported io.eof, and only whole
 /// bytes — partial bits were already dropped by the align at stream
-/// end.
+/// end. take()'s rest-state keeps nbits < 8, so the bitbuf half of
+/// this loop is unreachable in practice — whole bytes only ever
+/// wait in sbuf; the loop stays as the drain's honest shape.
 fn (d mut Reader) drain(b: []byte) -> [int, err] {
     n := 0
     for n < len(b) && d.nbits >= 8 {

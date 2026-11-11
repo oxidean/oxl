@@ -322,6 +322,11 @@ fn (t mut Reader) parse(b: []byte) -> [Header, err] {
         h.devminor = dmin
         pre := nulstr(b[345:500])
         if len(pre) > 0 {
+            // prefix(<=155) + '/' + name(<=100) can reach 256 —
+            // POSIX caps the reassembled name at 255
+            if len(pre) + 1 + len(h.name) > 255 {
+                return h, errors.new("tar: name too long")
+            }
             h.name = pre + "/" + h.name
         }
     }
@@ -810,6 +815,9 @@ fn (t mut Writer) writeheader(h: Header) -> err {
     if tf == 0 {
         tf = TREG
     }
+    if tf < 0 || tf > 255 {
+        return errors.new("tar: typeflag out of range")
+    }
     b[156] = tf
     e = putstr(b, 157, 100, h.linkname)
     if e != nil {
@@ -882,7 +890,7 @@ fn (t mut Writer) write(b: []byte) -> [int, err] {
     }
     n := len(b)
     if n > t.left {
-        n = t.left
+        return 0, errors.new("tar: write exceeds declared entry size")
     }
     sent := 0
     for sent < n {

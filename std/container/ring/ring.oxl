@@ -19,8 +19,9 @@ fn span() -> int {
 // link/unlink move elements between arenas rather than aliasing
 // them — Go's shared-cycle pointer semantics have no `own`
 // equivalent, so the moved elements' values splice across and the
-// consumed ring dies with its handle. Removed nodes recycle
-// through a freelist like std/container/list's.
+// consumed ring dies with its handle; self-linking a ring into
+// itself is unrepresentable for the same reason. Removed nodes
+// recycle through a freelist like std/container/list's.
 //
 // Payloads are int only in v0 (see std/collections for the same call).
 //
@@ -239,7 +240,7 @@ fn (r mut Ring) grow() {
 /// A dead i returns -1 and still consumes s — `own` can't be handed
 /// back, so the failed call destroys the ring.
 ///
-/// An EMPTY ring (r.n == 0 — a zero-value or fully drained one)
+/// An EMPTY ring (r.n == 0 — a zero-value ring)
 /// has no anchor to splice behind, so link adopts s's cycle
 /// wholesale and returns the adopted head. Go's `var r Ring;
 /// r.Link(s)` lazy-inits r to a self-singleton and splices s after

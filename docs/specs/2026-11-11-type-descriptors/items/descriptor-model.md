@@ -24,7 +24,7 @@ TypeDesc {
                        // already absolute
   nfields:int
   fields: FieldDesc*    // structs only; NULL elsewhere
-  elem:   int           // desc idx of element type: slice/chan/ptr
+  elem:   int           // desc idx of element type: slice/chan
   elem_ptr: int         // 1 when the element SLOT is a pointer to
                        // elem's layout (`[]own T`) — index(i) then
                        // derefs the slot like FieldDesc.ptr; 0 for
@@ -42,7 +42,8 @@ FieldDesc { name: cstr, off: int, td: int, tag: cstr, ptr: int }
 `FieldDesc` entries (`off` is relative to the union blob's base).
 Named payloads (`E.V{ a: t }`) keep their declared names — gob/xml
 need them for named-payload variants — and positional payloads get
-`name: ""`. Payload-carrying enums are
+synthesized names `f0`, `f1`, … so `%+v` and gob have a stable
+spelling rather than `""`. Payload-carrying enums are
 walkable end to end: `%v` prints `circle(3.0)`, gob/XML round-trip
 them (decode writes the tag through the `rt_field_set_i32` lane on
 `v.addr` — `v.set_tag(i)` — then payload slots through
@@ -73,7 +74,8 @@ PTR, CHAN, IFACE, FN, ERR, ENUM, VOID` — order frozen once R1 lands
 `MAP` stays in the frozen order but R1 emits no MAP descriptors:
 the language's map is the concrete `collections.Map` struct, which
 describes as STRUCT over its own internals. `elem` doubles as the
-element-desc slot for ptr and chan shapes.
+element-desc slot for chan shapes; PTR leaves it unset — the only
+v1 PTR row is `cstr`, which has no element type to describe.
 
 `Ty` → `kind` mapping (anything not listed can't be named by
 `tdesc` — the checker rejects it at fold time):
@@ -91,6 +93,17 @@ element-desc slot for ptr and chan shapes.
 | enum                                    | ENUM    | `{tag:int, union blob}` layout; `vars` names variants for `%v` |
 | `cstr`                                  | PTR     | raw `char*` — the only PTR row v1 produces |
 | `Scope`, bare `shared`                  | VOID    | emitted as opaque rows so `tdesc` stays total; reads rejected (`shared` is a non-generic atomic cell, not a `Shared[T]` parametric) |
+
+Enum correspondence is pinned: the emitted tag value IS the
+variant's index into `vars[]` — variants emit in decl order and
+tags count in the same order, so `v.tag()` selects
+`variant(v.tag())` directly.
+
+Table linkage follows the demand rule end to end: a program naming
+no `tdesc` emits no table AND references no `rt_desc_*`/`rt_field_*`
+symbol — the externs emit only where called, so descriptor-free
+programs link identically to today (the dead-code discipline
+already stated for the table itself).
 
 `tag` holds the field-tag string (`xml:"name"`, `gob:"-"`) — NULL
 when absent; needed by R5's xml and R4's gob name overrides. R1 emits
@@ -141,7 +154,8 @@ backing that could never be returned from a callee.
 
 ## Value reads — the one unsafe seam
 
-`reflect.Value{td, addr, mut}` is constructed only by
+`reflect.Value{td, addr, w}` (`w` — the write bit; `mut` is a
+keyword and can't name a field) is constructed only by
 `value_of`/`value_of_mut`, which are compiler-lowered intrinsics:
 `value_of[T](v: ref T)` emits `Value{tdesc(T), (int64_t)v, 0}` —
 there is no other way to turn a reference into an address (no
@@ -149,14 +163,23 @@ there is no other way to turn a reference into an address (no
 generic externs are not a surface R opens). "Only the intrinsics"
 is enforced: the language has no private fields, so the
 scope-bound flag additionally rejects `reflect.Value{...}`
-struct literals AND field writes on a `Value` outside
-`std/reflect` — `v.addr`/`v.mut` are public ints, so either
-lane would otherwise mint an address/writability the intrinsics
-never blessed (field reads stay open). The `poke8`/`poke16`/
-`poke32` builtins already write arbitrary memory by design, so
-the guard protects the `td`↔`addr` invariant the kind-checked
-lanes rely on, not the address space. Field walks add `off` to
-`addr` and propagate `mut`; reads go through externs that
+struct literals outside `std/reflect` — fabrication would
+otherwise be arbitrary-memory access. The flag makes `Value`
+**field-opaque** there too: `v.addr = x` on a `Value` var bypasses
+the literal ban while fabricating the same access, so stores to
+AND reads of `Value`'s fields are rejected outside `std/reflect`
+(inside it they stay ordinary ints for the extern calls). Field
+walks add `off` to `addr` and propagate `w`; reads go through
+externs that The same flag marks `Type`,
+`Field`, and `Variant` non-constructible by struct literal and
+field-opaque outside `std/reflect`: they are the same kind of
+forgeable handle — `Type{td: <any int>}` mints a descriptor index
+out of thin air, and without the ban every `rt_desc_*` accessor
+reached through it is an arbitrary-offset read (`t.name()` →
+`rt_desc_name(999999)` → `desc_tab[999999].name` — a pointer
+deref then `rt_str` over arbitrary memory). Reads of a forged
+handle's fields are equally non-load-bearing — nothing outside
+`std/reflect` spells `t.td` at all.
 interpret `addr` per the desc's kind:
 
 Field reads — trivial C loads interpreting `addr` per the desc's kind:
@@ -195,11 +218,17 @@ table index + read + (for strs) an rt-str build over the stored
 cstr:
 
 ```
+extern fn rt_desc_count() -> int             // emitted table length — the
+                                             //  bounds bound for every td
+                                             //  arg below
 extern fn rt_desc_name(td: int) -> str
 extern fn rt_desc_kind(td: int) -> int
 extern fn rt_desc_size(td: int) -> int
 extern fn rt_desc_nfields(td: int) -> int
-extern fn rt_desc_elem(td: int) -> int          // -1 when absent
+extern fn rt_desc_elem(td: int) -> int          // -1 when absent — the
+                                              //  public elem() is pair-shaped:
+                                              //  -1 → err_kind, never
+                                              //  Type{td:-1}
 extern fn rt_desc_nvars(td: int) -> int
 extern fn rt_desc_var(td: int, i: int) -> str
 extern fn rt_desc_f_name(td: int, i: int) -> str
@@ -208,29 +237,26 @@ extern fn rt_desc_f_td(td: int, i: int) -> int
 extern fn rt_desc_f_tag(td: int, i: int) -> str // "" when absent
 extern fn rt_desc_f_ptr(td: int, i: int) -> int // 1: slot is a ptr
 extern fn rt_desc_v_nfields(td: int, vi: int) -> int   // enum payload
+extern fn rt_desc_v_f_name(td: int, vi: int, fi: int) -> str
+                                             // decl name; "" when the
+                                             //  payload slot is positional
 extern fn rt_desc_v_f_td(td: int, vi: int, fi: int) -> int
 extern fn rt_desc_v_f_off(td: int, vi: int, fi: int) -> int
-extern fn rt_desc_v_f_name(td: int, vi: int, fi: int) -> str
-                                             // "" for positional slots
-extern fn rt_desc_v_base(td: int) -> int     // union blob base offset —
-                                             // codegen-pinned offsetof(u);
-                                             // NOT a fixed constant (tag is
-                                             // C `int` 4B; alignment varies)
-extern fn rt_desc_alloc(td: int) -> int      // decode lane's object mint —
-                                             // zeroed rt_alloc_own of the
-                                             // desc's `size`, returned as
-                                             // the raw address; store into
-                                             // an own field slot via
-                                             // rt_field_set_ptr, then walk
-                                             // it as {td, addr, mut:1}
-```
-
-All are trivial C; the ONLY unsafe surface is inside `std/reflect`
-(`unsafe` blocks around the addr arithmetic). The emitted `align`
-field is for the parity test and external ABI readers — rt
-helpers do no align math (offsets are already absolute) and no
-oxl-side accessor is needed.
-
+extern fn rt_desc_v_f_ptr(td: int, vi: int, fi: int) -> int
+                                             // 1: payload slot is a ptr
+                                             //  (own/mut/ref-typed payload —
+                                             //  vfield derefs once, like
+                                             //  FieldDesc.ptr)
+field is for ABI consumers only (parity checks, external tools) —
+the C helpers do no align math, and no oxl-side accessor is
+needed. The `rt_desc_*`/`rt_desc_v_f_*`/
+`rt_desc_f_*` externs themselves bounds-check every index arg —
+`td`, `i`, `vi`, `fi` against the emitted table dimensions
+(`rt_desc_count` is emitted alongside the table) — and return
+the sentinel (`err_oob`-equivalent / `-1` / `""`) on violation.
+That keeps the flag's guarantee honest even for modules that
+redeclare the externs: a forged `td` read is UB the helpers
+refuse to perform, not just a shape user code can't spell.
 **`Value` lifetime is enforced, not conventional — via
 provenance, not the `ref` signature bans.** Three ints carry no
 borrow marker, so the checker can't rely on the `ref` rules
@@ -241,19 +267,23 @@ The pinned rule: `reflect.Value` is a **scope-bound type** — the
 flag attaches at the decl (the checker marks `std/reflect`'s
 `Value` struct by decl site; no marker syntax ships in v1) — a
 `Value` may be returned only when it derives from one of the
-function's `ref`/`mut`/`Value` parameters (the checker tracks
-Value provenance through assignments and `field`/`index`/`vfield`
-walks — new, Value-only machinery; today's borrow rules are
-type-position bans, not a provenance pass). A `Value`
+function's `ref`/`mut`/`Value` parameters (the checker gains a
+provenance pass for this: it tracks Value derivation through
+assignments and `field`/`index`/`vfield` walks — a new rule, not a
+reuse of an existing borrow-provenance pass, which does not
+exist). A `Value`
 derived from a *local* `own` — `c := new(v); return value_of(c)`
 is the real dangling case, since `p`-derived Values address
 caller-owned storage — may not be returned, and no `Value` of
 any provenance may be stored into a file-scope global, stored in
-`own`/heap shapes, or sent to `spawn` (param-derived Values
-dangle in those slots identically — return is the only escape
-the rule opens). `v.field(i)`/`v.index(i)`/`v.vfield(vi, fi)`
-yield scope-bound `Value`s deriving from `v`. Inside `std/reflect` this
-is enough machinery to write the whole walk; outside, a `Value`
+`own`/heap shapes, captured into a closure or fn-value that
+outlives the source scope, or sent to `spawn` (param-derived
+Values dangle in those slots identically — return is the only
+escape the rule opens; the checker's ordinary ref-capture ban
+does not reach a Value's bare ints, so the capture vector is
+spelled out explicitly). `v.field(i)`/`v.index(i)`/`v.vfield(vi, fi)`
+yield scope-bound `Value`s deriving from `v`. Inside `std/reflect`
+this is enough machinery to write the whole walk; outside, a `Value`
 can live only as long as its source's scope. Kind mismatches
 return a `reflect.err_kind` err code, never garbage. (`err_kind`,
 `err_oob`, `err_nil` are fns returning interned sentinels, the
@@ -272,11 +302,9 @@ return a `reflect.err_kind` err code, never garbage. (`err_kind`,
 
 `SLICE` values are walkable: `v.len()` reads the slice header's
 `len`, `v.index(i)` yields a scope-bound `Value` at
-`data + i*stride`, where `stride` is pointer size when `elem_ptr`
-is set (the slot holds a pointer to `elem`'s layout and derefs
-once, like `FieldDesc.ptr`) or `elem.size` for inline elements.
-`index` rejects `i < 0 || i >= v.len()` with
-`err_oob` BEFORE the address math — the emitted address must never
+`data + i*stride` where stride is the SLOT width — `elem.size`
+normally, pointer width (8) when `elem_ptr` is set, then the slot
+is dereferenced once to reach `elem`'s layout. `index` rejects `i < 0 || i >= v.len()` with`err_oob` BEFORE the address math — the emitted address must never
 leave the slice's data window. The contract pins the emitted header layout
 — `RtSlice{ptr:int, len:int, cap:int, heap:int}` (`rt.h`) — as the
 read surface; both drivers already agree since they share the C
@@ -284,6 +312,14 @@ layout. `CHAN`, `FN`, and `IFACE` kind values are read-opaque:
 `v.len()`/`v.index(i)`/typed reads on them return `err_kind`.
 `PTR` is not opaque — `v.str()` reads it through `rt_field_cstr`;
 `ERR` reads its code through `v.int()` (the i64 lane).
+
+## Target gating
+
+Under `--target js` the whole lane is a diagnostic, not silent
+codegen: `tdesc`/`tqual`/`type_of`/`value_of`/`value_of_mut` fold
+sites and `rt_desc_*`/`rt_field_*` extern declarations are rejected
+by both checkers/emitters (js-lane descriptors defer to their own
+trigger — `addr:int` + C loads don't port).
 
 ## Fixpoint parity
 

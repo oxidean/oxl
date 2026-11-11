@@ -5,7 +5,7 @@ Status: accepted (WI-0006) — 2026-11-11
 ## Decision
 
 Milestone R emits a `TypeDesc` table per program (name, kind, size,
-align, fields `{name, off, td, tag}`, elem/key) and resolves
+align, fields `{name, off, td, tag, ptr}`, elem/key) and resolves
 `tdesc(T)` at **monomorph time**: inside an instantiated generic
 body the bound `T` is concrete, so the intrinsic folds to a static
 descriptor index. `std/reflect` exposes `type_of`/`value_of`/
@@ -18,18 +18,25 @@ Spec-level forks resolved:
 1. **Monomorph-resolved descriptors over runtime type-id tags** —
    every consumer is a generic fn (`sprintv[T]`, `gob.encode[T]`,
    `errors.as[T]`); monomorphization already specializes per `T`, so
-   no `any` type, no value boxing, no per-allocation tag, no rt.c
-   layout change is needed. The rejected alternative (tagging every
+   no `any` type, no value boxing, no per-allocation tag, and no
+   change to *object* layout — rt.c still grows the `rt_desc_*`/
+   `rt_field_*` helpers unconditionally and R3 extends `RtErrEnt`
+   with `{td, pdata}` for the box lane, so "no rt.c change" is
+   true of value representation only. The rejected alternative (tagging every
    value) buys dispatch-time reflection nothing in this scope pays
    for.
 2. **Descriptors describe layout only** — no method tables (ifaces
    carry vtables), no value payloads (those live behind
-   `reflect.Value{td, addr}`).
+   `reflect.Value{td, addr, w}` — field-opaque outside
+   `std/reflect`, per the spec's fabrication rules).
 3. **One `unsafe` seam, confined to `std/reflect`** — `Value` reads
    via `rt_field_*` externs; `value_of` is a compiler-lowered
-   intrinsic and `Value` a scope-bound type (same escape rules as
-   borrowed `ref`s — no return, no heap store, no spawn escape), so
-   a `Value` provably cannot outlive its source.
+   intrinsic and `Value` a scope-bound type under a *new*
+   provenance pass (not the borrow rules — none exist to reuse):
+   param-derived Values may be returned, local-`own`-derived ones
+   may not, and no Value reaches a file-scope global, heap shape,
+   escaping closure, or `spawn` — so a `Value` provably cannot
+   outlive its source.
 4. **`err` stays int64; typed errors are additive `ErrBox`** — the
    descriptor tag on the box gives `errors.as[T]` the identity match
    Go gets from a dynamic type, without re-shaping the `err` chain.

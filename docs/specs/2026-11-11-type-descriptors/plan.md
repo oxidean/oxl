@@ -36,7 +36,10 @@ you want verdicted, and again after the last fix commit.
       only while check.oxl also bans `Ret::Pair`; the `type_of`
       builtin special form (type operand, `mkslice`
       precedent — NOT a callable generic, params bind only from
-      args); `rt_desc_*` descriptor accessors (the lazy read lane
+      args); the `--target js` diagnostic for all five
+      intrinsics + the rt externs (native-lane only, per the
+      contract's target gating); `rt_desc_*` descriptor accessors
+      (the lazy read lane
       `Type`/`Field` methods wrap, incl. `rt_desc_v_base` for the
       codegen-pinned union-blob offset — never a fixed +8,
       `rt_desc_v_f_name` for named payload slots, and
@@ -60,8 +63,7 @@ you want verdicted, and again after the last fix commit.
       for ptrs, scalar forms per kind, variant name for enums),
       `%+v` adds field names (`{f1:v1 f2:v2}`), `%T` the type
       name, `%#v` the source-literal form for the repr kinds that
-      have one.
-      `tests/fmt_v.oxl` + `tests/reflect.oxl` gate every kind,
+      have one.      `tests/fmt_v.oxl` + `tests/reflect.oxl` gate every kind,
       wired into `tests/run.sh`.
 - [ ] **R3 — typed error payloads (completes #27).** `std/errors`:
       `box[T any](v: T)` minting int64 codes backed by the rt err
@@ -91,8 +93,7 @@ you want verdicted, and again after the last fix commit.
       payloads live in the capped, never-freed `RtErrEnt`
       registry (`RT_ERR_MAX` 65536, no dedupe — `as` clears the
       slots it consumes but frees nothing), so `box` is for error
-      paths, not hot loops.
-      `tests/errors_as.oxl`: box → as round-trip incl. no-match
+      paths, not hot loops.      `tests/errors_as.oxl`: box → as round-trip incl. no-match
       and wrapped-chain cases, wired into `tests/run.sh`.
 - [ ] **R4 — `encoding/gob`.** Descriptor-driven struct → bytes →
       struct round-trip (the canonical hard consumer — if the walk
@@ -132,4 +133,8 @@ arbitrary-shape round-trip is the strongest correctness signal
 the walk machinery can get before it is spent on easier
 consumers. R3 is independent of R4–R6 and needs only R1
 (`tdesc` + the registry change) — it may land any time after R1,
-in parallel with R2.
+in parallel with R2. R1's `--target js` rejection assumes the
+W lane on main (`feat/milestone-w` owns `--target` parsing and
+the emit dispatch); if R1 lands first the diagnostic still
+belongs in both drivers' target dispatch and W's lane wires it
+on arrival.

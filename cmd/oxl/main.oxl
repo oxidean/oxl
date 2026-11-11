@@ -72,8 +72,13 @@ fn report_diags(diags: []check.DBox) {
 // .oxl files (the file-list rule); argi is where program args begin
 struct PkgArgs { fs: []str, argi: int }
 
-// driver-flag vocabulary shared by pkg_args and flag_bound — returns
-// tokens consumed, 0 when a is positional (the run-arg boundary)
+// driver-flag vocabulary shared by pkg_args and run's child-argv
+// scan — returns tokens consumed, 0 when a is not a driver flag.
+// Flags are driver vocabulary anywhere before `--` (never forwarded
+// to a run child): the documented `run f.oxl --target js` puts them
+// after the sources. `--` is the only program-arg boundary for
+// flag-shaped tokens — a program wanting `--html` in argv gets it
+// via `run f.oxl -- --html`.
 fn flag_toks(a: str) -> int {
     if a == "--target" || a == "-o" {
         return 2
@@ -82,25 +87,6 @@ fn flag_toks(a: str) -> int {
         return 1
     }
     return 0
-}
-
-// index of the first non-driver-flag arg (or `--`/argc) — `run` scopes
-// flag_value/has_flag/target_is_js to argv[2..bound) so the program's
-// own flags never hijack driver switches
-fn flag_bound() -> int {
-    i := 2
-    for i < argc() {
-        a := argv(i)
-        if a == "--" {
-            return i
-        }
-        n := flag_toks(a)
-        if n == 0 {
-            return i
-        }
-        i = i + n
-    }
-    return i
 }
 
 struct PkgSrc { dir: str, files: []str }
@@ -112,7 +98,10 @@ fn pkg_args(start: int) -> PkgArgs {
         a := argv(i)
         // driver flags interleave ahead of the sources — skip them
         // (and a separate value where the flag takes one); once the
-        // source list has begun a flag-shaped arg is program argv
+        // source list has begun, any further token ends it (flags
+        // after the sources stay driver vocabulary via flag_value,
+        // and run's child-argv scan strips them rather than ending
+        // the program's own args)
         if len(fs) == 0 {
             n := flag_toks(a)
             if n > 0 {
@@ -134,21 +123,12 @@ fn pkg_args(start: int) -> PkgArgs {
     return PkgArgs{fs: fs, argi: i}
 }
 
-// argv index where program args begin — cmd_run scopes flag reads to
-// argv[2..g_bound); other commands leave -1 (scan to `--` as before)
-let g_bound = -1
-
-fn flag_upto() -> int {
-    if g_bound >= 0 && g_bound < argc() {
-        return g_bound
-    }
-    return argc()
-}
-
-// `--target <v>` / `--target=<v>`; "" when absent
+// `--target <v>` / `--target=<v>`; "" when absent. Flag reads stop at
+// `--` — past that boundary argv belongs to the program, so a
+// `--target` the program carries can't hijack the driver's lane pick.
 fn flag_value(name: str) -> str {
     i := 2
-    for i + 1 < flag_upto() {
+    for i + 1 < argc() {
         a := argv(i)
         if a == "--" {
             break
@@ -160,7 +140,7 @@ fn flag_value(name: str) -> str {
     }
     pfx := name + "="
     i = 2
-    for i < flag_upto() {
+    for i < argc() {
         a := argv(i)
         if a == "--" {
             break
@@ -175,7 +155,7 @@ fn flag_value(name: str) -> str {
 
 fn has_flag(name: str) -> int {
     i := 2
-    for i < flag_upto() {
+    for i < argc() {
         a := argv(i)
         if a == "--" {
             break
@@ -638,10 +618,13 @@ fn js_html(out: str) -> str {
 }
 
 // `out` for the js lane: -o respected verbatim, else a.mjs beside the
-// native a.out default
+// native a.out default — the scan stops at `--` (program argv)
 fn js_out_name() -> str {
     i := 0
     for i < argc() {
+        if argv(i) == "--" {
+            break
+        }
         if argv(i) == "-o" {
             if i + 1 < argc() {
                 return argv(i + 1)
@@ -676,6 +659,9 @@ fn child_code(st: int, e: err) -> int {
 fn out_arg() -> str {
     i := 0
     for i < argc() {
+        if argv(i) == "--" {
+            break
+        }
         if argv(i) == "-o" {
             if i + 1 < argc() {
                 return argv(i + 1)
@@ -711,7 +697,6 @@ fn cmd_build() {
 }
 
 fn cmd_run() {
-    g_bound = flag_bound()
     pa := pkg_args(2)
     src := pkg_src(pa.fs)
     res := compile(src)
@@ -731,15 +716,27 @@ fn cmd_run() {
     } else if emit_and_cc(res.c, out, entry_dir(src)) == 0 {
         exit(1)
     }
-    // everything after the sources is the program's argv — with or
-    // without a `--` separator (seed cmd_run)
+    // everything after the sources is the program's argv — minus
+    // consumed driver flags (`f.oxl --target js` selects the lane
+    // without leaking the flag); `--` hands the rest over verbatim,
+    // the program's only way to carry a flag-shaped token
     ai := pa.argi
-    if ai < argc() && argv(ai) == "--" {
-        ai = ai + 1
-    }
     cargs := mkslice(str, 0)
+    dd := 0
     for ai < argc() {
-        cargs = push(cargs, argv(ai))
+        a := argv(ai)
+        if dd == 1 {
+            cargs = push(cargs, a)
+        } else if a == "--" {
+            dd = 1
+        } else {
+            n := flag_toks(a)
+            if n > 0 {
+                ai = ai + n
+                continue
+            }
+            cargs = push(cargs, a)
+        }
         ai = ai + 1
     }
     if target_is_js() == 1 {

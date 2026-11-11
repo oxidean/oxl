@@ -231,25 +231,25 @@ echo "== oxl test: compress & archive =="
 out=$("$OXL" test tests/compress_flate.oxl)
 printf '%s
 ' "$out" >&2
-for t in test_fixed test_stored test_dynamic test_multiblock test_empty test_truncated test_zlib test_zlib_stream test_zlib_badheader test_zlib_badadler; do
+for t in test_fixed test_stored test_dynamic test_multiblock test_mixedblocks test_empty test_truncated test_zlib test_zlib_stream test_zlib_badheader test_zlib_badadler test_coreturn test_zlib_shorttrailer; do
     grep -q "$t ... ok" <<<"$out" || { echo "FAIL flate/zlib: $out"; exit 1; }
 done
 out=$("$OXL" test tests/compress_gzip.oxl)
 printf '%s
 ' "$out" >&2
-for t in test_basic test_header_fields test_multimember test_badcrc test_badmagic test_truncated; do
+for t in test_basic test_header_fields test_multimember test_badcrc test_badmagic test_truncated test_fextra_fhcrc; do
     grep -q "$t ... ok" <<<"$out" || { echo "FAIL gzip: $out"; exit 1; }
 done
 out=$("$OXL" test tests/archive_tar.oxl)
 printf '%s
 ' "$out" >&2
-for t in test_roundtrip test_prefix_split test_pax_longname test_gnu_longname test_skip_payload; do
+for t in test_roundtrip test_prefix_split test_pax_longname test_gnu_longname test_skip_payload test_truncated_midheader test_truncated_member test_pax_badlen test_meta_oversize test_b256_size test_signed_checksum; do
     grep -q "$t ... ok" <<<"$out" || { echo "FAIL tar: $out"; exit 1; }
 done
 out=$("$OXL" test tests/archive_zip.oxl)
 printf '%s
 ' "$out" >&2
-for t in test_read test_open test_lookup test_corrupt; do
+for t in test_read test_open test_lookup test_corrupt test_open_badindex; do
     grep -q "$t ... ok" <<<"$out" || { echo "FAIL zip: $out"; exit 1; }
 done
 

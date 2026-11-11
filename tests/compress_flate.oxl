@@ -124,6 +124,21 @@ fn test_multiblock() {
     testing.expect_streq(out as str, "aaabbb", "multiblock payload")
 }
 
+// python: Z_FIXED block, Z_FULL_FLUSH, dynamic block (default
+// strategy on repetitive text), Z_FULL_FLUSH, Z_FIXED final block —
+// the second fixed block must re-arm the fixed tables, not inherit
+// the dynamic block's.
+fn test_mixedblocks() {
+    // 'HELLO ' + 'pack my box with five dozen liquor jugs. ' * 174
+    // + 'pack my box with five dozen liquorWORLD'
+    [out, e] = flate.inflate(hx_b("f270f5f1f15700000000ffffeccac90143501400c0565e057a2211be906f89b57a6d38cc9c672c5fdf18cea8f2117bfab7f1495b1def7cd5bfe8d3b4e639bab5598a1845511445511445511445511445511445511445517c7abc010000ffff0bf70ff2710100") as []byte)
+    ck(e, "inflate mixedblocks")
+    testing.expect_eq(len(out), 7179, "mixedblocks length")
+    testing.expect_streq(out[0:6] as str, "HELLO ", "mixedblocks prefix")
+    testing.expect_streq(out[6:47] as str, "pack my box with five dozen liquor jugs. ", "mixedblocks body unit")
+    testing.expect_streq(out[7140:7179] as str, "pack my box with five dozen liquorWORLD", "mixedblocks final fixed block")
+}
+
 fn test_empty() {
     // python: compressobj over b"" -> one fixed block, end mark only
     [out, e] = flate.inflate(hx_b("0300") as []byte)

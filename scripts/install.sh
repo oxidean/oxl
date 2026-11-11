@@ -309,7 +309,8 @@ tc_install() { # tag|latest
     # tmp+rename — a concurrent `resolve` must never read a torn file
     [ -f "$OXL_HOME/default-version" ] || {
         df="$OXL_HOME/.default-version.$$"
-        echo "$tag" > "$df" && mv "$df" "$OXL_HOME/default-version"
+        echo "$tag" > "$df" || die "cannot write $OXL_HOME/default-version"
+        mv "$df" "$OXL_HOME/default-version" || die "cannot write $OXL_HOME/default-version"
     }
 }
 
@@ -345,11 +346,13 @@ tc_use() {
     [ -d "$VERS/$tag" ] || die "$tag is not installed — \`oxl toolchain install $tag\` first"
     if [ "$local_tag" ]; then
         df="./.oxl-version.$$"
-        echo "$tag" > "$df" && mv "$df" .oxl-version
+        echo "$tag" > "$df" || die "cannot write .oxl-version"
+        mv "$df" .oxl-version || die "cannot write .oxl-version"
         echo "oxl: pinned $tag in ./.oxl-version"
     else
         df="$OXL_HOME/.default-version.$$"
-        echo "$tag" > "$df" && mv "$df" "$OXL_HOME/default-version"
+        echo "$tag" > "$df" || die "cannot write $OXL_HOME/default-version"
+        mv "$df" "$OXL_HOME/default-version" || die "cannot write $OXL_HOME/default-version"
         echo "oxl: default toolchain -> $tag"
     fi
 }
@@ -404,7 +407,8 @@ install it with:  oxl toolchain install $tag"
 exec "$exe" "$@"
 SHIM_EOF
     chmod +x "$OXL_HOME/bin/.oxl.tmp.$$" \
-        && mv "$OXL_HOME/bin/.oxl.tmp.$$" "$OXL_HOME/bin/oxl"
+        && mv "$OXL_HOME/bin/.oxl.tmp.$$" "$OXL_HOME/bin/oxl" \
+        || die "cannot write $OXL_HOME/bin/oxl"
     trap - EXIT
     echo "wrote $OXL_HOME/bin/oxl"
 }
@@ -426,7 +430,8 @@ case "$tag" in
 esac
 if [ ! -f "$OXL_HOME/default-version" ] || [ "$set_default" = 1 ]; then
     df="$OXL_HOME/.default-version.$$"
-    echo "$tag" > "$df" && mv "$df" "$OXL_HOME/default-version"
+    echo "$tag" > "$df" || die "cannot write $OXL_HOME/default-version"
+    mv "$df" "$OXL_HOME/default-version" || die "cannot write $OXL_HOME/default-version"
 fi
 
 cat <<EOF

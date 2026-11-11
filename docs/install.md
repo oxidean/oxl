@@ -29,9 +29,9 @@ export PATH="$HOME/.oxl/bin:$PATH"
   default-version          the fallback tag
 ```
 
-The installer needs `curl`, `tar`, and one sha256 tool — it tries
-`sha256sum`, `shasum -a 256`, then `openssl dgst -sha256`. It verifies
-the release's `.sha256` when one is published (new releases ship the
+The installer needs `curl` and `tar`. Checksum verification uses
+`sha256sum`, `shasum -a 256`, or `openssl dgst -sha256`, whichever is on
+`PATH`. It verifies the release's `.sha256` when one is published (new releases ship the
 sidecar; releases cut before it warn and skip). With no sha256 tool on
 `PATH` it warns and skips verification — install coreutils or openssl
 for a verified install. It never runs the toolchain — only unpacks it.
@@ -114,5 +114,5 @@ oxl build cmd/oxl -o target/oxl-self
 
 A source-built binary reports `oxl dev (language 0.3)` — no `RELEASE`
 file sits beside it. The version manager only manages release installs;
-a dev build lives outside `~/.oxl/versions/` and can be shadowed by
-putting it earlier on `PATH`.
+a dev build lives outside `~/.oxl/versions/` and can shadow the shim
+by sitting earlier on `PATH`.

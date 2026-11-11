@@ -2,6 +2,9 @@ package list
 
 import "std/errors"
 
+// SPAN — arena bound: handles pack gen*SPAN + idx (2^20).
+let SPAN = 1048576
+
 // std/container/list — Go's container/list: a doubly-linked list.
 //
 // Element handles are ints, not *Element: `ref`/`mut` may not be
@@ -58,10 +61,24 @@ fn newlist() -> own List {
 
 /// init resets l to the empty list in place — List.Init.
 fn (l mut List) init() {
-    l.ns = mkslice(Node, 0)
+    // Drain the arena to the freelist rather than dropping it:
+    // a fresh mkslice would restart every gen at 1 and let stale
+    // handles resurrect on the recycled slots — the "dead
+    // forever" contract needs gens monotone, so every slot
+    // bumps once and re-chains onto free.
+    l.free = -1
+    i := 0
+    for i < len(l.ns) {
+        l.ns[i].v = 0
+        l.ns[i].prev = -1
+        l.ns[i].live = 0
+        l.ns[i].gen = l.ns[i].gen + 1
+        l.ns[i].next = l.free
+        l.free = i
+        i = i + 1
+    }
     l.head = -1
     l.tail = -1
-    l.free = -1
     l.n = 0
 }
 
@@ -91,7 +108,7 @@ fn (l ref List) mkh(i: int) -> int {
         // Go's nil-Element on an empty list
         return -1
     }
-    return l.ns[i].gen * 1048576 + i
+    return l.ns[i].gen * SPAN + i
 }
 
 // ok reports whether i names a live element of this list. The
@@ -104,8 +121,8 @@ fn (l ref List) ok(i: int) -> bool {
     if i < 0 {
         return false
     }
-    idx := i % 1048576
-    return idx < len(l.ns) && l.ns[idx].live == 1 && l.ns[idx].gen == i / 1048576
+    idx := i % SPAN
+    return idx < len(l.ns) && l.ns[idx].live == 1 && l.ns[idx].gen == i / SPAN
 }
 
 /// next returns the handle after i, or -1 at the tail (or when i
@@ -114,7 +131,7 @@ fn (l ref List) next(i: int) -> int {
     if !l.ok(i) {
         return -1
     }
-    return l.mkh(l.ns[i % 1048576].next)
+    return l.mkh(l.ns[i % SPAN].next)
 }
 
 /// prev returns the handle before i, or -1 at the head —
@@ -123,7 +140,7 @@ fn (l ref List) prev(i: int) -> int {
     if !l.ok(i) {
         return -1
     }
-    return l.mkh(l.ns[i % 1048576].prev)
+    return l.mkh(l.ns[i % SPAN].prev)
 }
 
 /// val returns element i's payload — Element.Value. A dead handle
@@ -132,7 +149,7 @@ fn (l ref List) val(i: int) -> int {
     if !l.ok(i) {
         return 0
     }
-    return l.ns[i % 1048576].v
+    return l.ns[i % SPAN].v
 }
 
 /// setval writes element i's payload; a dead handle is a no-op.
@@ -140,7 +157,7 @@ fn (l mut List) setval(i: int, v: int) {
     if !l.ok(i) {
         return
     }
-    l.ns[i % 1048576].v = v
+    l.ns[i % SPAN].v = v
 }
 
 // alloc recycles a freelist node before growing the arena — churn
@@ -161,8 +178,8 @@ fn (l mut List) alloc(v: int) -> int {
         l.free = l.ns[i].next
     } else {
         // SPAN bound — a 2^20th slot's handle would pack
-        // gen*1048576 + 1048576 and unpack back to slot 0
-        assert(len(l.ns) < 1048576)
+        // gen*SPAN + SPAN and unpack back to slot 0
+        assert(len(l.ns) < SPAN)
         i = len(l.ns)
         l.ns = push(l.ns, Node{v: 0, prev: -1, next: -1, live: 0, gen: 1})
     }
@@ -170,7 +187,7 @@ fn (l mut List) alloc(v: int) -> int {
     l.ns[i].prev = -1
     l.ns[i].next = -1
     l.ns[i].live = 1
-    return l.ns[i].gen * 1048576 + i
+    return l.ns[i].gen * SPAN + i
 }
 
 // splice links node i between a and b — the only pointer fixup in
@@ -213,7 +230,7 @@ fn (l mut List) unlink(i: int) {
 /// List.PushFront.
 fn (l mut List) pushfront(v: int) -> int {
     i := l.alloc(v)
-    l.splice(i % 1048576, -1, l.head)
+    l.splice(i % SPAN, -1, l.head)
     l.n = l.n + 1
     return i
 }
@@ -222,7 +239,7 @@ fn (l mut List) pushfront(v: int) -> int {
 /// List.PushBack.
 fn (l mut List) pushback(v: int) -> int {
     i := l.alloc(v)
-    l.splice(i % 1048576, l.tail, -1)
+    l.splice(i % SPAN, l.tail, -1)
     l.n = l.n + 1
     return i
 }
@@ -234,7 +251,7 @@ fn (l mut List) insertbefore(v: int, mark: int) -> [int, err] {
         return -1, errors.new("container/list: dead handle")
     }
     i := l.alloc(v)
-    l.splice(i % 1048576, l.ns[mark % 1048576].prev, mark % 1048576)
+    l.splice(i % SPAN, l.ns[mark % SPAN].prev, mark % SPAN)
     l.n = l.n + 1
     return i, nil
 }
@@ -246,7 +263,7 @@ fn (l mut List) insertafter(v: int, mark: int) -> [int, err] {
         return -1, errors.new("container/list: dead handle")
     }
     i := l.alloc(v)
-    l.splice(i % 1048576, mark % 1048576, l.ns[mark % 1048576].next)
+    l.splice(i % SPAN, mark % SPAN, l.ns[mark % SPAN].next)
     l.n = l.n + 1
     return i, nil
 }
@@ -257,9 +274,10 @@ fn (l mut List) remove(i: int) -> [int, err] {
     if !l.ok(i) {
         return 0, errors.new("container/list: dead handle")
     }
-    i = i % 1048576
+    i = i % SPAN
     l.unlink(i)
     v := l.ns[i].v
+    l.ns[i].v = 0
     l.ns[i].live = 0
     l.ns[i].gen = l.ns[i].gen + 1
     l.ns[i].next = l.free
@@ -271,20 +289,20 @@ fn (l mut List) remove(i: int) -> [int, err] {
 /// movetofront moves element i to the head — List.MoveToFront.
 /// A dead handle is a no-op; moving the head itself is free.
 fn (l mut List) movetofront(i: int) {
-    if !l.ok(i) || l.head == i % 1048576 {
+    if !l.ok(i) || l.head == i % SPAN {
         return
     }
-    l.unlink(i % 1048576)
-    l.splice(i % 1048576, -1, l.head)
+    l.unlink(i % SPAN)
+    l.splice(i % SPAN, -1, l.head)
 }
 
 /// movetoback moves element i to the tail — List.MoveToBack.
 fn (l mut List) movetoback(i: int) {
-    if !l.ok(i) || l.tail == i % 1048576 {
+    if !l.ok(i) || l.tail == i % SPAN {
         return
     }
-    l.unlink(i % 1048576)
-    l.splice(i % 1048576, l.tail, -1)
+    l.unlink(i % SPAN)
+    l.splice(i % SPAN, l.tail, -1)
 }
 
 /// movebefore moves element i immediately before mark —
@@ -293,8 +311,8 @@ fn (l mut List) movebefore(i: int, mark: int) {
     if !l.ok(i) || !l.ok(mark) || i == mark {
         return
     }
-    l.unlink(i % 1048576)
-    l.splice(i % 1048576, l.ns[mark % 1048576].prev, mark % 1048576)
+    l.unlink(i % SPAN)
+    l.splice(i % SPAN, l.ns[mark % SPAN].prev, mark % SPAN)
 }
 
 /// moveafter moves element i immediately after mark —
@@ -303,8 +321,8 @@ fn (l mut List) moveafter(i: int, mark: int) {
     if !l.ok(i) || !l.ok(mark) || i == mark {
         return
     }
-    l.unlink(i % 1048576)
-    l.splice(i % 1048576, mark % 1048576, l.ns[mark % 1048576].next)
+    l.unlink(i % SPAN)
+    l.splice(i % SPAN, mark % SPAN, l.ns[mark % SPAN].next)
 }
 
 /// pushbacklist appends other's elements, in order, at the tail —

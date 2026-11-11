@@ -1,5 +1,8 @@
 package ring
 
+// SPAN — arena bound: handles pack gen*SPAN + idx (2^20).
+let SPAN = 1048576
+
 // std/container/ring — Go's container/ring: a circular list.
 //
 // A Ring owns an arena of nodes; element handles are ints into it
@@ -43,6 +46,9 @@ fn newring(n: int) -> own Ring {
     if n <= 0 {
         return nil
     }
+    // SPAN bound — a slot index >= 2^20 would mis-decode its
+    // own handle (gen*SPAN + idx unpacks to the wrong slot)
+    assert(n <= SPAN)
     r := new(Ring)
     r.ns = mkslice(RNode, n)
     i := 0
@@ -79,7 +85,7 @@ fn (r ref Ring) mkh(i: int) -> int {
     if i < 0 || i >= len(r.ns) {
         return -1
     }
-    return r.ns[i].gen * 1048576 + i
+    return r.ns[i].gen * SPAN + i
 }
 
 // ok reports whether i names a live element of this ring. The
@@ -92,8 +98,8 @@ fn (r ref Ring) ok(i: int) -> bool {
     if i < 0 {
         return false
     }
-    idx := i % 1048576
-    return idx < len(r.ns) && r.ns[idx].live == 1 && r.ns[idx].gen == i / 1048576
+    idx := i % SPAN
+    return idx < len(r.ns) && r.ns[idx].live == 1 && r.ns[idx].gen == i / SPAN
 }
 
 /// next returns the handle after i in the cycle — Ring.Next.
@@ -102,7 +108,7 @@ fn (r ref Ring) next(i: int) -> int {
     if !r.ok(i) {
         return -1
     }
-    return r.mkh(r.ns[i % 1048576].next)
+    return r.mkh(r.ns[i % SPAN].next)
 }
 
 /// prev returns the handle before i in the cycle — Ring.Prev.
@@ -110,16 +116,16 @@ fn (r ref Ring) prev(i: int) -> int {
     if !r.ok(i) {
         return -1
     }
-    return r.mkh(r.ns[i % 1048576].prev)
+    return r.mkh(r.ns[i % SPAN].prev)
 }
 
 /// move returns the handle n positions forward from i — Ring.Move.
 /// n < 0 walks backward; the step count wraps modulo len.
 fn (r ref Ring) move(i: int, n: int) -> int {
-    if !r.ok(i) || r.n == 0 {
+    if !r.ok(i) {
         return -1
     }
-    p := i % 1048576
+    p := i % SPAN
     // reduce first: m keeps |m| < r.n, so `0 - m` can't overflow —
     // (0 - n) directly would wrap at n = INT_MIN
     m := n % r.n
@@ -145,7 +151,7 @@ fn (r ref Ring) val(i: int) -> int {
     if !r.ok(i) {
         return 0
     }
-    return r.ns[i % 1048576].v
+    return r.ns[i % SPAN].v
 }
 
 /// setval writes element i's payload; a dead handle is a no-op.
@@ -153,7 +159,7 @@ fn (r mut Ring) setval(i: int, v: int) {
     if !r.ok(i) {
         return
     }
-    r.ns[i % 1048576].v = v
+    r.ns[i % SPAN].v = v
 }
 
 // alloc recycles a freelist node before growing the arena.
@@ -169,7 +175,7 @@ fn (r mut Ring) alloc(v: int) -> int {
     if i != -1 {
         r.free = r.ns[i].next
     } else {
-        assert(len(r.ns) < 1048576)
+        assert(len(r.ns) < SPAN)
         i = len(r.ns)
         r.ns = push(r.ns, RNode{v: 0, prev: -1, next: -1, live: 0, gen: 1})
     }
@@ -177,7 +183,7 @@ fn (r mut Ring) alloc(v: int) -> int {
     r.ns[i].prev = -1
     r.ns[i].next = -1
     r.ns[i].live = 1
-    return r.ns[i].gen * 1048576 + i
+    return r.ns[i].gen * SPAN + i
 }
 
 /// link splices all of ring s into this ring right after element i
@@ -205,7 +211,7 @@ fn (r mut Ring) link(i: int, s: own Ring) -> int {
         p := s.root
         k := 0
         for k < s.n {
-            j := r.alloc(s.ns[p].v) % 1048576
+            j := r.alloc(s.ns[p].v) % SPAN
             if k == 0 {
                 r.root = j
                 r.ns[j].prev = j
@@ -225,7 +231,7 @@ fn (r mut Ring) link(i: int, s: own Ring) -> int {
     if !r.ok(i) {
         return -1
     }
-    i = i % 1048576
+    i = i % SPAN
     if s == nil || s.n == 0 {
         return r.mkh(r.ns[i].next)
     }
@@ -234,7 +240,7 @@ fn (r mut Ring) link(i: int, s: own Ring) -> int {
     p := s.root
     k := 0
     for k < s.n {
-        j := r.alloc(s.ns[p].v) % 1048576
+        j := r.alloc(s.ns[p].v) % SPAN
         // slot j between the splice point and n — n's prev is the
         // last element inserted so far (i itself on the first pass),
         // so consecutive inserts keep s's order
@@ -256,10 +262,10 @@ fn (r mut Ring) link(i: int, s: own Ring) -> int {
 /// `own` forces nil in both cases since the
 /// unchanged ring can't be returned without consuming the receiver).
 fn (r mut Ring) unlink(i: int, n: int) -> own Ring {
-    if !r.ok(i) || r.n == 0 || n <= 0 {
+    if !r.ok(i) || n <= 0 {
         return nil
     }
-    i = i % 1048576
+    i = i % SPAN
     k := n % r.n
     if k == 0 {
         return nil
@@ -305,11 +311,11 @@ fn (r ref Ring) do(i: int, f: fn(int)) {
     if !r.ok(i) {
         return
     }
-    p := i % 1048576
+    p := i % SPAN
     for true {
         f(r.ns[p].v)
         p = r.ns[p].next
-        if p == i % 1048576 {
+        if p == i % SPAN {
             break
         }
     }

@@ -250,5 +250,14 @@ fn main() {
     assert(cr.val(victim) == 0 && cr.next(victim) == -1)
     assert(cr.len() == 3)
 
+    // bare gen-0 indices never name live slots — minted handles
+    // carry gen >= 1, so a raw slot index reads dead even when
+    // the slot is live
+    gr := ring.newring(1)
+    gh := gr.head()
+    gr.setval(gh, 5)
+    assert(gr.val(gh) == 5)
+    assert(gr.val(0) == 0 && gr.next(0) == -1)
+
     println("ring ok")
 }

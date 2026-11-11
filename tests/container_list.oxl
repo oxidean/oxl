@@ -218,5 +218,18 @@ fn main() {
     assert(h2 != -1 && sl.val(h2) == 2)
     assert(sl.val(h1) == 0 && sl.next(h1) == -1 && sl.prev(h1) == -1)
 
+    // a stale handle stays dead across init() — the drain bumps
+    // every gen, so h can't resurrect on its recycled slot
+    il2 := list.newlist()
+    ih2 := il2.pushback(7)
+    il2.init()
+    assert(il2.len() == 0 && il2.front() == -1 && il2.back() == -1)
+    il2.pushback(9)
+    assert(il2.val(il2.front()) == 9)
+    assert(il2.val(ih2) == 0 && il2.next(ih2) == -1 && il2.prev(ih2) == -1)
+    // bare gen-0 indices never name live slots — minted handles
+    // carry gen >= 1, so slot 0's raw index reads dead too
+    assert(il2.val(0) == 0 && il2.next(0) == -1)
+
     println("list ok")
 }

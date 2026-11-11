@@ -129,9 +129,6 @@ fn (z mut Reader) read(b: []byte) -> [int, err] {
         return n, te
     }
     z.done = 1
-    if n > 0 {
-        return n, nil
-    }
     return 0, io.eof()
 }
 

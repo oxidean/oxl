@@ -23,9 +23,9 @@ let TPAX = 120
 
 let TPAXG = 103
 
-let TLONGLINK = 76
+let TLONGLINK = 75
 
-let TLONGNAME = 75
+let TLONGNAME = 76
 
 /// Header is one archive member's metadata. size is the payload
 /// length in bytes for regular files (0 for links/dirs). typeflag is
@@ -225,7 +225,11 @@ fn (t mut Reader) block() -> [own []byte, err] {
         }
         i = i + 1
     }
-    // a real block after a lone zero ends the archive either way
+    // a real block after a lone zero is a malformed archive, not a
+    // clean end — Go's reader errors here too
+    if !zero {
+        return nil, errors.new("tar: invalid header after end marker")
+    }
     return nil, io.eof()
 }
 
@@ -291,7 +295,7 @@ fn (t mut Reader) parse(b: []byte) -> [Header, err] {
     h.linkname = nulstr(b[157:257])
     // ustar: "ustar\0" "00" — also accept the GNU "ustar " variant;
     // non-ustar (v7) blocks just lack the extension fields
-    if b[257] == 117 && b[258] == 115 && b[259] == 116 && b[260] == 97 && b[261] == 114 {
+    if b[257] == 117 && b[258] == 115 && b[259] == 116 && b[260] == 97 && b[261] == 114 && (b[262] == 0 || b[262] == 32) {
         h.uname = nulstr(b[265:297])
         h.gname = nulstr(b[297:329])
         [dmaj, _e6] = parnum(b[329:337])
@@ -317,6 +321,7 @@ fn (t mut Reader) parse(b: []byte) -> [Header, err] {
 // paxname scans one 'x' record block for path=/linkpath= keys —
 // records are "<len> <key>=<val>\n" where <len> counts itself.
 fn paxname(rec: []byte, want: str) -> str {
+    best := ""
     i := 0
     for i < len(rec) {
         // record length: decimal up to the space
@@ -346,13 +351,14 @@ fn paxname(rec: []byte, want: str) -> str {
             if len(val) > 0 && val[len(val) - 1] == 10 {
                 val = val[0:len(val) - 1]
             }
+            // duplicate keys resolve last-wins, matching POSIX pax
             if k == want {
-                return val as str
+                best = val as str
             }
         }
         i = i + v
     }
-    return ""
+    return best
 }
 
 // pax reads a pax/GNU meta member's payload and folds the parts the
@@ -365,7 +371,7 @@ fn (t mut Reader) pax(size: int, flag: int) -> err {
     rec := mkslice(byte, size)
     [g, e] = t.xfull(rec)
     if g < size {
-        if e == io.eof() {
+        if e == nil || e == io.eof() {
             return errors.new("tar: unexpected EOF in meta block")
         }
         return e

@@ -173,6 +173,11 @@ fn (g mut Reader) readcstr() -> [str, err] {
                 return out as str, nil
             }
             out = push(out, one[0])
+            // FNAME/FCOMMENT are arbitrary-length in the format but
+            // not worth an unbounded alloc — cap like FEXTRA's 64KiB
+            if len(out) >= 65536 {
+                return "", errors.new("gzip: header string exceeds limit")
+            }
         }
         if e == io.eof() {
             return "", errors.new("gzip: unexpected EOF in header string")

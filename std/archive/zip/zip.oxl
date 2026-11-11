@@ -71,9 +71,15 @@ fn newreader(b: []byte) -> [Reader, err] {
         return z, errors.new("zip: multi-disk archives unsupported")
     }
     n := binary.le_u16(z.data, eocd + 10)
+    cdsize := binary.le_u32(z.data, eocd + 12)
     cdoff := binary.le_u32(z.data, eocd + 16)
-    if n == 65535 || cdoff == 4294967295 {
+    if n == 65535 || cdsize == 4294967295 || cdoff == 4294967295 {
         return z, errors.new("zip: zip64 unsupported")
+    }
+    // entries-on-this-disk must equal the total once multi-disk is
+    // rejected — a mismatch is the same split-archive shape
+    if binary.le_u16(z.data, eocd + 8) != n {
+        return z, errors.new("zip: multi-disk archives unsupported")
     }
     clen := binary.le_u16(z.data, eocd + 20)
     if clen > 0 && eocd + 22 + clen <= len(z.data) {
@@ -142,6 +148,11 @@ fn (z ref Reader) open(i: int) -> [own []byte, err] {
     p := f.lho
     if p + 30 > len(z.data) || binary.le_u32(z.data, p) != 67324752 {
         return nil, errors.new("zip: bad local header")
+    }
+    // local flags/method must agree with the central directory —
+    // a crafted mismatch redirects which decoder the member gets
+    if binary.le_u16(z.data, p + 6) != f.flags || binary.le_u16(z.data, p + 8) != f.meth {
+        return nil, errors.new("zip: local/central header mismatch")
     }
     nl := binary.le_u16(z.data, p + 26)
     el := binary.le_u16(z.data, p + 28)

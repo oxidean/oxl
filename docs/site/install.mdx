@@ -31,8 +31,9 @@ and Windows (x86_64, via MinGW gcc or LLVM clang) build from source.
    ```
 </Steps>
 
-The installer verifies each download against the release's `.sha256`
-using `sha256sum`, `shasum`, or `openssl` — first found on `PATH` —
+When the release publishes a sidecar, the installer verifies the
+download against its `.sha256` using `sha256sum`, `shasum`, or
+`openssl` — first found on `PATH` —
 and `latest` resolves the newest **toolchain** release: an `extra/v*`
 extras release never shadows it.
 

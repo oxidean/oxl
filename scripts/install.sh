@@ -14,8 +14,13 @@
 #      (release host override — tests point it at file:// fixtures)
 set -eu
 
+die() {
+    echo "install.sh: $*" >&2; exit 1
+}
+
 OXL_HOME="${OXL_HOME:-$HOME/.oxl}"
 BASE="${OXL_RELEASE_BASE:-https://github.com/oxidean/oxl/releases}"
+BASE="${BASE%/}"
 
 want="latest"
 shim_only=0
@@ -60,8 +65,9 @@ done
 # ---------- the shim (single source — also serves `oxl toolchain`) ----------
 write_shim() {
     mkdir -p "$OXL_HOME/bin" "$OXL_HOME/versions"
-    trap 'rm -f "$OXL_HOME/bin/.oxl.tmp.$$"' EXIT
-    cat > "$OXL_HOME/bin/.oxl.tmp.$$" <<'SHIM_EOF'
+    tmpf=$(mktemp "$OXL_HOME/bin/.oxl.tmp.XXXXXX") || exit 1
+    trap 'rm -f "$tmpf"' EXIT
+    cat > "$tmpf" <<'SHIM_EOF'
 #!/bin/sh
 # oxl — toolchain version manager + dispatcher (gvm-style).
 # Resolves a release tag, execs versions/<tag>/oxl-toolchain/oxl.
@@ -75,9 +81,14 @@ write_shim() {
 #   4. $OXL_HOME/default-version
 set -eu
 
+die() {
+    echo "install.sh: $*" >&2; exit 1
+}
+
 OXL_HOME="${OXL_HOME:-$HOME/.oxl}"
 VERS="$OXL_HOME/versions"
 BASE="${OXL_RELEASE_BASE:-https://github.com/oxidean/oxl/releases}"
+BASE="${BASE%/}"
 TAB=$(printf '\t')
 
 die() {
@@ -261,6 +272,9 @@ tc_install() { # tag|latest
     # live sibling install must never lose its dir mid-tar
     for s in "$VERS"/.stage.*; do
         [ -d "$s" ] || continue
+        # only reap dirs we own — kill -0 fails EPERM on another user's
+        # live install, and rm on a foreign stage dir is the real hazard
+        [ -O "$s" ] || continue
         sp=${s##*/.stage.}; sp=${sp%%.*}
         case "$sp" in
             ''|*[!0-9]*) rm -rf "$s" ;;
@@ -311,7 +325,7 @@ tc_install() { # tag|latest
     echo "oxl: installed $tag -> $VERS/$tag"
     # tmp+rename — a concurrent `resolve` must never read a torn file
     [ -f "$OXL_HOME/default-version" ] || {
-        df="$OXL_HOME/.default-version.$$"
+        df=$(mktemp "$OXL_HOME/.default-version.XXXXXX") || die "cannot write $OXL_HOME/default-version"
         echo "$tag" > "$df" || die "cannot write $OXL_HOME/default-version"
         mv "$df" "$OXL_HOME/default-version" || die "cannot write $OXL_HOME/default-version"
     }
@@ -348,12 +362,12 @@ tc_use() {
     tag=$(vtag "$raw") || die "invalid toolchain tag: $raw"
     [ -d "$VERS/$tag" ] || die "$tag is not installed — \`oxl toolchain install $tag\` first"
     if [ "$local_tag" ]; then
-        df="./.oxl-version.$$"
+        df=$(mktemp "./.oxl-version.XXXXXX") || die "cannot write .oxl-version"
         echo "$tag" > "$df" || die "cannot write .oxl-version"
         mv "$df" .oxl-version || die "cannot write .oxl-version"
         echo "oxl: pinned $tag in ./.oxl-version"
     else
-        df="$OXL_HOME/.default-version.$$"
+        df=$(mktemp "$OXL_HOME/.default-version.XXXXXX") || die "cannot write $OXL_HOME/default-version"
         echo "$tag" > "$df" || die "cannot write $OXL_HOME/default-version"
         mv "$df" "$OXL_HOME/default-version" || die "cannot write $OXL_HOME/default-version"
         echo "oxl: default toolchain -> $tag"
@@ -369,7 +383,7 @@ tc_list() {
         [ -d "$d" ] || continue
         t=$(basename "$d"); found=1
         mark=""; [ "$t" = "$def" ] && mark=" (default)"
-        echo "$t$mark"
+        printf '%s\n' "$t$mark"
     done
     if [ "$found" = 0 ]; then echo "(none installed)"; fi
 }
@@ -409,8 +423,8 @@ exe=$(exe_for "$tag")
 install it with:  oxl toolchain install $tag"
 exec "$exe" "$@"
 SHIM_EOF
-    chmod +x "$OXL_HOME/bin/.oxl.tmp.$$" \
-        && mv "$OXL_HOME/bin/.oxl.tmp.$$" "$OXL_HOME/bin/oxl" \
+    chmod +x "$tmpf" \
+        && mv "$tmpf" "$OXL_HOME/bin/oxl" \
         || die "cannot write $OXL_HOME/bin/oxl"
     trap - EXIT
     echo "wrote $OXL_HOME/bin/oxl"
@@ -432,7 +446,7 @@ case "$tag" in
         "— set the default manually: oxl toolchain use <tag>" >&2; exit 1 ;;
 esac
 if [ ! -f "$OXL_HOME/default-version" ] || [ "$set_default" = 1 ]; then
-    df="$OXL_HOME/.default-version.$$"
+    df=$(mktemp "$OXL_HOME/.default-version.XXXXXX") || die "cannot write $OXL_HOME/default-version"
     echo "$tag" > "$df" || die "cannot write $OXL_HOME/default-version"
     mv "$df" "$OXL_HOME/default-version" || die "cannot write $OXL_HOME/default-version"
 fi

@@ -1494,12 +1494,25 @@ impl<'a> Checker<'a> {
                 }
                 // captures are copied by value into a heap env struct —
                 // a borrowed ref/mut would outlive its borrow region, so
-                // reject them like ref/mut fields in heap objects
+                // reject them like ref/mut fields in heap objects.
+                // flattened `recv.m` callees arrive dotted — the
+                // capturable binding is the longest env-bound prefix
+                // (`recv`), same rule codegen's capture walk uses
                 for n in scan.refs.union(&scan.callees) {
-                    if pnames.contains(n) {
-                        continue;
-                    }
-                    if let Some(t @ (Ty::Ref(_) | Ty::Mut(_))) = env.get(n) {
+                    let mut m = n.as_str();
+                    let t = loop {
+                        if pnames.contains(m) {
+                            break None;
+                        }
+                        match env.get(m) {
+                            Some(t) => break Some(t),
+                            None => match m.rfind('.') {
+                                Some(i) => m = &m[..i],
+                                None => break None,
+                            },
+                        }
+                    };
+                    if let Some(t @ (Ty::Ref(_) | Ty::Mut(_))) = t {
                         self.diags.push(Diag::err(e.span, "check",
                             format!("closure captures `{n}` (`{}`) — borrowed refs may not be stored in heap objects (v0)", t.name())));
                     }

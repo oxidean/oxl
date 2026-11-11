@@ -389,6 +389,7 @@ struct OverEnt { path: str, text: str, next: own OverEnt }
 struct ClChk {
     callees: own SList,
     mcalls: own SList,
+    refs: own SList,
     seeded: int,
     next: own ClChk,
 }
@@ -4500,14 +4501,16 @@ fn ret_susp(ck: ref Ck, vals: ref parser.NList) -> bool {
 // check_closures because the susp set only exists post-fixpoint.
 fn closure_expr(ck: mut Ck, params: ref parser.NList, body: ref parser.Node, env: mut Env) -> int {
     // deferred susp scan — collect callees + seeded before checking body
-    cc := new(ClChk{callees: nil, mcalls: nil, seeded: 0, next: nil})
+    cc := new(ClChk{callees: nil, mcalls: nil, refs: nil, seeded: 0, next: nil})
     cl_scan_node(ck, body, cc)
     let ps: own IList = nil
+    let pnames: own SList = nil
     pl := params
     for pl != nil {
         match pl.v {
             parser.Node.Param{name, ty} => {
                 ps = icons(ty_parse(ck, ty_str(ty)), ps)
+                pnames = scons(name, pnames)
             }
             _ => {
             }
@@ -4515,6 +4518,49 @@ fn closure_expr(ck: mut Ck, params: ref parser.NList, body: ref parser.Node, env
         pl = pl.next
     }
     ps = irev(ps)
+    // captures are copied by value into a heap env struct — a borrowed
+    // ref/mut would outlive its borrow region, so reject them like
+    // ref/mut fields in heap objects (seed closure capture check).
+    // flattened `recv.m` names arrive dotted — the capturable binding
+    // is the longest env-bound prefix (`recv`)
+    let caps: own SList = nil
+    rl := cc.refs
+    for rl != nil {
+        if !sl_has(caps, rl.v) {
+            caps = scons(rl.v, caps)
+        }
+        rl = rl.next
+    }
+    cl2 := cc.callees
+    for cl2 != nil {
+        if !sl_has(caps, cl2.v) {
+            caps = scons(cl2.v, caps)
+        }
+        cl2 = cl2.next
+    }
+    for caps != nil {
+        cn := caps.v
+        cm := cn
+        for len(cm) > 0 {
+            if sl_has(pnames, cm) {
+                break
+            }
+            cvt := env_get(ck, env, cm)
+            if cvt >= 0 {
+                cvk := ck.tyv[cvt].k
+                if cvk == k_ref() || cvk == k_mut() {
+                    diag(ck, "check", "closure captures `" + cn + "` (`" + ty_name(ck, cvt) + "`) — borrowed refs may not be stored in heap objects (v0)")
+                }
+                break
+            }
+            cld := last_dot(cm)
+            if cld < 0 {
+                break
+            }
+            cm = substr(cm, 0, cld)
+        }
+        caps = caps.next
+    }
     s_in := ck.in_cl
     s_ret := ck.cl_ret
     ck.in_cl = 1
@@ -4641,6 +4687,9 @@ fn cl_scan_expr(ck: mut Ck, e: ref parser.Node, cc: mut ClChk) {
         }
         parser.Node.As{e} => {
             cl_scan_expr(ck, e, cc)
+        }
+        parser.Node.Name{n} => {
+            cc.refs = scons(n, cc.refs)
         }
         parser.Node.Field{obj} => {
             cl_scan_expr(ck, obj, cc)

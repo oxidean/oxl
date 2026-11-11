@@ -1290,7 +1290,20 @@ impl<'a> Gen<'a> {
                                     };
                                 }
                             }
-                            CallPlan::None => {}
+                            CallPlan::None => {
+                                // field-value call `x.m()` — `call`
+                                // resolves the field path and jumps
+                                // through its fp; the type side needs
+                                // the field's declared return
+                                if let Some((objp, mname)) = n.rsplit_once('.') {
+                                    if let Some(oe) = unflatten(objp, f.span) {
+                                        let ot = self.dt(&self.expr_ty(&oe));
+                                        if let Some(Ty::Fn(_, r)) = self.field_ty(&ot, mname) {
+                                            return *r;
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                     if let Some((_, r)) = self.fns.get(n) {

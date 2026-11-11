@@ -1,0 +1,14 @@
+package main
+
+struct Worker { n: int }
+
+fn (w Worker) pause() -> int {
+    return w.n
+}
+
+fn (w mut Worker) run() -> int {
+    c := { || return w.pause() }
+    return c()
+}
+
+fn main() {}

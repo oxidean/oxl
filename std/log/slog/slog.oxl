@@ -473,15 +473,19 @@ fn render_json(l: ref Logger, lvl: int, msg: str, a: own Attr) -> str {
             b = b.next
             continue
         }
-        for len(pending) > 0 {
-            gk := pending[0]
-            pending = pending[1:len(pending)]
-            if len(gk) == 0 {
-                continue
+        // bound group of nothing elides like Go — only an attr that
+        // actually renders materializes the marks pending before it
+        if renders(b) {
+            for len(pending) > 0 {
+                gk := pending[0]
+                pending = pending[1:len(pending)]
+                if len(gk) == 0 {
+                    continue
+                }
+                g := json.jobj()
+                json.jadd(parent, gk, g)
+                parent = lastchild(parent)
             }
-            g := json.jobj()
-            json.jadd(parent, gk, g)
-            parent = lastchild(parent)
         }
         jattr(parent, b)
         b = b.next

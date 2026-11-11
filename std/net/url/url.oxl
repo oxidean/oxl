@@ -10,6 +10,8 @@ package url
 //     println(url.queryescape("a b")) // a+b
 import "std/errors"
 
+import "std/net"
+
 // explicit release for `own ?` buffers (mkbuf) — scope arenas don't
 // reclaim them, so a temporary scratch must be freed by hand
 extern fn rt_free(p: own void)
@@ -302,6 +304,7 @@ fn lwr(s: str) -> str {
                 out[j] = b[j]
                 j = j + 1
             }
+            j = 0
             for j < len(s) {
                 if out[j] >= 65 && out[j] <= 90 {
                     out[j] = out[j] + 32
@@ -394,7 +397,12 @@ fn validuserinfo(s: str) -> bool {
 // parseHost handles host[:port] including [ipv6%25zone]:port —
 // Go's parseHost split across the zone-aware unescapes.
 fn parsehost(u: mut URL, host: str) -> err {
-    if len(host) > 0 && byteat(host, 0) == 91 {
+    ob := rfind_ch(host, 91)
+    if ob > 0 {
+        // a '[' anywhere but the front can't open an IP-literal
+        return errors.new("invalid IP-literal")
+    }
+    if ob == 0 {
         i := rfind_ch(host, 93)
         if i < 0 {
             return errors.new("missing ']' in host")
@@ -403,32 +411,48 @@ fn parsehost(u: mut URL, host: str) -> err {
         if !validport(colonport) {
             return errors.new("invalid port \"" + colonport + "\" after host")
         }
-        zone := find(substr(host, 0, i), "%25")
+        hostname := substr(host, 1, i)
+        un := ""
+        zone := find(hostname, "%25")
         if zone >= 0 {
             // RFC 6874: %25 starts the zone id — the zone may carry
             // escapes the bare host can't
-            [h1, e1] = unescape(substr(host, 0, zone), ENC_HOST)
+            [h1, e1] = unescape(substr(hostname, 0, zone), ENC_HOST)
             if e1 != nil {
                 return e1
             }
-            [h2, e2] = unescape(substr(host, zone, i), ENC_ZONE)
+            [h2, e2] = unescape(substr(hostname, zone, len(hostname)), ENC_ZONE)
             if e2 != nil {
                 return e2
             }
-            [h3, e3] = unescape(substr(host, i, len(host)), ENC_HOST)
+            un = h1 + h2
+        } else {
+            [h3, e3] = unescape(hostname, ENC_HOST)
             if e3 != nil {
                 return e3
             }
-            u.host = h1 + h2 + h3
-            return nil
+            un = h3
         }
-    } else {
-        i := rfind_ch(host, 58)
-        if i >= 0 {
-            colonport := substr(host, i, len(host))
-            if !validport(colonport) {
-                return errors.new("invalid port \"" + colonport + "\" after host")
-            }
+        // only a real IPv6 literal may sit in brackets — this rules
+        // out "[1.2.3.4]" and non-IP junk (Go's netip gate)
+        if !net.isip6(un) {
+            return errors.new("invalid IP-literal")
+        }
+        u.host = "[" + un + "]" + colonport
+        return nil
+    }
+    ci := find(host, ":")
+    if ci >= 0 {
+        i := ci
+        lc := rfind_ch(host, 58)
+        if lc != ci && !(u.scheme == "http" || u.scheme == "https") {
+            // postgres-style multi-host lists keep last-colon port
+            // splitting; http/https enforce strict colons
+            i = lc
+        }
+        colonport := substr(host, i, len(host))
+        if !validport(colonport) {
+            return errors.new("invalid port \"" + colonport + "\" after host")
         }
     }
     [h, e] = unescape(host, ENC_HOST)
@@ -840,6 +864,18 @@ fn resolve_reference(u: ref URL, r: ref URL) -> own URL {
             url.fragment = u.fragment
             url.rawfragment = u.rawfragment
         }
+    }
+    if len(r.path) == 0 && len(u.opaque) > 0 {
+        // opaque base: a path-less reference inherits the opaque
+        // tail verbatim — host/user/path stay empty (Go 1.25)
+        url.opaque = u.opaque
+        url.hasuser = false
+        url.user = ""
+        url.password = ""
+        url.haspass = false
+        url.host = ""
+        url.path = ""
+        return url
     }
     // abs_path / rel_path
     url.host = u.host

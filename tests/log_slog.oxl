@@ -62,6 +62,10 @@ fn test_json() {
     j3.debug("dbg", slog.str_("k", "v"))
     // an empty group emits nothing — no "empty":{} (Go's rule)
     j3.info("grp", slog.group("empty", nil))
+    // a BOUND empty group elides too — it must not materialize the
+    // "http" parent marks as "http":{}
+    j3b := j3.with(slog.group("gone", nil))
+    j3b.info("bound", slog.str_("k", "v"))
     testing.expect(true, "json emits did not crash")
 }
 

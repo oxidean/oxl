@@ -52,12 +52,13 @@ Milestone map: [docs/specs/2026-11-07-phase-2-plan/](../specs/2026-11-07-phase-2
 - **W — web compilation target**: shipped — `--target js` emit
   (node + browser flavors), `extra/gui/dom` backend, `web-todo`
   reference app; spec: `docs/specs/2026-11-10-web-target/`
+- **L — LLVM emit lane**: spec — `bootstrap/codegen/llvm.oxl`
+  textual-IR emitter behind the `CkRes` seam, `--target llvm` +
+  `--triple`, shared frame/poll suspension lowering, rt.c under
+  clang, IR fixpoint; spec:
+  `docs/specs/2026-11-11-llvm-backend/`
 - Parked on triggers (each unparks when its trigger fires, then
   takes the normal spec → work-item → PR loop):
-  - LLVM backend — trigger: the C emit lane hits a wall the
-    `interfaces.md` codegen seam can't route around (optimization
-    ceiling, platform reach) or a second backend consumer arrives
-    to prove the seam.
   - D4 shape-generics — spec item exists
     (`docs/specs/2026-11-04-0132-v0-2-forward/items/d4-shape-generics.md`);
     trigger: generic-heavy builds show measurable bloat or compile-
@@ -71,8 +72,8 @@ Milestone map: [docs/specs/2026-11-07-phase-2-plan/](../specs/2026-11-07-phase-2
     needs address-stable values (OS async handles, self-referential
     own graphs).
   - parked-stdlib list — per module, trigger: a real consumer
-    demands it; `compress`/`archive` landed, `net/url` and
-    `container/*` in flight, files one work item each.
+    demands it; `compress`/`archive`/`net`/`container` landed,
+    files one work item each.
 
 (The compiler already compiles itself — see `docs/self-hosting.md`;
 "T" retires the Rust seed driver, not the compiler.)

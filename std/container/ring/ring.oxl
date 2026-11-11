@@ -1,7 +1,12 @@
 package ring
 
-// SPAN — arena bound: handles pack gen*SPAN + idx (2^20).
-let SPAN = 1048576
+// span — handle modulus, 2^20: handles pack gen*span() + idx and the
+// arena bound is the same value. A fn, not a let — package members are
+// assignable across packages, and rewriting the modulus would mis-decode
+// every live handle.
+fn span() -> int {
+    return 1048576
+}
 
 // std/container/ring — Go's container/ring: a circular list.
 //
@@ -51,9 +56,9 @@ fn newring(n: int) -> own Ring {
     if n <= 0 {
         return nil
     }
-    // SPAN bound — a slot index >= 2^20 would mis-decode its
-    // own handle (gen*SPAN + idx unpacks to the wrong slot)
-    assert(n <= SPAN)
+    // span() bound — a slot index >= 2^20 would mis-decode its
+    // own handle (gen*span() + idx unpacks to the wrong slot)
+    assert(n <= span())
     r := new(Ring)
     r.ns = new(mkslice(RNode, n))
     i := 0
@@ -85,13 +90,13 @@ fn (r ref Ring) head() -> int {
     return r.mkh(r.root)
 }
 
-// mkh packs an arena index into a handle: gen*SPAN + idx, -1
-// stays -1. SPAN = 2^20 bounds the arena.
+// mkh packs an arena index into a handle: gen*span() + idx, -1
+// stays -1. span() = 2^20 bounds the arena.
 fn (r ref Ring) mkh(i: int) -> int {
     if i < 0 || r.ns == nil || i >= len(r.ns) {
         return -1
     }
-    return r.ns[i].gen * SPAN + i
+    return r.ns[i].gen * span() + i
 }
 
 // ok reports whether i names a live element of this ring. The
@@ -104,8 +109,8 @@ fn (r ref Ring) ok(i: int) -> bool {
     if i < 0 {
         return false
     }
-    idx := i % SPAN
-    return r.ns != nil && idx < len(r.ns) && r.ns[idx].live == 1 && r.ns[idx].gen == i / SPAN
+    idx := i % span()
+    return r.ns != nil && idx < len(r.ns) && r.ns[idx].live == 1 && r.ns[idx].gen == i / span()
 }
 
 /// next returns the handle after i in the cycle — Ring.Next.
@@ -114,7 +119,7 @@ fn (r ref Ring) next(i: int) -> int {
     if !r.ok(i) {
         return -1
     }
-    return r.mkh(r.ns[i % SPAN].next)
+    return r.mkh(r.ns[i % span()].next)
 }
 
 /// prev returns the handle before i in the cycle — Ring.Prev.
@@ -122,7 +127,7 @@ fn (r ref Ring) prev(i: int) -> int {
     if !r.ok(i) {
         return -1
     }
-    return r.mkh(r.ns[i % SPAN].prev)
+    return r.mkh(r.ns[i % span()].prev)
 }
 
 /// move returns the handle n positions forward from i — Ring.Move.
@@ -131,7 +136,7 @@ fn (r ref Ring) move(i: int, n: int) -> int {
     if !r.ok(i) {
         return -1
     }
-    p := i % SPAN
+    p := i % span()
     // reduce first: m keeps |m| < r.n, so `0 - m` can't overflow —
     // (0 - n) directly would wrap at n = INT_MIN
     m := n % r.n
@@ -157,7 +162,7 @@ fn (r ref Ring) val(i: int) -> int {
     if !r.ok(i) {
         return 0
     }
-    return r.ns[i % SPAN].v
+    return r.ns[i % span()].v
 }
 
 /// setval writes element i's payload; a dead handle is a no-op.
@@ -165,7 +170,7 @@ fn (r mut Ring) setval(i: int, v: int) {
     if !r.ok(i) {
         return
     }
-    r.ns[i % SPAN].v = v
+    r.ns[i % span()].v = v
 }
 
 // alloc recycles a freelist node before growing the arena.
@@ -186,7 +191,7 @@ fn (r mut Ring) alloc(v: int) -> int {
     if i != -1 {
         r.free = r.ns[i].next
     } else {
-        assert(r.water < SPAN)
+        assert(r.water < span())
         if r.water >= len(r.ns) {
             r.grow()
         }
@@ -197,7 +202,7 @@ fn (r mut Ring) alloc(v: int) -> int {
     r.ns[i].prev = -1
     r.ns[i].next = -1
     r.ns[i].live = 1
-    return r.ns[i].gen * SPAN + i
+    return r.ns[i].gen * span() + i
 }
 
 // grow doubles the arena into a fresh own slice — see list.grow:
@@ -208,8 +213,8 @@ fn (r mut Ring) grow() {
     if len(r.ns) > 0 {
         ncap = len(r.ns) * 2
     }
-    if ncap > SPAN {
-        ncap = SPAN
+    if ncap > span() {
+        ncap = span()
     }
     n2 := new(mkslice(RNode, ncap))
     j := 0
@@ -251,7 +256,7 @@ fn (r mut Ring) link(i: int, s: own Ring) -> int {
         p := s.root
         k := 0
         for k < s.n {
-            j := r.alloc(s.ns[p].v) % SPAN
+            j := r.alloc(s.ns[p].v) % span()
             if k == 0 {
                 r.root = j
                 r.ns[j].prev = j
@@ -271,7 +276,7 @@ fn (r mut Ring) link(i: int, s: own Ring) -> int {
     if !r.ok(i) {
         return -1
     }
-    i = i % SPAN
+    i = i % span()
     if s == nil || s.n == 0 {
         return r.mkh(r.ns[i].next)
     }
@@ -280,7 +285,7 @@ fn (r mut Ring) link(i: int, s: own Ring) -> int {
     p := s.root
     k := 0
     for k < s.n {
-        j := r.alloc(s.ns[p].v) % SPAN
+        j := r.alloc(s.ns[p].v) % span()
         // slot j between the splice point and n — n's prev is the
         // last element inserted so far (i itself on the first pass),
         // so consecutive inserts keep s's order
@@ -305,7 +310,7 @@ fn (r mut Ring) unlink(i: int, n: int) -> own Ring {
     if !r.ok(i) || n <= 0 {
         return nil
     }
-    i = i % SPAN
+    i = i % span()
     k := n % r.n
     if k == 0 {
         return nil
@@ -351,11 +356,11 @@ fn (r ref Ring) do(i: int, f: fn(int)) {
     if !r.ok(i) {
         return
     }
-    p := i % SPAN
+    p := i % span()
     for true {
         f(r.ns[p].v)
         p = r.ns[p].next
-        if p == i % SPAN {
+        if p == i % span() {
             break
         }
     }

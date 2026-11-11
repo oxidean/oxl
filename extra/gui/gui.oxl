@@ -18,6 +18,7 @@ import "std/sync"
 // session — a queued payload never aliases storage that can die
 // underneath it (poster arenas, shim ring buffers)
 extern fn rt_str_own(s: str) -> str
+
 extern fn rt_str_scope(s: str) -> str
 
 extern fn rt_str_free(s: str)
@@ -327,7 +328,8 @@ fn (b mut EventBuf) post(e: own Event) -> int {
             // must hold the owned copy, not the poster's borrowed str
             e.data = EventData.Text(eb_intern_l(b, t))
         }
-        _ => {}
+        _ => {
+        }
     }
     if e.kind == EventKind.text_changed && b.q != nil {
         if b.q.v.kind == EventKind.text_changed && b.q.v.target == e.target {
@@ -498,7 +500,8 @@ fn (b mut CmdBuf) post(c: own Cmd) -> int {
                 PropVal.Text(t) => {
                     c.prop.val = PropVal.Text(cb_intern_l(b, t))
                 }
-                _ => {}
+                _ => {
+                }
             }
             if c.props != nil {
                 i := 0
@@ -507,7 +510,8 @@ fn (b mut CmdBuf) post(c: own Cmd) -> int {
                         PropVal.Text(t) => {
                             c.props[i].val = PropVal.Text(cb_intern_l(b, t))
                         }
-                        _ => {}
+                        _ => {
+                        }
                     }
                     i = i + 1
                 }
@@ -581,13 +585,17 @@ fn last_dropped_cell() {
 struct PN { c: chan own CmdResult, next: own PN }
 
 let g_rp: own PN = nil
+
 let g_rp_n: int = 0
+
 let g_rp_mu: shared = nil
 
 struct SC { s: shared, next: own SC }
 
 let g_cells: own SC = nil
+
 let g_cells_n: int = 0
+
 let g_cell_mu: shared = nil
 
 // flag cells for per-call sent/settled markers — mkshared has no free
@@ -1033,14 +1041,30 @@ fn run(b: Backend, app: fn(chan own Event)) -> err {
 
 fn kind_i(k: WidgetKind) -> int {
     match k {
-        WidgetKind.window => { return 0 }
-        WidgetKind.vbox => { return 1 }
-        WidgetKind.hbox => { return 2 }
-        WidgetKind.label => { return 3 }
-        WidgetKind.button => { return 4 }
-        WidgetKind.entry => { return 5 }
-        WidgetKind.list => { return 6 }
-        WidgetKind.scrolled => { return 7 }
+        WidgetKind.window => {
+            return 0
+        }
+        WidgetKind.vbox => {
+            return 1
+        }
+        WidgetKind.hbox => {
+            return 2
+        }
+        WidgetKind.label => {
+            return 3
+        }
+        WidgetKind.button => {
+            return 4
+        }
+        WidgetKind.entry => {
+            return 5
+        }
+        WidgetKind.list => {
+            return 6
+        }
+        WidgetKind.scrolled => {
+            return 7
+        }
     }
 }
 
@@ -1357,7 +1381,8 @@ fn read_prop(h: int, id: int) -> [PropVal, err] {
             r.val = PropVal.Text(rt_str_scope(t))
             rt_str_free(t)
         }
-        _ => {}
+        _ => {
+        }
     }
     return r.val, nil
 }

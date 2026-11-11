@@ -358,8 +358,7 @@ fn (g Gtk) stopped() -> int {
     return 0
 }
 
-fn (g Gtk) pump_fin() {
-}
+fn (g Gtk) pump_fin() {}
 
 fn (g Gtk) pump(events: mut gui.EventBuf, cmds: mut gui.CmdBuf) {
     aff_check("pump")

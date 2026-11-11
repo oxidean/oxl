@@ -272,6 +272,8 @@ fn jav(g: mut G, args: ref parser.NList) -> own GAv {
 fn jav_decl(g: mut G, args: ref parser.NList, fi: int, bind: ref collections.Map, recv: ref parser.Node) -> own GAv {
     let head: own GAv = nil
     let tail: own GAv = nil
+    cpre := ""
+    cpost := ""
     let il: own check.IList = nil
     if fi >= 0 {
         il = g.ck.fnsv[fi].params
@@ -285,23 +287,43 @@ fn jav_decl(g: mut G, args: ref parser.NList, fi: int, bind: ref collections.Map
             }
             pt = gsub(g, pt)
             v = jadapt_v(g, recv, v, pt)
+            raw := gsub(g, xty(g, recv))
+            if tyk(g, raw) == check.k_own() {
+                pk := tyk(g, pt)
+                if pk == check.k_mut() {
+                    cpre = "rt.rt_borrow_mut(" + v + "); "
+                    cpost = "rt.rt_unborrow(" + v + "); "
+                }
+                if pk == check.k_ref() {
+                    cpre = "rt.rt_borrow_read(" + v + "); "
+                    cpost = "rt.rt_unborrow(" + v + "); "
+                }
+            }
             il = il.next
         }
         c := new(GAv)
         c.v = v
+        c.pre = cpre
+        c.post = cpost
         head = c
         tail = c
     }
     al := args
     for al != nil {
         v := jx(g, al.v)
+        apre := ""
+        apost := ""
         if il != nil {
             o := jarg_c(g, al.v, v, il.v, bind)
             v = o.v
+            apre = o.pre
+            apost = o.post
             il = il.next
         }
         c := new(GAv)
         c.v = v
+        c.pre = apre
+        c.post = apost
         if head == nil {
             head = c
             tail = c
@@ -491,6 +513,28 @@ fn jxun(g: mut G, op: str, inner: ref parser.Node) -> str {
     return "rt.rt_ineg(" + v + ")"
 }
 
+// jnil_eq — aggregate nil is a value shape, not a JS null: the spec
+// pins nil []T to {a:null,…} and the str zero value to an empty
+// view, so object identity with null can never hold. Returns ""
+// when the operand type has no shape-nil predicate.
+fn jnil_eq(g: mut G, op: str, other: str, ot: int) -> str {
+    okt := tyk(g, ot)
+    if okt == check.k_slice() {
+        if op == "!=" {
+            return "(" + other + ".a !== null)"
+        }
+        return "(" + other + ".a === null)"
+    }
+    if okt == check.k_str() {
+        z := "(" + other + ".len === 0 && " + other + ".off === 0 && " + other + ".u8.length === 0)"
+        if op == "!=" {
+            return "!(" + z + ")"
+        }
+        return z
+    }
+    return ""
+}
+
 fn jxbin(g: mut G, op: str, l: ref parser.Node, r: ref parser.Node, e: ref parser.Node) -> str {
     lt := xty(g, l)
     lv := jx(g, l)
@@ -549,8 +593,14 @@ fn jxbin(g: mut G, op: str, l: ref parser.Node, r: ref parser.Node, e: ref parse
         if ltk == check.k_err() || rtk == check.k_err() || tyk(g, rt2) == check.k_err() {
             if rv == "null" || lv == "null" {
                 other := lv
+                ot := lt2
                 if lv == "null" {
                     other = rv
+                    ot = rt2
+                }
+                j := jnil_eq(g, op, other, ot)
+                if len(j) > 0 {
+                    return j
                 }
                 // nil covers both spellings: `==` is either-form-or,
                 // `!=` must exclude both forms at once
@@ -568,8 +618,14 @@ fn jxbin(g: mut G, op: str, l: ref parser.Node, r: ref parser.Node, e: ref parse
         if rv == "null" || lv == "null" {
             // null literal vs a maybe-err slot — cover both nil forms
             other := lv
+            ot := lt2
             if lv == "null" {
                 other = rv
+                ot = rt2
+            }
+            j := jnil_eq(g, op, other, ot)
+            if len(j) > 0 {
+                return j
             }
             if op == "!=" {
                 return "(" + other + " !== null && " + other + " !== 0n)"
@@ -2079,6 +2135,18 @@ fn jspawn_args(g: mut G, qn: str, dst: str, argvs: ref GAv) {
     }
 }
 
+// gav_borrows — concat each arg node's borrow-ledger pre/post so an
+// inline susp call can hold own→mut/ref borrows across the poll
+fn gav_borrows(a: ref GAv) -> GArgOut {
+    o := GArgOut{v: "", pre: "", post: ""}
+    for a != nil {
+        o.pre = o.pre + a.pre
+        o.post = o.post + a.post
+        a = a.next
+    }
+    return o
+}
+
 // suspend point for an oxl-fn call: bare child frame object, fill p_
 // slots, poll inline, propagate PENDING/CANCEL, bind on READY.
 // dk: 0 void, 1 frame-field(da), 2 assign-text(da), 3 pair(da,db; ""=blank),
@@ -2118,12 +2186,19 @@ fn jfsusp_call(g: mut G, call: ref parser.Node, name: str, dk: int, da: str, db:
         bname = name
     }
     k := jfstate(g)
+    bo := gav_borrows(argvs)
+    if len(bo.pre) > 0 {
+        wln(g, "    " + bo.pre)
+    }
     wln(g, "    { const _c" + itoa(k) + " = {cur_scope: rt.rt_scope_current(), state: 0};")
     jspawn_args(g, bname, "_c" + itoa(k), argvs)
     wln(g, "      fr.child = _c" + itoa(k) + "; fr.state = " + itoa(k) + "; }")
     wln(g, "    case " + itoa(k) + ":")
     wln(g, "      _p = o_poll_" + cn + "(fr.child, t);")
     wln(g, "      if (_p !== rt.RT_READY) { fr.cur_scope = rt.rt_scope_current(); rt.rt_scope_set(saved); return _p; }")
+    if len(bo.post) > 0 {
+        wln(g, "      " + bo.post)
+    }
     if dk == 1 {
         wln(g, "      fr." + da + " = fr.child.result;")
     }

@@ -66,7 +66,9 @@ export function install(api) {
     rt_clone_attrs: () => -22n,
     rt_lsdir: () => empty_slice(),
     rt_file_readable: () => 0n,
-    rt_strlen: (s) => BigInt(typeof s === 'string' ? s.length : 0),
+    // UTF-8 byte length, matching rt.c's rt_strlen — s.length counts
+    // UTF-16 code units and diverges on any non-ASCII or astral char
+    rt_strlen: (s) => BigInt(typeof s === 'string' ? new TextEncoder().encode(s).length : 0),
     // blocking-capable surfaces with no browser equivalent — trap
     rt_proc_run: trap21,
     rt_proc_output: trap21,

@@ -388,7 +388,7 @@ fn gsplice(s: str, mark: str, ins: str) -> str {
 
 // collect call args as evaluated C fragments (linked list — []str returns
 // can't be written in the `->` position)
-struct GAv { v: str, next: own GAv }
+struct GAv { v: str, pre: str, post: str, next: own GAv }
 
 fn gav(g: mut G, args: ref parser.NList) -> own GAv {
     let head: own GAv = nil

@@ -182,7 +182,9 @@ export function install(api) {
     rt_file_readable: (p) => {
       try { fs.accessSync(path_of(p), fs.constants.R_OK); return 1n } catch { return 0n }
     },
-    rt_strlen: (s) => BigInt(typeof s === 'string' ? s.length : 0),
+    // UTF-8 byte length, matching rt.c's rt_strlen — s.length counts
+    // UTF-16 code units and diverges on any non-ASCII or astral char
+    rt_strlen: (s) => BigInt(typeof s === 'string' ? new TextEncoder().encode(s).length : 0),
 
     /* ---------- process spawn (sync surface) ---------- */
     // env is an override list merged onto the inherited environment —

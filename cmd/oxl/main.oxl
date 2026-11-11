@@ -740,14 +740,17 @@ fn cmd_run() {
         ai = ai + 1
     }
     if target_is_js() == 1 {
-        cargs = push(cargs, "") // node argv[1] slot — out.mjs leads
-        i := len(cargs) - 1
-        for i > 0 {
-            cargs[i] = cargs[i - 1]
-            i = i - 1
+        // node argv[1] slot — out.mjs leads; prepend without a
+        // trailing "" — process.argv.slice(1) must equal the
+        // native lane's argv exactly
+        nc := mkslice(str, len(cargs) + 1)
+        nc[0] = out
+        i := 0
+        for i < len(cargs) {
+            nc[i + 1] = cargs[i]
+            i = i + 1
         }
-        cargs[0] = out
-        child := exec.cmd("node", cargs)
+        child := exec.cmd("node", nc)
         [st, e] = child.run()
         if e != nil {
             eprintln("node exec failed: " + errors.msg(e))

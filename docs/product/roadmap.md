@@ -38,12 +38,17 @@ Milestone map: [docs/specs/2026-11-07-phase-2-plan/](../specs/2026-11-07-phase-2
 
 - **T — toolchain-in-oxl**: shipped — `cmd/oxl` is `.oxl` end to
   end; cargo is out of the build path
-- **E — monorepo / oxl-extra**: `extra/` module for packages outside
-  `std`, `oxl.work` workspaces, git-backed index + `oxl publish`
-  (absorbs registry), polish issues
+- **E — monorepo / oxl-extra**: shipped — `extra/` module for
+  packages outside `std`, `oxl.work` workspaces, git-backed index +
+  `oxl publish` (absorbs registry), polish issues
 - **G — portable GUI layer** in the language (charter path) as
   `extra/gui` + `extra/gui/gtk` — shipped; spec:
   `docs/specs/2026-11-09-gui-layer/`
+- **R — runtime type descriptors + reflection**: spec merged —
+  compiler-emitted `TypeDesc` table, `std/reflect` lite, `fmt %v`
+  (#28), typed `errors.As` (#27), then `gob`/`xml`/`template`/`sql`;
+  impl WI-0008 in flight — spec:
+  `docs/specs/2026-11-11-type-descriptors/`
 - **W — web compilation target**: shipped — `--target js` emit
   (node + browser flavors), `extra/gui/dom` backend, `web-todo`
   reference app; spec: `docs/specs/2026-11-10-web-target/`
@@ -57,16 +62,17 @@ Milestone map: [docs/specs/2026-11-07-phase-2-plan/](../specs/2026-11-07-phase-2
     (`docs/specs/2026-11-04-0132-v0-2-forward/items/d4-shape-generics.md`);
     trigger: generic-heavy builds show measurable bloat or compile-
     time pain — pure backend optimization, semantics unchanged.
-  - reflection-class stdlib (runtime type descriptors) — trigger:
-    a stdlib surface needs runtime type introspection (generic
-    fmt, serialization, plugin dispatch).
-  - TLS/x509 — trigger: first consumer needing authenticated or
-    encrypted transport beyond cleartext `net`; spec must cover
-    the x509 trust story, not just a wrapping API.
-  - `pin` primitive — trigger: FFI or IO needs address-stable
-    values (OS async handles, self-referential own graphs).
+  - TLS/x509 — spec in flight (`docs/specs/2026-11-11-tls-x509/`);
+    trigger: first consumer needing authenticated or encrypted
+    transport beyond cleartext `net`; spec must cover the x509
+    trust story, not just a wrapping API.
+  - `pin` primitive — spec merged
+    (`docs/specs/2026-11-11-pin-primitive/`); trigger: FFI or IO
+    needs address-stable values (OS async handles, self-referential
+    own graphs).
   - parked-stdlib list — per module, trigger: a real consumer
-    demands it; files one work item each.
+    demands it; `compress`/`archive` landed, `net/url` and
+    `container/*` in flight, files one work item each.
 
 (The compiler already compiles itself — see `docs/self-hosting.md`;
 "T" retires the Rust seed driver, not the compiler.)

@@ -1,0 +1,471 @@
+package main
+
+// archive acceptance: std/archive/tar — writer produces blocks the
+// reader round-trips (fields, payload, padding), long names go
+// through ustar prefix-splitting and PAX 'x'/GNU 'L' overrides, and
+// the trailer marker is honoured.
+import "std/io"
+
+import "std/archive/tar"
+
+import "std/bytes"
+
+import "std/errors"
+
+import "std/encoding/hex"
+
+import "std/testing"
+
+fn ck(e: err, m: str) {
+    testing.expect(e == nil, m + ": " + errors.msg(e))
+}
+
+fn hdr(name: str, size: int, tf: int) -> tar.Header {
+    return tar.Header{name: name, mode: 420, uid: 1000, gid: 100, size: size, mtime: 1700000000, typeflag: tf, linkname: "", uname: "jesse", gname: "users", devmajor: 0, devminor: 0}
+}
+
+// write_one emits a single-member archive via the writer.
+fn write_one(w: mut tar.Writer, name: str, payload: str) {
+    h := hdr(name, len(payload), tar.TREG)
+    ck(w.writeheader(h), "writeheader " + name)
+    if len(payload) > 0 {
+        [_n, e] = w.write(payload as []byte)
+        ck(e, "write " + name)
+        testing.expect_eq(_n, len(payload), "write count " + name)
+    }
+}
+
+fn test_roundtrip() {
+    buf := bytes.newbuffer()
+    w := new(tar.newwriter(buf.aswriter()))
+    d := hdr("adir", 0, tar.TDIR)
+    ck(w.writeheader(d), "dir header")
+    write_one(w, "adir/hello.txt", "hello tar!!!")
+    write_one(w, "empty.bin", "")
+    l := hdr("link", 0, tar.TSYMLINK)
+    l.linkname = "adir/hello.txt"
+    ck(w.writeheader(l), "link header")
+    ck(w.close(), "close")
+
+    data := buf.str()
+    testing.expect_eq(len(data) % 512, 0, "archive is block-aligned")
+
+    rb := bytes.newbuffer()
+    [_n, _e] = rb.write(data as []byte)
+    tr := tar.newreader(rb.asreader())
+
+    [h0, e0] = tr.next()
+    ck(e0, "next dir")
+    testing.expect_streq(h0.name, "adir", "dir name")
+    testing.expect_eq(h0.typeflag, tar.TDIR, "dir typeflag")
+
+    [h1, e1] = tr.next()
+    ck(e1, "next file")
+    testing.expect_streq(h1.name, "adir/hello.txt", "file name")
+    testing.expect_eq(h1.size, 12, "file size")
+    testing.expect_eq(h1.mode, 420, "file mode")
+    testing.expect_eq(h1.uid, 1000, "file uid")
+    testing.expect_streq(h1.uname, "jesse", "file uname")
+    [s1, re1] = io.readall(tr.asreader())
+    ck(re1, "read payload")
+    testing.expect_streq(s1, "hello tar!!!", "file payload")
+
+    [h2, e2] = tr.next()
+    ck(e2, "next empty")
+    testing.expect_streq(h2.name, "empty.bin", "empty name")
+    [_s2, re2] = io.readall(tr.asreader())
+    ck(re2, "empty payload read")
+
+    [h3, e3] = tr.next()
+    ck(e3, "next link")
+    testing.expect_eq(h3.typeflag, tar.TSYMLINK, "symlink type")
+    testing.expect_streq(h3.linkname, "adir/hello.txt", "symlink target")
+
+    [_h4, e4] = tr.next()
+    testing.expect(e4 == io.eof(), "clean archive EOF")
+}
+
+// A name longer than 100 bytes splits into prefix + name at '/'.
+fn test_prefix_split() {
+    buf := bytes.newbuffer()
+    w := new(tar.newwriter(buf.aswriter()))
+    lname := "deep/deep/deep/deep/deep/deep/deep/deep/deep/deep/deep/deep/deep/deep/deep/deep/deep/deep/deep/deep/file.txt"
+    testing.expect(len(lname) > 100, "fixture name is long")
+    write_one(w, lname, "x")
+    ck(w.close(), "close long")
+    testing.expect_streq(read_first_name(buf.str()), lname, "prefix-split name reassembled")
+}
+
+fn read_first_name(data: str) -> str {
+    rb := bytes.newbuffer()
+    [_n, _e] = rb.write(data as []byte)
+    tr := tar.newreader(rb.asreader())
+    [h, e] = tr.next()
+    ck(e, "read_first_name next")
+    return h.name
+}
+
+// Hand-assembled PAX 'x' member carrying a 120-char path — the reader
+// folds it into the following header's name.
+fn test_pax_longname() {
+    buf := bytes.newbuffer()
+    w := new(tar.newwriter(buf.aswriter()))
+    lname := "paxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.txt"
+    rec := " path=" + lname + "\n"
+    // record format: "<len> <body>" with len counting itself
+    ln := len(rec) + 2
+    // widen until the digit count stabilises
+    for len(itoa(ln)) + len(rec) != ln {
+        ln = len(rec) + len(itoa(ln))
+    }
+    rec = itoa(ln) + rec
+    ph := hdr("PaxHeader", len(rec), tar.TPAX)
+    ck(w.writeheader(ph), "pax header")
+    [_n, we] = w.write(rec as []byte)
+    ck(we, "pax payload")
+    write_one(w, "short.txt", "pax!")
+    ck(w.close(), "pax close")
+
+    rb := bytes.newbuffer()
+    [_n2, _e2] = rb.write(buf.str() as []byte)
+    tr := tar.newreader(rb.asreader())
+    [h, e] = tr.next()
+    ck(e, "pax next")
+    testing.expect_streq(h.name, lname, "pax path override applied")
+    [s, re] = io.readall(tr.asreader())
+    ck(re, "pax member payload")
+    testing.expect_streq(s, "pax!", "pax member contents")
+}
+
+// The GNU 'L' longname block — payload is the next member's name.
+fn test_gnu_longname() {
+    buf := bytes.newbuffer()
+    w := new(tar.newwriter(buf.aswriter()))
+    lname := "gnu-long-name-that-will-never-ever-fit-in-one-hundred-bytes-so-it-needs-the-gnu-extension-block.bin"
+    lh := hdr("././@LongLink", len(lname) + 1, tar.TLONGNAME)
+    ck(w.writeheader(lh), "L header")
+    // NUL-terminate the longname payload — push onto a []byte view
+    lb := lname as []byte
+    lb = push(lb, 0)
+    [_n, we] = w.write(lb)
+    ck(we, "L payload")
+    write_one(w, "s.txt", "z")
+    ck(w.close(), "L close")
+
+    rb := bytes.newbuffer()
+    [_n2, _e2] = rb.write(buf.str() as []byte)
+    tr := tar.newreader(rb.asreader())
+    [h, e] = tr.next()
+    ck(e, "L next")
+    testing.expect_streq(h.name, lname, "GNU longname applied")
+}
+
+// Skipping a member's payload mid-read still lands on the next header.
+fn test_skip_payload() {
+    buf := bytes.newbuffer()
+    w := new(tar.newwriter(buf.aswriter()))
+    big := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaax"
+    write_one(w, "big.bin", big)
+    write_one(w, "after.txt", "B")
+    ck(w.close(), "skip close")
+    rb := bytes.newbuffer()
+    [_n, _e] = rb.write(buf.str() as []byte)
+    tr := tar.newreader(rb.asreader())
+    [h, e] = tr.next()
+    ck(e, "skip next 1")
+    testing.expect_eq(h.size, len(big), "big member size")
+    // read only a piece, then move on — next() must discard the rest
+    piece := mkslice(byte, 10)
+    [rn, re] = tr.read(piece)
+    ck(re, "partial read")
+    testing.expect_eq(rn, 10, "partial read count")
+    [h2, e2] = tr.next()
+    ck(e2, "skip next 2")
+    testing.expect_streq(h2.name, "after.txt", "header after skip")
+    [s, re2] = io.readall(tr.asreader())
+    ck(re2, "after payload")
+    testing.expect_streq(s, "B", "after contents")
+}
+
+// --- hostile-input coverage: crafted blocks, truncation, oversize ---
+fn foct(b: []byte, off: int, width: int, v: int) {
+    i := width - 2
+    x := v
+    for i >= 0 {
+        b[off + i] = 48 + x % 8
+        x = x / 8
+        i = i - 1
+    }
+    // residue means v never fit the field — fail loudly instead of
+    // writing a silently truncated number into a crafted header
+    assert(x == 0)
+    b[off + width - 1] = 0
+}
+
+fn fstr(b: []byte, off: int, s: str) {
+    sb := s as []byte
+    i := 0
+    for i < len(sb) {
+        b[off + i] = sb[i]
+        i = i + 1
+    }
+}
+
+fn fixsum(b: []byte) {
+    i := 148
+    for i < 156 {
+        b[i] = 32
+        i = i + 1
+    }
+    sum := 0
+    i = 0
+    for i < 512 {
+        sum = sum + b[i]
+        i = i + 1
+    }
+    foct(b, 148, 8, sum)
+}
+
+// mkhdr builds a real 512-byte header block — valid checksum so
+// parse() reaches whatever the field under test carries.
+fn mkhdr(name: str, size: int, tf: int) -> own []byte {
+    b := mkslice(byte, 512)
+    fstr(b, 0, name)
+    foct(b, 100, 8, 420)
+    foct(b, 108, 8, 1000)
+    foct(b, 116, 8, 100)
+    foct(b, 124, 12, size)
+    foct(b, 136, 12, 1700000000)
+    b[156] = tf
+    fstr(b, 257, "ustar")
+    fstr(b, 263, "00")
+    fstr(b, 265, "jesse")
+    fstr(b, 297, "users")
+    fixsum(b)
+    return new(b)
+}
+
+fn test_truncated_midheader() {
+    buf := bytes.newbuffer()
+    w := new(tar.newwriter(buf.aswriter()))
+    write_one(w, "f.txt", "hello")
+    ck(w.close(), "trunc close")
+    data := buf.str() as []byte
+    // header + member block land; the second zero block is cut at
+    // 476 bytes — mid-structure EOF must error, not report clean end
+    rb := bytes.newbuffer()
+    [_rd, _re] = rb.write(data[0:1500])
+    tr := tar.newreader(rb.asreader())
+    [h, e] = tr.next()
+    ck(e, "first member")
+    [_h2, e2] = tr.next()
+    testing.expect(e2 != nil && e2 != io.eof(), "mid-header EOF errors")
+    testing.expect_streq(errors.msg(e2), "tar: unexpected EOF in header block", "mid-header message")
+}
+
+fn test_truncated_member() {
+    buf := bytes.newbuffer()
+    w := new(tar.newwriter(buf.aswriter()))
+    big := ""
+    i := 0
+    for i < 600 {
+        big = big + "a"
+        i = i + 1
+    }
+    write_one(w, "big.bin", big)
+    ck(w.close(), "close")
+    data := buf.str() as []byte
+    // header + only 188 of the 600-byte payload
+    rb := bytes.newbuffer()
+    [_rd, _re] = rb.write(data[0:700])
+    tr := tar.newreader(rb.asreader())
+    [h, e] = tr.next()
+    ck(e, "member header")
+    testing.expect_eq(h.size, 600, "declared size")
+    piece := mkslice(byte, 700)
+    [rn, re] = tr.read(piece)
+    ck(re, "partial payload kept")
+    testing.expect_eq(rn, 188, "partial count")
+    [_rn2, re2] = tr.read(piece)
+    testing.expect(re2 != nil && re2 != io.eof(), "short member errors")
+    testing.expect_streq(errors.msg(re2), "tar: unexpected EOF in member payload", "member EOF message")
+}
+
+fn test_pax_badlen() {
+    // an 'x' record whose declared length overruns its block — the
+    // override is ignored, not trapped on
+    x := mkhdr("x", 10, tar.TPAX)
+    payload := mkslice(byte, 512)
+    pr := "99 x      " as []byte
+    i := 0
+    for i < len(pr) {
+        payload[i] = pr[i]
+        i = i + 1
+    }
+    real := mkhdr("real.txt", 0, tar.TREG)
+    zero := mkslice(byte, 1024)
+    rb := bytes.newbuffer()
+    [_rd, _re] = rb.write((x as str + payload as str + real as str + zero as str) as []byte)
+    tr := tar.newreader(rb.asreader())
+    [h, e] = tr.next()
+    ck(e, "next past bad pax")
+    testing.expect_streq(h.name, "real.txt", "header after bad pax")
+}
+
+fn test_pax_numericoverride() {
+    // pax 'x' records override the ustar numeric fields — size is
+    // framing-critical: the member's payload is sized by the pax
+    // value, not the header's octal field
+    rec := "10 size=5\n20 mtime=1234567890\n" as []byte
+    xpayload := mkslice(byte, 512)
+    i := 0
+    for i < len(rec) {
+        xpayload[i] = rec[i]
+        i = i + 1
+    }
+    x := mkhdr("x", len(rec), tar.TPAX)
+    real := mkhdr("f.txt", 0, tar.TREG)
+    body := mkslice(byte, 512)
+    hello := "hello" as []byte
+    j := 0
+    for j < 5 {
+        body[j] = hello[j]
+        j = j + 1
+    }
+    zero := mkslice(byte, 1024)
+    rb := bytes.newbuffer()
+    [_rd, _re] = rb.write((x as str + xpayload as str + real as str + body as str + zero as str) as []byte)
+    tr := tar.newreader(rb.asreader())
+    [h, e] = tr.next()
+    ck(e, "pax member header")
+    testing.expect_eq(h.size, 5, "pax size override")
+    testing.expect_eq(h.mtime, 1234567890, "pax mtime override")
+    [s, re] = io.readall(tr.asreader())
+    ck(re, "pax member payload")
+    testing.expect_streq(s, "hello", "pax-sized payload")
+    // last record wins when the same key repeats
+    rec2 := "10 size=3\n10 size=7\n" as []byte
+    xp2 := mkslice(byte, 512)
+    k := 0
+    for k < len(rec2) {
+        xp2[k] = rec2[k]
+        k = k + 1
+    }
+    x2 := mkhdr("x", len(rec2), tar.TPAX)
+    real2 := mkhdr("g.txt", 0, tar.TREG)
+    body2 := mkslice(byte, 512)
+    seven := "1234567" as []byte
+    l := 0
+    for l < 7 {
+        body2[l] = seven[l]
+        l = l + 1
+    }
+    rb2 := bytes.newbuffer()
+    [_rd2, _re2] = rb2.write((x2 as str + xp2 as str + real2 as str + body2 as str + zero as str) as []byte)
+    tr2 := tar.newreader(rb2.asreader())
+    [h2, e2] = tr2.next()
+    ck(e2, "second pax member")
+    testing.expect_eq(h2.size, 7, "last-wins size override")
+}
+
+fn test_meta_oversize() {
+    // declared meta size over the 16 MiB cap — rejected before alloc
+    x := mkhdr("x", 2000000000, tar.TPAX)
+    zero := mkslice(byte, 1024)
+    rb := bytes.newbuffer()
+    [_rd, _re] = rb.write((x as str + zero as str) as []byte)
+    tr := tar.newreader(rb.asreader())
+    [_h, e] = tr.next()
+    testing.expect(e != nil, "oversize meta errors")
+    testing.expect_streq(errors.msg(e), "tar: meta block too large", "oversize message")
+}
+
+fn test_b256_size() {
+    zero := mkslice(byte, 1024)
+    // negative base-256 (0xFF-prefixed) — sign rejected in parnum
+    b := mkhdr("n.bin", 0, tar.TREG)
+    i := 124
+    for i < 136 {
+        b[i] = 255
+        i = i + 1
+    }
+    fixsum(b)
+    rb := bytes.newbuffer()
+    [_rd, _re] = rb.write((b as str + zero as str) as []byte)
+    tr := tar.newreader(rb.asreader())
+    [_h, e] = tr.next()
+    testing.expect(e != nil, "negative base-256 errors")
+    // positive base-256 magnitude that overflows int64
+    b2 := mkhdr("o.bin", 0, tar.TREG)
+    b2[124] = 128
+    i = 125
+    for i < 136 {
+        b2[i] = 255
+        i = i + 1
+    }
+    fixsum(b2)
+    rb2 := bytes.newbuffer()
+    [_rd2, _re2b] = rb2.write((b2 as str + zero as str) as []byte)
+    tr2 := tar.newreader(rb2.asreader())
+    [_h2, e2] = tr2.next()
+    testing.expect(e2 != nil, "base-256 overflow errors")
+}
+
+fn test_signed_checksum() {
+    // a >=0x80 name byte + a signed-byte checksum (legacy writer
+    // form) verifies alongside the unsigned sum
+    b := mkhdr("plain", 0, tar.TREG)
+    b[0] = 200
+    sum := 0
+    i := 0
+    for i < 512 {
+        c := b[i]
+        if i >= 148 && i < 156 {
+            c = 32
+        }
+        if c > 127 {
+            c = c - 256
+        }
+        sum = sum + c
+        i = i + 1
+    }
+    foct(b, 148, 8, sum)
+    zero := mkslice(byte, 1024)
+    rb := bytes.newbuffer()
+    [_rd, _re] = rb.write((b as str + zero as str) as []byte)
+    tr := tar.newreader(rb.asreader())
+    [_h, e] = tr.next()
+    ck(e, "signed checksum verifies")
+}
+
+/// foreign GNU archive — produced by python tarfile.GNU_FORMAT, not
+/// this reader's writer: 'L'/'K' longname+longlink records must route
+/// to name/linkname correctly
+let GNUHEX = "2e2f2e2f404c6f6e674c696e6b00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000030303030303030003030303030303000303030303030300030303030303030303237320030303030303030303030300030303737353600204c000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000007573746172202000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000006161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161612f6262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262622e7478740000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000006161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161612f62626262626262626230303030363434003030303030303000303030303030300030303030303030303031340030303030303030303030300030333035373500203000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000757374617220200000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000676e757361797368656c6c6f00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000002e2f2e2f404c6f6e674c696e6b00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000030303030303030003030303030303000303030303030300030303030303030303236360030303030303030303030300030303737363000204b000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000007573746172202000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000006363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363632f646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000006c6e6b000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000003030303036343400303030303030300030303030303030003030303030303030303030003030303030303030303030003033313630350020326363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363632f64646464646464646475737461722020000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+
+let GNUNAME = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.txt"
+
+let GNUTARGET = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc/dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+
+fn test_gnu_foreign() {
+    [b, e] = hex.decode(GNUHEX)
+    ck(e, "gnu hex decode")
+    rb := bytes.newbuffer()
+    [_w, _we] = rb.write(b)
+    tr := tar.newreader(rb.asreader())
+    [h1, e1] = tr.next()
+    ck(e1, "gnu member 1")
+    testing.expect_streq(h1.name, GNUNAME, "gnu long name")
+    testing.expect_eq(h1.typeflag, tar.TREG, "gnu m1 typeflag")
+    [s1, e1r] = io.readall(tr.asreader())
+    ck(e1r, "gnu m1 payload read")
+    testing.expect_streq(s1, "gnusayshello", "gnu m1 payload")
+    [h2, e2] = tr.next()
+    ck(e2, "gnu member 2")
+    testing.expect_streq(h2.name, "lnk", "gnu link member name")
+    testing.expect_streq(h2.linkname, GNUTARGET, "gnu long link target")
+    [_h3, e3] = tr.next()
+    testing.expect_eq(e3, io.eof(), "gnu archive end")
+}
+
+fn main() {}

@@ -559,7 +559,12 @@ fn emit_and_js(jssrc: str, out: str, entry: str) -> int {
     names = push(names, "rt-dom.mjs")
     i := 0
     for i < len(names) {
-        we = write_text(od + "/" + names[i], readfile(rt + "/runtime/" + names[i]))
+        src := readfile(rt + "/runtime/" + names[i])
+        if len(src) == 0 {
+            eprintln("cannot read runtime/" + names[i])
+            return 0
+        }
+        we = write_text(od + "/" + names[i], src)
         if we != 0 {
             eprintln("cannot write " + od + "/" + names[i] + ": " + rt_errstr(we))
             return 0

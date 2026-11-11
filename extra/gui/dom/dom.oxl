@@ -45,6 +45,8 @@ extern fn oxl_dom_ev_kind() -> int
 
 extern fn oxl_dom_ev_aux() -> int
 
+extern fn oxl_dom_ev_txt() -> cstr
+
 extern fn oxl_dom_fire(h: int, kind: int)
 
 extern fn oxl_dom_unlisten(h: int, kind: int)
@@ -69,6 +71,8 @@ let D_ROWCLICK = 4
 let D_CLOSE = 5
 
 struct Dom { stopf: shared, wakech: chan }
+
+let g_viol: shared = nil // dead-target protocol violations recorded
 
 // ---- live-handle set (sweep on teardown; mirrors gtk) ----
 struct AH { h: int, next: own AH }
@@ -114,6 +118,7 @@ fn al_del(h: int) {
 // backend — the DOM flavor the emitted page uses: #app when present,
 // <body> otherwise; under node the provider is headless already.
 fn backend() -> Dom {
+    g_viol = mkshared(0)
     d := Dom{stopf: mkshared(0), wakech: mkchan()}
     // hand the provider our wake chan — a real DOM event posts an
     // edge there so the pump's park wakes on input, not on the
@@ -202,6 +207,10 @@ fn (d Dom) new(kind: gui.WidgetKind, props: own []gui.Prop) -> [int, err] {
 fn (d Dom) set_prop(h: int, p: gui.Prop) {
     match p.val {
         gui.PropVal.Text(s) => {
+            if p.id == gui.P_ROWS || al_has(h) == 0 {
+                sadd(g_viol, 1)
+                return
+            }
             oxl_dom_set_text(h, p.id, s)
         }
         _ => {
@@ -211,6 +220,10 @@ fn (d Dom) set_prop(h: int, p: gui.Prop) {
 }
 
 fn (d Dom) attach(parent: int, child: int) {
+    if al_has(parent) == 0 || al_has(child) == 0 {
+        sadd(g_viol, 1)
+        return
+    }
     oxl_dom_attach(parent, child)
     // a child under a <ul> is a row — row_activated click target per
     // the event mapping; the row index rides the dom layer's aux
@@ -220,6 +233,10 @@ fn (d Dom) attach(parent: int, child: int) {
 }
 
 fn (d Dom) detach(parent: int, child: int) {
+    if al_has(parent) == 0 || al_has(child) == 0 {
+        sadd(g_viol, 1)
+        return
+    }
     if d.tag(parent) == "ul" {
         oxl_dom_unlisten(child, D_ROWCLICK)
     }
@@ -227,9 +244,11 @@ fn (d Dom) detach(parent: int, child: int) {
 }
 
 fn (d Dom) destroy(h: int) {
-    if al_has(h) == 1 {
-        al_del(h)
+    if al_has(h) == 0 {
+        sadd(g_viol, 1)
+        return
     }
+    al_del(h)
     oxl_dom_destroy(h)
 }
 
@@ -285,6 +304,9 @@ fn (d Dom) exec(c: own gui.Cmd) {
         return
     }
     if c.kind == gui.CmdKind.dismiss_close {
+        if al_has(c.target) == 0 {
+            sadd(g_viol, 1)
+        }
         return
     }
     if c.kind == gui.CmdKind.read {
@@ -352,7 +374,7 @@ fn (d Dom) deliver(events: mut gui.EventBuf, h: int, k: int, aux: int) {
     if k == D_INPUT {
         e.kind = gui.EventKind.text_changed
         if oxl_dom_read_has(h, gui.P_TEXT) == 1 {
-            e.data = gui.EventData.Text(str(oxl_dom_read_str(h, gui.P_TEXT)))
+            e.data = gui.EventData.Text(str(oxl_dom_ev_txt()))
         }
     }
     // unknown provider kinds carry no meaningful event — dropping
@@ -405,6 +427,11 @@ fn (d Dom) pump_edge() -> chan {
 
 fn (d Dom) stopped() -> int {
     return sget(d.stopf)
+}
+
+// dead-target protocol calls recorded so far.
+fn (d Dom) violations() -> int {
+    return sget(g_viol)
 }
 
 // teardown — the contract forbids returning with live handles; the

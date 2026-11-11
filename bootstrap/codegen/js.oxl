@@ -3234,7 +3234,7 @@ fn jgenall(g: mut G) -> str {
                             } else {
                                 tb = tb + "o_f_" + cn + "(); "
                             }
-                            tb = tb + "_e" + sid + " = rt.rt_scope_try(_t" + sid + "); } catch (_x) { _e" + sid + " = (_x && _x.code !== undefined) ? _x.code : 1n; try { rt.rt_scope_leave(_t" + sid + "); } catch (_y) {} } "
+                            tb = tb + "_e" + sid + " = await rt.rt_scope_drain(_t" + sid + "); } catch (_x) { _e" + sid + " = (_x && _x.code !== undefined) ? _x.code : 1n; try { await rt.rt_scope_drain(_t" + sid + "); } catch (_y) {} } "
                             tb = tb + "rt.rt_print_str(rt.rt_str_lit(\"" + base64.encode(("  " + name + " ... ") as []byte) + "\")); if (_e" + sid + ") rt.rt_println_str(rt.rt_str_lit(\"" + base64.encode("FAIL" as []byte) + "\")); else rt.rt_println_str(rt.rt_str_lit(\"" + base64.encode("ok" as []byte) + "\")); }\n"
                             id = id + 1
                         }

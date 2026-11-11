@@ -91,6 +91,7 @@ const POLLS_PER_DRAIN = 64
 let scheduled = false
 let keepalive = null
 let root_task = null // the task __oxl_boot drives; settled ends the boot
+let drain_waits = 0 // outstanding drain_scope waits keep the loop alive
 
 /* msgchan is built on first use — under node setImmediate always
  * wins and an eagerly-created port1 (a ref'd handle the moment an
@@ -156,13 +157,15 @@ function drain() {
     sched()
     return
   }
-  // queue drained
-  if (root_task && !root_task.settled) {
-    // root merely parked — wakes arrive from timers/ffi edges
+  // queue drained — stay alive while the current root is merely
+  // parked (wakes arrive from timers/ffi edges) or a boot/test
+  // scope-drain wait is outstanding; both are work the native lane
+  // would block on
+  if ((root_task && !root_task.settled) || drain_waits > 0) {
     arm_keepalive()
     return
   }
-  if (root_task && root_task.settled) disarm_keepalive()
+  disarm_keepalive()
 }
 
 /* ---------------- borrow ledger (§9) ----------------
@@ -305,6 +308,11 @@ function scope_done(s) {
       s.dead = 1
       scope_orphan_free(s)
     }
+    if (s._drainers) {
+      const ds = s._drainers
+      s._drainers = null
+      for (const r of ds) r()
+    }
   }
 }
 
@@ -382,6 +390,27 @@ export function rt_scope_leave(s) {
 
 export function rt_scope_try(s) {
   return s ? join_scope(s) : 0n
+}
+
+/* wait for a scope's pending count to drain — the async counterpart
+ * of native join_scope's blocking wait. scope_done resolves waiters
+ * at zero; drain_waits keeps the keepalive armed so node cannot
+ * retire with a drain still outstanding. */
+function drain_scope(s) {
+  if (!s || s.pending === 0) return Promise.resolve()
+  if (!s._drainers) s._drainers = []
+  drain_waits++
+  return new Promise((res) => s._drainers.push(() => {
+    drain_waits--
+    res()
+  }))
+}
+
+/* drain + join — the async counterpart of rt_scope_try for callers
+ * that must block until the scope's descendants settle */
+export async function rt_scope_drain(s) {
+  await drain_scope(s)
+  return rt_scope_try(s)
 }
 
 export function rt_scope_join_free(sv) {
@@ -744,7 +773,7 @@ export function rt_run_root(fr) {
   t.external = 1
   const prev = tls_task
   t.is_root = prev === null ? 1 : 0
-  if (t.is_root && root_task === null) root_task = t
+  if (t.is_root) root_task = t
   const prev_scope = tls_scope
   tls_task = t
   tls_scope = t.scope
@@ -2171,6 +2200,9 @@ export async function __oxl_boot(main_entry) {
   try {
     const trapped = await main_entry()
     const code = env.exitCodeOf ? env.exitCodeOf() : 0
+    /* native join_scope blocks until children drain; the js lane
+     * awaits the same drain so spawned work cannot be orphaned */
+    await drain_scope(base)
     rt_scope_leave(base)
     if (isNode) env.setExitCode(code)
     return trapped ? 1 : 0

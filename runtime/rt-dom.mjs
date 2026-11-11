@@ -58,8 +58,8 @@ const EQ = []
  * defensive 50ms timeout eventually finds */
 let EDGE = null
 let TRYSEND = null
-const pushEv = (el, kind, aux) => {
-  EQ.push({ h: el.__oxl_h, kind, aux })
+const pushEv = (el, kind, aux, txt) => {
+  EQ.push({ h: el.__oxl_h, kind, aux, txt })
   if (EDGE && TRYSEND) TRYSEND(EDGE, 1n)
 }
 
@@ -75,7 +75,7 @@ function tagOf(el) {
 function propField(el, id) {
   if (id === P_PLACEHOLDER) return 'placeholder'
   if (id === P_TEXT && tagOf(el) === 'input') return 'value'
-  if (id === P_TEXT || id === P_TITLE) return 'textContent'
+  if (id === P_TEXT) return 'textContent'
   return null
 }
 const pget = (el, f) => REAL ? el[f] : el.props[f]
@@ -192,7 +192,7 @@ export function install(api) {
       return
     }
     if (k === D_INPUT) {
-      reg('input', () => pushEv(el, D_INPUT, 0n))
+      reg('input', () => pushEv(el, D_INPUT, 0n, pget(el, 'value')))
       return
     }
     if (k === D_ENTER) {
@@ -242,6 +242,9 @@ export function install(api) {
   F.oxl_dom_ev_pop = () => { if (EQ.length) EQ.shift() }
   F.oxl_dom_ev_kind = () => (EQ.length ? EQ[0].kind : 0n)
   F.oxl_dom_ev_aux = () => (EQ.length ? EQ[0].aux : 0n)
+  /* the value an input carried when its event fired — text_changed
+   * reports fire-time state, not delivery-time state */
+  F.oxl_dom_ev_txt = () => (EQ.length ? String(EQ[0].txt || '') : '')
 
   F.oxl_dom_set_edge = (ch) => { EDGE = ch }
 
@@ -261,7 +264,8 @@ export function install(api) {
   F.oxl_dom_style = (h, name, v) => {
     const el = get(h)
     if (!el) return
-    el.style[String(STR(name))] = String(STR(v))
+    if (REAL) el.style.setProperty(String(STR(name)), String(STR(v)))
+    else el.style[String(STR(name))] = String(STR(v))
   }
 
   /* headless inspection — tests read the tree the backend built */

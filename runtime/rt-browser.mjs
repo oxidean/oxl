@@ -19,11 +19,18 @@ export function install(api) {
   const env = api.env
   const F = api.F
 
-  // console-backed writer (lossy decode — documented divergence)
+  // console-backed writer (lossy decode — documented divergence),
+  // line-buffered so partial writes aren't split one line per call
+  const wbuf = { 1: '', 2: '' }
   env.write = (fd, u8, off, len) => {
-    const s = dec.decode(u8.subarray(off, off + len))
-    if (fd === 2) console.error(s.replace(/\n$/, ''))
-    else console.log(s.replace(/\n$/, ''))
+    wbuf[fd] = (wbuf[fd] || '') + dec.decode(u8.subarray(off, off + len))
+    let i
+    while ((i = wbuf[fd].indexOf('\n')) >= 0) {
+      const line = wbuf[fd].slice(0, i)
+      wbuf[fd] = wbuf[fd].slice(i + 1)
+      if (fd === 2) console.error(line)
+      else console.log(line)
+    }
   }
   env.argv = [] // no argv: argv(0) reads as empty
   env.setExitCode = () => {}

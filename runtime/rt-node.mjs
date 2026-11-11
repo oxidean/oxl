@@ -123,7 +123,7 @@ export function install(api) {
     },
     rt_open_write_mode: (p, mode, src) => {
       try {
-        return ok_int(fs.openSync(path_of(p), 'w', Number(mode)))
+        return ok_int(fs.openSync(path_of(p), 'wx', (Number(mode) | 0o200) & 0o777))
       } catch (e) { return neg_errno(e) }
     },
     rt_fd_read: (fd, b) => {
@@ -193,7 +193,9 @@ export function install(api) {
         })
         return 0n
       } catch (e) {
-        return ok_int(typeof e.status === 'number' ? e.status : 1)
+        return ok_int(typeof e.status === 'number' ? e.status
+          : e.errno != null ? neg_errno(e)
+          : e.signal ? 128 + (os.constants.signals[e.signal] || 15) : 1)
       }
     },
     rt_proc_output: (argv, envv, outp, errp) => {
@@ -207,12 +209,12 @@ export function install(api) {
           env: env_merge(envv),
           encoding: 'buffer',
         })
-        if (r.error) return ok_int(-(r.error.errno || 1))
+        if (r.error) return ok_int(neg_errno(r.error))
         if (outp) outp.v = slice_of_u8(new Uint8Array(r.stdout || []))
         if (errp) errp.v = slice_of_u8(new Uint8Array(r.stderr || []))
-        return ok_int(r.status == null ? (r.signal ? 128 : 1) : r.status)
+        return ok_int(r.status == null ? (r.signal ? 128 + (os.constants.signals[r.signal] || 15) : 1) : r.status)
       } catch (e) {
-        return ok_int(-(e.errno || 1))
+        return ok_int(neg_errno(e))
       }
     },
 

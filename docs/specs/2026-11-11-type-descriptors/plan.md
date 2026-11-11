@@ -13,17 +13,28 @@ you want verdicted, and again after the last fix commit.
       for every type reachable through a `tdesc` reference
       (demand-driven — no `tdesc`, no table), deduplicated, emitted
       into the binary's static data by `codegen.rs` AND
-      `codegen.oxl`; `tdesc(T)` intrinsic folded at instantiation
-      (yields the descriptor index); `value_of` intrinsic +
-      scope-bound-`Value` escape rules in both checkers; the
-      `type_of` builtin special form (type operand, `mkslice`
+      `codegen.oxl` (records per the contract incl. `elem_ptr` for
+      `[]own T` element slots and named-variant payload names);
+      `tdesc(T)` intrinsic folded at instantiation (yields the
+      descriptor index) plus sibling `tqual(T)` (0/own/ref/mut —
+      `%v`'s `&{…}` mechanism, frozen decision per the contract);
+      `value_of`/`value_of_mut` intrinsics + the scope-bound-`Value`
+      rules in both checkers — the *provenance* rule (a `Value`
+      returns only when derived from a `ref`/`mut`/`Value` param;
+      locally-derived Values never return/store/spawn) plus the
+      no-struct-literal fabrication guard, NOT a reuse of the
+      signature-level `ref` bans — note the pre-existing diag-parity
+      gap this sits on: check.rs bans `ref`/`mut` under `Ret::One`
+      only while check.oxl also bans `Ret::Pair`; the `type_of`
+      builtin special form (type operand, `mkslice`
       precedent — NOT a callable generic, params bind only from
       args); `rt_desc_*` descriptor accessors (the lazy read lane
-      `Type`/`Field` methods wrap), `rt_field_*` extern read AND
-      `rt_field_set_*` write helpers (raw typed access at
-      `addr+off` — the externs see no descriptors, so kind checking
-      lives in std/reflect's dispatch, R2; the write half is specced
-      up front because R4–R6 decode through it); parity test
+      `Type`/`Field` methods wrap, incl. `rt_desc_v_base` for the
+      codegen-pinned union-blob offset — never a fixed +8), the
+      `rt_field_*` extern read AND `rt_field_set_*` write helpers in
+      ALL width lanes (i64/i32/u8/f64/str/ptr — `bool` fields and
+      enum tags are C `int` 4B, `byte` 1B; an i64-only lane would
+      misread every one); parity test
       `tests/desc_parity.oxl` asserting
       name/kind/size/fields/offsets/variants for fixture struct and
       enum types under both drivers, wired into `tests/run.sh`.
@@ -41,10 +52,20 @@ you want verdicted, and again after the last fix commit.
       wired into `tests/run.sh`.
 - [ ] **R3 — typed error payloads (completes #27).** `std/errors`:
       `box[T any](v: T)` minting int64 codes backed by the rt err
-      registry (binds T from `v` — that is what `tdesc(T)` needs)
-      (`{tdesc, payload}` stored out-of-band — a box IS an `err`),
-      `as[T](e, out: mut T)`, interop with `wrap`/`unwrap`/`is`;
-      `docs/semantics/errors.md` records the box lane.
+      registry (binds T from `v` — that is what `tdesc(T)` needs).
+      Rt change, named here because today's `RtErrEnt`
+      (`{next, mlen, cause, msg}`) has no payload slots: extend the
+      entry with `{td, pdata}` — a box IS an `err` end to end and
+      chains through `wrap`/`unwrap`/`is` untouched. Ownership pins:
+      `box` CONSUMES its `v` (the registry adopts the payload —
+      call sites pass `own` values); `as[T](e, out: mut T)` MOVES
+      the payload out into `out` and clears the slot, so a given
+      box answers `as` exactly once — the only move-safe shape (a
+      shallow copy would alias `own` handles, a borrow can't be
+      expressed); `as` walks the `unwrap` chain like Go's As —
+      first descriptor match wins;
+      `docs/semantics/errors.md` gains a section recording the
+      box lane.
       `tests/errors_as.oxl`: box → as round-trip incl. no-match
       and wrapped-chain cases, wired into `tests/run.sh`.
 - [ ] **R4 — `encoding/gob`.** Descriptor-driven struct → bytes →
@@ -76,5 +97,6 @@ R1 is the compiler-risk stage (both drivers must emit identical
 layouts). R2 retires the headline feature early. R4 deliberately
 precedes R5/R6 — gob's arbitrary-shape round-trip is the strongest
 correctness signal the walk machinery can get before it is spent on
-easier consumers. R3 is independent of R4–R6 and may land any time
-after R2.
+easier consumers. R3 is independent of R4–R6 and needs only R1
+(`tdesc` + the registry change) — it may land any time after R1,
+in parallel with R2.

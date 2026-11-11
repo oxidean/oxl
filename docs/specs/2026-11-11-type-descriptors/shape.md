@@ -2,7 +2,10 @@
 
 ## Scope
 
-Milestone R from the parked list
+Milestone R (letter reclaimed — the earlier "R — package
+registry" row in `docs/specs/2026-11-07-phase-2-plan/plan.md` was
+folded into milestone E and ships already; this spec is the only
+live R) from the parked list
 (`docs/specs/2026-11-06-0111-package-system/items/parked-stdlib.md`,
 `docs/specs/2026-11-07-phase-2-plan/parked.md`): compiler-emitted
 runtime type descriptors + the reflection-class stdlib they unlock —
@@ -16,9 +19,10 @@ reflection (iface-typed `T` describes as IFACE and stops — no path
 to the concrete payload), `unsafe` pointer arithmetic as a language
 feature (`unsafe` is a scoping-block marker today — it silences
 no checks; R adds no opt-out either), `runtime/pprof`-class introspection, and the `--target js`
-emit lane: `addr:int` arithmetic and C `rt_field_*` loads don't
-port to JS, so R is native-lane only — js-lane descriptors/`%v`
-defer to their own trigger.
+emit lane (milestone W, in flight as this spec lands — the js emit
+path exists only on that branch): `addr:int` arithmetic and C
+`rt_field_*` loads don't port to JS, so R is native-lane only —
+js-lane descriptors/`%v` defer to their own trigger.
 
 ## Evidence
 
@@ -57,19 +61,33 @@ defer to their own trigger.
    shapes, variant names for enums. No method tables — ifaces already carry vtables; the
    descriptor surface composes with them rather than duplicating.
 3. **Reading field values crosses one unsafe seam — with enforced
-   lifetime.** `reflect.Value` is `{tdesc, addr}` — an opaque field
-   address. `value_of` is a compiler-lowered intrinsic (no `addrof`
+   lifetime and origin.** `reflect.Value` is `{tdesc, addr, mut}` —
+   opaque field addressing plus a writability bit. `value_of` /
+   `value_of_mut` are compiler-lowered intrinsics (no `addrof`
    builtin exists to abuse) and `Value` is declared a scope-bound
-   type: the checker applies the same escape rules as borrowed
-   `ref`s (no return, no heap store, no spawn escape), so a `Value`
-   provably cannot outlive its source. The read path is a small set
-   of extern helpers (`rt_field_*`, `rt_desc_*`) called inside
+   type. The enforced rule is *provenance*, not the literal `ref`
+   signature bans — those would reject this spec's own
+   `-> [Value, err]` methods (the self-hosted checker bans `ref`/
+   `mut` under `Ret::Pair` as well as `Ret::One`). Instead the
+   checker tracks Value provenance like borrow provenance: a
+   function may return a `Value` only when it derives from one of
+   that function's `ref`/`mut`/`Value` parameters; a `Value`
+   derived from a local `own` (the actually-dangerous case —
+   `c := new(v); return value_of(c)` returns an address whose
+   pointee dies at scope end) may not be returned, stored in heap
+   shapes, or sent to `spawn`. (`value_of(p)` on a `ref` param IS
+   safe to return — the pointee lives in the caller's frame, and
+   the provenance rule says exactly that.) The flag also marks
+   `Value` non-constructible by struct literal outside
+   `std/reflect` — the language has no private fields, so without
+   this, `Value{td: 3, addr: <any int>}` would fabricate arbitrary
+   memory access; the checker's flag rejects it. The read path is
+   extern helpers (`rt_field_*`, `rt_desc_*`) called inside
    `std/reflect`'s `unsafe` blocks; user code sees typed `Value`
-   methods (`v.int()`, `v.str()`, `v.field(i)`, `v.len()`/
-   `v.index(i)`), never raw addresses. The externs are not private
-   — any module may redeclare them — so confinement is social; the
-   *enforced* guarantee is `Value`'s scope-bound escape rule, which
-   holds regardless of who calls the externs.
+   methods, never raw addresses. The externs are not private —
+   any module may redeclare them — so confinement is social; the
+   *enforced* guarantees are the provenance rule and the
+   no-literal rule, which hold regardless of who calls the externs.
 4. **`errors.As` gets a typed box, `err` stays int64.** Go's As
    matches a *dynamic* type; int64 codes have none. `box(v)` mints
    a fresh int64 code and stores `{tdesc(T), payload}` in the rt
@@ -114,35 +132,56 @@ fn type_of(t) -> Type                        // builtin special form —
 fn value_of[T any](v: ref T) -> Value        // intrinsic → {tdesc(base(T)),
                                              //  pointee addr — qualified T
                                              //  derefs the handle once}
-fn (v Value) field(i: int) -> [Value, err]   // addr + f_off(i); td ← f_td(i)
+fn value_of_mut[T any](v: mut T) -> Value    // same, sets v.mut — the write
+                                             //  lane's provenance (see below)
+fn (v Value) field(i: int) -> [Value, err]   // STRUCT only; addr + f_off(i);
+                                             //  td ← f_td(i); err_oob past
+                                             //  nfields — always bind the
+                                             //  pair ([f, e] = v.field(i))
 fn (v Value) len() -> [int, err]             // SLICE only (RtSlice.len)
-fn (v Value) index(i: int) -> [Value, err]   // SLICE only, scope-bound
-fn (v Value) int() -> [int, err]             // kind-checked read
+fn (v Value) index(i: int) -> [Value, err]   // SLICE only, scope-bound;
+                                             //  err_oob before address math;
+                                             //  elem_ptr slots deref once
+fn (v Value) int() -> [int, err]             // kind-checked read (i64 lane)
 fn (v Value) f64() -> [float, err]           // kind-checked read
+fn (v Value) bool() -> [int, err]            // kind-checked read (i32 lane —
+                                             //  C `int`, 4B — NOT an i64 load)
+fn (v Value) byte() -> [int, err]            // kind-checked read (u8 lane)
 fn (v Value) str() -> [str, err]             // kind-checked read
-fn (v Value) set_int(x: int) -> err          // kind-checked write
-fn (v Value) set_f64(x: float) -> err        // kind-checked write
-fn (v Value) set_str(x: str) -> err          // kind-checked write
+fn (v Value) set_int(x: int) -> err          // kind-checked write; err_kind
+fn (v Value) set_bool(x: int) -> err         //  unless v.mut (mut-derived)
+fn (v Value) set_byte(x: int) -> err         //
+fn (v Value) set_f64(x: float) -> err        //
+fn (v Value) set_str(x: str) -> err          //
 fn (t Type) name() -> str                    // rt_desc_name
 fn (t Type) kind() -> int                    // rt_desc_kind
 fn (t Type) size() -> int                    // rt_desc_size
 fn (t Type) nfields() -> int                 // rt_desc_nfields
-fn (t Type) field(i: int) -> Field           // {td, i}
+fn (t Type) field(i: int) -> [Field, err]    // {td, i}; err_oob — an OOB
+                                             //  desc read is UB, so index
+                                             //  accessors are pair-shaped
+                                             //  like v.index
 fn (t Type) elem() -> Type                   // rt_desc_elem
 fn (t Type) nvars() -> int                   // rt_desc_nvars
-fn (t Type) varname(i: int) -> str           // rt_desc_var
-fn (t Type) variant(i: int) -> Variant       // {td, i}
+fn (t Type) varname(i: int) -> [str, err]    // rt_desc_var
+fn (t Type) variant(i: int) -> [Variant, err]// {td, i}; err_oob
 fn (x Variant) name() -> str                 // rt_desc_var
 fn (x Variant) nfields() -> int              // rt_desc_v_nfields —
-                                             // positional payload slots
-fn (x Variant) ftyp(i: int) -> Type          // {rt_desc_v_f_td}
-fn (x Variant) foff(i: int) -> int           // rt_desc_v_f_off — relative
-                                             // to the union blob base
+                                             //  positional payload slots
+fn (x Variant) ftyp(i: int) -> [Type, err]   // {rt_desc_v_f_td}; err_oob
+fn (x Variant) foff(i: int) -> [int, err]    // rt_desc_v_f_off — relative
+                                             //  to the union blob base;
+                                             //  err_oob
 fn (v Value) tag() -> [int, err]             // ENUM only — reads the tag
-                                             // slot; the union blob
-                                             // begins at addr + 8 (the
-                                             // i64 tag), and Variant
-                                             // foff()s index from there
+                                             //  slot via the i32 lane (the
+                                             //  tag is a C `int`, 4B in both
+                                             //  drivers). The union blob
+                                             //  base is rt_desc_v_base(td)
+                                             //  — codegen-pinned offsetof,
+                                             //  NOT a fixed constant: with
+                                             //  `int` tags it is alignment-
+                                             //  dependent (4 for unit-only
+                                             //  or low-align payloads)
 fn (f Field) name() -> str                   // rt_desc_f_name
 fn (f Field) off() -> int                    // rt_desc_f_off
 fn (f Field) typ() -> Type                   // {rt_desc_f_td}
@@ -163,7 +202,16 @@ shaped as pairs from the start.
 `fmt` grows `sprintv[T any](v: T) -> str` / `printv[T any]` +
 `vfmt[T](f: str, v: T)` covering `%v`/`%+v`/`%T`/`%#v` for a single
 typed value — the Go variadic-multi-arg form stays impossible (no
-variadics) and the doc says so. By-value `v: T` can't coerce to
+variadics) and the doc says so. The `&{…}` ptr form is delivered
+by a sibling intrinsic `tqual(T) -> int` (0 unqualified, 1 `own`,
+2 `ref`, 3 `mut`) folded at mono time next to `tdesc(T)` — the
+generic binding of `T` carries the qualifier, so a
+`sprintv[own Point]` instantiation statically knows to print
+`&`. (Caveat worth one line: a `v: T` param of `sprintv` itself
+receives the value — `own` args are *moved* into the callee by the
+usual rules.) `%v` on opaque kinds (IFACE/FN/CHAN/ERR) prints a
+placeholder form — `iface{…}`/`fn`/`chan`/`err <code>` — pinned
+here so R2 doesn't improvise. By-value `v: T` can't coerce to
 `ref T` (`assignable` admits refs only from own/mut/ref args), so
 the bridge inside these wrappers is pinned: `c := new(v)` yields
 `own T`, which coerces to `ref T` for `value_of` — then `c` drops
@@ -182,4 +230,8 @@ qualified `T` to the wrapped desc per the contract). Decode paths
 (`gob` decode, `xml` unmarshal, `sql.scan[T]`'s `out`) write
 through `field(i).set_*` on `mut`-derived `Value`s — the same
 scope-bound rule applies, so a writable `Value` provably cannot
-outlive the buffer it mutates.
+outlive the buffer it mutates. Writability is *enforced*, not
+conventional: `mut T` args coerce to `ref T`, which would erase
+the bit, so the lane takes `value_of_mut` — a parallel intrinsic
+that sets `Value.mut`; `field`/`index` propagate it, and `set_*`
+returns `err_kind` on a Value lacking it.

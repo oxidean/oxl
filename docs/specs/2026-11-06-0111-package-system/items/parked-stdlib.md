@@ -31,9 +31,9 @@ half. Staying parked: `html/template` (out of R's scope) and
 - Plugin loading, compiler-self packages (ast/parser/token class),
   `runtime` internals,
   `runtime/pprof` — runtime/codecs introspection doesn't exist.
-- `unsafe` in the memory-unsafe sense — oxl `unsafe` is an
-  ownership-check opt-out
-  block, not `Pointer` arithmetic.
+- `unsafe` in the memory-unsafe sense — oxl `unsafe` is a
+  scoping-block marker that silences no checks (`docs/semantics/
+  ownership.md`), not `Pointer` arithmetic.
 
 ## Replaced by language semantics — porting them would be wrong
 

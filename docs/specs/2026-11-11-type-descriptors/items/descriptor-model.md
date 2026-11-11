@@ -15,10 +15,19 @@ TypeDesc {
   name:   cstr          // "Point", "io.File", "int", "[]byte"
   kind:   u8            // kind enum below
   size:   int           // sizeof in the C layout the emitter produced
-  align:  int           // field-address arithmetic needs it for ptr reads
+  align:  int           // recorded for the table's ABI consumers
+                       // (cross-driver parity checks, external tools);
+                       // rt helpers do no align math — offsets are
+                       // already absolute
   nfields:int
   fields: FieldDesc*    // structs only; NULL elsewhere
   elem:   int           // desc idx of element type: slice/chan/ptr
+  elem_ptr: int         // 1 when the element SLOT is a pointer to
+                       // elem's layout (`[]own T`) — index(i) then
+                       // derefs the slot like FieldDesc.ptr; 0 for
+                       // inline elements. CHAN payloads are in-flight
+                       // values, never addressable — CHAN reads stay
+                       // opaque regardless.
   nvars:  int           // enum variant count (0 elsewhere)
   vars:   VariantDesc*  // enums only; NULL elsewhere
 }
@@ -26,9 +35,11 @@ VariantDesc { name: cstr, nfields: int, fields: FieldDesc* }
 FieldDesc { name: cstr, off: int, td: int, tag: cstr, ptr: int }
 ```
 
-`VariantDesc.fields` describes a variant's positional payload
-slots as anonymous `FieldDesc` entries (`name` is `""`, `off` is
-relative to the union blob's base). Payload-carrying enums are
+`VariantDesc.fields` describes a variant's payload slots as
+`FieldDesc` entries (`off` is relative to the union blob's base).
+Named payloads (`E.V{ a: t }`) keep their declared names — gob/xml
+need them for named-payload variants — and positional payloads get
+`name: ""`. Payload-carrying enums are
 walkable end to end: `%v` prints `circle(3.0)`, gob/XML round-trip
 them, and `reflect` exposes them — a name-only variant table would
 make every payload invisible to all three consumers.
@@ -96,18 +107,28 @@ backing that could never be returned from a callee.
 
 ## Value reads — the one unsafe seam
 
-`reflect.Value{td, addr}` is constructed only by `value_of`, which
-is itself a compiler-lowered intrinsic: `value_of[T](v: ref T)`
-emits `Value{tdesc(T), (int64_t)v}` — there is no other way to turn
-a reference into an address (no `addrof` builtin; `as` casts stay
-str/byte/int/enum-only, and generic externs are not a surface R
-opens). Field walks add `off` to `addr`; reads go through externs
-that interpret `addr` per the desc's kind:
+`reflect.Value{td, addr, mut}` is constructed only by
+`value_of`/`value_of_mut`, which are compiler-lowered intrinsics:
+`value_of[T](v: ref T)` emits `Value{tdesc(T), (int64_t)v, 0}` —
+there is no other way to turn a reference into an address (no
+`addrof` builtin; `as` casts stay str/byte/int/enum-only, and
+generic externs are not a surface R opens). "Only the intrinsics"
+is enforced: the language has no private fields, so the
+scope-bound flag additionally rejects `reflect.Value{...}`
+struct literals outside `std/reflect` — fabrication would
+otherwise be arbitrary-memory access. Field walks add `off` to
+`addr` and propagate `mut`; reads go through externs that
+interpret `addr` per the desc's kind:
 
 Field reads — trivial C loads interpreting `addr` per the desc's kind:
 
 ```
-extern fn rt_field_i64(addr: int) -> int
+extern fn rt_field_i64(addr: int) -> int     // INT lane (8B)
+extern fn rt_field_i32(addr: int) -> int     // BOOL + enum tag lane
+                                             // (C `int`, 4B — an i64
+                                             // load would pull adjacent
+                                             // memory)
+extern fn rt_field_u8(addr: int) -> int      // BYTE lane (1B)
 extern fn rt_field_f64(addr: int) -> float
 extern fn rt_field_str(addr: int) -> str       // borrow — same lifetime as v
 extern fn rt_field_ptr(addr: int) -> int       // raw field address
@@ -118,6 +139,8 @@ through `mut`-derived `Value`s):
 
 ```
 extern fn rt_field_set_i64(addr: int, v: int)
+extern fn rt_field_set_i32(addr: int, v: int)
+extern fn rt_field_set_u8(addr: int, v: int)
 extern fn rt_field_set_f64(addr: int, v: float)
 extern fn rt_field_set_str(addr: int, v: str)
 extern fn rt_field_set_ptr(addr: int, v: int)
@@ -143,6 +166,10 @@ extern fn rt_desc_f_ptr(td: int, i: int) -> int // 1: slot is a ptr
 extern fn rt_desc_v_nfields(td: int, vi: int) -> int   // enum payload
 extern fn rt_desc_v_f_td(td: int, vi: int, fi: int) -> int
 extern fn rt_desc_v_f_off(td: int, vi: int, fi: int) -> int
+extern fn rt_desc_v_base(td: int) -> int     // union blob base offset —
+                                             // codegen-pinned offsetof(u);
+                                             // NOT a fixed constant (tag is
+                                             // C `int` 4B; alignment varies)
 ```
 
 All are trivial C; the ONLY unsafe surface is inside `std/reflect`
@@ -150,18 +177,27 @@ All are trivial C; the ONLY unsafe surface is inside `std/reflect`
 field is consumed only by the C helpers' own address math — no
 oxl-side accessor is needed.
 
-**`Value` lifetime is enforced, not conventional.** Two ints carry
-no borrow marker, so the checker can't rely on the `ref` rules
-alone — `fn leak(p: ref Point) -> Value { return value_of(p) }`
-would otherwise compile and return a dangling `addr`. The rule:
-`reflect.Value` is a **scope-bound type** — the same escape checks
-borrowed `ref`s already get (no `return`, no store in `own`/heap
-shapes, no spawn escape; the `check.rs` code paths for `ref` escape
-are reused via a type flag on `Value`). `v.field(i)`/`v.index(i)`
-yield scope-bound `Value`s deriving from `v`. Inside `std/reflect`
-this is enough machinery to write the whole walk; outside, a
-`Value` can live only as long as its source's scope. Kind
-mismatches return a `reflect.err_kind` err code, never garbage.
+**`Value` lifetime is enforced, not conventional — via
+provenance, not the `ref` signature bans.** Two ints carry no
+borrow marker, so the checker can't rely on the `ref` rules
+alone — and a literal reuse of those rules would also reject this
+surface's own `-> [Value, err]` methods (check.oxl bans `ref`/
+`mut` under `Ret::Pair` too; `[]T` returns are banned under both).
+The pinned rule: `reflect.Value` is a **scope-bound type** — a
+`Value` may be returned only when it derives from one of the
+function's `ref`/`mut`/`Value` parameters (the checker tracks
+Value provenance through assignments and `field`/`index` walks,
+the same machinery it uses for borrow provenance). A `Value`
+derived from a *local* `own` — `c := new(v); return value_of(c)`
+is the real dangling case, since `p`-derived Values address
+caller-owned storage — may not be returned, stored in `own`/heap
+shapes, or sent to `spawn`. `v.field(i)`/`v.index(i)` yield
+scope-bound `Value`s deriving from `v`. Inside `std/reflect` this
+is enough machinery to write the whole walk; outside, a `Value`
+can live only as long as its source's scope. Kind mismatches
+return a `reflect.err_kind` err code, never garbage. (`err_kind`,
+`err_oob`, `err_nil` are fns returning interned sentinels, the
+`io.eof()` convention.)
 
 ## What is NOT emitted
 

@@ -33,7 +33,37 @@ emitter are written in oxl and compile themselves (see
 - `docs/prototype/report.md` — de-risking benchmarks (state-machine
   frames ~96 B/task; ownership checks ≈ free)
 
-## Building the toolchain
+## Installing the toolchain
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/oxidean/oxl/main/scripts/install.sh | sh
+```
+
+The installer drops a dispatch shim at `~/.oxl/bin/oxl` and the latest
+toolchain under `~/.oxl/versions/<tag>/`. Put the shim on PATH
+(the installer prints the line):
+
+```sh
+export PATH="$HOME/.oxl/bin:$PATH"
+oxl version     # → oxl vX.Y.Z (language 0.3)
+```
+
+The shim manages multiple toolchains side by side and auto-detects the
+one a project needs — `$OXL_TOOLCHAIN`, a `.oxl-version` file,
+`toolchain vX.Y.Z` in the nearest `oxl.mod`, else the default:
+
+```sh
+oxl toolchain list                  # installed versions
+oxl toolchain install v0.9.0        # fetch another release
+oxl toolchain use v0.9.0            # set the default
+oxl toolchain use --local v0.9.0    # pin a directory (.oxl-version)
+```
+
+Full details: [`docs/install.md`](docs/install.md). Prebuilt tarballs
+currently ship for Linux x86_64; other supported platforms build from
+source below.
+
+## Building from source
 
 Requires: a Rust toolchain (cargo) for the seed compiler, a C compiler
 (`cc`), and pthreads. Programs that use the sqlite3 shims also need
@@ -156,9 +186,13 @@ replace github.com/oxidean/widget => ../widget
 
 Directives: `module` (this module's path), `oxl` (minimum toolchain
 version), `require` (a dependency at a version, also in a parenthesized
-block), and `replace` (pin a dependency to a local directory). The
-toolchain walks up from the entry file to the nearest `oxl.mod`;
-without one, only `std/` imports resolve.
+block), `replace` (pin a dependency to a local directory), and
+`toolchain` (toolchain pin — parsed by the language, consumed by the
+version-manager shim). The two lookups root differently: the language
+walks up from the entry file to the nearest `oxl.mod` (without one,
+only `std/` imports resolve), while the version-manager shim picks the
+pin walking up from the current working directory — invoking `oxl` from
+outside the project tree can resolve a different pin or the default.
 
 Import resolution runs one longest-prefix competition across every
 candidate tree: `std/...` (the toolchain's shipped standard library),

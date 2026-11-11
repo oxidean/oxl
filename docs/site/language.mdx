@@ -79,9 +79,11 @@ supported). The v0.4 line ships 39 packages:
 
 Packages are directories of `.oxl` files that share a `package` clause;
 `package main` marks an executable. A project opts into module mode by
-placing an `oxl.mod` manifest at its root; the toolchain walks up from
+placing an `oxl.mod` manifest at its root; the language walks up from
 the entry file to the nearest one, and without it only `std/` imports
-resolve:
+resolve (the version-manager shim looks the pin up from the current
+working directory instead — a build run from outside the project tree
+can resolve a different pin or the default):
 
 ```text title="oxl.mod"
 module github.com/me/app
@@ -94,7 +96,9 @@ replace github.com/oxidean/widget => ../widget
 
 Directives: `module` (this module's path), `oxl` (minimum toolchain
 version), `require` (a dependency at a version, also in a parenthesized
-block), and `replace` (pin a dependency to a local directory).
+block), `replace` (pin a dependency to a local directory), and
+`toolchain` (toolchain pin — parsed by the language, consumed by the
+version-manager shim).
 
 Import resolution runs one longest-prefix competition across every
 candidate tree: `std/...` (the shipped standard library), this module's

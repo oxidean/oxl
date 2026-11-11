@@ -72,8 +72,10 @@ with_timeout() {
 # dies even when a probe fails mid-suite
 scratch=$(mktemp -d)
 srv_pid=""
+relsrv=""
 cleanup() {
     if [ -n "$srv_pid" ]; then kill "$srv_pid" 2>/dev/null || true; fi
+    if [ -n "$relsrv" ]; then kill "$relsrv" 2>/dev/null || true; wait "$relsrv" 2>/dev/null || true; fi
     # v2's sealed module-cache slots are read-only — restore write
     # permission or rm leaves them behind
     chmod -R u+w "$scratch" 2>/dev/null
@@ -1747,5 +1749,327 @@ if command -v pkg-config >/dev/null 2>&1 && pkg-config --exists gtk4 2>/dev/null
 else
     echo "  (skipped: gtk4 not installed)"
 fi
+
+echo "== toolchain shim + version manager (i60) =="
+# offline shim suite: fake installed toolchains, no network. Asserts
+# the spec's resolution order (env > .oxl-version > oxl.mod toolchain
+# > default), the 127-on-missing contract, and every `oxl toolchain`
+# verb staying inside the shim.
+tch="$scratch/tchome"; mkdir -p "$tch"
+for v in v0.1.0 v0.2.0; do
+    mkdir -p "$tch/versions/$v/oxl-toolchain"
+    printf '#!/bin/sh\necho "FAKE %s $@"\n' "$v" > "$tch/versions/$v/oxl-toolchain/oxl"
+    chmod +x "$tch/versions/$v/oxl-toolchain/oxl"
+done
+echo v0.1.0 > "$tch/default-version"
+# the shim embeds in install.sh — --shim-only extracts it without a download
+OXL_HOME="$tch" sh scripts/install.sh --shim-only >/dev/null
+SHIM="$tch/bin/oxl"
+tcw="$scratch/tcwork"; mkdir -p "$tcw/proj"
+
+# default resolution (bare dir, no config anywhere)
+out=$(cd "$tcw" && OXL_HOME="$tch" "$SHIM" check x)
+[ "$out" = "FAKE v0.1.0 check x" ] || { echo "FAIL shim default: $out"; exit 1; }
+# env beats everything
+out=$(cd "$tcw" && OXL_HOME="$tch" OXL_TOOLCHAIN=v0.2.0 "$SHIM" run)
+[ "$out" = "FAKE v0.2.0 run" ] || { echo "FAIL shim env: $out"; exit 1; }
+# oxl.mod toolchain directive beats default (walk-up from proj/)
+printf 'module example.com/m\n\noxl 0.3\ntoolchain v0.2.0\n' > "$tcw/oxl.mod"
+out=$(cd "$tcw/proj" && OXL_HOME="$tch" "$SHIM" build)
+[ "$out" = "FAKE v0.2.0 build" ] || { echo "FAIL shim directive: $out"; exit 1; }
+# .oxl-version beats a NEARER oxl.mod directive — precedence, not proximity:
+# the dotfile sits FARTHER up the tree and must still win
+mv "$tcw/oxl.mod" "$tcw/proj/oxl.mod"
+echo v0.1.0 > "$tcw/.oxl-version"
+out=$(cd "$tcw/proj" && OXL_HOME="$tch" "$SHIM" build)
+[ "$out" = "FAKE v0.1.0 build" ] || { echo "FAIL shim dotfile-precedence: $out"; exit 1; }
+rm "$tcw/.oxl-version"
+mv "$tcw/proj/oxl.mod" "$tcw/oxl.mod"
+# nearer oxl.mod without a pin shadows an ancestor's directive
+mkdir -p "$tcw/proj/inner"
+printf 'module example.com/inner\n\noxl 0.3\n' > "$tcw/proj/inner/oxl.mod"
+out=$(cd "$tcw/proj/inner" && OXL_HOME="$tch" "$SHIM" build)
+[ "$out" = "FAKE v0.1.0 build" ] || { echo "FAIL shim mod-shadow: $out"; exit 1; }
+# missing resolved version -> exit 127 with the install hint
+rc=0
+out=$(cd "$tcw" && OXL_HOME="$tch" OXL_TOOLCHAIN=v9.9.9 "$SHIM" build 2>&1) || rc=$?
+[ "$rc" = 127 ] && grep -q "toolchain install v9.9.9" <<<"$out" || {
+    echo "FAIL shim missing-127: rc=$rc $out"; exit 1; }
+# verbs: list marks the default; use flips it; current names the source
+out=$(OXL_HOME="$tch" "$SHIM" toolchain list)
+grep -q '^v0.1.0 (default)$' <<<"$out" && grep -q '^v0.2.0$' <<<"$out" || {
+    echo "FAIL toolchain list: $out"; exit 1; }
+out=$(OXL_HOME="$tch" "$SHIM" toolchain use v0.2.0)
+[ "$(cat "$tch/default-version")" = "v0.2.0" ] || { echo "FAIL toolchain use"; exit 1; }
+out=$(cd "$tcw/proj/inner" && OXL_HOME="$tch" "$SHIM" toolchain current)
+grep -q '^v0.2.0.*default-version' <<<"$out" || { echo "FAIL toolchain current: $out"; exit 1; }
+# use --local writes ./.oxl-version; uninstall refuses the default, --force wins
+out=$(cd "$tcw/proj" && OXL_HOME="$tch" "$SHIM" toolchain use --local v0.1.0)
+[ "$(cat "$tcw/proj/.oxl-version")" = "v0.1.0" ] || { echo "FAIL use --local"; exit 1; }
+rc=0
+out=$(OXL_HOME="$tch" "$SHIM" toolchain uninstall v0.2.0 2>&1) || rc=$?
+[ "$rc" != 0 ] && grep -q "is the default" <<<"$out" || {
+    echo "FAIL uninstall-default-guard: rc=$rc $out"; exit 1; }
+out=$(OXL_HOME="$tch" "$SHIM" toolchain uninstall v0.2.0 --force)
+[ ! -d "$tch/versions/v0.2.0" ] || { echo "FAIL uninstall --force"; exit 1; }
+# `version` is a real-binary verb reporting the RELEASE file stamp
+# (else dev) — probe it on the actual drivers
+out=$("$OXL" version)
+grep -qE '^oxl (dev|v[0-9]+\.[0-9]+\.[0-9]+) \(language [0-9]+\.[0-9]+\)$' <<<"$out" || {
+    echo "FAIL self version shape: $out"; exit 1; }
+out=$("$SEEDOXL" version)
+grep -qE '^oxl (dev|v[0-9]+\.[0-9]+\.[0-9]+) \(language [0-9]+\.[0-9]+\)$' <<<"$out" || {
+    echo "FAIL seed version shape: $out"; exit 1; }
+# RELEASE stamp is picked up beside the exe
+cp "$OXL" "$scratch/oxl-stamp$EXE" && echo v7.7.7 > "$scratch/RELEASE"
+out=$("$scratch/oxl-stamp$EXE" version)
+grep -qE '^oxl v7\.7\.7 \(language [0-9]+\.[0-9]+\)$' <<<"$out" || { echo "FAIL version stamp: $out"; exit 1; }
+# a manifest carrying `toolchain` builds clean on both drivers
+printf 'module example.com/tc\n\noxl 0.3\ntoolchain v0.9.0\n' > "$tcw/proj/inner/oxl.mod"
+printf 'package main\n\nfn main() { println("tc") }\n' > "$tcw/proj/inner/main.oxl"
+out=$("$OXL" run "$tcw/proj/inner" 2>&1)
+[ "$out" = "tc" ] || { echo "FAIL self toolchain-manifest: $out"; exit 1; }
+out=$("$SEEDOXL" run "$tcw/proj/inner" 2>&1)
+[ "$out" = "tc" ] || { echo "FAIL seed toolchain-manifest: $out"; exit 1; }
+# and `mod tidy` preserves the directive
+rm "$tcw/proj/inner/main.oxl"
+(cd "$tcw/proj/inner" && "$OXL" mod tidy >/dev/null 2>&1)
+grep -q '^toolchain v0.9.0$' "$tcw/proj/inner/oxl.mod" || {
+    echo "FAIL tidy preserves toolchain"; cat "$tcw/proj/inner/oxl.mod"; exit 1; }
+
+# unprefixed `toolchain 0.9.0` pins resolve and parse on both drivers
+rm -f "$tcw/proj/.oxl-version"
+# the --force uninstall above removed v0.2.0 — restore the fake install
+mkdir -p "$tch/versions/v0.2.0/oxl-toolchain"
+printf '#!/bin/sh\necho "FAKE v0.2.0 $@"\n' > "$tch/versions/v0.2.0/oxl-toolchain/oxl"
+chmod +x "$tch/versions/v0.2.0/oxl-toolchain/oxl"
+printf 'module example.com/tc2\n\noxl 0.3\ntoolchain 0.2.0\n' > "$tcw/oxl.mod"
+rm -f "$tcw/proj/inner/oxl.mod"
+out=$(cd "$tcw/proj" && OXL_HOME="$tch" "$SHIM" build)
+[ "$out" = "FAKE v0.2.0 build" ] || { echo "FAIL shim unprefixed-directive: $out"; exit 1; }
+printf 'module example.com/tc3\n\noxl 0.3\ntoolchain 0.9.0\n' > "$tcw/proj/inner/oxl.mod"
+printf 'package main\n\nfn main() { println("tc3") }\n' > "$tcw/proj/inner/main.oxl"
+out=$("$OXL" run "$tcw/proj/inner" 2>&1)
+[ "$out" = "tc3" ] || { echo "FAIL self unprefixed-toolchain: $out"; exit 1; }
+out=$("$SEEDOXL" run "$tcw/proj/inner" 2>&1)
+[ "$out" = "tc3" ] || { echo "FAIL seed unprefixed-toolchain: $out"; exit 1; }
+rm "$tcw/proj/inner/main.oxl"
+(cd "$tcw/proj/inner" && "$OXL" mod tidy >/dev/null 2>&1)
+grep -q '^toolchain 0.9.0$' "$tcw/proj/inner/oxl.mod" || {
+    echo "FAIL tidy preserves unprefixed pin"; cat "$tcw/proj/inner/oxl.mod"; exit 1; }
+# invalid directive is rejected, not silently selected
+printf 'module example.com/tc4\n\noxl 0.3\ntoolchain vfoo\n' > "$tcw/oxl.mod"
+rc=0
+out=$(cd "$tcw/proj" && OXL_HOME="$tch" "$SHIM" build 2>&1) || rc=$?
+[ "$rc" != 0 ] && grep -q "invalid toolchain directive" <<<"$out" || {
+    echo "FAIL shim bad-directive: rc=$rc $out"; exit 1; }
+# `//` is the manifest comment — a trailing note does not break the pin
+printf 'module example.com/m\n\noxl 0.3\ntoolchain v0.2.0 // pinned\n' > "$tcw/oxl.mod"
+out=$(cd "$tcw/proj" && OXL_HOME="$tch" "$SHIM" build)
+[ "$out" = "FAKE v0.2.0 build" ] || { echo "FAIL shim comment-directive: $out"; exit 1; }
+# `#` is NOT a manifest comment — trailing tokens make the directive invalid
+printf 'module example.com/m\n\noxl 0.3\ntoolchain v0.2.0 # note\n' > "$tcw/oxl.mod"
+rc=0
+out=$(cd "$tcw/proj" && OXL_HOME="$tch" "$SHIM" build 2>&1) || rc=$?
+[ "$rc" != 0 ] && grep -q "invalid toolchain directive" <<<"$out" || {
+    echo "FAIL shim hash-directive: rc=$rc $out"; exit 1; }
+# a bare `toolchain` line is a malformed directive, not a pin to nothing
+printf 'module example.com/m\n\noxl 0.3\ntoolchain\n' > "$tcw/oxl.mod"
+rc=0
+out=$(cd "$tcw/proj" && OXL_HOME="$tch" "$SHIM" build 2>&1) || rc=$?
+[ "$rc" != 0 ] && grep -q "requires a tag" <<<"$out" || {
+    echo "FAIL shim bare-directive: rc=$rc $out"; exit 1; }
+# two directives in one manifest must die, not silently pick one
+printf 'module example.com/m\n\noxl 0.3\ntoolchain v0.1.0\ntoolchain v0.2.0\n' > "$tcw/oxl.mod"
+rc=0
+out=$(cd "$tcw/proj" && OXL_HOME="$tch" "$SHIM" build 2>&1) || rc=$?
+[ "$rc" != 0 ] && grep -q "duplicate toolchain directive" <<<"$out" || {
+    echo "FAIL shim dup-directive: rc=$rc $out"; exit 1; }
+# a multiline tag can never reach a path — the env/arg trim guards die first
+printf 'module example.com/m\n\noxl 0.3\ntoolchain v0.1.0\n' > "$tcw/oxl.mod"
+rc=0
+out=$(OXL_HOME="$tch" OXL_TOOLCHAIN="$(printf 'v9.9.9\n../x')" "$SHIM" build 2>&1) || rc=$?
+[ "$rc" != 0 ] && grep -q "invalid OXL_TOOLCHAIN" <<<"$out" || {
+    echo "FAIL shim env-multiline: rc=$rc $out"; exit 1; }
+# invalid pins die loudly rather than traversing paths
+rc=0
+out=$(OXL_HOME="$tch" OXL_TOOLCHAIN="../v0.1.0" "$SHIM" build 2>&1) || rc=$?
+[ "$rc" != 0 ] && grep -q "invalid OXL_TOOLCHAIN" <<<"$out" || {
+    echo "FAIL shim env-traversal: rc=$rc $out"; exit 1; }
+mkdir -p "$scratch/keepme"
+rc=0
+out=$(OXL_HOME="$tch" "$SHIM" toolchain uninstall "v0.1.0/../../../$scratch/keepme" 2>&1) || rc=$?
+[ "$rc" != 0 ] && grep -q "invalid toolchain tag" <<<"$out"     && [ -d "$scratch/keepme" ] || {
+    echo "FAIL uninstall-traversal: rc=$rc $out"; exit 1; }
+[ -d "$tch/versions/v0.1.0" ] || { echo "FAIL uninstall-traversal removed real dir"; exit 1; }
+
+# the pipeline section resolves via tch2's default-version — clear the
+# oxl.mod pin the traversal checks left behind
+rm -f "$tcw/oxl.mod"
+
+# file:// release bases hit the same Windows wall as the fetch fixture:
+# native curl can't open MSYS-style paths (curl 37), so the install
+# pipeline is POSIX-gated — the shim's resolution verbs above are
+# offline and already cover the Windows leg.
+case "$(uname -s)" in
+MINGW*|MSYS*|CYGWIN*) ;;
+*)
+echo "== i60 install pipeline — file:// release fixture =="
+# end-to-end: download -> sha256 verify -> stage -> atomic mv -> verbs.
+# OXL_RELEASE_BASE takes file:// so the whole pipeline runs offline.
+reldir="$scratch/relfix"; mkdir -p "$reldir/download/v9.9.9" "$reldir/download/v9.9.8"
+# mirror asset_os_arch() in scripts/install.sh so the fixture name always matches the request
+tch_os=$(uname -s | tr '[:upper:]' '[:lower:]')
+case "$tch_os" in mingw*|msys*|cygwin*|windows*) tch_os=windows ;; esac
+tch_arch=$(uname -m)
+case "$tch_arch" in x86_64|amd64) tch_arch=x86_64 ;; arm64|aarch64) tch_arch=arm64 ;; esac
+tch_asset="oxl-toolchain-$tch_os-$tch_arch.tar.gz"
+mkdir -p "$reldir/work/oxl-toolchain"
+printf '#!/bin/sh\necho "FAKE 9.9.9 $@"\n' > "$reldir/work/oxl-toolchain/oxl"
+chmod +x "$reldir/work/oxl-toolchain/oxl"
+tar czf "$reldir/download/v9.9.9/$tch_asset" -C "$reldir/work" oxl-toolchain
+if have_sum=$(command -v sha256sum 2>/dev/null); then
+    (cd "$reldir/download/v9.9.9" && "$have_sum" "$tch_asset" > "$tch_asset.sha256")
+elif command -v shasum >/dev/null 2>&1; then
+    (cd "$reldir/download/v9.9.9" && shasum -a 256 "$tch_asset" > "$tch_asset.sha256")
+fi
+# tampered tarball for the verify-or-die path (wrong payload, real sum)
+mkdir -p "$reldir/work2/oxl-toolchain"
+printf '#!/bin/sh\necho tampered\n' > "$reldir/work2/oxl-toolchain/oxl"
+chmod +x "$reldir/work2/oxl-toolchain/oxl"
+tar czf "$reldir/download/v9.9.8/$tch_asset" -C "$reldir/work2" oxl-toolchain
+printf '%s  %s\n' "0000000000000000000000000000000000000000000000000000000000000000" "$tch_asset" \
+    > "$reldir/download/v9.9.8/$tch_asset.sha256"
+# atom feed so `latest` resolves offline — newest-first. An extras
+# entry leads page one to prove the scan skips non-toolchain tags.
+# $reldir/latest must exist for curl's file:// HEAD to succeed; its
+# url_effective then falls through to the atom scan.
+printf '<feed><entry>releases/tag/extra/v9.9.10</entry><entry>releases/tag/v9.9.9</entry></feed>\n' > "$reldir.atom"
+printf 'latest\n' > "$reldir/latest"
+
+tch2="$scratch/tchome2"
+OXL_HOME="$tch2" OXL_RELEASE_BASE="file://$reldir" \
+    sh scripts/install.sh v9.9.9 >"$scratch/i60-install.log" 2>&1 || {
+    echo "FAIL install pipeline:"; cat "$scratch/i60-install.log"; exit 1; }
+[ -x "$tch2/versions/v9.9.9/oxl-toolchain/oxl" ] || { echo "FAIL install: no toolchain dir"; exit 1; }
+[ "$(cat "$tch2/default-version")" = "v9.9.9" ] || { echo "FAIL install: default-version"; cat "$tch2/default-version"; exit 1; }
+! ls -d "$tch2/versions"/.stage.* >/dev/null 2>&1 || { echo "FAIL install: stage dir leaked"; exit 1; }
+SHIM2="$tch2/bin/oxl"
+# dispatch goes through the shim to the installed toolchain
+out=$(cd "$tcw" && OXL_HOME="$tch2" "$SHIM2" run --help)
+[ "$out" = "FAKE 9.9.9 run --help" ] || { echo "FAIL pipeline dispatch: $out"; exit 1; }
+# verbs: list marks default, default echoes the tag, current names source
+out=$(OXL_HOME="$tch2" "$SHIM2" toolchain list)
+[ "$out" = "v9.9.9 (default)" ] || { echo "FAIL pipeline list: $out"; exit 1; }
+out=$(OXL_HOME="$tch2" "$SHIM2" toolchain default)
+[ "$out" = "v9.9.9" ] || { echo "FAIL pipeline default: $out"; exit 1; }
+out=$(cd "$tcw" && OXL_HOME="$tch2" "$SHIM2" toolchain current)
+case "$out" in v9.9.9*default-version*installed*) ;; *)
+    echo "FAIL pipeline current: $out"; exit 1 ;; esac
+# `latest` resolves through the atom-feed fallback on file://
+out=$(OXL_HOME="$tch2" OXL_RELEASE_BASE="file://$reldir" \
+    "$SHIM2" toolchain install latest 2>&1)
+grep -q "already installed" <<<"$out" || { echo "FAIL pipeline latest: $out"; exit 1; }
+# feed pagination: page one carries only extras tags, the toolchain
+# tag lands on page two — file:// cannot carry ?page= so this needs
+# a real http base. Gated on python3 like the other lanes.
+if command -v "$PY" >/dev/null 2>&1; then
+reldir2="$scratch/relfix2"; mkdir -p "$reldir2/download/v9.9.7" "$reldir2/work/oxl-toolchain"
+printf '#!/bin/sh\necho "FAKE 9.9.7 $@"\n' > "$reldir2/work/oxl-toolchain/oxl"
+chmod +x "$reldir2/work/oxl-toolchain/oxl"
+tar czf "$reldir2/download/v9.9.7/$tch_asset" -C "$reldir2/work" oxl-toolchain
+if have_sum=$(command -v sha256sum 2>/dev/null); then
+    (cd "$reldir2/download/v9.9.7" && "$have_sum" "$tch_asset" > "$tch_asset.sha256")
+elif command -v shasum >/dev/null 2>&1; then
+    (cd "$reldir2/download/v9.9.7" && shasum -a 256 "$tch_asset" > "$tch_asset.sha256")
+fi
+printf '<feed><entry>releases/tag/extra/v9.9.10</entry><entry>releases/tag/extra/v9.9.11</entry></feed>\n' > "$reldir2/atom-1.xml"
+printf '<feed><entry>releases/tag/v9.9.7</entry></feed>\n' > "$reldir2/atom-2.xml"
+printf 'latest\n' > "$reldir2/latest"
+cat > "$scratch/relserve.py" <<'PY'
+import pathlib, sys, urllib.parse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+root = pathlib.Path(sys.argv[1]).resolve()
+class H(BaseHTTPRequestHandler):
+    def _serve(self, head):
+        u = urllib.parse.urlparse(self.path)
+        path = u.path
+        if path.startswith('/releases'):
+            path = path[len('/releases'):] or '/'
+        if path.endswith('.atom'):
+            f = root / ('atom-%s.xml' % urllib.parse.parse_qs(u.query).get('page', ['1'])[0])
+        else:
+            f = (root / path.lstrip('/')).resolve()
+        try:
+            ok = f.is_file() and root in f.resolve().parents
+        except OSError:
+            ok = False
+        if not ok:
+            self.send_response(404); self.end_headers(); return
+        body = f.read_bytes()
+        self.send_response(200)
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        if not head:
+            self.wfile.write(body)
+    def do_GET(self): self._serve(False)
+    def do_HEAD(self): self._serve(True)
+    def log_message(self, *a): pass
+srv = ThreadingHTTPServer(('127.0.0.1', 0), H)
+print(srv.server_address[1], flush=True)
+srv.serve_forever()
+PY
+"$PY" "$scratch/relserve.py" "$reldir2" > "$scratch/relserve.port" &
+relsrv=$!
+for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$scratch/relserve.port" ] && break; sleep 0.2; done
+relport=$(cat "$scratch/relserve.port")
+rc=0
+out=$(OXL_HOME="$tch2" OXL_RELEASE_BASE="http://127.0.0.1:$relport/releases" \
+    "$SHIM2" toolchain install latest 2>&1) || rc=$?
+kill "$relsrv" 2>/dev/null || true; wait "$relsrv" 2>/dev/null || true
+relsrv=""
+[ "$rc" = 0 ] && grep -q "installed v9.9.7" <<<"$out" \
+    && [ -x "$tch2/versions/v9.9.7/oxl-toolchain/oxl" ] || {
+    echo "FAIL latest pagination: rc=$rc $out"; exit 1; }
+fi
+# --default forces the pin even when a default exists
+echo v9.9.8 > "$tch2/default-version"
+OXL_HOME="$tch2" OXL_RELEASE_BASE="file://$reldir" \
+    sh scripts/install.sh --default v9.9.9 >>"$scratch/i60-install.log" 2>&1 || {
+    echo "FAIL --default install:"; cat "$scratch/i60-install.log"; exit 1; }
+[ "$(cat "$tch2/default-version")" = "v9.9.9" ] || { echo "FAIL --default pin"; cat "$tch2/default-version"; exit 1; }
+# --shim-only rejects a positional tag instead of silently ignoring it
+rc=0
+out=$(OXL_HOME="$tch2" sh scripts/install.sh --shim-only v1.2.3 2>&1) || rc=$?
+[ "$rc" = 2 ] && grep -q "no effect with --shim-only" <<<"$out" || {
+    echo "FAIL shim-only positional guard: rc=$rc $out"; exit 1; }
+# OXL_TOOLCHAIN with stray whitespace trims instead of dying
+out=$(cd "$tcw" && OXL_HOME="$tch2" OXL_TOOLCHAIN=" v9.9.9 " "$SHIM2" version)
+[ "$out" = "FAKE 9.9.9 version" ] || { echo "FAIL env trim: $out"; exit 1; }
+# a tampered payload must die at the checksum gate, never install
+rc=0
+out=$(OXL_HOME="$tch2" OXL_RELEASE_BASE="file://$reldir" \
+    "$SHIM2" toolchain install v9.9.8 2>&1) || rc=$?
+[ "$rc" != 0 ] && grep -q "sha256 mismatch" <<<"$out" \
+    && [ ! -d "$tch2/versions/v9.9.8" ] || {
+    echo "FAIL sha256 gate: rc=$rc $out"; ls "$tch2/versions"; exit 1; }
+# uninstall guards the default; --force removes it
+rc=0
+out=$(OXL_HOME="$tch2" "$SHIM2" toolchain uninstall v9.9.9 2>&1) || rc=$?
+[ "$rc" != 0 ] && grep -q "is the default" <<<"$out" || {
+    echo "FAIL uninstall default-guard: rc=$rc $out"; exit 1; }
+out=$(OXL_HOME="$tch2" "$SHIM2" toolchain uninstall v9.9.9 --force 2>&1)
+grep -q "removed v9.9.9" <<<"$out" && [ ! -d "$tch2/versions/v9.9.9" ] || {
+    echo "FAIL uninstall --force: $out"; exit 1; }
+# a non-directory parked at the version path dies before the stage work
+mkdir -p "$tch2/versions"; echo x > "$tch2/versions/v9.9.9"
+rc=0
+out=$(OXL_HOME="$tch2" OXL_RELEASE_BASE="file://$reldir" \
+    "$SHIM2" toolchain install v9.9.9 2>&1) || rc=$?
+[ "$rc" != 0 ] && grep -q "not a directory" <<<"$out" || {
+    echo "FAIL nondir guard: rc=$rc $out"; exit 1; }
+rm "$tch2/versions/v9.9.9"
+;;
+esac
 
 echo "ALL TESTS PASSED"

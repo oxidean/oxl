@@ -1875,10 +1875,11 @@ chmod +x "$reldir/work2/oxl-toolchain/oxl"
 tar czf "$reldir/download/v9.9.8/$tch_asset" -C "$reldir/work2" oxl-toolchain
 printf '%s  %s\n' "0000000000000000000000000000000000000000000000000000000000000000" "$tch_asset" \
     > "$reldir/download/v9.9.8/$tch_asset.sha256"
-# atom feed so `latest` resolves offline — newest-first, toolchain
-# tag. $reldir/latest must exist for curl's file:// HEAD to succeed;
-# its url_effective then falls through to the atom scan.
-printf '<feed><entry>releases/tag/v9.9.9</entry></feed>\n' > "$reldir.atom"
+# atom feed so `latest` resolves offline — newest-first. An extras
+# entry leads page one to prove the scan skips non-toolchain tags.
+# $reldir/latest must exist for curl's file:// HEAD to succeed; its
+# url_effective then falls through to the atom scan.
+printf '<feed><entry>releases/tag/extra/v9.9.10</entry><entry>releases/tag/v9.9.9</entry></feed>\n' > "$reldir.atom"
 printf 'latest\n' > "$reldir/latest"
 
 tch2="$scratch/tchome2"
@@ -1904,6 +1905,67 @@ case "$out" in v9.9.9*default-version*installed*) ;; *)
 out=$(OXL_HOME="$tch2" OXL_RELEASE_BASE="file://$reldir" \
     "$SHIM2" toolchain install latest 2>&1)
 grep -q "already installed" <<<"$out" || { echo "FAIL pipeline latest: $out"; exit 1; }
+# feed pagination: page one carries only extras tags, the toolchain
+# tag lands on page two — file:// cannot carry ?page= so this needs
+# a real http base. Gated on python3 like the other lanes.
+if command -v "$PY" >/dev/null 2>&1; then
+reldir2="$scratch/relfix2"; mkdir -p "$reldir2/download/v9.9.7" "$reldir2/work/oxl-toolchain"
+printf '#!/bin/sh\necho "FAKE 9.9.7 $@"\n' > "$reldir2/work/oxl-toolchain/oxl"
+chmod +x "$reldir2/work/oxl-toolchain/oxl"
+tar czf "$reldir2/download/v9.9.7/$tch_asset" -C "$reldir2/work" oxl-toolchain
+if have_sum=$(command -v sha256sum 2>/dev/null); then
+    (cd "$reldir2/download/v9.9.7" && sha256sum "$tch_asset" > "$tch_asset.sha256")
+elif command -v shasum >/dev/null 2>&1; then
+    (cd "$reldir2/download/v9.9.7" && shasum -a 256 "$tch_asset" > "$tch_asset.sha256")
+fi
+printf '<feed><entry>releases/tag/extra/v9.9.10</entry><entry>releases/tag/extra/v9.9.11</entry></feed>\n' > "$reldir2/atom-1.xml"
+printf '<feed><entry>releases/tag/v9.9.7</entry></feed>\n' > "$reldir2/atom-2.xml"
+printf 'latest\n' > "$reldir2/latest"
+cat > "$scratch/relserve.py" <<'PY'
+import pathlib, sys, urllib.parse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+root = pathlib.Path(sys.argv[1]).resolve()
+class H(BaseHTTPRequestHandler):
+    def _serve(self, head):
+        u = urllib.parse.urlparse(self.path)
+        path = u.path
+        if path.startswith('/releases'):
+            path = path[len('/releases'):] or '/'
+        if path.endswith('.atom'):
+            f = root / ('atom-%s.xml' % urllib.parse.parse_qs(u.query).get('page', ['1'])[0])
+        else:
+            f = (root / path.lstrip('/')).resolve()
+        try:
+            ok = f.is_file() and root in f.resolve().parents
+        except OSError:
+            ok = False
+        if not ok:
+            self.send_response(404); self.end_headers(); return
+        body = f.read_bytes()
+        self.send_response(200)
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        if not head:
+            self.wfile.write(body)
+    def do_GET(self): self._serve(False)
+    def do_HEAD(self): self._serve(True)
+    def log_message(self, *a): pass
+srv = ThreadingHTTPServer(('127.0.0.1', 0), H)
+print(srv.server_address[1], flush=True)
+srv.serve_forever()
+PY
+"$PY" "$scratch/relserve.py" "$reldir2" > "$scratch/relserve.port" &
+relsrv=$!
+for i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$scratch/relserve.port" ] && break; sleep 0.2; done
+relport=$(cat "$scratch/relserve.port")
+out=$(OXL_HOME="$tch2" OXL_RELEASE_BASE="http://127.0.0.1:$relport/releases" \
+    "$SHIM2" toolchain install latest 2>&1)
+rc=$?
+kill "$relsrv" 2>/dev/null; wait "$relsrv" 2>/dev/null
+[ "$rc" = 0 ] && grep -q "installed v9.9.7" <<<"$out" \
+    && [ -x "$tch2/versions/v9.9.7/oxl-toolchain/oxl" ] || {
+    echo "FAIL latest pagination: rc=$rc $out"; exit 1; }
+fi
 # --default forces the pin even when a default exists
 echo v9.9.8 > "$tch2/default-version"
 OXL_HOME="$tch2" OXL_RELEASE_BASE="file://$reldir" \

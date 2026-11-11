@@ -149,16 +149,25 @@ latest_tag() {
     esac
     case "$lt" in
         v[0-9]*) ;;
-        *) # an extras-lane tag (extra/vX.Y.Z) can hold "latest" — scan the
-           # release feed for the newest toolchain tag instead of failing
-           # walk candidates newest-first until one validates — a
-           # malformed v-shaped tag must be skipped, not picked
-           lt=$(curl -fsSL "$BASE.atom" 2>/dev/null \
-                | grep -o 'releases/tag/v[0-9][^"<]*' \
-                | while IFS= read -r m; do
-                      c=${m#releases/tag/}
-                      vtag "$c" >/dev/null 2>&1 && { printf '%s\n' "$c"; break; }
-                  done) ;;
+        *) # an extras-lane tag (extra/vX.Y.Z) can hold "latest" — page the
+           # release feed newest-first until a toolchain tag validates;
+           # page one alone can be all extras/docs-manifest entries, so a
+           # first-page miss must not fail the lookup
+           lt=$(
+               page=1
+               while [ "$page" -le 10 ]; do
+                   if [ "$page" -eq 1 ]; then u="$BASE.atom"; else u="$BASE.atom?page=$page"; fi
+                   feed=$(curl -fsSL --connect-timeout 15 --max-time 60 "$u" 2>/dev/null) || break
+                   printf '%s' "$feed" | grep -q 'releases/tag/' || break
+                   hit=$(printf '%s\n' "$feed" \
+                        | grep -o 'releases/tag/v[0-9][^"<]*' \
+                        | while IFS= read -r m; do
+                              c=${m#releases/tag/}
+                              vtag "$c" >/dev/null 2>&1 && { printf '%s\n' "$c"; break; }
+                          done)
+                   [ -n "$hit" ] && { printf '%s\n' "$hit"; break; }
+                   page=$((page + 1))
+               done) ;;
     esac
     [ -n "$lt" ] \
         || die "no toolchain release tag found — pass one: oxl toolchain install vX.Y.Z"

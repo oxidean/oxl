@@ -103,6 +103,10 @@ struct Url { host: str, port: int, path: str, secure: int }
 // userinfo/query handling is untouched — this spec adds a scheme.
 
 struct Client { tmo: int, tlscfg: tls.Config }
+// NB: oxl struct literals are exhaustive — adding `tlscfg` breaks
+// every `Client{tmo: N}` literal in the wild. Accepted churn
+// (one-line fix per site); a `new_client(tmo)` helper exists
+// for literals that want the default.
 // request(): u.secure ⇒ tls.dial_timeout(u.host, u.port, cl.tmo,
 // cl.tlscfg) — cfg.server_name defaulted to u.host when
 // empty, cfg.alpn defaulted to ["http/1.1"] when empty;
@@ -110,6 +114,9 @@ struct Client { tmo: int, tlscfg: tls.Config }
 ```
 
 `serve` is untouched — TLS server is a parked trigger, not a stage.
+`Roots`/`Config` are by-value params carrying `own` fields — fine
+under scope arenas (no aliasing escapes the call), stated so the
+by-value shape isn't read as a borrow contract.
 The `host:` header appends `:port` only when the port differs
 from the scheme default (443 secure, 80 else) — no spurious
 `:443`. `connection: close`, read-until-EOF body loop,

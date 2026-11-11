@@ -7,7 +7,7 @@ cleartext `net`; spec must cover the x509 trust story, not just a
 wrapping API." The consumer is `std/net/http` `https://`. Forks
 covered: the spec-level design space for the stack itself.
 
-## Fork L-a — implementation strategy
+## Fork X-a — implementation strategy
 
 | option | shape | tradeoff |
 |---|---|---|
@@ -18,7 +18,7 @@ covered: the spec-level design space for the stack itself.
 Recommendation: **A** — with verify-only scoping and external-vector
 gates.
 
-## Fork L-b — protocol floor
+## Fork X-b — protocol floor
 
 | option | shape | tradeoff |
 |---|---|---|
@@ -27,7 +27,7 @@ gates.
 
 Recommendation: **1.3 only**; 1.2 parks with its own trigger.
 
-## Fork L-c — trust-root sourcing
+## Fork X-c — trust-root sourcing
 
 | option | shape | tradeoff |
 |---|---|---|
@@ -38,7 +38,7 @@ Recommendation: **1.3 only**; 1.2 parks with its own trigger.
 Recommendation: **env → platform → err**; bundling parks with a
 trigger.
 
-## Fork L-d — caller override shape
+## Fork X-d — caller override shape
 
 | option | shape | tradeoff |
 |---|---|---|
@@ -47,7 +47,7 @@ trigger.
 
 Recommendation: **hook, no flag.**
 
-## Fork L-e — hostname policy
+## Fork X-e — hostname policy
 
 | option | shape | tradeoff |
 |---|---|---|

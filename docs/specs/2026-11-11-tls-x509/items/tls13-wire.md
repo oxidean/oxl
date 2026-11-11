@@ -11,6 +11,7 @@ implementation must not improvise.
 |---|---|
 | `legacy_version` | 0x0303 (TLS 1.2 encoding position; 1.3 rides `supported_versions`) |
 | `legacy_session_id` | 32 bytes of fresh `rt_csrand` — compat mode §4.1.2; the ServerHello must echo it verbatim (`legacy_session_id_echo` check, `unexpected_message` else) |
+| `legacy_compression_methods` | single `0x00` (null) — required field, always this value |
 | `supported_versions` | 0x0304 only |
 | `cipher_suites` | `TLS_AES_128_GCM_SHA256` (0x1301), `TLS_CHACHA20_POLY1305_SHA256` (0x1303), `TLS_AES_256_GCM_SHA384` (0x1302) — in that order |
 | `supported_groups` | `x25519` (0x001d), `secp256r1` (0x0017), `secp384r1` (0x0018) — all three advertised; a server may only pick an advertised group |
@@ -29,6 +30,10 @@ equal to either RFC 8446 §4.1.3 sentinel is a hard `illegal_parameter`
 alert — we offer 1.3 only, so their presence is an attack, not a
 negotiation.
 
+RSA-PSS in CertificateVerify: `salt_len` pins to the hash length
+(the generic "salt-len recover" verify path accepts anything — we
+send and accept only hashlen).
+
 ## Handshake state machine
 
 ```
@@ -36,11 +41,19 @@ ClientHello
   → [HelloRetryRequest — at most once; echo any `cookie`
      extension verbatim (§4.2.2), rebuild CH with a key_share for
      the demanded group if it's x25519/secp256r1/secp384r1
-     (illegal_parameter else); transcript carries the HRR
-     message_hash]
-  → ServerHello        — suite/group echoes must ∈ offered, any
+     (`illegal_parameter` alert else); transcript carries the HRR
+     message_hash. A second HRR → `unexpected_message` alert]
+  → ServerHello        — must carry `supported_versions`=0x0304
+                          (its mandatory pin; a 0x0303-only ServerHello
+                          is a 1.2 answer → `protocol_version` alert).
+                          Suite/group echoes must ∈ offered, any
                           extension we didn't offer →
-                          illegal_parameter; else alert
+                          illegal_parameter; else alert.
+                          The peer's key_share validates BEFORE use:
+                          x25519 → RFC 7748 all-zero output check
+                          (`illegal_parameter` alert — the RFC's
+                          "MUST abort"); P-256/P-384 →
+                          point-on-curve check (invalid-curve defense)
   → EncryptedExtensions — ALPN echo must ∈ offered list when sent;
                           any unoffered extension →
                           illegal_parameter
@@ -79,9 +92,13 @@ Post-handshake, consume quietly:
 - **KeyUpdate** — `update_requested` → apply peer keys and answer
   `update_not_requested`; `update_not_requested` → apply only.
   Never initiated by us.
-- CertificateRequest post-handshake — same answer as
-  mid-flight: an empty Certificate message, then the server's
-  own call (usually `certificate_required`). Any other
+- CertificateRequest post-handshake — protocol-illegal here
+  (`post_handshake_auth` is never offered), so the strict read is
+  `unexpected_message`. We answer leniently instead — the same
+  empty Certificate as mid-flight — because real servers do send
+  it and an alert buys nothing: the server's own follow-up
+  (usually `certificate_required`) ends the session either way.
+  The strict alternative is recorded, not chosen. Any other
   handshake-type post-handshake → `unexpected_message` alert.
 
 ## Key schedule
@@ -113,6 +130,11 @@ the whole HKDF chain against an external answer.
 - `TLSCiphertext`: 5-byte header `{type=23, version=0x0303, len}`;
   fragment ≤ 16384 + 256 expansion — larger inbound →
   `record_overflow` alert.
+- Handshake messages reassemble across record boundaries and
+  coalesce within one record — a Certificate flight routinely
+  exceeds one fragment, and several handshake messages may share
+  one. The handshake reader buffers until each message's 4-byte
+  header length is complete — never assume record == message.
 - Nonce: `iv ^ (seq` zero-padded to iv len`)`; seq per direction,
   never reused, reset at each secret epoch; wrap → `err_proto`
   (a seq can never legally wrap in our lifetime anyway).

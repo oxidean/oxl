@@ -21,8 +21,11 @@ last fix commit.
       needs no rt symbols, so the gate names the entropy feature); `std/crypto/rand` (`bytes(n)
       -> [own []byte, err]`, `fill(b) -> err`); `std/crypto/sha512`
       (`new`/`sum512`/`sum384`/`hexdigest`, `hash.Hash` impl);
-      `std/crypto/hkdf` (`extract`/`expand`/`expand_label` over
-      `hash.Hash`). `math/rand`'s header grows one line naming it
+      `std/crypto/hkdf` (`extract`/`expand` — expand needs a fresh
+      `hash.Hash` per round, so the contract is `new_fn: fn() ->
+      hash.Hash` (hmac.new's shape), not a Hash instance — and
+      `expand_label` is TLS-shaped ("tls13 " prefix): it lives in
+      `std/net/tls`, not generic hkdf). `math/rand`'s header grows one line naming it
       non-cryptographic and pointing at `crypto/rand`.
       `tests/crypto_rand_test.oxl` (test_csrand — nonzero fill, two
       draws differ, `fill` honors len), `tests/sha512_test.oxl`
@@ -142,7 +145,9 @@ last fix commit.
       `crypto/tls`/`x509`/asymmetric rows and record what moved to
       live triggers (TLS server, resumption, revocation, constant-
       time pass); `docs/product/roadmap.md`'s TLS/x509 parked row
-      → shipped (the `— SHIPPED` pattern); `http.oxl` header's
+      → shipped (the `— SHIPPED` pattern; the row lands with
+      milestone W — if X merges first this flips when W lands, no
+      row to edit until then); `http.oxl` header's
       "HTTPS stays parked" line updated; plan markers `[done]`;
       WI-0009 → shipped.
 

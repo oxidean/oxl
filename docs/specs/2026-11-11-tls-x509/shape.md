@@ -3,7 +3,7 @@
 ## Scope
 
 Milestone X (x509’s letter — fresh; R was reclaimed by the descriptor
-spec, T/G/E/W are taken, and L went to the LLVM lane spec, `docs/specs/2026-11-11-llvm-backend/`) un-parks the `crypto/tls` + `x509` row from
+spec, T/G/E/W are taken, and L went to the LLVM lane spec, `docs/specs/2026-11-11-llvm-backend/` — spec in flight) un-parks the `crypto/tls` + `x509` row from
 `docs/specs/2026-11-07-phase-2-plan/parked.md` and
 `docs/specs/2026-11-06-0111-package-system/items/parked-stdlib.md`.
 The trigger fired: `std/net/http`'s client is the first consumer
@@ -26,7 +26,8 @@ lane (sockets already trap under node; `tls` inherits net's path).
   "written fresh in oxl from the public specs — no C port" and the
   item closes with "the language is sufficient." u32-in-int64
   arithmetic (`x/2**n`, `(x*2**n)&M32`) is the established pattern —
-  the compiler recovers the shifts at C level.
+  correct first; the perf gate (X5 interop budget) is what makes it
+  acceptable, not any compiler strength-reduction (there is none).
 - The driver's link pattern is demand-driven off emitted text:
   `rt_sqlite_*` → `-DOXL_SQLITE` + `-lsqlite3` (or `LANG_SQLITE_SRC`
   amalgamation on Windows); `rt_sock_*` → `-DOXL_NET` + `ws2_32`;
@@ -49,7 +50,8 @@ lane (sockets already trap under node; `tls` inherits net's path).
   `time.unix` (CLOCK_REALTIME — cert validity checks can use it).
 - CI runs ubuntu + macOS + windows (git-bash, `LANG_CC=gcc`), and
   `tests/run.sh` already gates lanes on `command -v` probes
-  (`node`, amalgamation env vars) — the TLS interop lane rides the
+  (gtk's `pkg-config`, amalgamation env vars; W's js lane adds `node`
+  in flight) — the TLS interop lane rides the
   same probe pattern on `openssl`.
 - Windows and macOS have no filesystem root bundle a stock program
   can assume; POSIX distros disagree on the path. The platform
@@ -138,7 +140,8 @@ lane (sockets already trap under node; `tls` inherits net's path).
    checked-in x509 fixtures (generator script in `scripts/`) gate
    the trust story; `openssl s_server` end-to-end interop runs in a
    `command -v openssl`–gated lane, never the sole gate.
-10. **js-lane inherits net's answer.** `runtime/rt-node.mjs`/`rt-browser.mjs` sockets trap21; TLS
+10. **js-lane inherits net's answer.** Under milestone W (in
+    flight): `runtime/rt-node.mjs`/`rt-browser.mjs` sockets trap21; TLS
     needs sockets, so `--target js` gains nothing here — the
     packages compile (pure .oxl) and their socket use fails the same
     documented way. A fetch-backed transport is its own trigger.

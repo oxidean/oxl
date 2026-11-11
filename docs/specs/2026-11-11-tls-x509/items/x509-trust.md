@@ -16,7 +16,8 @@ struct Cert {                       // a parsed certificate; fields
     issuer: str, subject: str,      //  RDN → printable form — display
     //  only; path linking compares DER, never these strings
     issuer_der: own []byte, subject_der: own []byte,
-    //  the raw Name encodings sliced from `raw`
+    //  the raw Name encodings — OWNED copies (not slices into
+    //  `raw`; the cert may outlive its parse buffer)
     not_before: int, not_after: int,//  epoch seconds (UTCTime/GenTime)
     dns_names: own []str,           //  SAN dNSName entries, lowercased
     ip_addrs: own []str,            //  SAN iPAddress entries —

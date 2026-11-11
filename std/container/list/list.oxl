@@ -29,6 +29,8 @@ import "std/errors"
 struct Node { v: int, prev: int, next: int, live: int }
 
 /// List is a doubly-linked list; create with newlist.
+/// The zero value is not usable — always create with newlist (a
+/// forged List's handles point into an empty arena and trap).
 struct List { ns: []Node, head: int, tail: int, free: int, n: int }
 
 /// newlist returns an empty list — list.New.

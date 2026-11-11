@@ -167,5 +167,17 @@ fn main() {
     assert(b2.val(b2.back()) == 11 && b2.prev(iha) == bb)
     assert(b2.len() == 4)
 
+    // movetofront(front) / movetoback(back) hit the inert early
+    // returns — position and length are unchanged
+    ml := list.newlist()
+    mf1 := ml.pushback(1)
+    ml.pushback(2)
+    mb3 := ml.pushback(3)
+    ml.movetofront(mf1)
+    assert(ml.front() == mf1 && ml.val(mf1) == 1)
+    ml.movetoback(mb3)
+    assert(ml.back() == mb3 && ml.val(mb3) == 3)
+    assert(ml.len() == 3)
+
     println("list ok")
 }

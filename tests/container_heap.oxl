@@ -244,5 +244,29 @@ fn main() {
     assert(d.v[0] == 10 && d.v[1] == 40 && d.v[3] == 60)
     drainsorted(d.asheap(), 5)
 
+    // init on empty and singleton impls is a no-op
+    h5 := IntHeap{v: mkslice(int, 0)}
+    heap.init(h5.asheap())
+    h5.v = push(h5.v, 42)
+    heap.init(h5.asheap())
+    assert(h5.v[0] == 42 && h5.len() == 1)
+
+    // remove's down-then-up compensation performs a real up-swap:
+    // removing index 3 (value 9) lifts 5 over its parent 8
+    h6 := IntHeap{v: mkslice(int, 0)}
+    h6.v = push(h6.v, 1)
+    h6.v = push(h6.v, 8)
+    h6.v = push(h6.v, 3)
+    h6.v = push(h6.v, 9)
+    h6.v = push(h6.v, 10)
+    h6.v = push(h6.v, 4)
+    h6.v = push(h6.v, 5)
+    heap.init(h6.asheap())
+    got6 := heap.remove(h6.asheap(), 3)
+    assert(got6 == 9)
+    assert(h6.v[1] == 5)
+    drainsorted(h6.asheap(), 6)
+    assert(h6.len() == 0)
+
     println("heap ok")
 }

@@ -180,5 +180,29 @@ fn main() {
     assert(wout != nil && wout.len() == 2)
     assert(wr.len() == 3)
 
+    // link into a singleton ring splices in order; do on a
+    // singleton visits its one element exactly once
+    sg1 := ring.newring(1)
+    sg1h := sg1.head()
+    sg1.setval(sg1h, 7)
+    sg2 := ring.newring(2)
+    sg2h := sg2.head()
+    sg2.setval(sg2h, 8)
+    sg2n := sg2.next(sg2h) // hoisted — setval(next()) nests ref under mut
+    sg2.setval(sg2n, 9)
+    sg1.link(sg1h, sg2)
+    assert(sg1.len() == 3)
+    walkacc = 0
+    walkn = 0
+    sg1.do(sg1h, acc)
+    assert(walkn == 3 && walkacc == 789)
+    solo := ring.newring(1)
+    sh := solo.head()
+    solo.setval(sh, 4)
+    walkacc = 0
+    walkn = 0
+    solo.do(sh, acc)
+    assert(walkn == 1 && walkacc == 4)
+
     println("ring ok")
 }

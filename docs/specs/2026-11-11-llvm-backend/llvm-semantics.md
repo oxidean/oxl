@@ -215,6 +215,12 @@ The lane never declares `RtScope`'s layout:
   additive ABI only; the C lane's emitted text and the fixpoint are
   untouched. Named scopes already use `rt_scope_new()` heap scopes —
   opaque `ptr` throughout, unaffected.
+- **`tls_scope` is boundary**: declared `@tls_scope = external
+  thread_local global ptr` — rt.h's `extern _Thread_local
+  RtScope *`, the only rt.c *variable* emitted code names. Poll
+  prologue/epilogue load/store it directly (the save/restore
+  choreography in items/suspension.md) — a plain `external
+  global` would miscompile the TLS access.
 - **The frame header is boundary**: `ptr cur_scope; i32 state`
   field-for-field with `RtFrame` — rt.c writes `fr->cur_scope` in
   `rt_task_new`'s spawn init and reads it in

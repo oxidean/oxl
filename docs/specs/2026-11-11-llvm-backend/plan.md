@@ -14,7 +14,7 @@ two-lane `compile_res` directly and the text reads the same with
 one fewer sibling.
 
 - [ ] **L0 — spec** — *(this PR)* — this directory, WI-0010
-      artifacts, ADR-0012 for the spec-level forks, roadmap/parked
+      artifacts, ADR-0013 for the spec-level forks, roadmap/parked
       annotations.
 - [ ] **L1 — `bootstrap/codegen/llvm.oxl`: IR skeleton +
       non-concurrency surface.**
@@ -28,7 +28,7 @@ one fewer sibling.
 ## L0 — spec (this docset)
 
 `shape.md`, `llvm-semantics.md`, `plan.md`, `items/{emit-seam,
-suspension,toolchain}.md`, ADR-0012, WI-0010 artifacts, roadmap +
+suspension,toolchain}.md`, ADR-0013, WI-0010 artifacts, roadmap +
 `parked.md` trigger-fired annotations. Gate: merged.
 
 ## L1 — emitter skeleton + non-concurrency surface

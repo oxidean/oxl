@@ -2,7 +2,7 @@
 
 Deliverable: `docs/specs/2026-11-11-llvm-backend/` (shape.md,
 llvm-semantics.md, plan.md, items/{emit-seam,suspension,toolchain}.md)
-+ ADR-0012 + roadmap/parked annotations.
++ ADR-0013 + roadmap/parked annotations.
 
 Intent: un-park the LLVM backend on the second-consumer trigger —
 milestone W landed `--target js`, so the codegen seam

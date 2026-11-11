@@ -1,4 +1,4 @@
-# ADR-0012: LLVM backend — sibling .ll emitter, shared poll machines, rt.c under clang, --target llvm lane
+# ADR-0013: LLVM backend — sibling .ll emitter, shared poll machines, rt.c under clang, --target llvm lane
 
 Status: accepted (WI-0010) — 2026-11-11
 

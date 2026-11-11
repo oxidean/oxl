@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "id": "WI-0010",
+  "title": "LLVM backend spec — emit lane",
+  "state": "implementing",
+  "profile": "normal",
+  "current_stage": "implementation",
+  "created_at": "2026-11-11T10:04:30Z",
+  "updated_at": "2026-11-11T10:20:00Z"
+}

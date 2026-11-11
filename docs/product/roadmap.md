@@ -50,9 +50,13 @@ Milestone map: [docs/specs/2026-11-07-phase-2-plan/](../specs/2026-11-07-phase-2
   `docs/specs/2026-11-11-type-descriptors/`
 - **W — web/JS compilation target**: in flight — `--target js`,
   JS runtime + emitter, `extra/gui/dom` backend, `web-todo`
-  reference app; spec: `docs/specs/2026-11-10-web-target/`
-- Parked on triggers: LLVM backend (behind the `interfaces.md`
-  codegen seam), D4 shape-generics, parked-stdlib list
+  reference app; spec+impl on `feat/milestone-w` (PR open)
+- **L — LLVM emit lane**: spec — `bootstrap/codegen/llvm.oxl`
+  textual-IR emitter behind the `CkRes` seam, `--target llvm` +
+  `--triple`, shared frame/poll suspension lowering, rt.c under
+  clang, IR fixpoint; spec:
+  `docs/specs/2026-11-11-llvm-backend/`
+- Parked on triggers: D4 shape-generics, parked-stdlib list
 
 (The compiler already compiles itself — see `docs/self-hosting.md`;
 "T" retires the Rust seed driver, not the compiler.)

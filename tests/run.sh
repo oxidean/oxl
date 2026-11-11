@@ -254,7 +254,8 @@ for t in test_read test_open test_lookup test_corrupt test_open_badindex; do
 done
 
 echo "== oxl test: hostile archive/compress inputs =="
-out=$("$OXL" test tests/archive_hostile.oxl)
+# bounded: a decoder hang must fail the gate, not stall the suite
+out=$(with_timeout 120 "$OXL" test tests/archive_hostile.oxl || true)
 printf '%s
 ' "$out" >&2
 for t in test_dist_oob test_overlap_ok test_btype3 test_oversub test_stored_badlen test_rep_noprev test_random test_gz_nonul_name test_gz_badhcrc test_gz_goodhcrc test_gz_fextra_short test_gz_trailgarbage test_gz_halfmember test_zip64 test_zip_mismatch test_zip_bigcsize test_tar_badsum test_tar_badoctal test_zlib_keepalive; do

@@ -7,6 +7,9 @@ package gzip
 // concatenated stream. Header reads run through flate's drain() so
 // header bytes, payload bytes, and trailer bytes all share the one
 // byte pump — no shadow buffering between members.
+// decompress() is the one-shot []byte form: output grows without
+// bound, so it is for trusted input — untrusted data belongs on the
+// streaming Reader.
 import "std/io"
 
 import "std/errors"

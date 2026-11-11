@@ -414,7 +414,19 @@ fn paxdec(rec: []byte, want: str) -> [int, err] {
                     neg = 1
                     d = 1
                 }
-                for d < len(val) && val[d] >= 48 && val[d] <= 57 {
+                // count digits before accumulating: 19+ digits
+                // overflow int64 and can wrap to a positive garbage
+                // value that passes the apply-time >= 0 guard —
+                // the record is unusable, skip it
+                nd := d
+                for nd < len(val) && val[nd] >= 48 && val[nd] <= 57 {
+                    nd = nd + 1
+                }
+                if nd - d > 18 {
+                    i = i + v
+                    continue
+                }
+                for d < nd {
                     num = num * 10 + (val[d] - 48)
                     d = d + 1
                 }

@@ -4,7 +4,10 @@ package flate
 // deflate bit stream off an io.Reader through a small byte window and
 // emits into a rolling output history (the last 32 KiB are kept for
 // LZ77 back-references; everything older is dropped once the caller
-// has read it). inflate() is the one-shot []byte form. The pump
+// has read it). inflate() is the one-shot []byte form — like the
+// other one-shot decompress APIs it grows output without bound, so
+// it is for trusted input; the streaming Reader bounds memory by the
+// window and is the right shape for untrusted data. The pump
 // deliberately buffers at most one window ahead: bytes pulled but not
 // consumed by the bit stream stay reachable through drain(), which is
 // how zlib/gzip read their trailers without losing data.

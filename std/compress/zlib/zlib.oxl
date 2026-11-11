@@ -5,6 +5,9 @@ package zlib
 // reader wraps flate's decompressor, accumulates the checksum over
 // everything it hands out, and verifies the trailer through flate's
 // drain() so bytes the bit reader buffered aren't lost.
+// decompress() is the one-shot []byte form: output grows without
+// bound, so it is for trusted input — untrusted data belongs on the
+// streaming Reader.
 import "std/io"
 
 import "std/errors"

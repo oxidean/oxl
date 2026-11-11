@@ -6,6 +6,9 @@ package zip
 // the members, open() inflates one member and verifies its CRC-32.
 // Stored and deflate members are supported; encryption and multi-disk
 // archives are rejected.
+// open() inflates a whole member before its usize/CRC verify —
+// untrusted archives can over-claim a tiny member into a large
+// allocation, so verify member metadata before opening.
 import "std/errors"
 
 import "std/compress/flate"
@@ -78,6 +81,10 @@ fn newreader(b: []byte) -> [Reader, err] {
     }
     // entries-on-this-disk must equal the total once multi-disk is
     // rejected — a mismatch is the same split-archive shape
+    // the directory must fit before the EOCD it was located from
+    if cdoff + cdsize > eocd {
+        return z, errors.new("zip: central directory overruns end record")
+    }
     if binary.le_u16(z.data, eocd + 8) != n {
         return z, errors.new("zip: multi-disk archives unsupported")
     }

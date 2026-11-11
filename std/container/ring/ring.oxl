@@ -191,7 +191,8 @@ fn (r mut Ring) link(i: int, s: own Ring) -> int {
 /// unlink removes the n elements starting at i.next — Ring.Unlink —
 /// and returns them as a new ring whose head is the first removed
 /// element. Removing nothing yields nil: n <= 0 or n % len == 0
-/// (Go's Unlink returns r.Next() there — `own` forces nil since the
+/// (Go returns nil for n <= 0 and r.Next() for n % len == 0 —
+/// `own` forces nil in both cases since the
 /// unchanged ring can't be returned without consuming the receiver).
 fn (r mut Ring) unlink(i: int, n: int) -> own Ring {
     if !r.ok(i) || r.n == 0 || n <= 0 {

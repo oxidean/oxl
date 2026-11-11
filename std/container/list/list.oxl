@@ -30,7 +30,8 @@ struct Node { v: int, prev: int, next: int, live: int }
 
 /// List is a doubly-linked list; create with newlist.
 /// The zero value is not usable — always create with newlist (a
-/// forged List's handles point into an empty arena and trap).
+/// forged List's handles read as dead (-1/0) and pushes corrupt it
+/// silently — it does not trap).
 struct List { ns: []Node, head: int, tail: int, free: int, n: int }
 
 /// newlist returns an empty list — list.New.

@@ -73,7 +73,7 @@ fn push(h: Interface, x: int) {
 
 /// pop removes and returns the minimum — heap.Pop, O(log n).
 /// Calling pop on an empty heap is a programming error; the impl's
-/// Swap(0, -1) indexing traps first, the same way indexing an empty
+/// swap(0, -1) indexing traps first, the same way indexing an empty
 /// slice does.
 fn pop(h: Interface) -> int {
     n := h.len() - 1

@@ -116,6 +116,14 @@ struct Reader {
     pad: int, // block padding owed after the payload
     lname: str, // pending name override ('x'/'L' records)
     llink: str, // pending link override ('x'/'K' records)
+    luname: str, // pending uname override ('x' records)
+    lgname: str, // pending gname override ('x' records)
+    lsize: int, // pending size override ('x' records) — -1 unset;
+    //  framing-critical: a pax 'size' overrides the ustar size the
+    //  writer zeroed, so it must drive `left`/`pad`, not just display
+    luid: int, // pending uid/gid/mtime overrides — -1 unset
+    lgid: int,
+    lmtime: int,
     done: int,
     rerr: err, // latched terminal error — next() retries return it
 }
@@ -123,7 +131,7 @@ struct Reader {
 /// newreader wraps r as a tar reader — the first next() call parses
 /// the first header.
 fn newreader(r: io.Reader) -> Reader {
-    return Reader{r: r, left: 0, pad: 0, lname: "", llink: "", done: 0, rerr: nil}
+    return Reader{r: r, left: 0, pad: 0, lname: "", llink: "", luname: "", lgname: "", lsize: -1, luid: -1, lgid: -1, lmtime: -1, done: 0, rerr: nil}
 }
 
 // xfull fills buf from the source — readfull with a spin guard.
@@ -159,6 +167,7 @@ fn (t mut Reader) xfull(buf: []byte) -> [int, err] {
 fn (t mut Reader) skip(n: int) -> err {
     scr := mkslice(byte, 512)
     left := n
+    dry := 0
     for left > 0 {
         m := left
         if m > 512 {
@@ -175,7 +184,12 @@ fn (t mut Reader) skip(n: int) -> err {
             return e
         }
         if rn <= 0 && e == nil {
-            return io.noprogress()
+            dry = dry + 1
+            if dry >= 100 {
+                return io.noprogress()
+            }
+        } else {
+            dry = 0
         }
     }
     return nil
@@ -311,14 +325,6 @@ fn (t mut Reader) parse(b: []byte) -> [Header, err] {
             h.name = pre + "/" + h.name
         }
     }
-    if len(t.lname) > 0 {
-        h.name = t.lname
-        t.lname = ""
-    }
-    if len(t.llink) > 0 {
-        h.linkname = t.llink
-        t.llink = ""
-    }
     return h, nil
 }
 
@@ -368,6 +374,66 @@ fn paxname(rec: []byte, want: str) -> str {
     return best
 }
 
+// paxdec scans one 'x' record block for a decimal <key>=<val> —
+// pax numerics are ASCII decimal (mtime may carry a fractional
+// tail, which this truncates at '.', matching the int-second
+// Header field). Returns [value, found]; non-numeric or negative
+// values count as absent — a malformed override must not corrupt
+// framing.
+fn paxdec(rec: []byte, want: str) -> [int, err] {
+    i := 0
+    for i < len(rec) {
+        j := i
+        v := 0
+        for j < len(rec) && rec[j] >= 48 && rec[j] <= 57 {
+            if j - i >= 10 {
+                return 0, io.eof()
+            }
+            v = v * 10 + (rec[j] - 48)
+            j = j + 1
+        }
+        if j >= len(rec) || rec[j] != 32 || v <= 0 || j + 1 > i + v || i + v > len(rec) {
+            return 0, io.eof()
+        }
+        body := rec[j + 1:i + v]
+        eq := 0
+        for eq < len(body) && body[eq] != 61 {
+            eq = eq + 1
+        }
+        if eq < len(body) {
+            k := body[0:eq] as str
+            if k == want {
+                val := body[eq + 1:len(body)]
+                if len(val) > 0 && val[len(val) - 1] == 10 {
+                    val = val[0:len(val) - 1]
+                }
+                d := 0
+                num := 0
+                neg := 0
+                if len(val) > 0 && val[0] == 45 {
+                    neg = 1
+                    d = 1
+                }
+                for d < len(val) && val[d] >= 48 && val[d] <= 57 {
+                    num = num * 10 + (val[d] - 48)
+                    d = d + 1
+                }
+                // any non-digit non-dot tail makes the value unusable
+                if d == 0 + neg || (d < len(val) && val[d] != 46) {
+                    i = i + v
+                    continue
+                }
+                if neg == 1 {
+                    num = 0 - num
+                }
+                return num, nil
+            }
+        }
+        i = i + v
+    }
+    return 0, io.eof()
+}
+
 // pax reads a pax/GNU meta member's payload and folds the parts the
 // reader tracks into lname/llink, then skips the padding.
 fn (t mut Reader) pax(size: int, flag: int) -> err {
@@ -395,6 +461,38 @@ fn (t mut Reader) pax(size: int, flag: int) -> err {
         lp := paxname(rec, "linkpath")
         if len(lp) > 0 {
             t.llink = lp
+        }
+        un := paxname(rec, "uname")
+        if len(un) > 0 {
+            t.luname = un
+        }
+        gn := paxname(rec, "gname")
+        if len(gn) > 0 {
+            t.lgname = gn
+        }
+        [sz, fsz] = paxdec(rec, "size")
+
+        if fsz == nil {
+            t.lsize = sz
+        }
+        [ud, fud] = paxdec(rec, "uid")
+        if fud == nil {
+            t.luid = ud
+        }
+        [gd, fgd] = paxdec(rec, "gid")
+        if fgd == nil {
+            t.lgid = gd
+        }
+        [mt, fmt_] = paxdec(rec, "mtime")
+        if fmt_ == nil {
+            t.lmtime = mt
+        }
+        // GNU sparse maps ('S' members and GNU.sparse.* pax keys)
+        // re-encode the payload — reading them as a regular member
+        // would deliver map bytes as file data, so reject loudly
+        sp := paxname(rec, "GNU.sparse.major")
+        if len(sp) > 0 {
+            return errors.new("tar: sparse members unsupported")
         }
     }
     // 'g' (TPAXG) records apply to the whole archive — the reader is
@@ -443,6 +541,14 @@ fn (t mut Reader) next() -> [Header, err] {
             t.rerr = errors.new("tar: negative size field")
             return h, t.rerr
         }
+        // 'S' members carry a GNU sparse map instead of raw payload —
+        // decoding it is out of scope; reject rather than deliver map
+        // bytes as file data
+        if ph.typeflag == 83 {
+            t.done = 1
+            t.rerr = errors.new("tar: sparse members unsupported")
+            return h, t.rerr
+        }
         // meta members carry their payload in-band — fold it into
         // the pending overrides and continue to the real header
         if ph.typeflag == TPAX || ph.typeflag == TPAXG || ph.typeflag == TLONGNAME || ph.typeflag == TLONGLINK {
@@ -453,6 +559,41 @@ fn (t mut Reader) next() -> [Header, err] {
                 return h, e5
             }
             continue
+        }
+        // pending overrides resolve here — on the real member, not
+        // on the meta headers that set them (an 'x' record must not
+        // consume a pending GNU longname it doesn't itself carry)
+        if len(t.lname) > 0 {
+            ph.name = t.lname
+            t.lname = ""
+        }
+        if len(t.llink) > 0 {
+            ph.linkname = t.llink
+            t.llink = ""
+        }
+        if len(t.luname) > 0 {
+            ph.uname = t.luname
+            t.luname = ""
+        }
+        if len(t.lgname) > 0 {
+            ph.gname = t.lgname
+            t.lgname = ""
+        }
+        if t.lsize >= 0 {
+            ph.size = t.lsize
+            t.lsize = -1
+        }
+        if t.luid >= 0 {
+            ph.uid = t.luid
+            t.luid = -1
+        }
+        if t.lgid >= 0 {
+            ph.gid = t.lgid
+            t.lgid = -1
+        }
+        if t.lmtime >= 0 {
+            ph.mtime = t.lmtime
+            t.lmtime = -1
         }
         t.left = ph.size
         t.pad = (512 - ph.size % 512) % 512

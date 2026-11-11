@@ -1712,7 +1712,7 @@ export function rt_atof(s) {
 function ftoa_g(v, prec) {
   if (Number.isNaN(v)) return 'nan'
   if (!Number.isFinite(v)) return v < 0 ? '-inf' : 'inf'
-  if (v === 0) return '0'
+  if (v === 0) return Object.is(v, -0) ? '-0' : '0'
   const exp = Math.floor(Math.log10(Math.abs(v)))
   let out
   if (exp < -4 || exp >= prec) {
@@ -1792,10 +1792,9 @@ export function rt_slice_own(s) {
 export function rt_sidx(s, i) {
   i = BigInt(i)
   if (i < 0n || i >= BigInt(s.len)) rt_trap(10n)
-  const v = s.a[s.off + Number(i)]
-  /* byte-slice backings are Uint8Array — the Number element widens
-   * to the int domain's BigInt (mirror of rt_sidx_set's narrow) */
-  return s.a instanceof Uint8Array ? BigInt(v) : v
+  /* byte-slice backings are Uint8Array — elements are already the
+   * masked Number the byte domain pins (js-semantics §1) */
+  return s.a[s.off + Number(i)]
 }
 export function rt_sidx_set(s, i, v) {
   i = BigInt(i)

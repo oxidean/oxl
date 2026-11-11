@@ -159,6 +159,20 @@ fn jiface_wrap_v(g: mut G, e: ref parser.Node, v: str, w: str, implkey: str) -> 
 fn jconv_v(g: mut G, e: ref parser.Node, v: str, want: int) -> str {
     w := gsub(g, want)
     got := gsub(g, xty(g, e))
+    // byte is the masked-Number domain (js-semantics §1): int/err
+    // sources narrow through asUintN(8); a byte widening to int
+    // re-enters the BigInt domain. err keeps both nil spellings
+    // (null literal / 0n zero) — ==/!= stays mixed-form (jxbin).
+    if w >= 0 && got >= 0 {
+        bw := tyk(g, w)
+        bg := tyk(g, got)
+        if bw == check.k_byte() && (bg == check.k_int() || bg == check.k_err()) {
+            return "Number(BigInt.asUintN(8, " + v + "))"
+        }
+        if bw == check.k_int() && bg == check.k_byte() {
+            return "BigInt(" + v + ")"
+        }
+    }
     if got >= 0 && tyk(g, got) == check.k_err() && w >= 0 && tyk(g, w) == check.k_slice() {
         return "{a:null,off:0,len:0,cap:0}"
     }
@@ -541,10 +555,15 @@ fn jxbin(g: mut G, op: str, l: ref parser.Node, r: ref parser.Node, e: ref parse
     rv := jx(g, r)
     ltk := tyk(g, gdt(g, gsub(g, lt)))
     rtk := tyk(g, gdt(g, gsub(g, xty(g, e))))
-    if rtk == check.k_byte() && (op == "+" || op == "-" || op == "*" || op == "/" || op == "%" || op == "&" || op == "|" || op == "^") {
+    // byte arith masks only when the result stays byte — byte op int
+    // promotes to int and must take the BigInt rt_i* path below
+    if ltk == check.k_byte() && rtk == check.k_byte() && (op == "+" || op == "-" || op == "*" || op == "/" || op == "%" || op == "&" || op == "|" || op == "^") {
         return "((Number(" + lv + ") " + op + " Number(" + rv + ")) & 0xff)"
     }
-    if (op == "==" || op == "!=") && ltk == check.k_byte() {
+    // byte ==/!= coerces both sides through Number — byte is always
+    // the masked Number, so an int(BigInt) or err counterpart would
+    // otherwise hit === and never compare equal
+    if (op == "==" || op == "!=") && (ltk == check.k_byte() || tyk(g, gsub(g, xty(g, r))) == check.k_byte()) {
         neg := ""
         if op == "!=" {
             neg = "!"
@@ -609,11 +628,14 @@ fn jxbin(g: mut G, op: str, l: ref parser.Node, r: ref parser.Node, e: ref parse
                 }
                 return "(" + other + " === null || " + other + " === 0n)"
             }
-            c := "==="
+            // err has two nil spellings — `null` (nil literal, pair
+            // returns) and `0n` (jzero'd slots, normalized binds).
+            // Var-vs-var ==/!= must accept either pairing on both sides.
+            eq := "((" + lv + ") === (" + rv + ") || ((" + lv + ") === null && (" + rv + ") === 0n) || ((" + lv + ") === 0n && (" + rv + ") === null))"
             if op == "!=" {
-                c = "!=="
+                return "!(" + eq + ")"
             }
-            return "(" + lv + " " + c + " " + rv + ")"
+            return eq
         }
         if rv == "null" || lv == "null" {
             // null literal vs a maybe-err slot — cover both nil forms
@@ -638,7 +660,9 @@ fn jxbin(g: mut G, op: str, l: ref parser.Node, r: ref parser.Node, e: ref parse
         }
         return "(" + lv + " " + c + " " + rv + ")"
     }
-    if ltk == check.k_int() || ltk == check.k_err() {
+    // a byte lhs with an int-domain result promotes through the same
+    // helpers — rt_i* coerces the masked Number via BigInt()
+    if ltk == check.k_int() || ltk == check.k_err() || (ltk == check.k_byte() && rtk == check.k_int()) {
         if op == "+" {
             return "rt.rt_iadd(" + lv + ", " + rv + ")"
         }
@@ -1060,7 +1084,18 @@ fn jclosure(g: mut G, params: ref parser.NList, body: ref parser.Node) -> str {
             capv = capv + ", "
         }
         capn = capn + "_c_" + cname(cp.n)
-        capv = capv + jref(g, cp.n)
+        cv := jref(g, cp.n)
+        kt := -1
+        if cp.t >= 0 {
+            kt = tyk(g, gsub(g, cp.t))
+        }
+        if kt == check.k_struct() || kt == check.k_enum() {
+            // value capture — the native env memcpy's the aggregate;
+            // a bare ref would alias outer mutations. Shallow clone
+            // mirrors jiface_wrap_v: nested value fields stay shared.
+            cv = "Object.assign({}, " + cv + ")"
+        }
+        capv = capv + cv
         cp = cp.next
     }
     inner := "(" + ps + ") => " + btxt
@@ -1414,20 +1449,31 @@ fn jcall(g: mut G, f: ref parser.Node, args: ref parser.NList) -> str {
             parser.Node.Field{obj} => {
                 ov := jx(g, obj)
                 argl := ""
+                pre := ""
+                post := ""
                 il := cp.ps
                 al := args
                 av := argvs
                 for al != nil {
                     v := av.v
                     if il != nil {
-                        v = jconv_v(g, al.v, v, il.v)
+                        // same arg adaptation as direct calls —
+                        // jarg_c adds the own->mut/ref borrow ledger
+                        o := jarg_c(g, al.v, v, il.v, nil)
+                        v = o.v
+                        pre = pre + o.pre
+                        post = post + o.post
                         il = il.next
                     }
                     argl = argl + ", " + v
                     al = al.next
                     av = av.next
                 }
-                return "((_iv) => _iv.methods." + cp.mname + "(_iv.obj" + argl + "))(" + ov + ")"
+                inner := "((_iv) => _iv.methods." + cp.mname + "(_iv.obj" + argl + "))(" + ov + ")"
+                if len(pre) == 0 {
+                    return inner
+                }
+                return "(() => { " + pre + "const __rc = " + inner + "; " + post + "return __rc; })()"
             }
             _ => {
             }

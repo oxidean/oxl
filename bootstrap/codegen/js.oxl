@@ -103,8 +103,16 @@ fn jzero(g: mut G, t: int) -> str {
 
 // JS reserved words oxl identifiers could collide with get `u_`
 fn jname(n: str) -> str {
-    rsv := "|break|case|catch|class|const|continue|debugger|default|delete|do|enum|export|extends|finally|function|import|instanceof|new|return|super|switch|this|throw|try|typeof|var|void|while|with|yield|static|let|of|get|set|async|await|null|true|false|if|else|for|in|"
+    rsv := "|break|case|catch|class|const|continue|debugger|default|delete|do|enum|export|extends|finally|function|import|instanceof|new|return|super|switch|this|throw|try|typeof|var|void|while|with|yield|static|let|of|get|set|async|await|null|true|false|if|else|for|in|eval|arguments|implements|interface|package|private|protected|public|rt|Math|Object|BigInt|Number|Uint8Array|Promise|queueMicrotask|setTimeout|globalThis|process|"
     if find(rsv, "|" + n + "|") >= 0 {
+        return "u_" + n
+    }
+    // emitted-namespace stems: o_* top-levels and _a*/_d* internals —
+    // user names on those stems collide with emitted code
+    if len(n) > 1 && byteat(n, 0) == 111 && byteat(n, 1) == 95 {
+        return "u_" + n
+    }
+    if len(n) > 1 && byteat(n, 0) == 95 && (byteat(n, 1) == 97 || byteat(n, 1) == 100) {
         return "u_" + n
     }
     return n
@@ -490,7 +498,14 @@ fn jxbin(g: mut G, op: str, l: ref parser.Node, r: ref parser.Node, e: ref parse
     ltk := tyk(g, gdt(g, gsub(g, lt)))
     rtk := tyk(g, gdt(g, gsub(g, xty(g, e))))
     if rtk == check.k_byte() && (op == "+" || op == "-" || op == "*" || op == "/" || op == "%" || op == "&" || op == "|" || op == "^") {
-        return "((" + lv + " " + op + " " + rv + ") & 0xff)"
+        return "((Number(" + lv + ") " + op + " Number(" + rv + ")) & 0xff)"
+    }
+    if (op == "==" || op == "!=") && ltk == check.k_byte() {
+        neg := ""
+        if op == "!=" {
+            neg = "!"
+        }
+        return "(Number(" + lv + ") " + neg + "== Number(" + rv + "))"
     }
     if op == "+" && ltk == check.k_str() {
         return "rt.rt_strcat(" + lv + ", " + rv + ")"

@@ -9,7 +9,6 @@ package dom
 // Cooperative-scheduler backend: susp_pump() == 1 — run drives
 // pump_iter passes on its own frame and parks on wakech between
 // them. stop/wake and the headless fire path both post an edge.
-
 import "std/errors"
 
 import "github.com/oxidean/oxl/extra/gui"
@@ -150,15 +149,33 @@ fn (d Dom) tag(h: int) -> str {
 // widget kind -> tag name (per items/dom-backend.md's mapping)
 fn tag_of(kind: gui.WidgetKind) -> str {
     match kind {
-        gui.WidgetKind.window => { return "div" }
-        gui.WidgetKind.vbox => { return "div" }
-        gui.WidgetKind.hbox => { return "div" }
-        gui.WidgetKind.label => { return "span" }
-        gui.WidgetKind.button => { return "button" }
-        gui.WidgetKind.entry => { return "input" }
-        gui.WidgetKind.list => { return "ul" }
-        gui.WidgetKind.scrolled => { return "div" }
-        _ => { return "div" }
+        gui.WidgetKind.window => {
+            return "div"
+        }
+        gui.WidgetKind.vbox => {
+            return "div"
+        }
+        gui.WidgetKind.hbox => {
+            return "div"
+        }
+        gui.WidgetKind.label => {
+            return "span"
+        }
+        gui.WidgetKind.button => {
+            return "button"
+        }
+        gui.WidgetKind.entry => {
+            return "input"
+        }
+        gui.WidgetKind.list => {
+            return "ul"
+        }
+        gui.WidgetKind.scrolled => {
+            return "div"
+        }
+        _ => {
+            return "div"
+        }
     }
     return "div"
 }
@@ -354,7 +371,7 @@ fn (d Dom) exec(c: own gui.Cmd) {
 
 // marshal one queued dom event into a core Event and post — never
 // blocks; the aux slot carries the row index for row_activated.
-fn (d Dom) deliver(events: mut gui.EventBuf, h: int, k: int, aux: int) {
+fn (d Dom) deliver(events: mut gui.EventBuf, h: int, k: int, aux: int, txt: cstr) {
     e := new(gui.Event)
     e.target = h
     e.data = gui.EventData.None
@@ -374,7 +391,7 @@ fn (d Dom) deliver(events: mut gui.EventBuf, h: int, k: int, aux: int) {
     if k == D_INPUT {
         e.kind = gui.EventKind.text_changed
         if oxl_dom_read_has(h, gui.P_TEXT) == 1 {
-            e.data = gui.EventData.Text(str(oxl_dom_ev_txt()))
+            e.data = gui.EventData.Text(str(txt))
         }
     }
     // unknown provider kinds carry no meaningful event — dropping
@@ -405,8 +422,12 @@ fn (d Dom) pump_iter(events: mut gui.EventBuf, cmds: mut gui.CmdBuf) -> int {
         }
         k := oxl_dom_ev_kind()
         a := oxl_dom_ev_aux()
+        // the queue head is popped before deliver runs, so the
+        // fire-time text must be read here — after pop it would be
+        // the NEXT event's payload (or "" on a drained queue)
+        t := oxl_dom_ev_txt()
         oxl_dom_ev_pop()
-        d.deliver(events, h, k, a)
+        d.deliver(events, h, k, a, t)
     }
     q := cmds.drain()
     worked := 0

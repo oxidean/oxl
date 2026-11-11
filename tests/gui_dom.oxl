@@ -73,7 +73,23 @@ fn app_main(events: chan own gui.Event) {
             g_d.fire(en.handle(), dom.D_ENTER)
         }
         if ev.kind == gui.EventKind.text_changed && ev.target == en.handle() {
-            println("text_changed")
+            // the payload must be the fire-time text, not "" — the
+            // event is popped before deliver reads its string
+            ok := 0
+            match ev.data {
+                gui.EventData.Text(t) => {
+                    if t == "write tests" {
+                        ok = 1
+                    }
+                }
+                _ => {
+                }
+            }
+            if ok == 1 {
+                println("text_changed")
+            } else {
+                println("text_changed payload err")
+            }
         }
         if ev.kind == gui.EventKind.activated && ev.target == en.handle() {
             println("activated")

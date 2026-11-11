@@ -710,6 +710,9 @@ fn cmd_run() {
         cargs[0] = out
         child := exec.cmd("node", cargs)
         [st, e] = child.run()
+        if e != nil {
+            eprintln("node exec failed: " + errors.msg(e))
+        }
         os.remove_all(dir)
         exit(child_code(st, e))
     }
@@ -740,6 +743,9 @@ fn cmd_test() {
         nargs = push(nargs, out)
         child := exec.cmd("node", nargs)
         [st, e] = child.run()
+        if e != nil {
+            eprintln("node exec failed: " + errors.msg(e))
+        }
         os.remove_all(dir)
         exit(child_code(st, e))
     }

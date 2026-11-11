@@ -57,7 +57,7 @@ real vs headless by `typeof document`. Programs that never touch
 
 `extern fn name(args)` emits `__oxl_ffi.name(args)` verbatim:
 
-- `int`/`err`/`byte` → `BigInt`; `float`/`bool` → JS primitives
+- `int`/`err` → `BigInt`; `byte` → masked `Number`; `float`/`bool` → JS primitives
 - `str` → the oxl `{u8,off,len}` rep **end-to-end** — the emitter
   performs no boundary conversion; providers decode args with
   `rt_str_cstr` and construct `{u8,off,len}` returns themselves

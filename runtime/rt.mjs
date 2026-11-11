@@ -796,7 +796,7 @@ export function rt_cancelled() {
 
 /* the gui.run gate: set only on the rt_run_root-entered task */
 export function rt_is_root() {
-  return !!(tls_task && tls_task.is_root)
+  return tls_task && tls_task.is_root ? 1n : 0n
 }
 
 /* the caller's innermost live scope as an opaque handle (curscope()) */

@@ -117,7 +117,12 @@ last fix commit.
       values; test_record — AEAD round-trip with fixed keys).
       `tests/tls_handshake_test.oxl` (test_handshake_replay —
       checked-in server flight fixture → Finished verifies and the
-      Conn reads the fixture's encrypted app data). The flight
+      Conn reads the fixture's encrypted app data; the fixture
+      pins the client side too — replay runs under a deterministic
+      `rt_csrand`/ECDHE test hook emitting the captured
+      ClientHello, since fresh random/share would break the
+      transcript and Finished verification — the RFC 8448
+      everything-published rule). The flight
       fixture is captured once by a `flight` subcommand added to
       `scripts/gen_tls_fixtures.sh` (openssl s_server + s_client
       against a generated CA; capture script, CA key, and openssl

@@ -26,7 +26,7 @@ lane (sockets already trap under node; `tls` inherits net's path).
   "written fresh in oxl from the public specs — no C port" and the
   item closes with "the language is sufficient." u32-in-int64
   arithmetic (`x/2**n`, `(x*2**n)&M32`) is the established pattern —
-  correct first; the perf gate (X5 interop budget) is what makes it
+  correct first; the perf gate (X6 interop budget) is what makes it
   acceptable, not any compiler strength-reduction (there is none).
 - The driver's link pattern is demand-driven off emitted text:
   `rt_sqlite_*` → `-DOXL_SQLITE` + `-lsqlite3` (or `LANG_SQLITE_SRC`

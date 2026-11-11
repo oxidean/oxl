@@ -119,8 +119,12 @@ OID) yields `err_alg` at verify. `SPKI_*`: `rsa`, `ec_p256`,
    membership, so the anchor's own self-signature is never verified
    and the sig-alg check (step 2's SHA-1/MD5 hard-fail) does not
    reach it — a SHA-1 self-signed anchor in the store validates,
-   matching real trust stores. The returned path includes the
-   anchor.
+   matching real trust stores. The exemption is scoped: steps
+   2–4's content checks (validity window, `is_ca`, KU/EKU,
+   `max_path`) do not apply to the anchor either — store
+   membership alone vouches for it; only its subject/SKID/AKID
+   fields feed path building and chain assembly. The returned
+   path includes the anchor.
 
 NameConstraints is not processed — parked with the
 revocation/name-constraint trigger. One floor rule: the
@@ -148,7 +152,10 @@ only source of trust.
    documented in docs/tls.md). Either set to a bad path →
    `err_roots` naming the var — an override that doesn't work
    must not fall through silently to the store it meant to
-   replace.
+   replace. "Non-empty" means ≥1 parsed certificate: a set env
+   override whose file parses to zero certs → `err_roots`
+   (same rule), while a platform-store candidate yielding zero
+   certs is skipped to the next entry.
 2. **`SSL_CERT_FILE` / `SSL_CERT_DIR`** — same semantics;
    honored so tools configured for the OpenSSL convention work
    unmodified.

@@ -33,7 +33,8 @@ negotiation.
 
 RSA-PSS in CertificateVerify: `salt_len` pins to the hash length
 (the generic "salt-len recover" verify path accepts anything — we
-send and accept only hashlen).
+accept only hashlen; the client never sends CertificateVerify —
+no mTLS — but the verify path is shared).
 
 ## Handshake state machine
 
@@ -64,7 +65,10 @@ ClientHello
                           (`illegal_parameter` alert — the RFC's
                           "MUST abort"); P-256/P-384 →
                           point-on-curve check (invalid-curve defense)
-  → EncryptedExtensions — ALPN echo must ∈ offered list when sent;
+  → EncryptedExtensions — ALPN echo must ∈ offered list when sent
+                          (mismatch → `illegal_parameter`; RFC 7301
+                          names `no_application_protocol` — the
+                          divergence is documented in docs/tls.md);
                           any unoffered extension →
                           illegal_parameter
   → [CertificateRequest mid-flight — answered with an empty
@@ -117,6 +121,9 @@ Post-handshake, consume quietly:
   empty Certificate as mid-flight — because real servers do send
   it and an alert buys nothing: the server's own follow-up
   (usually `certificate_required`) ends the session either way.
+  The lenient reply is a complete client flight — the empty
+  Certificate followed by Finished, no CertificateVerify, same
+  shape as the mid-flight answer.
   The strict alternative is recorded, not chosen. Any other
   handshake-type post-handshake → `unexpected_message` alert.
 

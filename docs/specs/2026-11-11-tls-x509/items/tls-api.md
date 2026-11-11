@@ -90,7 +90,9 @@ fn (c ref Conn) rawfd() -> int     // inner.rawfd() — set_*timo works
 fn (c ref Conn) peer() -> x509.Cert
     // the verified leaf — callers needing the presented identity
     // (audit logs, key pinning checks on top of verify) read it
-    // here, never from a parallel parse.
+    // here, never from a parallel parse. Returns a snapshot
+    // copy (own fields cloned): mutating the result affects
+    // neither the conn's stored leaf nor later peer() calls.
 fn (c mut Conn) asreader/aswriter/ascloser/asreadwriter  // net.Conn parity
 ```
 

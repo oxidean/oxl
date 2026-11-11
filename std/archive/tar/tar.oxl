@@ -419,7 +419,7 @@ fn paxdec(rec: []byte, want: str) -> [int, err] {
                     d = d + 1
                 }
                 // any non-digit non-dot tail makes the value unusable
-                if d == 0 + neg || (d < len(val) && val[d] != 46) {
+                if d == 0 + neg || d < len(val) && val[d] != 46 {
                     i = i + v
                     continue
                 }

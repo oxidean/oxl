@@ -39,7 +39,12 @@ struct RNode { v: int, prev: int, next: int, live: int, gen: int }
 /// Ring is a circular list; create with newring. `root` is any one
 /// live element kept as the entry point (link/unlink maintain it);
 //  -1 only on a ring nothing was ever linked into.
-struct Ring { ns: []RNode, root: int, free: int, n: int }
+// ns is `own`-boxed for the same reason list's arena is: a plain
+// slice's backing binds to whichever scope grew it — a ring
+// created outside but first grown inside a nested scope would
+// dangle after join. own-domain backing survives for the ring's
+// own lifetime.
+struct Ring { ns: own []RNode, root: int, free: int, n: int, water: int }
 
 /// newring creates a ring of n elements — ring.New. nil for n <= 0.
 fn newring(n: int) -> own Ring {
@@ -50,7 +55,7 @@ fn newring(n: int) -> own Ring {
     // own handle (gen*SPAN + idx unpacks to the wrong slot)
     assert(n <= SPAN)
     r := new(Ring)
-    r.ns = mkslice(RNode, n)
+    r.ns = new(mkslice(RNode, n))
     i := 0
     for i < n {
         r.ns[i].v = 0
@@ -63,6 +68,7 @@ fn newring(n: int) -> own Ring {
     r.root = 0
     r.free = -1
     r.n = n
+    r.water = n
     return r
 }
 
@@ -82,7 +88,7 @@ fn (r ref Ring) head() -> int {
 // mkh packs an arena index into a handle: gen*SPAN + idx, -1
 // stays -1. SPAN = 2^20 bounds the arena.
 fn (r ref Ring) mkh(i: int) -> int {
-    if i < 0 || i >= len(r.ns) {
+    if i < 0 || r.ns == nil || i >= len(r.ns) {
         return -1
     }
     return r.ns[i].gen * SPAN + i
@@ -99,7 +105,7 @@ fn (r ref Ring) ok(i: int) -> bool {
         return false
     }
     idx := i % SPAN
-    return idx < len(r.ns) && r.ns[idx].live == 1 && r.ns[idx].gen == i / SPAN
+    return r.ns != nil && idx < len(r.ns) && r.ns[idx].live == 1 && r.ns[idx].gen == i / SPAN
 }
 
 /// next returns the handle after i in the cycle — Ring.Next.
@@ -164,6 +170,11 @@ fn (r mut Ring) setval(i: int, v: int) {
 
 // alloc recycles a freelist node before growing the arena.
 fn (r mut Ring) alloc(v: int) -> int {
+    // a zero Ring (new(ring.Ring)) has a nil arena — materialize
+    // before len() derefs the nil box
+    if r.ns == nil {
+        r.ns = new(mkslice(RNode, 0))
+    }
     if r.n == 0 && len(r.ns) == 0 && r.root == 0 {
         // re-arm a zero-value Ring like list's alloc does — the
         // sentinels a used ring keeps can't collide with this
@@ -175,15 +186,44 @@ fn (r mut Ring) alloc(v: int) -> int {
     if i != -1 {
         r.free = r.ns[i].next
     } else {
-        assert(len(r.ns) < SPAN)
-        i = len(r.ns)
-        r.ns = push(r.ns, RNode{v: 0, prev: -1, next: -1, live: 0, gen: 1})
+        assert(r.water < SPAN)
+        if r.water >= len(r.ns) {
+            r.grow()
+        }
+        i = r.water
+        r.water = r.water + 1
     }
     r.ns[i].v = v
     r.ns[i].prev = -1
     r.ns[i].next = -1
     r.ns[i].live = 1
     return r.ns[i].gen * SPAN + i
+}
+
+// grow doubles the arena into a fresh own slice — see list.grow:
+// push() can't take an own slice, and a plain backing would bind
+// to whichever scope ran the grow.
+fn (r mut Ring) grow() {
+    ncap := 4
+    if len(r.ns) > 0 {
+        ncap = len(r.ns) * 2
+    }
+    if ncap > SPAN {
+        ncap = SPAN
+    }
+    n2 := new(mkslice(RNode, ncap))
+    j := 0
+    for j < r.water {
+        n2[j] = r.ns[j]
+        j = j + 1
+    }
+    // fresh slots mint at gen 1 — a gen-0 slot would collide with
+    // the bare index and resurrect as a handle
+    for j < ncap {
+        n2[j].gen = 1
+        j = j + 1
+    }
+    r.ns = n2
 }
 
 /// link splices all of ring s into this ring right after element i

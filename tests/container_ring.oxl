@@ -259,5 +259,25 @@ fn main() {
     assert(gr.val(gh) == 5)
     assert(gr.val(0) == 0 && gr.next(0) == -1)
 
+    // arena survives a nested growth scope: link allocs into r's
+    // arena inside scope{} and the ring stays readable after join
+    sr := ring.newring(3)
+    ss := ring.newring(2)
+    sh0 := sr.head()
+    sr.link(sh0, ss)
+    scope {
+        ss2 := ring.newring(1)
+        sh := sr.head()
+        sr.link(sh, ss2)
+    }
+    assert(sr.len() == 6)
+    k2 := 0
+    i3 := sr.head()
+    for k2 < 6 {
+        i3 = sr.next(i3)
+        k2 = k2 + 1
+    }
+    assert(i3 == sr.head())
+
     println("ring ok")
 }

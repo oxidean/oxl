@@ -231,5 +231,23 @@ fn main() {
     // carry gen >= 1, so slot 0's raw index reads dead too
     assert(il2.val(0) == 0 && il2.next(0) == -1)
 
+    // arena survives a nested growth scope: a list created outside
+    // but first grown inside scope{} keeps backing after join —
+    // the own-domain arena binds to the list, not the grow site
+    sl2 := list.newlist()
+    scope {
+        sl2.pushback(11)
+        sl2.pushback(22)
+    }
+    assert(sl2.len() == 2)
+    assert(sl2.val(sl2.front()) == 11 && sl2.val(sl2.back()) == 22)
+    assert(sl2.val(sl2.next(sl2.front())) == 22)
+    // and a bare zero List grown inside a scope survives too
+    zl3 := new(list.List)
+    scope {
+        zl3.pushback(7)
+    }
+    assert(zl3.len() == 1 && zl3.val(zl3.front()) == 7)
+
     println("list ok")
 }

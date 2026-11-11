@@ -46,16 +46,30 @@ struct Node { v: int, prev: int, next: int, live: int, gen: int }
 /// value is usable, matching Go — the first alloc re-arms the
 /// sentinel fields (a forged List{...} with only some fields set
 /// is still corrupt input, same as Go).
-struct List { ns: []Node, head: int, tail: int, free: int, n: int }
+///
+/// ns is `own`-boxed on purpose: a plain slice's arena backing
+/// would bind to whichever scope happened to grow it, so a list
+/// created in an outer scope but first grown inside a nested
+/// `scope{}` would dangle after that scope joined. own-domain
+/// backing survives for the list's own lifetime instead.
+struct List {
+    ns: own []Node,
+    head: int,
+    tail: int,
+    free: int,
+    n: int,
+    water: int,
+}
 
 /// newlist returns an empty list — list.New.
 fn newlist() -> own List {
     l := new(List)
-    l.ns = mkslice(Node, 0)
+    l.ns = new(mkslice(Node, 0))
     l.head = -1
     l.tail = -1
     l.free = -1
     l.n = 0
+    l.water = 0
     return l
 }
 
@@ -68,7 +82,13 @@ fn (l mut List) init() {
     // bumps once and re-chains onto free.
     l.free = -1
     i := 0
-    for i < len(l.ns) {
+    if l.ns == nil {
+        l.head = -1
+        l.tail = -1
+        l.n = 0
+        return
+    }
+    for i < l.water {
         l.ns[i].v = 0
         l.ns[i].prev = -1
         l.ns[i].live = 0
@@ -102,7 +122,7 @@ fn (l ref List) back() -> int {
 // mkh packs an arena index into a handle: gen*SPAN + idx, -1
 // stays -1. SPAN = 2^20 bounds the arena.
 fn (l ref List) mkh(i: int) -> int {
-    if i < 0 || i >= len(l.ns) {
+    if i < 0 || l.ns == nil || i >= len(l.ns) {
         // -1 stays -1; an unarmed zero-value List (head==0, no
         // arena) also maps to -1 rather than indexing ns[0] —
         // Go's nil-Element on an empty list
@@ -122,7 +142,7 @@ fn (l ref List) ok(i: int) -> bool {
         return false
     }
     idx := i % SPAN
-    return idx < len(l.ns) && l.ns[idx].live == 1 && l.ns[idx].gen == i / SPAN
+    return l.ns != nil && idx < len(l.ns) && l.ns[idx].live == 1 && l.ns[idx].gen == i / SPAN
 }
 
 /// next returns the handle after i, or -1 at the tail (or when i
@@ -168,6 +188,11 @@ fn (l mut List) setval(i: int, v: int) {
 // newlist'd or used list can present (emptied lists keep -1
 // sentinels), so detecting it here can't misfire.
 fn (l mut List) alloc(v: int) -> int {
+    // a zero List (new(list.List), never armed) has a nil arena —
+    // materialize before len() would deref the nil box
+    if l.ns == nil {
+        l.ns = new(mkslice(Node, 0))
+    }
     if l.n == 0 && len(l.ns) == 0 && l.head == 0 {
         l.head = -1
         l.tail = -1
@@ -179,15 +204,46 @@ fn (l mut List) alloc(v: int) -> int {
     } else {
         // SPAN bound — a 2^20th slot's handle would pack
         // gen*SPAN + SPAN and unpack back to slot 0
-        assert(len(l.ns) < SPAN)
-        i = len(l.ns)
-        l.ns = push(l.ns, Node{v: 0, prev: -1, next: -1, live: 0, gen: 1})
+        assert(l.water < SPAN)
+        if l.water >= len(l.ns) {
+            l.grow()
+        }
+        i = l.water
+        l.water = l.water + 1
     }
     l.ns[i].v = v
     l.ns[i].prev = -1
     l.ns[i].next = -1
     l.ns[i].live = 1
     return l.ns[i].gen * SPAN + i
+}
+
+// grow doubles the arena into a fresh own slice. push() can't
+// take an own slice, and a plain []Node backing would bind to
+// whichever scope ran the grow — an outer list first grown inside
+// a nested scope would dangle after join. own-domain backing
+// survives for the list's lifetime instead.
+fn (l mut List) grow() {
+    ncap := 4
+    if len(l.ns) > 0 {
+        ncap = len(l.ns) * 2
+    }
+    if ncap > SPAN {
+        ncap = SPAN
+    }
+    n2 := new(mkslice(Node, ncap))
+    j := 0
+    for j < l.water {
+        n2[j] = l.ns[j]
+        j = j + 1
+    }
+    // fresh slots mint at gen 1 — a gen-0 slot would collide with
+    // the bare index and resurrect as a handle
+    for j < ncap {
+        n2[j].gen = 1
+        j = j + 1
+    }
+    l.ns = n2
 }
 
 // splice links node i between a and b — the only pointer fixup in
@@ -330,7 +386,7 @@ fn (l mut List) moveafter(i: int, mark: int) {
 //  its arena dies with the handle; its handles are dead after.
 fn (l mut List) pushbacklist(other: own List) {
     i := other.head
-    for i >= 0 && i < len(other.ns) {
+    for i >= 0 && other.ns != nil && i < len(other.ns) {
         nx := other.ns[i].next
         l.pushback(other.ns[i].v)
         i = nx
@@ -342,7 +398,7 @@ fn (l mut List) pushbacklist(other: own List) {
 /// `other` is consumed like in pushbacklist.
 fn (l mut List) pushfrontlist(other: own List) {
     i := other.tail
-    for i >= 0 && i < len(other.ns) {
+    for i >= 0 && other.ns != nil && i < len(other.ns) {
         pv := other.ns[i].prev
         l.pushfront(other.ns[i].v)
         i = pv

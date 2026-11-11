@@ -5,12 +5,13 @@ firing moves the item into the milestone map via a new work item.
 
 ## LLVM backend
 
-- **Why parked:** the C backend works, is portable, and keeps emitted
-  code inspectable. The codegen seam (`docs/semantics/interfaces.md`)
-  exists precisely so LLVM can slot in later.
-- **Reopen trigger:** C codegen is a *measured* bottleneck (compile-
-  time or runtime) or a platform target requires it (e.g. wasm via
-  LLVM).
+- **Status: trigger fired.** Milestone W landed a second emit lane
+  (`--target js`), so the `interfaces.md` codegen seam is proven
+  with a second consumer and a third is pattern work; clang-only
+  platform reach (wasm, target SDKs — the trigger's "platform
+  target requires it" arm) is the standing justification. Spec:
+  `docs/specs/2026-11-11-llvm-backend/` (milestone L, WI-0010).
+  This section retires when L merges.
 
 ## Web compilation target (JS/HTML/CSS)
 

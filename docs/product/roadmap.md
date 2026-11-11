@@ -62,7 +62,7 @@ Milestone map: [docs/specs/2026-11-07-phase-2-plan/](../specs/2026-11-07-phase-2
     (`docs/specs/2026-11-04-0132-v0-2-forward/items/d4-shape-generics.md`);
     trigger: generic-heavy builds show measurable bloat or compile-
     time pain — pure backend optimization, semantics unchanged.
-  - TLS/x509 — spec in flight (`docs/specs/2026-11-11-tls-x509/`);
+  - TLS/x509 — spec in flight on `docs/tls-x509-spec`;
     trigger: first consumer needing authenticated or encrypted
     transport beyond cleartext `net`; spec must cover the x509
     trust story, not just a wrapping API.

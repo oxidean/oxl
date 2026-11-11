@@ -197,22 +197,45 @@ fn (v Value) alloc_field(i: int) -> [Value, err]
                                              //  it mut-set; err_oob past
                                              //  nfields; err_kind unless
                                              //  ptr field + v.w
+fn (v Value) alloc_slice(i: int, n: int) -> [Value, err]
+                                             // STRUCT only, SLICE-typed
+                                             //  fields — the decode lane's
+                                             //  slice mint: rt_desc_alloc_
+                                             //  slice(elem_td, n) builds a
+                                             //  live RtSlice header + backing
+                                             //  (own-lane) and writes it into
+                                             //  the field's ptr slot; yields
+                                             //  the slice Value mut-set so
+                                             //  index(j)/set_* fill it;
+                                             //  err_oob/err_kind as above
 fn (t Type) name() -> str                    // rt_desc_name
-fn (t Type) kind() -> int                    // rt_desc_kind
+fn (t Type) kind() -> int                    // rt_desc_kind — compares
+                                             //  against the Kind* constants
+                                             //  below (frozen order, never
+                                             //  raw literals at call sites)
+fn KindInt() -> int                       // … plus KindByte/KindBool/
+                                             //  KindF64/KindStr/KindCstr/
+                                             //  KindSlice/KindStruct/KindEnum/
+                                             //  KindIface/KindFn/KindChan/
+                                             //  KindErr/KindVoid — declared
+                                             //  as fns returning the frozen
+                                             //  INT..VOID codes (no `const`
+                                             //  surface in v1)
 fn (t Type) size() -> int                    // rt_desc_size
 fn (t Type) nfields() -> int                 // rt_desc_nfields
-fn (t Type) field(i: int) -> [Field, err]    // {td, i}; err_oob — an OOB
-                                             //  desc read is UB, so index
-                                             //  accessors are pair-shaped
-                                             //  like v.index
+fn (t Type) field(i: int) -> [Field, err]    // {td, i}; err_oob — the
+                                             //  helpers bounds-check and
+                                             //  sentinel-return, but pair-
+                                             //  shape keeps misuse from ever
+                                             //  manufacturing a handle
 fn (t Type) elem() -> [Type, err]            // rt_desc_elem — PAIR-shaped:
                                              //  -1 (absent elem: scalars,
                                              //  structs) would fabricate
                                              //  Type{td:-1}; err_kind instead
 fn (t Type) nvars() -> int                   // rt_desc_nvars
-fn (t Type) varname(i: int) -> [str, err]    // rt_desc_var
+fn (t Type) varname(i: int) -> [str, err]    // rt_desc_v_name
 fn (t Type) variant(i: int) -> [Variant, err]// {td, i}; err_oob
-fn (x Variant) name() -> str                 // rt_desc_var
+fn (x Variant) name() -> str                 // rt_desc_v_name
                                              //  (name asymmetry is
                                              //  deliberate: Variant.name /
                                              //  Field.name for decl names,
@@ -229,11 +252,14 @@ fn (x Variant) fname(i: int) -> [str, err]   // rt_desc_v_f_name — declared
                                              //  name for named payloads,
                                              //  synthesized `fN` for
                                              //  positional; err_oob
+fn (x Variant) fptr(i: int) -> [int, err]    // rt_desc_v_f_ptr; err_oob
 fn (v Value) tag() -> [int, err]             // ENUM only — reads the tag
                                              //  slot via the i32 lane (the
                                              //  tag is a C `int`, 4B in both
                                              //  drivers). The union blob
-                                             //  base is rt_desc_v_base(td)
+                                             //  base is rt_desc_v_base(td) —
+                                             //  one arg; same base for all
+                                             //  variants
                                              //  — codegen-pinned offsetof,
                                              //  NOT a fixed constant: with
                                              //  `int` tags it is alignment-
@@ -258,7 +284,10 @@ fn (v Value) vfield(vi: int, fi: int) -> [Value, err]
                                              //  MUST pass vi = v.tag() (any
                                              //  other variant's offsets
                                              //  describe the wrong shape) —
-                                             //  the method still bounds-
+                                             //  vfield enforces it: it reads
+                                             //  the tag slot itself (i32
+                                             //  lane) and returns err_kind on
+                                             //  a mismatch, plus bounds-
                                              //  checks vi/fi with err_oob,
                                              //  and err_kind on non-ENUM.
                                              //  An `own`-typed payload slot
@@ -269,10 +298,14 @@ fn (v Value) vfield(vi: int, fi: int) -> [Value, err]
                                              //  struct fields) and yields the
                                              //  pointee layout — never the
                                              //  handle slot itself.
-fn (f Field) name() -> str                   // rt_desc_f_name
+fn (f Field) name() -> str                   // rt_desc_f_sname
 fn (f Field) off() -> int                    // rt_desc_f_off
-fn (f Field) typ() -> Type                   // {rt_desc_f_td}
+fn (f Field) typ() -> [Type, err]            // {rt_desc_f_td} — pair-shaped
+                                             //  like elem(): -1 → err_kind,
+                                             //  never Type{td:-1}
 fn (f Field) tag() -> str                    // rt_desc_f_tag; "" absent
+fn (f Field) ptr() -> int                    // rt_desc_f_ptr — gob/xml
+                                             //  branch on ptr-ness
 fn (v Value) typ() -> Type                   // {v.td}
 ```
 
@@ -322,7 +355,9 @@ generic binding of `T` carries the qualifier, so a
 `sprintv[own Point]` instantiation statically knows to print
 `&` — and so do `ref`/`mut` (`tqual` ≠ 0 → `&{…}`, matching Go's
 `*T` print for all pointer-lane qualifiers). (Caveat worth one line: a `v: T` param of `sprintv` itself receives the value — `own` args are *moved* into the callee by the
-usual rules.) `%v` on opaque kinds (IFACE/FN/CHAN/ERR) prints a
+usual rules.) `%v` on SLICE prints `[e1 e2 …]` via the `len`/`index`
+walk — pinned alongside the opaque forms. `%v` on opaque kinds
+(IFACE/FN/CHAN/ERR) prints a
 placeholder form — `iface{…}`/`fn`/`chan`/`err <code>` — pinned
 here so R2 doesn't improvise; PTR-kind (cstr) values print the
 C string's contents via the same `rt_field_cstr` lane `v.str()`
@@ -345,9 +380,14 @@ qualified `T` to the wrapped desc per the contract). Decode paths
 (`gob` decode, `xml` unmarshal, `sql.scan[T]`'s `out`) write
 through `field(i).set_*` on `mut`-derived `Value`s — minting
 `own`-field pointees through `v.alloc_field(i)` (a nil `own`
-slot reads `err_nil`; the alloc is the mint) and enum payloads
+slot reads `err_nil`; the alloc is the mint), SLICE fields
+through `v.alloc_slice(i, n)` — the `rt_desc_alloc_slice` lane
+writes a live RtSlice header into the ptr slot, after which
+`index(j)`/`set_*` mutate elements in place — and enum payloads
 through `set_tag` + `vfield` (tag write on the i32 lane, then
-payload-slot writes) — the same
+payload-slot writes; a nil own-typed payload slot mints the same
+way via the `rt_desc_alloc` lane before `vfield` derefs it) —
+the same
 scope-bound rule applies, so a writable `Value` provably cannot
 outlive the buffer it mutates. Writability is *enforced*, not
 conventional: `mut T` args coerce to `ref T`, which would erase

@@ -102,17 +102,21 @@ variant's index into `vars[]` — variants emit in decl order and
 tags count in the same order, so `v.tag()` selects
 `variant(v.tag())` directly.
 
-Table linkage follows the demand rule end to end: a program naming
-no `tdesc` emits no table AND references no `rt_desc_*`/`rt_field_*`
-symbol — the externs emit only where called, so descriptor-free
-programs link identically to today (the dead-code discipline
-already stated for the table itself).
+Table linkage follows the demand rule end to end: codegen emits
+the populated table only on `tdesc`-reach — a program naming no
+`tdesc` emits no *populated* table. The `rt_desc_*`/`rt_field_*`
+helpers live in rt.c unconditionally, and rt.c ships a weak stub
+(`o_desc_tab[1]`/`o_desc_tab_n` = 0) so a module that redeclares
+and calls an extern still links and gets the sentinel
+(`rt_desc_count` → 0 → every accessor `err_oob`s) — "link
+identically to today" means no emitted table, not no helper
+symbols.
 
 `tag` holds the field-tag string (`xml:"name"`, `gob:"-"`) — NULL
 when absent; needed by R5's xml and R4's gob name overrides. R1 emits
-the slot (parser already carries tags if it does — checked at R1;
-if tag syntax doesn't exist yet, R1 adds `tag "..."` on fields and
-threads it through both parsers/checkers/emitters).
+the slot — the parser carries no tags today, so R1 adds
+`tag "..."` on fields and threads it through both
+parsers/checkers/emitters.
 
 ## Resolution: `tdesc(T)` at monomorph time
 
@@ -235,9 +239,14 @@ extern fn rt_desc_elem(td: int) -> int          // -1 when absent — the
                                               //  public elem() is pair-shaped:
                                               //  -1 → err_kind, never
                                               //  Type{td:-1}
+extern fn rt_desc_elem_ptr(td: int) -> int      // 1 when the element SLOT is
+                                              //  a pointer to elem's layout
+                                              //  ([]own T) — v.index's stride
+                                              //  + deref-once contract needs
+                                              //  this to be callable
 extern fn rt_desc_nvars(td: int) -> int
-extern fn rt_desc_var(td: int, i: int) -> str
-extern fn rt_desc_f_name(td: int, i: int) -> str
+extern fn rt_desc_v_name(td: int, i: int) -> str
+extern fn rt_desc_f_sname(td: int, i: int) -> str
 extern fn rt_desc_f_off(td: int, i: int) -> int
 extern fn rt_desc_f_td(td: int, i: int) -> int
 extern fn rt_desc_f_tag(td: int, i: int) -> str // "" when absent
@@ -255,10 +264,11 @@ extern fn rt_desc_v_f_ptr(td: int, vi: int, fi: int) -> int
                                              //  (own/mut/ref-typed payload —
                                              //  vfield derefs once, like
                                              //  FieldDesc.ptr)
-extern fn rt_desc_v_base(td: int, vi: int) -> int
-                                             // offsetof the variant's union
-                                             //  blob — codegen-pinned, never
-                                             //  a fixed constant
+extern fn rt_desc_v_base(td: int) -> int
+                                             // offsetof the union blob —
+                                             //  identical for every variant
+                                             //  (one arg — codegen-pinned,
+                                             //  never a fixed constant)
 extern fn rt_desc_alloc(td: int) -> int      // decode lane: zeroed pointee
                                              //  mint for td — allocated via
                                              //  rt_alloc_own (heap): a scope-
@@ -266,9 +276,22 @@ extern fn rt_desc_alloc(td: int) -> int      // decode lane: zeroed pointee
                                              //  decoder's scope while the
                                              //  target struct lives in the
                                              //  caller
-field is for ABI consumers only (parity checks, external tools) —
-the C helpers do no align math, and no oxl-side accessor is
-needed. The `rt_desc_*`/`rt_desc_v_f_*`/
+extern fn rt_desc_alloc_slice(td: int, n: int) -> int
+                                             // decode lane for SLICE fields:
+                                             //  mints an RtSlice{ptr,len,cap,
+                                             //  heap} header + n*elem-size
+                                             //  backing, own-lane; the header
+                                             //  addr writes through the
+                                             //  ptr-slot lane
+field is emitted for ABI consumers only (parity checks,
+external tools) — the C helpers do no align math, but the accessor
+itself ships for the same consumers:
+
+```
+extern fn rt_desc_align(td: int) -> int          // ABI-consumer surface
+```
+
+The `rt_desc_*`/`rt_desc_v_f_*`/
 `rt_desc_f_*` externs themselves bounds-check every index arg —
 `td`, `i`, `vi`, `fi` against the emitted table dimensions
 (`rt_desc_count` is emitted alongside the table) — and return
@@ -281,8 +304,11 @@ provenance, not the `ref` signature bans.** Three ints carry no
 borrow marker, so the checker can't rely on the `ref` rules
 alone — and a literal reuse of those rules would also reject this
 surface's own `-> [Value, err]` methods (check.oxl bans `ref`/
-`mut` under `Ret::Pair` too — `-> []T` itself is a plain slice
-return and is NOT banned; only the borrow-typed slots are).
+`mut` under `Ret::Pair` too — under check.oxl `-> []T` itself is
+a plain slice return and is NOT banned; only the borrow-typed
+slots are. check.rs is stricter: it bans `[]T` returns under both
+ret shapes — check.rs:814-817/`825-828` — a real parity gap the
+R1 implementation must pick a side on).
 The pinned rule: `reflect.Value` is a **scope-bound type** — the
 flag attaches at the decl (the checker marks `std/reflect`'s
 `Value` struct by decl site; no marker syntax ships in v1) — a

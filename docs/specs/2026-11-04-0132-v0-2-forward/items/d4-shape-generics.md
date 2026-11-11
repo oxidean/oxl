@@ -58,5 +58,6 @@ hundreds of mono'd bodies sharing a shape in one compile).
 Re-measured 2026-11-11 (grown corpus): 23 generic fn defs;
 ~7 emitted instantiations total (`first__{int,float}`,
 `Id_ident__int`, `use__{Lower,Upper}`, `sort_{sifto,sort}__str`);
-one shareable pair (`first__{int,float}` — word shapes). Still
-~2 orders under the bar; stays parked.
+one shareable pair (`first__{int,float}` — word shapes;
+`use__{Lower,Upper}` shares layout but its `Writer` bound breaks
+the shape signature). Still ~2 orders under the bar; stays parked.

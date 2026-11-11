@@ -75,7 +75,8 @@ Widget layer in the language on top of the GTK4 FFI pilot
 layout model, event dispatch into `scope`/`select` concurrency,
 platform backend interface with GTK4 as the first backend. The
 widget tree must stay DOM-mappable — it is the agreed guardrail that
-keeps the web target open (`docs/specs/2026-11-04-0132-v0-2-forward/items/parked-web.md` in the v0.2 spec).
+kept the web target open — later un-parked as milestone W
+(`--target js`).
 Lands as `extra/gui` + `extra/gui/gtk` — the first real consumer of
 E's monorepo machinery.
 
@@ -113,7 +114,7 @@ in E's stage E6. Filed items:
 
 ## Parked
 
-See `parked.md` — LLVM backend, web target, D4 shape-generics,
+See `parked.md` — LLVM backend, D4 shape-generics,
 parked-stdlib list. Each has an explicit reopen trigger; none is
 scheduled.
 

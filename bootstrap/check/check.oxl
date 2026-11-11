@@ -2557,7 +2557,7 @@ fn reg_fn(ck: mut Ck, mod: str, ex: bool, name: str, recv: ref parser.Node, typa
     // the seed qualifies every non-main package — its BUILTINS probe only
     // ever sees bare names for `package main` decls. Root items stay
     // unqualified here (mod == ""), so gate on the root clause.
-    if !ex && len(mod) == 0 && ck.root_pkg == "main" && is_builtin(name) {
+    if !ex && recv == nil && len(mod) == 0 && ck.root_pkg == "main" && is_builtin(name) {
         diag(ck, "check", "`" + name + "` is a builtin and cannot be redefined")
     }
     tl2 := tp

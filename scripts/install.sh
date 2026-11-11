@@ -72,7 +72,6 @@ write_shim() {
     mkdir -p "$OXL_HOME/bin" "$OXL_HOME/versions"
     tmpf=$(mktemp "$OXL_HOME/bin/.oxl.tmp.XXXXXX") || exit 1
     trap 'rm -f "$tmpf"' EXIT
-    trap 'rm -f "$tmpf"' EXIT
     cat > "$tmpf" <<'SHIM_EOF'
 #!/bin/sh
 # oxl — toolchain version manager + dispatcher (gvm-style).
@@ -170,13 +169,21 @@ latest_feed_tag() {
         # pipeline and do the control flow in plain shell. A page whose
         # tags all fail vtag (or carry none) just iterates zero times —
         # no nonzero status reaches set -e, so the scan advances.
+        # the unquoted $() glob-expands candidate tokens against
+        # the caller's cwd — a stray v1.* file could shadow a real
+        # tag. set -f kills pathname expansion for the scan; the
+        # break (not return) keeps set +f reachable.
+        set -f
+        hit=""
         for c in $(printf '%s\n' "$feed" \
                  | grep -o 'releases/tag/v[0-9][^"<]*' \
                  | sed 's|releases/tag/||'); do
             # prereleases pass vtag but "latest" means a stable tag
             case "$c" in *-*) continue ;; esac
-            vtag "$c" >/dev/null 2>&1 && { printf '%s\n' "$c"; return; }
+            vtag "$c" >/dev/null 2>&1 && { hit=$c; break; }
         done
+        set +f
+        [ -n "$hit" ] && { printf '%s\n' "$hit"; return; }
         page=$((page + 1))
     done
 }
@@ -354,10 +361,10 @@ tc_install() { # tag|latest
     rm -rf "$tmp"; trap - EXIT
     echo "oxl: installed $tag -> $VERS/$tag"
     # tmp+rename — a concurrent `resolve` must never read a torn file
+    [ -d "$OXL_HOME/default-version" ] && die "$OXL_HOME/default-version is a directory"
     [ -s "$OXL_HOME/default-version" ] || {
         df=$(mktemp "$OXL_HOME/.default-version.XXXXXX") || die "cannot write $OXL_HOME/default-version"
         echo "$tag" > "$df" || die "cannot write $OXL_HOME/default-version"
-        [ ! -d "$OXL_HOME/default-version" ] || die "$OXL_HOME/default-version is a directory"
         chmod 644 "$df"
         mv "$df" "$OXL_HOME/default-version" || die "cannot write $OXL_HOME/default-version"
     }
@@ -401,9 +408,10 @@ tc_use() {
         mv "$df" .oxl-version || die "cannot write .oxl-version"
         echo "oxl: pinned $tag in ./.oxl-version"
     else
+        [ -d "$OXL_HOME/default-version" ] && die "$OXL_HOME/default-version is a directory"
         df=$(mktemp "$OXL_HOME/.default-version.XXXXXX") || die "cannot write $OXL_HOME/default-version"
         echo "$tag" > "$df" || die "cannot write $OXL_HOME/default-version"
-        [ ! -d "$OXL_HOME/default-version" ] || die "$OXL_HOME/default-version is a directory"
+        chmod 644 "$df"
         mv "$df" "$OXL_HOME/default-version" || die "cannot write $OXL_HOME/default-version"
         echo "oxl: default toolchain -> $tag"
     fi
@@ -483,6 +491,7 @@ case "$tag" in
     *) echo "install.sh: install succeeded but no tag resolved (got \`$tag\`)" \
         "— set the default manually: oxl toolchain use <tag>" >&2; exit 1 ;;
 esac
+[ -d "$OXL_HOME/default-version" ] && die "$OXL_HOME/default-version is a directory"
 if [ ! -s "$OXL_HOME/default-version" ] || [ "$set_default" = 1 ]; then
     df=$(mktemp "$OXL_HOME/.default-version.XXXXXX") || die "cannot write $OXL_HOME/default-version"
     echo "$tag" > "$df" || die "cannot write $OXL_HOME/default-version"

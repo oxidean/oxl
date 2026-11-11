@@ -170,3 +170,23 @@ fn test_resolve() {
     [_, ce] = url.parse("http://x/" + cb as str)
     testing.expect(ce == nil, "ctl byte inside fragment parses")
 }
+
+fn test_parsehost() {
+    // bracketed IPv6 host parses; zone via %25 (RFC 6874)
+    [u1, e1] = url.parse("http://[::1]:8080/x")
+    ck(e1, "bracketed ipv6")
+    testing.expect(find(u1.host, "::1") >= 0, "ipv6 host kept")
+    [u2, e2] = url.parse("http://[fe80::1%25eth0]/")
+    ck(e2, "zoned ipv6")
+    testing.expect(find(u2.host, "%25") >= 0 || find(u2.host, "%") >= 0, "zone kept")
+    // deliberate divergences: bracketed non-IPv6 and stray brackets
+    // reject where Go passes them through
+    [_, r1] = url.parse("http://[127.0.0.1]/")
+    testing.expect(r1 != nil, "bracketed ipv4 rejects")
+    [_, r2] = url.parse("http://[junk]/")
+    testing.expect(r2 != nil, "junk brackets reject")
+    [_, r3] = url.parse("http://x[bad/")
+    testing.expect(r3 != nil, "stray bracket rejects")
+    [_, r4] = url.parse("http://[::1")
+    testing.expect(r4 != nil, "unclosed bracket rejects")
+}

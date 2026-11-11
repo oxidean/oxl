@@ -321,6 +321,17 @@ fn needsquote(s: str) -> bool {
         if c <= 32 || c == 127 || c == 34 || c == 61 {
             return true
         }
+        if c >= 128 {
+            // invalid UTF-8 quotes via the \ufffd path in
+            // quotetxt — Go's needsQuoting returns true on
+            // utf8.RuneError
+            n := utf8seq(s, i)
+            if n == 0 {
+                return true
+            }
+            i = i + n
+            continue
+        }
         i = i + 1
     }
     return false

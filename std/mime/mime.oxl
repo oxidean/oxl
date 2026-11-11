@@ -498,14 +498,12 @@ fn parsemediatype(v: str) -> [own MediaType, err] {
             if m.found {
                 return nil, errors.new("mime: duplicate parameter name")
             }
-            if !m.found {
-                c := new(Cont)
-                c.base = basename
-                c.k = key
-                c.v = value
-                c.next = cont
-                cont = c
-            }
+            c := new(Cont)
+            c.base = basename
+            c.k = key
+            c.v = value
+            c.next = cont
+            cont = c
         } else {
             m := pfindv(out.params, key)
             if m.found {

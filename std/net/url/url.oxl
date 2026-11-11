@@ -438,7 +438,8 @@ fn parsehost(u: mut URL, host: str) -> err {
             un = h3
         }
         // only a real IPv6 literal may sit in brackets — this rules
-        // out "[1.2.3.4]" and non-IP junk (Go's netip gate)
+        // out "[1.2.3.4]" and non-IP junk. Deliberate divergence:
+        // Go's net/url accepts any bracketed host verbatim.
         if !net.isip6(un) {
             return errors.new("invalid IP-literal")
         }

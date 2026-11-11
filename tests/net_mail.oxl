@@ -151,3 +151,51 @@ fn test_string() {
     ck(e6, "split word round-trip")
     testing.expect_streq(bb.name, bigname, "split decode joins")
 }
+
+fn test_domainliteral() {
+    // RFC 5321 domain literals — bracketed IP after @
+    [a1, e1] = mail.parseaddress("a@[127.0.0.1]")
+    ck(e1, "ipv4 literal")
+    testing.expect_streq(a1.address, "a@[127.0.0.1]", "ipv4 kept")
+    [a2, e2] = mail.parseaddress("a@[IPv6:::1]")
+    ck(e2, "ipv6 literal")
+    testing.expect(find(a2.address, "[IPv6:::1]") >= 0, "ipv6 kept")
+    // rejects: unclosed, empty, bad ipv4, lowercase ipv6 tag
+    [_, r1] = mail.parseaddress("a@[")
+    testing.expect(r1 != nil, "unclosed rejects")
+    [_, r2] = mail.parseaddress("a@[]")
+    testing.expect(r2 != nil, "empty rejects")
+    [_, r3] = mail.parseaddress("a@[999.1.1.1]")
+    testing.expect(r3 != nil, "bad ipv4 rejects")
+    [_, r4] = mail.parseaddress("a@[ipv6:::1]")
+    testing.expect(r4 != nil, "lowercase ipv6 tag rejects")
+    // a tab inside a display comment separates words, not strips
+    [a5, e5] = mail.parseaddress("a@x (Foo\tBar)")
+    ck(e5, "comment tab")
+    testing.expect_streq(a5.name, "Foo Bar", "tab separates")
+    // raw bytes >126 in a Q-word reject — Go's qDecode errors
+    bad := mkslice(byte, 0)
+    bad = push(bad, 61) // =
+    bad = push(bad, 63) // ?
+    bad = push(bad, 85) // U
+    bad = push(bad, 84) // T
+    bad = push(bad, 70) // F
+    bad = push(bad, 45) // -
+    bad = push(bad, 56) // 8
+    bad = push(bad, 63) // ?
+    bad = push(bad, 81) // Q
+    bad = push(bad, 63) // ?
+    bad = push(bad, 120) // x
+    bad = push(bad, 95) // _
+    bad = push(bad, 233) // raw 0xE9 — the reject case
+    bad = push(bad, 63) // ?
+    bad = push(bad, 61) // =
+    bad = push(bad, 32) // space
+    bad = push(bad, 60) // <
+    bad = push(bad, 97) // a
+    bad = push(bad, 64) // @
+    bad = push(bad, 120) // x
+    bad = push(bad, 62) // >
+    [_, r5] = mail.parseaddress(bad as str)
+    testing.expect(r5 != nil, "raw >126 byte rejects")
+}

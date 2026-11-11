@@ -355,6 +355,9 @@ fn consumedomainliteral(p: mut P) -> [str, err] {
         return "", errors.new("mail: empty domain literal")
     }
     if substr(inner, 0, 5) == "IPv6:" {
+        // isip6 admits a %zone suffix (RFC 6874, needed by url
+        // brackets) where Go's ParseIP rejects it in domain
+        // literals — a deliberate ultra-edge divergence
         if !net.isip6(substr(inner, 5, len(inner))) {
             return "", errors.new("mail: invalid IPv6 domain literal")
         }
@@ -445,7 +448,8 @@ fn decode2047(w: str) -> [own DWord, err] {
 
 // wordtext expands decoded bytes per charset — iso-8859-1 maps
 // byte-for-byte onto codepoints 0–255, so each high byte becomes a
-// two-byte UTF-8 sequence. utf-8/us-ascii pass through.
+// two-byte UTF-8 sequence. utf-8 validates per sequence and emits
+// U+FFFD per bad byte; us-ascii passes through.
 fn wordtext(d: str, charset: str) -> str {
     out := mkslice(byte, 0)
     if charset == "utf-8" {
@@ -516,8 +520,8 @@ fn qdecode(t: str) -> [str, err] {
             continue
         }
         // printable ASCII plus the whitespace controls Go accepts;
-        // bytes >126 pass through raw, matching Go's qDecode
-        if c <= 32 && c != 9 && c != 10 && c != 13 {
+        // Go's qDecode errors on unescaped bytes >126
+        if c <= 32 && c != 9 && c != 10 && c != 13 || c > 126 {
             return "", errors.new("mail: bad character in q-encoding")
         }
         b = push(b, c)
@@ -626,7 +630,9 @@ fn consumedisplaycomment(p: mut P) -> [str, err] {
     j := 0
     for j < len(comment) {
         cc := byteat(comment, j)
-        if cc >= 32 && cc != 127 {
+        if cc == 9 || cc >= 32 && cc != 127 {
+            // tab survives — the splitter below uses it as a
+            // separator; CR/LF/DEL strip
             clean = clean + substr(comment, j, j + 1)
         }
         j = j + 1
@@ -957,8 +963,8 @@ fn (a ref Address) string() -> str {
 
 // ewords_b base64s each 45-byte chunk separately — 45 raw bytes
 // produce exactly 60 payload chars, the largest 4-aligned payload
-// under the cap. Chunks may split a multi-byte char; concatenated
-// decode restores the byte stream.
+// under the cap. Chunks are rune-aligned — a multi-byte char is
+// never split across word boundaries.
 fn ewords_b(name: str) -> str {
     b := name as []byte
     out := ""

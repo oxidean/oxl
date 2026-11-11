@@ -81,3 +81,17 @@ fn test_default() {
     slog.set_default(d) // restore
     testing.expect(true, "set_default round-trip")
 }
+
+fn test_quoting() {
+    // invalid UTF-8 quotes via \ufffd (Go's needsQuoting on
+    // utf8.RuneError); DEL escapes as \x7f — both asserted
+    // against the emitted text/json shapes by the suite greps
+    b := mkslice(byte, 0)
+    b = push(b, 255)
+    v := b as str
+    slog.error("quote-check", slog.str_("bad", v))
+    b2 := mkslice(byte, 0)
+    b2 = push(b2, 127)
+    slog.error("quote-check", slog.str_("del", b2 as str))
+    testing.expect(true, "quoting emits did not crash")
+}

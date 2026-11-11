@@ -38,15 +38,21 @@ Milestone map: [docs/specs/2026-11-07-phase-2-plan/](../specs/2026-11-07-phase-2
 
 - **T — toolchain-in-oxl**: shipped — `cmd/oxl` is `.oxl` end to
   end; cargo is out of the build path
-- **E — monorepo / oxl-extra**: `extra/` module for packages outside
-  `std`, `oxl.work` workspaces, git-backed index + `oxl publish`
-  (absorbs registry), polish issues
+- **E — monorepo / oxl-extra**: shipped — `extra/` module for
+  packages outside `std`, `oxl.work` workspaces, git-backed index +
+  `oxl publish` (absorbs registry), polish issues
 - **G — portable GUI layer** in the language (charter path) as
-  `extra/gui` + `extra/gui/gtk` — spec:
+  `extra/gui` + `extra/gui/gtk` — shipped; spec:
   `docs/specs/2026-11-09-gui-layer/`
+- **R — runtime type descriptors + reflection**: compiler-emitted
+  `TypeDesc` table, `std/reflect` lite, `fmt %v` (#28), typed
+  `errors.As` (#27), then `gob`/`xml`/`template`/`sql` — spec:
+  `docs/specs/2026-11-11-type-descriptors/`
+- **W — web/JS compilation target**: in flight — `--target js`,
+  JS runtime + emitter, `extra/gui/dom` backend, `web-todo`
+  reference app; spec: `docs/specs/2026-11-10-web-target/`
 - Parked on triggers: LLVM backend (behind the `interfaces.md`
-  codegen seam), web compilation target (JS/HTML/CSS — guardrail in
-  `docs/specs/2026-11-04-0132-v0-2-forward/items/parked-web.md`), D4 shape-generics, parked-stdlib list
+  codegen seam), D4 shape-generics, parked-stdlib list
 
 (The compiler already compiles itself — see `docs/self-hosting.md`;
 "T" retires the Rust seed driver, not the compiler.)

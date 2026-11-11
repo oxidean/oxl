@@ -164,19 +164,19 @@ latest_feed_tag() {
         if [ "$page" -eq 1 ]; then u="$BASE.atom"; else u="$BASE.atom?page=$page"; fi
         feed=$(curl -fsSL --connect-timeout 15 --max-time 60 "$u" 2>/dev/null) || break
         printf '%s' "$feed" | grep -q 'releases/tag/' || break
-        # || : — a page whose tags all fail vtag (or carry none)
-        # leaves the pipeline nonzero; under set -e that would
-        # kill the scan instead of advancing to the next page
-        hit=$(printf '%s\n' "$feed" \
-             | grep -o 'releases/tag/v[0-9][^"<]*' \
-             | while IFS= read -r m; do
-                   c=${m#releases/tag/}
-                   # prereleases pass vtag but "latest" should
-                   # mean a stable tag — skip them
-                   case "$c" in *-*) continue ;; esac
-                   vtag "$c" >/dev/null 2>&1 && { printf '%s\n' "$c"; break; }
-               done) || :
-        [ -n "$hit" ] && { printf '%s\n' "$hit"; return; }
+        # for + $(pipeline), not $(... while ... case ... done): bash
+        # 3.2's parser chokes on compound constructs nested inside a
+        # command substitution — keep the substitution to a plain
+        # pipeline and do the control flow in plain shell. A page whose
+        # tags all fail vtag (or carry none) just iterates zero times —
+        # no nonzero status reaches set -e, so the scan advances.
+        for c in $(printf '%s\n' "$feed" \
+                 | grep -o 'releases/tag/v[0-9][^"<]*' \
+                 | sed 's|releases/tag/||'); do
+            # prereleases pass vtag but "latest" means a stable tag
+            case "$c" in *-*) continue ;; esac
+            vtag "$c" >/dev/null 2>&1 && { printf '%s\n' "$c"; return; }
+        done
         page=$((page + 1))
     done
 }

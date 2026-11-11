@@ -10,8 +10,11 @@ transitively, every type its descriptor points at (`elem`,
 repo's dead-code/size discipline. Records are deduplicated by type
 identity; indices are assigned in first-mention order — the
 sequence each driver meets `tdesc` references in its existing
-decl/instantiation emission traversal — so the fixpoint's
-byte-level C diff sees identical tables:
+decl/instantiation emission traversal. Cross-driver table parity
+is asserted by `tests/desc_parity.oxl` run under both drivers (the
+suite's seed-vs-self output-compare pattern) — NOT by the C-text
+fixpoint, which only diffs the self emitter across its own
+generations:
 
 ```
 TypeDesc {
@@ -71,9 +74,9 @@ type emitted.
 `kind` values: `INT, FLOAT, BOOL, STR, BYTE, SLICE, MAP, STRUCT,
 PTR, CHAN, IFACE, FN, ERR, ENUM, VOID` — order frozen once R1 lands
 (the table is a stable ABI surface for tools that read the binary).
-`MAP` stays in the frozen order but R1 emits no MAP descriptors:
-the language's map is the concrete `collections.Map` struct, which
-describes as STRUCT over its own internals. `elem` doubles as the
+`MAP` is reserved in the frozen order — no `Ty` produces it
+(the language's map is the concrete `collections.Map` struct,
+which describes as STRUCT over its own internals). `elem` doubles as the
 element-desc slot for chan shapes; PTR leaves it unset — the only
 v1 PTR row is `cstr`, which has no element type to describe.
 
@@ -170,7 +173,7 @@ the literal ban while fabricating the same access, so stores to
 AND reads of `Value`'s fields are rejected outside `std/reflect`
 (inside it they stay ordinary ints for the extern calls). Field
 walks add `off` to `addr` and propagate `w`; reads go through
-externs that The same flag marks `Type`,
+externs. The same flag marks `Type`,
 `Field`, and `Variant` non-constructible by struct literal and
 field-opaque outside `std/reflect`: they are the same kind of
 forgeable handle — `Type{td: <any int>}` mints a descriptor index
@@ -180,7 +183,6 @@ reached through it is an arbitrary-offset read (`t.name()` →
 deref then `rt_str` over arbitrary memory). Reads of a forged
 handle's fields are equally non-load-bearing — nothing outside
 `std/reflect` spells `t.td` at all.
-interpret `addr` per the desc's kind:
 
 Field reads — trivial C loads interpreting `addr` per the desc's kind:
 
@@ -209,7 +211,11 @@ extern fn rt_field_set_i64(addr: int, v: int)
 extern fn rt_field_set_i32(addr: int, v: int)
 extern fn rt_field_set_u8(addr: int, v: int)
 extern fn rt_field_set_f64(addr: int, v: float)
-extern fn rt_field_set_str(addr: int, v: str)
+extern fn rt_field_set_str(addr: int, v: str) // caller must pass
+                                             //  rt_str_own backing — a
+                                             //  callee-arena str written
+                                             //  into caller-owned storage
+                                             //  dangles at scope leave
 extern fn rt_field_set_ptr(addr: int, v: int)
 ```
 
@@ -238,8 +244,10 @@ extern fn rt_desc_f_tag(td: int, i: int) -> str // "" when absent
 extern fn rt_desc_f_ptr(td: int, i: int) -> int // 1: slot is a ptr
 extern fn rt_desc_v_nfields(td: int, vi: int) -> int   // enum payload
 extern fn rt_desc_v_f_name(td: int, vi: int, fi: int) -> str
-                                             // decl name; "" when the
-                                             //  payload slot is positional
+                                             // decl name; synthesized `fN`
+                                             //  (f0, f1, …) when the payload
+                                             //  slot is positional — the same
+                                             //  spelling the C member gets
 extern fn rt_desc_v_f_td(td: int, vi: int, fi: int) -> int
 extern fn rt_desc_v_f_off(td: int, vi: int, fi: int) -> int
 extern fn rt_desc_v_f_ptr(td: int, vi: int, fi: int) -> int
@@ -247,6 +255,17 @@ extern fn rt_desc_v_f_ptr(td: int, vi: int, fi: int) -> int
                                              //  (own/mut/ref-typed payload —
                                              //  vfield derefs once, like
                                              //  FieldDesc.ptr)
+extern fn rt_desc_v_base(td: int, vi: int) -> int
+                                             // offsetof the variant's union
+                                             //  blob — codegen-pinned, never
+                                             //  a fixed constant
+extern fn rt_desc_alloc(td: int) -> int      // decode lane: zeroed pointee
+                                             //  mint for td — allocated via
+                                             //  rt_alloc_own (heap): a scope-
+                                             //  arena mint would die with the
+                                             //  decoder's scope while the
+                                             //  target struct lives in the
+                                             //  caller
 field is for ABI consumers only (parity checks, external tools) —
 the C helpers do no align math, and no oxl-side accessor is
 needed. The `rt_desc_*`/`rt_desc_v_f_*`/
@@ -262,7 +281,8 @@ provenance, not the `ref` signature bans.** Three ints carry no
 borrow marker, so the checker can't rely on the `ref` rules
 alone — and a literal reuse of those rules would also reject this
 surface's own `-> [Value, err]` methods (check.oxl bans `ref`/
-`mut` under `Ret::Pair` too; `[]T` returns are banned under both).
+`mut` under `Ret::Pair` too — `-> []T` itself is a plain slice
+return and is NOT banned; only the borrow-typed slots are).
 The pinned rule: `reflect.Value` is a **scope-bound type** — the
 flag attaches at the decl (the checker marks `std/reflect`'s
 `Value` struct by decl site; no marker syntax ships in v1) — a
@@ -272,7 +292,10 @@ provenance pass for this: it tracks Value derivation through
 assignments and `field`/`index`/`vfield` walks — a new rule, not a
 reuse of an existing borrow-provenance pass, which does not
 exist). A `Value`
-derived from a *local* `own` — `c := new(v); return value_of(c)`
+derived from a *local* `own` — `c := new(v); return value_of(c)` — or a
+*file-scope global* (global storage never dies, but v1 classifies
+`value_of(g)` like a local-`own` derivation: usable in-scope, not
+returnable — a future marker could exempt it)
 is the real dangling case, since `p`-derived Values address
 caller-owned storage — may not be returned, and no `Value` of
 any provenance may be stored into a file-scope global, stored in
@@ -321,9 +344,12 @@ sites and `rt_desc_*`/`rt_field_*` extern declarations are rejected
 by both checkers/emitters (js-lane descriptors defer to their own
 trigger — `addr:int` + C loads don't port).
 
-## Fixpoint parity
+## Cross-driver parity
 
 `tests/desc_parity.oxl` asserts for a fixture struct: identical
-`name`, `kind`, `size`, `nfields`, `off` list under both drivers.
-The suite's existing fixpoint already proves the emitted programs
-behave identically; this asserts the *tables* do.
+`name`, `kind`, `size`, `nfields`, `off` list under both drivers —
+it compiles the fixture through codegen.rs AND codegen.oxl and
+compares the descriptor contents the programs print. The suite's
+C-text fixpoint only diffs the self emitter across its own
+generations, so it cannot witness rs-vs-oxl table drift; this test
+is the parity gate.

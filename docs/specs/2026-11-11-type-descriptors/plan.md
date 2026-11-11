@@ -16,8 +16,10 @@ you want verdicted, and again after the last fix commit.
       `codegen.oxl` (records per the contract incl. `elem_ptr` for
       `[]own T` element slots and named-variant payload names;
       indices in first-mention order through the existing
-      decl/inst emission traversal — the fixpoint diffs emitted C
-      byte-level — and initializers spelled `sizeof(struct
+      decl/inst emission traversal — cross-driver parity asserted
+      by `tests/desc_parity.oxl` (the C-text fixpoint only diffs
+      the self emitter across generations) — and initializers
+      spelled `sizeof(struct
       o_s_*)`/`offsetof(...)`, which keeps layout C-truth AND
       pulls desc-referenced decls live through the textual-edge
       reachability that prunes dead decls);
@@ -63,7 +65,8 @@ you want verdicted, and again after the last fix commit.
       for ptrs, scalar forms per kind, variant name for enums),
       `%+v` adds field names (`{f1:v1 f2:v2}`), `%T` the type
       name, `%#v` the source-literal form for the repr kinds that
-      have one.      `tests/fmt_v.oxl` + `tests/reflect.oxl` gate every kind,
+      have one.
+      `tests/fmt_v.oxl` + `tests/reflect.oxl` gate every kind,
       wired into `tests/run.sh`.
 - [ ] **R3 — typed error payloads (completes #27).** `std/errors`:
       `box[T any](v: T)` minting int64 codes backed by the rt err
@@ -91,9 +94,11 @@ you want verdicted, and again after the last fix commit.
       `docs/semantics/errors.md` is created with a section
       recording the box lane — incl. payload lifetime: boxed
       payloads live in the capped, never-freed `RtErrEnt`
-      registry (`RT_ERR_MAX` 65536, no dedupe — `as` clears the
-      slots it consumes but frees nothing), so `box` is for error
-      paths, not hot loops.      `tests/errors_as.oxl`: box → as round-trip incl. no-match
+      registry (`RT_ERR_MAX` 65536; the *box lane* never dedupes —
+      `rt_err_new` itself dedupes message text — and `as` clears
+      the slots it consumes but frees nothing), so `box` is for error
+      paths, not hot loops.
+      `tests/errors_as.oxl`: box → as round-trip incl. no-match
       and wrapped-chain cases, wired into `tests/run.sh`.
 - [ ] **R4 — `encoding/gob`.** Descriptor-driven struct → bytes →
       struct round-trip (the canonical hard consumer — if the walk

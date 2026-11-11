@@ -9,7 +9,7 @@ live R) from the parked list
 (`docs/specs/2026-11-06-0111-package-system/items/parked-stdlib.md`,
 `docs/specs/2026-11-07-phase-2-plan/parked.md`): compiler-emitted
 runtime type descriptors + the reflection-class stdlib they unlock —
-`fmt` `%v`/`%+v`/`%T` (issue #28), `errors.As` typed binding (issue
+`fmt` `%v`/`%+v`/`%T`/`%#v` (issue #28), `errors.As` typed binding (issue
 #27 partial), then `encoding/gob`, `encoding/xml`, `text/template`,
 `database/sql`, and a `std/reflect` lite as the public machinery.
 
@@ -128,9 +128,11 @@ never silently emitted into a lane where they can't work.
    (arbitrary nested struct → bytes → equal struct). Stages ordered
    so each consumer retires a real risk before the next is spent.
 6. **Two drivers, one contract.** Descriptor emission lands in
-   `codegen.rs` AND `codegen.oxl`; the fixpoint suite is the parity
-   check — a test asserts descriptor contents (name, fields, offsets)
-   for a fixture type compiled by each driver.
+   `codegen.rs` AND `codegen.oxl`; parity is asserted by
+   `tests/desc_parity.oxl` — it compiles a fixture under each driver
+   and compares descriptor contents (name, fields, offsets). The
+   C-text fixpoint only guards the self emitter across generations
+   and cannot witness cross-driver table drift.
 
 ## The decision
 
@@ -206,7 +208,8 @@ fn (t Type) field(i: int) -> [Field, err]    // {td, i}; err_oob — an OOB
 fn (t Type) elem() -> [Type, err]            // rt_desc_elem — PAIR-shaped:
                                              //  -1 (absent elem: scalars,
                                              //  structs) would fabricate
-                                             //  Type{td:-1}; err_kind insteadfn (t Type) nvars() -> int                   // rt_desc_nvars
+                                             //  Type{td:-1}; err_kind instead
+fn (t Type) nvars() -> int                   // rt_desc_nvars
 fn (t Type) varname(i: int) -> [str, err]    // rt_desc_var
 fn (t Type) variant(i: int) -> [Variant, err]// {td, i}; err_oob
 fn (x Variant) name() -> str                 // rt_desc_var
@@ -223,7 +226,8 @@ fn (x Variant) foff(i: int) -> [int, err]    // rt_desc_v_f_off — relative
                                              //  to the union blob base;
                                              //  err_oob
 fn (x Variant) fname(i: int) -> [str, err]   // rt_desc_v_f_name — declared
-                                             //  name for named payloads, ""
+                                             //  name for named payloads,
+                                             //  synthesized `fN` for
                                              //  positional; err_oob
 fn (v Value) tag() -> [int, err]             // ENUM only — reads the tag
                                              //  slot via the i32 lane (the
@@ -264,7 +268,8 @@ fn (v Value) vfield(vi: int, fi: int) -> [Value, err]
                                              //  once (like FieldDesc.ptr on
                                              //  struct fields) and yields the
                                              //  pointee layout — never the
-                                             //  handle slot itself.fn (f Field) name() -> str                   // rt_desc_f_name
+                                             //  handle slot itself.
+fn (f Field) name() -> str                   // rt_desc_f_name
 fn (f Field) off() -> int                    // rt_desc_f_off
 fn (f Field) typ() -> Type                   // {rt_desc_f_td}
 fn (f Field) tag() -> str                    // rt_desc_f_tag; "" absent
@@ -292,14 +297,17 @@ shape (no import required to type-check the call). A
 legal only inside a body where `T` is a bound generic param —
 elsewhere `T` is just an unknown name and the checker's ordinary
 "unknown type" diagnostic applies (no special intrinsic-side rule
-needed, recorded here so nobody adds one). Inside amonomorphized body `type_of(T)` folds with `tdesc(T)`; elsewhere it
+needed, recorded here so nobody adds one). Inside a monomorphized body `type_of(T)` folds with `tdesc(T)`; elsewhere it
 takes any concrete type operand. `type_of`, `value_of`, and
 `value_of_mut` — and `box` over in `std/errors`' lane — are
 global builtins in the `mkslice`/`push` family: the checker
 resolves them with no import; they sit in this block because
 they are the surface users meet, not because `std/reflect` owns
 the names (a package could never declare them — type operands
-and ref→int lowering are not expressible in signatures). Kind mismatches return the
+and ref→int lowering are not expressible in signatures). One
+nuance: `type_of(T)` resolves without the import, but the
+`Type`/`Field`/`Variant`/`Value` methods live in `std/reflect` —
+`t.name()` DOES require importing it. Kind mismatches return the
 `reflect.err_kind` err code through the `[v, err]` lanes — the
 read contract's err channel is deliverable because the surface is
 shaped as pairs from the start.
@@ -313,7 +321,7 @@ by a sibling intrinsic `tqual(T) -> int` (0 unqualified, 1 `own`,
 generic binding of `T` carries the qualifier, so a
 `sprintv[own Point]` instantiation statically knows to print
 `&` — and so do `ref`/`mut` (`tqual` ≠ 0 → `&{…}`, matching Go's
-`*T` print for all pointer-lane qualifiers). (Caveat worth one line: a `v: T` param of `sprintv` itselfreceives the value — `own` args are *moved* into the callee by the
+`*T` print for all pointer-lane qualifiers). (Caveat worth one line: a `v: T` param of `sprintv` itself receives the value — `own` args are *moved* into the callee by the
 usual rules.) `%v` on opaque kinds (IFACE/FN/CHAN/ERR) prints a
 placeholder form — `iface{…}`/`fn`/`chan`/`err <code>` — pinned
 here so R2 doesn't improvise; PTR-kind (cstr) values print the

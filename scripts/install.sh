@@ -289,8 +289,15 @@ tc_install() { # tag|latest
     fetch "$BASE/download/$tag/$asset" "$tmp/$asset" \
         || die "no toolchain asset for $suf at $tag — build from source instead:
     https://github.com/oxidean/oxl#building-from-source"
-    sha_code=$(curl -fsSL "$BASE/download/$tag/$asset.sha256" -o "$tmp/$asset.sha256" \
-        -w '%{http_code}' 2>/dev/null) && sha_rc=0 || sha_rc=$?
+    if [ "${BASE#file://}" != "$BASE" ]; then
+        sc="${BASE#file://}/download/$tag/$asset.sha256"
+        if [ -f "$sc" ]; then
+            cp "$sc" "$tmp/$asset.sha256" && sha_rc=0 || sha_rc=$?
+        else sha_rc=1; sha_code=404; fi
+    else
+        sha_code=$(curl -fsSL "$BASE/download/$tag/$asset.sha256" -o "$tmp/$asset.sha256" \
+            -w '%{http_code}' 2>/dev/null) && sha_rc=0 || sha_rc=$?
+    fi
     if [ "${sha_rc:-1}" = 0 ]; then
         if have sha256sum; then (cd "$tmp" && sha256sum -c "$asset.sha256");
         elif have shasum; then (cd "$tmp" && shasum -a 256 -c "$asset.sha256");
@@ -327,6 +334,7 @@ tc_install() { # tag|latest
     [ -f "$OXL_HOME/default-version" ] || {
         df=$(mktemp "$OXL_HOME/.default-version.XXXXXX") || die "cannot write $OXL_HOME/default-version"
         echo "$tag" > "$df" || die "cannot write $OXL_HOME/default-version"
+        [ ! -d "$OXL_HOME/default-version" ] || die "$OXL_HOME/default-version is a directory"
         mv "$df" "$OXL_HOME/default-version" || die "cannot write $OXL_HOME/default-version"
     }
 }
@@ -364,11 +372,13 @@ tc_use() {
     if [ "$local_tag" ]; then
         df=$(mktemp "./.oxl-version.XXXXXX") || die "cannot write .oxl-version"
         echo "$tag" > "$df" || die "cannot write .oxl-version"
+        [ ! -d .oxl-version ] || die ".oxl-version is a directory"
         mv "$df" .oxl-version || die "cannot write .oxl-version"
         echo "oxl: pinned $tag in ./.oxl-version"
     else
         df=$(mktemp "$OXL_HOME/.default-version.XXXXXX") || die "cannot write $OXL_HOME/default-version"
         echo "$tag" > "$df" || die "cannot write $OXL_HOME/default-version"
+        [ ! -d "$OXL_HOME/default-version" ] || die "$OXL_HOME/default-version is a directory"
         mv "$df" "$OXL_HOME/default-version" || die "cannot write $OXL_HOME/default-version"
         echo "oxl: default toolchain -> $tag"
     fi
@@ -400,6 +410,8 @@ if [ "${1:-}" = toolchain ]; then
         default)   [ -z "${2:-}" ] || die "usage: oxl toolchain default"
                    { [ -f "$OXL_HOME/default-version" ] && [ -s "$OXL_HOME/default-version" ]; } \
                        || die "no default — \`oxl toolchain use <tag>\`"
+                   [ -r "$OXL_HOME/default-version" ] \
+                       || die "cannot read $OXL_HOME/default-version"
                    def=$(head -n1 "$OXL_HOME/default-version" | tr -d '\r\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
                    vtag "$def" || die "invalid version in default-version: $def" ;;
         current)   [ -z "${2:-}" ] || die "usage: oxl toolchain current"

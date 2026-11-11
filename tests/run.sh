@@ -1827,7 +1827,24 @@ rc=0
 out=$(cd "$tcw/proj" && OXL_HOME="$tch" "$SHIM" build 2>&1) || rc=$?
 [ "$rc" != 0 ] && grep -q "invalid toolchain directive" <<<"$out" || {
     echo "FAIL shim hash-directive: rc=$rc $out"; exit 1; }
+# a bare `toolchain` line is a malformed directive, not a pin to nothing
+printf 'module example.com/m\n\noxl 0.3\ntoolchain\n' > "$tcw/oxl.mod"
+rc=0
+out=$(cd "$tcw/proj" && OXL_HOME="$tch" "$SHIM" build 2>&1) || rc=$?
+[ "$rc" != 0 ] && grep -q "requires a tag" <<<"$out" || {
+    echo "FAIL shim bare-directive: rc=$rc $out"; exit 1; }
+# two directives in one manifest must die, not silently pick one
+printf 'module example.com/m\n\noxl 0.3\ntoolchain v0.1.0\ntoolchain v0.2.0\n' > "$tcw/oxl.mod"
+rc=0
+out=$(cd "$tcw/proj" && OXL_HOME="$tch" "$SHIM" build 2>&1) || rc=$?
+[ "$rc" != 0 ] && grep -q "duplicate toolchain directive" <<<"$out" || {
+    echo "FAIL shim dup-directive: rc=$rc $out"; exit 1; }
+# a multiline tag can never reach a path — the env/arg trim guards die first
 printf 'module example.com/m\n\noxl 0.3\ntoolchain v0.1.0\n' > "$tcw/oxl.mod"
+rc=0
+out=$(OXL_HOME="$tch" OXL_TOOLCHAIN="$(printf 'v9.9.9\n../x')" "$SHIM" build 2>&1) || rc=$?
+[ "$rc" != 0 ] && grep -q "invalid OXL_TOOLCHAIN" <<<"$out" || {
+    echo "FAIL shim env-multiline: rc=$rc $out"; exit 1; }
 # invalid pins die loudly rather than traversing paths
 rc=0
 out=$(OXL_HOME="$tch" OXL_TOOLCHAIN="../v0.1.0" "$SHIM" build 2>&1) || rc=$?

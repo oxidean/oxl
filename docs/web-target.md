@@ -55,11 +55,15 @@ real vs headless by `typeof document`. Programs that never touch
 
 ## Extern convention
 
-`extern fn name(args)` emits `__oxl_ffi.name(mapped)`:
+`extern fn name(args)` emits `__oxl_ffi.name(args)` verbatim:
 
 - `int`/`err`/`byte` → `BigInt`; `float`/`bool` → JS primitives
-- `str`/`cstr` → JS `string` — providers decode args with
-  `rt_str_cstr` and the emitter wraps returns with `rt_str`
+- `str` → the oxl `{u8,off,len}` rep **end-to-end** — the emitter
+  performs no boundary conversion; providers decode args with
+  `rt_str_cstr` and construct `{u8,off,len}` returns themselves
+  (`rt_readfile` does exactly this). `cstr` positions alone are
+  JS `string` on the wire (e.g. `oxl_dom_tag` → String, consumed
+  via the `str()` builtin)
 - `[]byte` → `Uint8Array` view (writes land in caller storage);
   other slices → `{a,off,len,cap}`
 - `[T, err]` returns → `{val, err}` with `err` a BigInt code

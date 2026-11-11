@@ -195,7 +195,13 @@ chan = {
   (buffered / parked sends / rendezvous / closed); winner pick
   is **uniform random** among ready arms; losers unlink via
   `rt_select_arm` analog; `timeout` → `setTimeout` one-shot
-  park; `else` → READY-immediate. Cancel of a timed select
+  park; `else` → **one-turn deferred, not synchronous** — a
+  synchronous else-poll never yields under the cooperative
+  scheduler and would starve spawned peers in a poll loop, so a
+  miss parks a single scheduler turn (`setTimeout(0)`); the
+  waiters stay armed meanwhile, and a send landing mid-turn
+  claims an arm through the normal winner path. `else` reports
+  only on a still-empty set. Cancel of a timed select
   keeps refs alive until deadline (rt.c parity).
 
 ## 6. Scopes, tasks, defers, traps

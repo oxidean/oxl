@@ -330,11 +330,12 @@ fn try_addrspec(p: mut P) -> [str, err] {
     return local + "@" + dom, nil
 }
 
-// consumedomainliteral reads `[...]` — RFC 5321 domain literals:
-// `[127.0.0.1]` (IPv4 dotted quad) or `[IPv6:::1]` (tagged IPv6),
-// validated by net.isip4/isip6 like Go's consumeDomainLiteral +
-// netip check. Other bracket contents fail — a literal that can't
-// route is worse than no literal.
+// consumedomainliteral reads `[...]` — domain literals:
+// `[127.0.0.1]` (IPv4 dotted quad), `[IPv6:::1]` (RFC 5321 tagged
+// IPv6 — an oxl superset; Go's mail rejects the tag), or a bare
+// `[::1]` (Go's accepted form). Validated by net.isip4/isip6.
+// Other bracket contents fail — a literal that can't route is
+// worse than no literal.
 fn consumedomainliteral(p: mut P) -> [str, err] {
     p.pos = p.pos + 1 // consume '['
     start := p.pos
@@ -361,6 +362,9 @@ fn consumedomainliteral(p: mut P) -> [str, err] {
         if !net.isip6(substr(inner, 5, len(inner))) {
             return "", errors.new("mail: invalid IPv6 domain literal")
         }
+        return "[" + inner + "]", nil
+    }
+    if net.isip6(inner) {
         return "[" + inner + "]", nil
     }
     if !net.isip4(inner) {
@@ -448,31 +452,13 @@ fn decode2047(w: str) -> [own DWord, err] {
 
 // wordtext expands decoded bytes per charset — iso-8859-1 maps
 // byte-for-byte onto codepoints 0–255, so each high byte becomes a
-// two-byte UTF-8 sequence. utf-8 validates per sequence and emits
-// U+FFFD per bad byte; us-ascii passes through.
+// two-byte UTF-8 sequence; utf-8 needs no transcoding, so its bytes
+// pass through unchanged (Go's WordDecoder does the same — invalid
+// UTF-8 lands raw, not as U+FFFD); us-ascii passes through.
 fn wordtext(d: str, charset: str) -> str {
     out := mkslice(byte, 0)
     if charset == "utf-8" {
-        // Go substitutes U+FFFD for invalid sequences rather than
-        // letting mojibake land raw in the name
-        i := 0
-        for i < len(d) {
-            n := utf8seq(d, i)
-            if n == 0 {
-                out = push(out, 239)
-                out = push(out, 191)
-                out = push(out, 189)
-                i = i + 1
-                continue
-            }
-            j := i
-            for j < i + n {
-                out = push(out, byteat(d, j))
-                j = j + 1
-            }
-            i = i + n
-        }
-        return out as str
+        return d
     }
     i := 0
     for i < len(d) {

@@ -160,6 +160,10 @@ fn test_domainliteral() {
     [a2, e2] = mail.parseaddress("a@[IPv6:::1]")
     ck(e2, "ipv6 literal")
     testing.expect(find(a2.address, "[IPv6:::1]") >= 0, "ipv6 kept")
+    // Go's bare bracketed IPv6 form is also accepted
+    [a3, e3] = mail.parseaddress("a@[::1]")
+    ck(e3, "bare ipv6 literal")
+    testing.expect(find(a3.address, "[::1]") >= 0, "bare ipv6 kept")
     // rejects: unclosed, empty, bad ipv4, lowercase ipv6 tag
     [_, r1] = mail.parseaddress("a@[")
     testing.expect(r1 != nil, "unclosed rejects")

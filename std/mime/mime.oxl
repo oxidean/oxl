@@ -506,7 +506,9 @@ fn parsemediatype(v: str) -> [own MediaType, err] {
             cont = c
         } else {
             m := pfindv(out.params, key)
-            if m.found {
+            // Go's ParseMediaType rejects only CONFLICTING duplicates —
+            // an identical repeat is a no-op
+            if m.found && m.v != value {
                 return nil, errors.new("mime: duplicate parameter name")
             }
             out.params = pset(out.params, key, value)

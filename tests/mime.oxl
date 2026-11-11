@@ -125,9 +125,10 @@ fn test_formatmediatype() {
 }
 
 fn test_dupparam() {
-    // any repeated param key errors — same-value included
-    [_, e1] = mime.parsemediatype("text/plain; a=1; a=1")
-    testing.expect(e1 != nil, "same-value dup rejects")
+    // Go parity: identical repeats are a no-op, conflicting dups error
+    [m1, e1] = mime.parsemediatype("text/plain; a=1; a=1")
+    ck(e1, "same-value dup parses")
+    testing.expect_streq(mime.pget(m1.params, "a"), "1", "same-value kept")
     [_, e2] = mime.parsemediatype("text/plain; a=1; a=2")
     testing.expect(e2 != nil, "diff-value dup rejects")
     // continuation member dup

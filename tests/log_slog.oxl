@@ -93,5 +93,13 @@ fn test_quoting() {
     b2 := mkslice(byte, 0)
     b2 = push(b2, 127)
     slog.error("quote-check", slog.str_("del", b2 as str))
+    // Unicode non-printables take the \u escape path — NBSP (U+00A0)
+    // and ZWSP (U+200B) both quote under runeprint
+    b3 := mkslice(byte, 0)
+    b3 = push(b3, 194); b3 = push(b3, 160)
+    slog.error("quote-check", slog.str_("nbsp", b3 as str))
+    b4 := mkslice(byte, 0)
+    b4 = push(b4, 226); b4 = push(b4, 128); b4 = push(b4, 139)
+    slog.error("quote-check", slog.str_("zwsp", b4 as str))
     testing.expect(true, "quoting emits did not crash")
 }

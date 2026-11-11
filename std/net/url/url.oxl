@@ -545,7 +545,9 @@ fn setfragment(u: mut URL, f: str) -> err {
 // parseerr wraps the inner error the way Go's url.Error reports:
 // parse "rawurl": message.
 fn parseerr(raw: str, e: err) -> err {
-    return errors.new("parse \"" + raw + "\": " + errors.msg(e))
+    // wrap keeps the inner error reachable through errors.is/unwrap —
+    // Go's *url.Error.Unwrap parity
+    return errors.wrap("parse \"" + raw + "\": " + errors.msg(e), e)
 }
 
 /// parse reads rawurl into a URL — absolute, protocol-relative or

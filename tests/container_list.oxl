@@ -179,5 +179,27 @@ fn main() {
     assert(ml.back() == mb3 && ml.val(mb3) == 3)
     assert(ml.len() == 3)
 
+    // init() resets in place — handles minted before die with the
+    // generation bump, the arena clears, fresh handles mint gen 1
+    il := list.newlist()
+    il.pushback(7)
+    il.pushback(8)
+    il.pushback(9)
+    assert(il.len() == 3)
+    il.init()
+    assert(il.len() == 0)
+    assert(il.front() == -1 && il.back() == -1)
+    il.pushback(42)
+    assert(il.len() == 1 && il.val(il.front()) == 42)
+
+    // zero-value reads: a bare List{} fronts/backs -1, no trap —
+    // and splicing a zero other's arena is a no-op
+    zl := new(list.List)
+    assert(zl.front() == -1 && zl.back() == -1 && zl.len() == 0)
+    l2 := list.newlist()
+    l2.pushback(1)
+    l2.pushbacklist(zl)
+    assert(l2.len() == 1)
+
     println("list ok")
 }

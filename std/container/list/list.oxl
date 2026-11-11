@@ -85,7 +85,10 @@ fn (l ref List) back() -> int {
 // mkh packs an arena index into a handle: gen*SPAN + idx, -1
 // stays -1. SPAN = 2^20 bounds the arena.
 fn (l ref List) mkh(i: int) -> int {
-    if i == -1 {
+    if i < 0 || i >= len(l.ns) {
+        // -1 stays -1; an unarmed zero-value List (head==0, no
+        // arena) also maps to -1 rather than indexing ns[0] —
+        // Go's nil-Element on an empty list
         return -1
     }
     return l.ns[i].gen * 1048576 + i
@@ -157,6 +160,9 @@ fn (l mut List) alloc(v: int) -> int {
     if i != -1 {
         l.free = l.ns[i].next
     } else {
+        // SPAN bound — a 2^20th slot's handle would pack
+        // gen*1048576 + 1048576 and unpack back to slot 0
+        assert(len(l.ns) < 1048576)
         i = len(l.ns)
         l.ns = push(l.ns, Node{v: 0, prev: -1, next: -1, live: 0, gen: 1})
     }
@@ -306,7 +312,7 @@ fn (l mut List) moveafter(i: int, mark: int) {
 //  its arena dies with the handle; its handles are dead after.
 fn (l mut List) pushbacklist(other: own List) {
     i := other.head
-    for i != -1 {
+    for i >= 0 && i < len(other.ns) {
         nx := other.ns[i].next
         l.pushback(other.ns[i].v)
         i = nx
@@ -318,7 +324,7 @@ fn (l mut List) pushbacklist(other: own List) {
 /// `other` is consumed like in pushbacklist.
 fn (l mut List) pushfrontlist(other: own List) {
     i := other.tail
-    for i != -1 {
+    for i >= 0 && i < len(other.ns) {
         pv := other.ns[i].prev
         l.pushfront(other.ns[i].v)
         i = pv

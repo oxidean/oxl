@@ -4,7 +4,6 @@ package main
 // the closure resolves lexically to the local — it is not a capture
 // even when the enclosing `w` is borrowed (mut). Both drivers must
 // accept and codegen must emit only the local decl.
-
 struct Worker { n: int }
 
 fn (w Worker) pause() -> int {

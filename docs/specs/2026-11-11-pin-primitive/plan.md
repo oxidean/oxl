@@ -1,15 +1,16 @@
 # `pin` primitive — Stage Plan
 
 Spec: `shape.md`. Contracts: `items/pin-semantics.md`,
-`items/ffi-boundary.md`. Working artifacts: WI-0011 under
-`.ox-agent/work/`. Only P0 and P1 are scheduled: P2–P4 are one
+`items/ffi-boundary.md`. Working item WI-0011 — its
+`.ox-agent/work/` artifacts ride `feat/milestone-w`; this PR ships
+the spec only. Only P0 and P1 are scheduled: P2–P4 are one
 implementation unit gated on the trigger test in
 `items/ffi-boundary.md` — the first in-tree extern decl that
 retains a caller pointer past return. Every stage is a PR through
 the review loop (approval + green CI); every stage lands with the
 suite green.
 
-- [done] **P0 — spec** — this directory, WI-0011 artifacts.
+- [done] **P0 — spec** — this directory.
       *(this PR)*
 - [ ] **P1 — contract documentation (trigger-free, may land any
       time)** — write down the guarantee that already holds:
@@ -75,9 +76,13 @@ suite green.
       `docs/semantics/ownership.md` grows the real `pin` section
       (the P1 text points at it), `concurrency.md` gains the
       task-migration note, `language.mdx` swaps the retention rule
-      for the checked contract.
+      for the checked contract; `parked.md`'s pin section and the
+      roadmap's parked pin row retire (the #71 bookkeeping lands
+      first — this stage owns the flip).
       Gate: `tests/ffi_pin.oxl` green native + js lane (ledger
-      semantics); self-hosted driver compiles the new surface
+      semantics — the js lane presumes milestone W merged, since
+      `rt.mjs`/`__oxl_ffi` land there; if W is still open when P4
+      fires, the js half waits on it); self-hosted driver compiles the new surface
       byte-identically (bootstrap chain green); docs land.
 
 ## Dependencies

@@ -51,13 +51,13 @@ already decides most of the question:
   construction*. What can end that life: `rt_free` (reachable from
   C — `rt_str_free` precedent in `extra/gui/gtk`), `drop_elem` on a
   `chan own T` (teardown, close-drain, retracted `try_send` —
-  rt.c:1507-1666, codegen `o_drop_*`), and process exit. Arena
+  rt.c:1507-1970, codegen `o_drop_*`), and process exit. Arena
   objects die wholesale at scope close, but nothing `own`-typed is
   arena-backed.
 - **One real relocation exists:** `rt_slice_push` growth allocates a
-  new backing and `memcpy`s (rt.c:2515) — a pointer into the old
+  new backing and `memcpy`s (rt.c:2516) — a pointer into the old
   backing dangles. `rt_slice_own` gives an `own []T` a boxed header
-  + private heap backing (rt.c:2532) — two pinnable blocks.
+  + private heap backing (rt.c:2533) — two pinnable blocks.
 - **The FFI boundary retains nothing today.** Full survey:
   `extra/gui/gtk` passes opaque int handles and heap-copies closures
   (the pilot's `gui_connect` pattern — C copies the `RtFnv`, frees

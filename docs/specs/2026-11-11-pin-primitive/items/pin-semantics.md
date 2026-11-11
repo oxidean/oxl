@@ -113,7 +113,7 @@ shape in the bootstrap checker — check.oxl:395). Entries:
 - **`pin` and `push`:** `s = push(s, v)` where `s` is a pinned
   `own []T` binding is a compile error — "push may relocate the
   pinned backing; unpin first" (`rt_slice_push` allocates a new
-  backing on growth, rt.c:2515). Element writes `s[i] = v` are
+  backing on growth, rt.c:2516). Element writes `s[i] = v` are
   fine — they go through the same backing.
 
 ## Runtime rules

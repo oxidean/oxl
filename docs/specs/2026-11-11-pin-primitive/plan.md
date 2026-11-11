@@ -44,18 +44,25 @@ suite green.
       drivers, same shape: `pin`/`unpin` builtins (`BUILTINS` +
       call dispatch in `oxl/src/check.rs`; the builtin-name table +
       `expr` dispatch in `bootstrap/check/check.oxl`); a `pinned`
-      set riding `env` beside `moved`/`ck.moved` with branch-union
-      merge; move-site bans (own-arg/send/try_send/return/field-
-      store/spawn-arg + `push` on pinned `own []T` + assign-over);
-      `pin` → `Kw::Pin` + `TyKind::Pin` in the seed, `is_kw` +
-      `p_ty`/`ty_parse` qualifier arms + `k_pin()` in bootstrap;
+      set riding `env` beside `moved`/`ck.moved` with branch-
+      **intersection** merge (pin-semantics.md — pinned iff pinned
+      on every non-diverging incoming path); move-site bans
+      (own-arg/send/try_send/return/field-store/spawn-arg +
+      `push` on pinned `own []T` + assign-over);
+      `pin` stays a contextual qualifier — `TyKind::Pin` in the
+      seed (parser `ty()` matches the `pin` *ident* — no
+      `Kw::Pin`/keyword-table entry: `getmod.oxl` binds `pin`
+      as an identifier) + `k_pin()` and the same text-matched
+      qualifier arm in bootstrap's `p_ty`/`ty_parse` — never
+      `is_kw`;
       `pin own T` legal on extern params only; `pin` param arg
       must be a pinned `own` binding. `tests/diag/` gains:
       `pin_move_send.oxl`, `pin_move_return.oxl`,
       `pin_move_field.oxl`, `pin_nonown.oxl`, `pin_expr.oxl`,
       `pin_twice.oxl`, `unpin_unpinned.oxl`,
       `pin_arg_unpinned.oxl`, `pin_param_nonextern.oxl`,
-      `pin_push.oxl`.
+      `pin_push.oxl`, `pin_if_arm.oxl`, `unpin_if_arm.oxl`,
+      `pin_for_body.oxl`.
       Gate: byte-identical diagnostics from both checkers on the
       new diag files (the existing parity mechanism); `oxl test`
       green on both drivers.

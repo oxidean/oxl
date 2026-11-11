@@ -104,6 +104,12 @@ shape in the bootstrap checker — check.oxl:395). Entries:
   created while the mark holds — otherwise `send(ch, b2)` would
   push a still-pinned object into `drop_elem` (trap 11 — the rt
   backstop is the second line, not the contract).
+  Noted, not solved: the mark rides per-binding-name and the
+  checker tracks no alias classes — an alias created *before*
+  `pin(b)` runs, and a per-alias `unpin` after the object is
+  released, both escape the compile-time surface; the rt pin
+  count remains the enforcement (the former frees under a pin →
+  trap 11, the latter traps on count 0).
 - **`pin` and `push`:** `s = push(s, v)` where `s` is a pinned
   `own []T` binding is a compile error — "push may relocate the
   pinned backing; unpin first" (`rt_slice_push` allocates a new
@@ -115,8 +121,9 @@ shape in the bootstrap checker — check.oxl:395). Entries:
 `ObjHdr` gains `pinned` in the existing `_pad` byte — the header
 stays 24 bytes, no ABI change (ownership.md:71-81).
 
-- `rt_pin(obj)`: `hdr->arena` set → trap 11 (arena memory bulk-
-  frees under a pin; the checker should already have rejected
+- `rt_pin(obj)`: `hdr->arena` or `hdr->hscope` set → trap 11
+  (any scope-lived block bulk-frees under a pin — arena memory
+  frees wholesale, the checker should already have rejected
   non-`own` args — this is the second line). `pinned == 255` →
   trap 11 (overflow). Otherwise `pinned++`.
 - `rt_unpin(obj)`: `pinned == 0` → trap 11 (double release — the

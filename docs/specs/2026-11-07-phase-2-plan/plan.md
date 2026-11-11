@@ -87,6 +87,33 @@ E's monorepo machinery.
 raw FFI calls); a second backend sketched or an honest written case
 for why the abstraction doesn't foreclose one.
 
+## W — web compilation target (`--target js`)
+
+*Un-parked 2026-11-09* — its reopen trigger fired on G's merge:
+the G spec shipped the widget tree DOM-mappable, which was the
+guardrail keeping web parked. Spec merged at
+`docs/specs/2026-11-10-web-target/` (W0); work item WI-0007;
+implementation on `feat/milestone-w`.
+
+**Scope sketch:** a second emit lane beside native C —
+`runtime/rt.js` semantic runtime (run queue, frame-task
+scheduler, scope trees + cancel, err registry), `js` emitter for
+the full surface incl. `susp` poll state-machines and
+chans/select/named scopes, driver `--target js` on
+build/run/test, node lane env shims (`rt-node.js`) with
+`rt-browser.js` err-stubs, `extra/gui/dom` backend +
+`examples/web-todo`. Blocking forms trap (`rt_trap(21)`), no
+Worker/SAB lane.
+
+**Entry:** G shipped (done — the DOM-mappable tree was the
+gate); stages W1–W6 sequential per the spec plan.
+
+**Exit:** JS lane green in the suite on CI (node-gated);
+conformance — `conc_*` + `gui_*` (mock) files emit identical
+output under `node out.mjs`; `examples/web-todo` live; the
+guarded differences (repr, blocking traps) documented in
+`docs/web-target.md`; WI-0007 shipped.
+
 ## R — package registry — FOLDED INTO E
 
 *2026-11-08:* rescoped to a **git-backed index** and folded into
@@ -121,6 +148,8 @@ scheduled.
 ## Sequence
 
 ```
-T (shipped) ──► E ──► G        (R, P absorbed into E)
-└── LLVM, web, D4, stdlib-list: parked on triggers
+T (shipped) ──► E ──► G ──► W  (R, P absorbed into E; W
+                               un-parked — G shipped the
+                               DOM-mappable widget tree)
+└── LLVM, D4, stdlib-list: parked on triggers
 ```

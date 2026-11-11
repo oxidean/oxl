@@ -57,9 +57,11 @@ hundreds of mono'd bodies sharing a shape in one compile).
 
 ## Re-measured 2026-11-11 (grown corpus)
 
-23 generic fn defs (19 in `std/` — sort 6, slices 9, cmp 3, rand 1 —
-plus 4 in tests/corpus incl. one generic method; the run.sh
-reject fixture excluded). ~35 unique (fn,T) instantiations
+22 generic fn defs (19 in `std/` — sort 6, slices 9, cmp 3, rand 1 —
+plus 3 in `tests/`: `first` in slices.oxl, `use` in methods.oxl
+(generic with a `Writer` bound, not a method), and `f` in the
+diag/generic_constraint reject fixture — the `fn id[T]` inside
+run.sh's `gen)` printf is a string fixture, not a def). ~35 unique (fn,T) instantiations
 corpus-wide (decl sites grepped via `fn \w+\[`; instantiation
 counts from `ginst_name`'s `(fn,tyargs)` dedup in the driver's own
 emit queue — `bootstrap/codegen/codegen.oxl` — plus per-file call-site

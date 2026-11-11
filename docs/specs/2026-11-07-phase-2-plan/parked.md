@@ -17,7 +17,7 @@ firing moves the item into the milestone map via a new work item.
 - **Why parked:** deferred with a real measurement in the v0.2 spec —
   3 generic fns in the entire corpus, zero shared-shape groups; type-
   dictionary passing is pure complexity at that scale. Re-measured
-  2026-11-11 on the grown corpus (item doc): 23 generic fn defs,
+  2026-11-11 on the grown corpus (item doc): 22 generic fn defs,
   ~35 unique (fn,T) instantiations, one shareable pair — still
   ~2 orders under the bar.
 - **Reopen trigger:** shared-shape groups grow enough that mono dedup

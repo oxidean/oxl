@@ -640,7 +640,7 @@ fn formatmediatype(t: str, params: ref Param) -> str {
         j := 0
         for j < len(value) {
             c := byteat(value, j)
-            if (c < 32 && c != 9) || c > 126 {
+            if c < 32 && c != 9 || c > 126 {
                 needenc = true
                 break
             }

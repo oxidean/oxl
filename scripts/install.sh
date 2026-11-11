@@ -195,7 +195,9 @@ latest_feed_tag() {
                  | grep -o 'releases/tag/v[0-9][^"<]*' \
                  | sed 's|releases/tag/||'); do
             # prereleases pass vtag but "latest" means a stable tag
-            case "$c" in *-*) continue ;; esac
+            # hyphens only mark a prerelease before `+` — build
+            # metadata (v1.2.3+build-5) may carry them too
+            case "${c%%+*}" in *-*) continue ;; esac
             vtag "$c" >/dev/null 2>&1 || continue
             # skip asset-less releases (extras/docs lanes) — one extra
             # fetch per stable candidate, bounded by the feed scan

@@ -42,7 +42,7 @@ share code per *memory shape*, not per type.
   spec honestly says: do it when generic usage is heavy enough to
   measure, not before.
 
-## Deferred (measured 2026-11-05)
+## Deferred (measured 2026-11-05 — baseline for the re-measure below)
 
 Per the risk note's own bar, generic usage was measured before
 building: the entire corpus defines **3** generic fns
@@ -60,7 +60,10 @@ hundreds of mono'd bodies sharing a shape in one compile).
 23 generic fn defs (19 in `std/` — sort 6, slices 9, cmp 3, rand 1 —
 plus 4 in tests/corpus incl. one generic method; the run.sh
 reject fixture excluded). ~35 unique (fn,T) instantiations
-corpus-wide; the heaviest single compile (`tests/util_test.oxl`)
+corpus-wide (decl sites grepped via `fn \w+\[`; instantiation
+counts from `ginst_name`'s `(fn,tyargs)` dedup in the driver's own
+emit queue — `bootstrap/codegen/codegen.oxl` — plus per-file call-site
+inspection); the heaviest single compile (`tests/util_test.oxl`)
 emits ~26 mono'd bodies — `cmp_{compare,min,max}`,
 `sort_{sort,sifto,is_sorted,sortfn,sift,reverse}`, `slices_*`
 over `{int,str,float,byte}`. The driver build itself emits only

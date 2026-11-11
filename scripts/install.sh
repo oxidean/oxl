@@ -154,6 +154,33 @@ fetch() { # url out  — download url to file out
     curl -fsSL --connect-timeout 15 --max-time 300 "$1" -o "$2"
 }
 
+# newest toolchain tag on the release feed, or nothing — paged because a
+# single page can be all extras/docs-manifest entries. Kept out of
+# latest_tag's case arms: bash 3.2's case parser cannot handle `done)`
+# inside a command substitution.
+latest_feed_tag() {
+    page=1
+    while [ "$page" -le 10 ]; do
+        if [ "$page" -eq 1 ]; then u="$BASE.atom"; else u="$BASE.atom?page=$page"; fi
+        feed=$(curl -fsSL --connect-timeout 15 --max-time 60 "$u" 2>/dev/null) || break
+        printf '%s' "$feed" | grep -q 'releases/tag/' || break
+        # || : — a page whose tags all fail vtag (or carry none)
+        # leaves the pipeline nonzero; under set -e that would
+        # kill the scan instead of advancing to the next page
+        hit=$(printf '%s\n' "$feed" \
+             | grep -o 'releases/tag/v[0-9][^"<]*' \
+             | while IFS= read -r m; do
+                   c=${m#releases/tag/}
+                   # prereleases pass vtag but "latest" should
+                   # mean a stable tag — skip them
+                   case "$c" in *-*) continue ;; esac
+                   vtag "$c" >/dev/null 2>&1 && { printf '%s\n' "$c"; break; }
+               done) || :
+        [ -n "$hit" ] && { printf '%s\n' "$hit"; return; }
+        page=$((page + 1))
+    done
+}
+
 latest_tag() {
     # releases/latest 302s to releases/tag/<tag> — the redirect target
     # carries the tag; no API quota involved. Take the full tag path,
@@ -172,28 +199,11 @@ latest_tag() {
         *) # an extras-lane tag (extra/vX.Y.Z) can hold "latest" — page the
            # release feed newest-first until a toolchain tag validates;
            # page one alone can be all extras/docs-manifest entries, so a
-           # first-page miss must not fail the lookup
-           lt=$(
-               page=1
-               while [ "$page" -le 10 ]; do
-                   if [ "$page" -eq 1 ]; then u="$BASE.atom"; else u="$BASE.atom?page=$page"; fi
-                   feed=$(curl -fsSL --connect-timeout 15 --max-time 60 "$u" 2>/dev/null) || break
-                   printf '%s' "$feed" | grep -q 'releases/tag/' || break
-                   # || : — a page whose tags all fail vtag (or carry none)
-                   # leaves the pipeline nonzero; under set -e that would
-                   # kill the scan instead of advancing to the next page
-                   hit=$(printf '%s\n' "$feed" \
-                        | grep -o 'releases/tag/v[0-9][^"<]*' \
-                        | while IFS= read -r m; do
-                              c=${m#releases/tag/}
-                              # prereleases pass vtag but "latest" should
-                              # mean a stable tag — skip them
-                              case "$c" in *-*) continue ;; esac
-                              vtag "$c" >/dev/null 2>&1 && { printf '%s\n' "$c"; break; }
-                          done) || :
-                   [ -n "$hit" ] && { printf '%s\n' "$hit"; break; }
-                   page=$((page + 1))
-               done) ;;
+           # first-page miss must not fail the lookup. The scan lives in
+           # latest_feed_tag — a case arm cannot hold a command
+           # substitution containing `done` under bash 3.2 (macOS /bin/sh):
+           # its parser treats `done)` as the pattern close.
+           lt=$(latest_feed_tag) ;;
     esac
     [ -n "$lt" ] \
         || die "no toolchain release tag found — pass one: oxl toolchain install vX.Y.Z"

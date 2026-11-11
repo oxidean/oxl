@@ -128,7 +128,27 @@ fn main() {
     big.do(big.head(), acc)
     assert(walkacc == 1234567 && walkn == 8)
 
-    // dead handles go inert — one of the nodes unlink recycled
+    // link anchored away from head — off-head splice between a
+    // middle element and its old next
+    t := ring.newring(3)
+    th := t.head()
+    t.setval(th, 100)
+    tn := t.next(th)
+    t.setval(tn, 200)
+    tp := t.prev(th)
+    t.setval(tp, 300)
+    u := ring.newring(2)
+    uh := u.head()
+    u.setval(uh, 7)
+    un := u.next(uh)
+    u.setval(un, 8)
+    bd2 := t.link(tn, u) // splices {7,8} between 200 and 300
+    assert(t.len() == 5)
+    assert(t.val(bd2) == 300) // element behind the splice
+    assert(t.val(t.next(tn)) == 7 && t.val(t.prev(bd2)) == 8)
+    assert(t.val(t.prev(tn)) == 100)
+
+    // dead handles go inert — 999 is out-of-bounds, not a node
     assert(big.next(999) == -1)
     assert(big.val(999) == 0)
 

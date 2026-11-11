@@ -142,5 +142,18 @@ fn main() {
     }
     assert(l.len() == 0)
 
+    // inserts at the boundaries — before front, after back
+    b2 := list.newlist()
+    bf := b2.pushback(7)
+    b2.pushback(9)
+    [ihb, ieb] = b2.insertbefore(5, bf) // before front -> new front
+    assert(ieb == nil)
+    assert(b2.val(b2.front()) == 5 && b2.next(ihb) == bf)
+    bb := b2.back()
+    [iha, iea] = b2.insertafter(11, bb) // after back -> new back
+    assert(iea == nil)
+    assert(b2.val(b2.back()) == 11 && b2.prev(iha) == bb)
+    assert(b2.len() == 4)
+
     println("list ok")
 }

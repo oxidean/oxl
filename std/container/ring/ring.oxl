@@ -68,7 +68,9 @@ fn (r ref Ring) head() -> int {
     return r.root
 }
 
-// ok reports whether i names a live element of this ring.
+// ok reports whether i names a live element of this ring. Handles
+// minted by a different Ring that happen to index a live slot here
+// are indistinguishable — don't mix handles across rings.
 fn (r ref Ring) ok(i: int) -> bool {
     return i >= 0 && i < len(r.ns) && r.ns[i].live == 1
 }

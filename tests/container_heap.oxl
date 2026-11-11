@@ -216,5 +216,19 @@ fn main() {
     assert(heap.pop(q.asheap()) == 4)
     assert(heap.pop(q.asheap()) == 0)
 
+    // fix sifts down too — a priority drop mid-heap sinks the node
+    // past its smaller child, not just a leaf sifting up
+    d := IntHeap{v: mkslice(int, 0)}
+    d.v = push(d.v, 10)
+    d.v = push(d.v, 20)
+    d.v = push(d.v, 30)
+    d.v = push(d.v, 40)
+    d.v = push(d.v, 50)
+    heap.init(d.asheap())
+    d.v[1] = 60 // children {40,50} — sinks past the smaller (40)
+    heap.fix(d.asheap(), 1)
+    assert(d.v[0] == 10 && d.v[1] == 40 && d.v[3] == 60)
+    drainsorted(d.asheap(), 5)
+
     println("heap ok")
 }

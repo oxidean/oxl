@@ -57,7 +57,7 @@ fn main() {
 
 `std/` ships next to the toolchain binary; pull in a package with
 `import "std/<pkg>"` (`as` aliases and `.{name, ...}` selection
-supported). The v0.4 line ships 36 packages:
+supported). The v0.4 line ships 39 packages:
 
 - **Text**: `std/strings` (`startswith`/`contains`, `trim`, `split`,
   `join`, case ops), `std/strconv`, `std/unicode/utf8`, `std/regexp`
@@ -67,9 +67,9 @@ supported). The v0.4 line ships 36 packages:
   fs primitives, env), `std/os/exec` (process `cmd`/`run`/`output`)
 - **Tooling**: `std/flag`, `std/log`, `std/testing` (assertions for
   `oxl test`), `std/time`, `std/sync`
-- **Data and algorithms**: `std/collections`, `std/sort`, `std/slices`,
-  `std/maps`, `std/cmp` (the `Ordered` constraint generics bind on),
-  `std/math`, `std/math/rand`
+- **Data and algorithms**: `std/collections`, `std/container/{heap,
+  list,ring}`, `std/sort`, `std/slices`, `std/maps`, `std/cmp` (the
+  `Ordered` constraint generics bind on), `std/math`, `std/math/rand`
 - **Encoding and crypto**: `std/encoding/{json,base64,hex,binary,csv}`,
   `std/hash`, `std/crypto/{sha256,md5,hmac}`
 - **Networking**: `std/net` (dial/listen), `std/net/http` (server plus

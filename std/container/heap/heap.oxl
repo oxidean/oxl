@@ -43,9 +43,9 @@ package heap
 /// elements at positions i and j; Push appends x as element Len()
 /// (before the sift), Pop removes and returns element Len()-1 (after
 /// the sift) — the package calls them at the sift boundaries only.
-/// The methods are capitalized like Go's: an Interface impl has to
-/// declare them, and decls named `len`/`push` collide with builtins
-/// when the impl lives in package main.
+/// The methods are capitalized like Go's — parity, so an Interface
+/// impl's method set reads identically and can't clash with the
+/// lowercase builtins either way.
 interface Interface {
     Len() -> int,
     Less(i: int, j: int) -> bool,
@@ -73,7 +73,7 @@ fn push(h: Interface, x: int) {
 
 /// pop removes and returns the minimum — heap.Pop, O(log n).
 /// Calling pop on an empty heap is a programming error; the impl's
-/// pop() traps on the underflow the same way indexing an empty
+/// Swap(0, -1) indexing traps first, the same way indexing an empty
 /// slice does.
 fn pop(h: Interface) -> int {
     n := h.Len() - 1

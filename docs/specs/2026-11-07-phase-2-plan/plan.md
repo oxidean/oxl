@@ -75,7 +75,8 @@ Widget layer in the language on top of the GTK4 FFI pilot
 layout model, event dispatch into `scope`/`select` concurrency,
 platform backend interface with GTK4 as the first backend. The
 widget tree must stay DOM-mappable — it is the agreed guardrail that
-keeps the web target open (`docs/specs/2026-11-04-0132-v0-2-forward/items/parked-web.md` in the v0.2 spec).
+kept the web target open — later un-parked as milestone W
+(`--target js`).
 Lands as `extra/gui` + `extra/gui/gtk` — the first real consumer of
 E's monorepo machinery.
 
@@ -86,10 +87,40 @@ E's monorepo machinery.
 raw FFI calls); a second backend sketched or an honest written case
 for why the abstraction doesn't foreclose one.
 
+**Shipped as:** milestone G merged — `extra/gui` + GTK4 backend,
+`examples/gui-todo`.
+
+## W — web compilation target (`--target js`)
+
+*Un-parked 2026-11-09* — its reopen trigger fired on G's merge:
+the G spec shipped the widget tree DOM-mappable, which was the
+guardrail keeping web parked. Spec and implementation are in
+flight together on `feat/milestone-w` (PR open); work item WI-0007.
+
+**Scope sketch:** a second emit lane beside native C —
+`runtime/rt.mjs` semantic runtime (run queue, frame-task
+scheduler, scope trees + cancel, err registry), `js` emitter for
+the full surface incl. `susp` poll state-machines and
+chans/select/named scopes, driver `--target js` on
+build/run/test, node lane env shims (`rt-node.mjs`) with
+`rt-browser.mjs` err-stubs, `extra/gui/dom` backend +
+`examples/web-todo`. Blocking forms trap (`rt_trap(21)`), no
+Worker/SAB lane.
+
+**Entry:** G shipped (done — the DOM-mappable tree was the
+gate); stages W1–W6 sequential per the spec plan.
+
+**Exit:** JS lane green in the suite on CI (node-gated);
+conformance — `conc_*` + `gui_*` (mock) files emit identical
+output under `node out.mjs`; `examples/web-todo` live; the
+guarded differences (repr, blocking traps) documented in
+`docs/web-target.md`; WI-0007 shipped.
+
 ## R — package registry — FOLDED INTO E
 
-*(letter later reclaimed by the type-descriptors milestone —
-`docs/specs/2026-11-11-type-descriptors/`)*
+*(letter later reclaimed by the type-descriptors milestone — spec
+merged `docs/specs/2026-11-11-type-descriptors/`; implementation
+WI-0008 in flight)*
 
 *2026-11-08:* rescoped to a **git-backed index** and folded into
 milestone E (stages E3–E5). `oxl get` consults the index via
@@ -116,14 +147,16 @@ in E's stage E6. Filed items:
 
 ## Parked
 
-See `parked.md` — LLVM backend, web target, D4 shape-generics,
+See `parked.md` — LLVM backend, D4 shape-generics, pin primitive,
 parked-stdlib list. Each has an explicit reopen trigger; none is
 scheduled.
 
 ## Sequence
 
 ```
-T (shipped) ──► E ──► G        (registry-R, P absorbed into E;
-                                R letter reused by type descriptors)
-└── LLVM, web, D4, stdlib-list: parked on triggers
+T (shipped) ──► E ──► G ──► W  (registry-R, P absorbed into E;
+                               W un-parked — G shipped the
+                               DOM-mappable widget tree; R letter
+                               reused by type descriptors)
+└── LLVM, D4, pin, stdlib-list: parked on triggers
 ```

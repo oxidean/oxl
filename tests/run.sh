@@ -1847,7 +1847,7 @@ if command -v node >/dev/null 2>&1; then
     # each file's last-line success marker is grepped — an err-path
     # regression that prints + exits 0 (gui_dom's `run err:` shape)
     # can't pass silently
-    for f in conc_ping conc_scale select select_fair chan_own chanbuf chanbuf_close scope_exit orphan_join defer_order pairfwd match methods fnval d5_qual stdmods_test susp_closure closure_mcall closure_fnfield closure_shadow zero_str gui_mock gui_lifecycle gui_overflow gui_select gui_stress gui_cancel gui_dom gui_delay_stop; do
+    for f in conc_ping conc_scale select select_fair chan_own chanbuf chanbuf_close scope_exit orphan_join defer_order pairfwd match methods fnval d5_qual stdmods_test susp_closure closure_mcall closure_fnfield closure_shadow zero_str gui_mock gui_lifecycle gui_overflow gui_select gui_stress gui_cancel gui_dom gui_delay_stop js_ident; do
         case "$f" in
             conc_ping)      marker='bounces=' ;;
             conc_scale)     marker='done' ;;
@@ -1878,6 +1878,7 @@ if command -v node >/dev/null 2>&1; then
             gui_cancel)     marker='cancel ok' ;;
             gui_dom)        marker='activated' ;;
             gui_delay_stop) marker='delay stop ok' ;;
+            js_ident)       marker='js ident ok' ;;
         esac
         out=$(with_timeout 60 "$SELFOXL" run --target js "tests/$f.oxl" 2>&1) || { echo "FAIL js lane $f: $out"; exit 1; }
         grep -q "$marker" <<<"$out" || { echo "FAIL js lane $f marker '$marker': $out"; exit 1; }

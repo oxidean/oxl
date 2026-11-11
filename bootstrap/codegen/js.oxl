@@ -107,12 +107,17 @@ fn jname(n: str) -> str {
     if find(rsv, "|" + n + "|") >= 0 {
         return "u_" + n
     }
-    // emitted-namespace stems: o_* top-levels and _a*/_d* internals —
-    // user names on those stems collide with emitted code
+    // emitted-namespace stems: o_* top-levels, every _*-prefixed
+    // frame/temp stem (_ms/_r/_sc/_c/_t/_a/_d/_sv/_fw/__rc/…), and
+    // u_*-prefixed escapes themselves — user names on those stems
+    // collide with emitted temps or with another ident's escape
     if len(n) > 1 && byteat(n, 0) == 111 && byteat(n, 1) == 95 {
         return "u_" + n
     }
-    if len(n) > 1 && byteat(n, 0) == 95 && (byteat(n, 1) == 97 || byteat(n, 1) == 100) {
+    if len(n) > 0 && byteat(n, 0) == 95 {
+        return "u_" + n
+    }
+    if len(n) > 1 && byteat(n, 0) == 117 && byteat(n, 1) == 95 {
         return "u_" + n
     }
     return n

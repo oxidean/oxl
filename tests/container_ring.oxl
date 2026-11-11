@@ -48,6 +48,9 @@ fn main() {
     // move forward, backward, and wrapping
     assert(r.val(r.move(r.head(), 2)) == 30)
     assert(r.val(r.move(r.head(), -1)) == 40)
+    // a step count equal to len walks home — n % len == 0
+    assert(r.move(r.head(), 4) == r.head())
+    assert(r.move(r.head(), -4) == r.head())
     assert(r.val(r.move(r.head(), 5)) == 20)
 
     // do visits every element in order
@@ -151,6 +154,31 @@ fn main() {
     // dead handles go inert — 999 is out-of-bounds, not a node
     assert(big.next(999) == -1)
     assert(big.val(999) == 0)
+    assert(big.move(999, 3) == -1)
+    assert(big.unlink(999, 1) == nil)
+    // do on a dead handle calls nothing — acc stays at its sum
+    pre := walkacc
+    big.do(999, acc)
+    assert(walkacc == pre)
+    // link on a dead i still consumes s — own can't be handed back
+    deadsrc := ring.newring(2)
+    assert(big.link(999, deadsrc) == -1)
+
+    // unlink wraps n mod len — asking for 7 on a 5-ring removes 2
+    wr := ring.newring(5)
+    wi := wr.head()
+    wv := 1
+    wk := 0
+    for wk < 5 {
+        wr.setval(wi, wv)
+        wv = wv + 1
+        wi = wr.next(wi)
+        wk = wk + 1
+    }
+    whd := wr.head() // hoisted — unlink(head()) borrows r twice
+    wout := wr.unlink(whd, 7)
+    assert(wout != nil && wout.len() == 2)
+    assert(wr.len() == 3)
 
     println("ring ok")
 }

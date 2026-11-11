@@ -16,6 +16,9 @@ package ring
 //
 // Payloads are int only in v0 (see std/collections for the same call).
 //
+// Dead-handle convention matches std/container/list: reads return
+// -1/0 and mutators no-op, rather than either package erring.
+//
 //   r := ring.newring(3)
 //   i := r.head()
 //   k := 0
@@ -99,14 +102,17 @@ fn (r ref Ring) move(i: int, n: int) -> int {
         return -1
     }
     p := i
-    if n < 0 {
-        k := (0 - n) % r.n
+    // reduce first: m keeps |m| < r.n, so `0 - m` can't overflow —
+    // (0 - n) directly would wrap at n = INT_MIN
+    m := n % r.n
+    if m < 0 {
+        k := 0 - m
         for k > 0 {
             p = r.ns[p].prev
             k = k - 1
         }
     } else {
-        k := n % r.n
+        k := m
         for k > 0 {
             p = r.ns[p].next
             k = k - 1
@@ -153,6 +159,8 @@ fn (r mut Ring) alloc(v: int) -> int {
 /// migrate into r's arena in order. Returns i's original next — the
 /// element now behind the inserted block, so it heads the remainder
 /// just like Go's result. link(i, nil) is a no-op returning i.next.
+/// A dead i returns -1 and still consumes s — `own` can't be handed
+/// back, so the failed call destroys the ring.
 fn (r mut Ring) link(i: int, s: own Ring) -> int {
     if !r.ok(i) {
         return -1

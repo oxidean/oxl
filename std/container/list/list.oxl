@@ -9,7 +9,8 @@ import "std/errors"
 // node arena and -1 plays nil. `remove` recycles nodes through a
 // freelist, bounding the arena at the high-water mark — the same
 // call std/collections made. A removed handle is dead: readers
-// return -1/0, mutators no-op or report err.
+// return -1/0, mutators no-op or report err — the convention
+// std/container/ring shares.
 //
 // Payloads are int only in v0 — rich values wait on payload
 // generics, like std/collections' map values.

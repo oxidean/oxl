@@ -75,6 +75,18 @@ fn main() {
     assert(l.prev(c) == -1)
     assert(l.val(c) == 0)
     l.setval(c, 99) // no-op on a dead handle
+    // move* no-op on dead handles too — reads don't resurrect them
+    l.movetofront(c)
+    l.movetoback(c)
+    l.movebefore(c, a)
+    l.moveafter(c, a)
+    assert(l.val(l.front()) == 1 && l.val(l.back()) == 4)
+    // splicing an empty other is a no-op both directions
+    el := list.newlist()
+    l.pushbacklist(el)
+    ef := list.newlist()
+    l.pushfrontlist(ef)
+    assert(l.len() == 4)
 
     // moveto* reorder in place — list is [1,2,3,4]
     l.movetofront(i4) // [4,1,2,3]

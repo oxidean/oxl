@@ -169,6 +169,20 @@ fn main() {
     drainsorted(ih, 3)
     assert(ih.Len() == 0)
 
+    // remove boundary indices — the n == i last-element fast path
+    // skips the sift entirely, and the root is the index most
+    // likely to regress
+    h4 := IntHeap{v: mkslice(int, 0)}
+    h4.v = push(h4.v, 10)
+    h4.v = push(h4.v, 20)
+    h4.v = push(h4.v, 30)
+    h4.v = push(h4.v, 40)
+    heap.init(h4.asheap())
+    assert(heap.remove(h4.asheap(), h4.Len() - 1) == 40)
+    assert(heap.remove(h4.asheap(), 0) == 10)
+    drainsorted(h4.asheap(), 2)
+    assert(h4.Len() == 0)
+
     // fix re-orders after an in-place priority change — the borrow
     // handle leaves the backing reachable so v[] can be edited
     h3 := IntHeap{v: mkslice(int, 0)}

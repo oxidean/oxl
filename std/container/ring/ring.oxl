@@ -29,8 +29,9 @@ package ring
 //   }
 
 // RNode is a ring cell: v the payload, prev/next arena indices,
-// live marks the cell linked (0 = on the freelist).
-struct RNode { v: int, prev: int, next: int, live: int }
+// live marks the cell linked (0 = on the freelist), gen the
+// live-interval tag handles pack (bumped on every freelist push).
+struct RNode { v: int, prev: int, next: int, live: int, gen: int }
 
 /// Ring is a circular list; create with newring. `root` is any one
 /// live element kept as the entry point (link/unlink maintain it);
@@ -48,6 +49,7 @@ fn newring(n: int) -> own Ring {
     for i < n {
         r.ns[i].v = 0
         r.ns[i].live = 1
+        r.ns[i].gen = 1
         r.ns[i].prev = (i + n - 1) % n
         r.ns[i].next = (i + 1) % n
         i = i + 1
@@ -68,14 +70,30 @@ fn (r ref Ring) len() -> int {
 /// leave a cursor so callers don't have to remember one. -1 only
 /// when the ring holds nothing (impossible once newring ran).
 fn (r ref Ring) head() -> int {
-    return r.root
+    return r.mkh(r.root)
 }
 
-// ok reports whether i names a live element of this ring. Handles
-// minted by a different Ring that happen to index a live slot here
-// are indistinguishable — don't mix handles across rings.
+// mkh packs an arena index into a handle: gen*SPAN + idx, -1
+// stays -1. SPAN = 2^20 bounds the arena.
+fn (r ref Ring) mkh(i: int) -> int {
+    if i == -1 {
+        return -1
+    }
+    return r.ns[i].gen * 1048576 + i
+}
+
+// ok reports whether i names a live element of this ring. The
+// generation tag makes staleness permanent: a slot's gen bumps on
+// every freelist push, so a handle minted before its slot was
+// recycled never matches again. Handles minted by a DIFFERENT
+// Ring can still alias a live slot by chance — don't mix handles
+// across rings.
 fn (r ref Ring) ok(i: int) -> bool {
-    return i >= 0 && i < len(r.ns) && r.ns[i].live == 1
+    if i < 0 {
+        return false
+    }
+    idx := i % 1048576
+    return idx < len(r.ns) && r.ns[idx].live == 1 && r.ns[idx].gen == i / 1048576
 }
 
 /// next returns the handle after i in the cycle — Ring.Next.
@@ -84,7 +102,7 @@ fn (r ref Ring) next(i: int) -> int {
     if !r.ok(i) {
         return -1
     }
-    return r.ns[i].next
+    return r.mkh(r.ns[i % 1048576].next)
 }
 
 /// prev returns the handle before i in the cycle — Ring.Prev.
@@ -92,7 +110,7 @@ fn (r ref Ring) prev(i: int) -> int {
     if !r.ok(i) {
         return -1
     }
-    return r.ns[i].prev
+    return r.mkh(r.ns[i % 1048576].prev)
 }
 
 /// move returns the handle n positions forward from i — Ring.Move.
@@ -101,7 +119,7 @@ fn (r ref Ring) move(i: int, n: int) -> int {
     if !r.ok(i) || r.n == 0 {
         return -1
     }
-    p := i
+    p := i % 1048576
     // reduce first: m keeps |m| < r.n, so `0 - m` can't overflow —
     // (0 - n) directly would wrap at n = INT_MIN
     m := n % r.n
@@ -118,7 +136,7 @@ fn (r ref Ring) move(i: int, n: int) -> int {
             k = k - 1
         }
     }
-    return p
+    return r.mkh(p)
 }
 
 /// val returns element i's payload — Ring.Value. A dead handle
@@ -127,7 +145,7 @@ fn (r ref Ring) val(i: int) -> int {
     if !r.ok(i) {
         return 0
     }
-    return r.ns[i].v
+    return r.ns[i % 1048576].v
 }
 
 /// setval writes element i's payload; a dead handle is a no-op.
@@ -135,7 +153,7 @@ fn (r mut Ring) setval(i: int, v: int) {
     if !r.ok(i) {
         return
     }
-    r.ns[i].v = v
+    r.ns[i % 1048576].v = v
 }
 
 // alloc recycles a freelist node before growing the arena.
@@ -145,13 +163,13 @@ fn (r mut Ring) alloc(v: int) -> int {
         r.free = r.ns[i].next
     } else {
         i = len(r.ns)
-        r.ns = push(r.ns, RNode{v: 0, prev: -1, next: -1, live: 0})
+        r.ns = push(r.ns, RNode{v: 0, prev: -1, next: -1, live: 0, gen: 1})
     }
     r.ns[i].v = v
     r.ns[i].prev = -1
     r.ns[i].next = -1
     r.ns[i].live = 1
-    return i
+    return r.ns[i].gen * 1048576 + i
 }
 
 /// link splices all of ring s into this ring right after element i
@@ -165,15 +183,16 @@ fn (r mut Ring) link(i: int, s: own Ring) -> int {
     if !r.ok(i) {
         return -1
     }
+    i = i % 1048576
     if s == nil || s.n == 0 {
-        return r.ns[i].next
+        return r.mkh(r.ns[i].next)
     }
     n := r.ns[i].next
     // splice s's cycle, walking it once from s.root
     p := s.root
     k := 0
     for k < s.n {
-        j := r.alloc(s.ns[p].v)
+        j := r.alloc(s.ns[p].v) % 1048576
         // slot j between the splice point and n — n's prev is the
         // last element inserted so far (i itself on the first pass),
         // so consecutive inserts keep s's order
@@ -185,7 +204,7 @@ fn (r mut Ring) link(i: int, s: own Ring) -> int {
         k = k + 1
     }
     r.n = r.n + s.n
-    return n
+    return r.mkh(n)
 }
 
 /// unlink removes the n elements starting at i.next — Ring.Unlink —
@@ -198,6 +217,7 @@ fn (r mut Ring) unlink(i: int, n: int) -> own Ring {
     if !r.ok(i) || r.n == 0 || n <= 0 {
         return nil
     }
+    i = i % 1048576
     k := n % r.n
     if k == 0 {
         return nil
@@ -221,6 +241,7 @@ fn (r mut Ring) unlink(i: int, n: int) -> own Ring {
     for j < k {
         nx := r.ns[first].next
         r.ns[first].live = 0
+        r.ns[first].gen = r.ns[first].gen + 1
         r.ns[first].prev = -1
         r.ns[first].next = r.free
         r.free = first
@@ -228,7 +249,9 @@ fn (r mut Ring) unlink(i: int, n: int) -> own Ring {
         j = j + 1
     }
     r.n = r.n - k
-    if !r.ok(r.root) {
+    // root is a raw arena index, not a handle — liveness reads the
+    // node flag, not ok() (ok takes packed handles).
+    if r.root >= 0 && r.ns[r.root].live == 0 {
         r.root = i
     }
     return out
@@ -240,11 +263,11 @@ fn (r ref Ring) do(i: int, f: fn(int)) {
     if !r.ok(i) {
         return
     }
-    p := i
+    p := i % 1048576
     for true {
         f(r.ns[p].v)
         p = r.ns[p].next
-        if p == i {
+        if p == i % 1048576 {
             break
         }
     }

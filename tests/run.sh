@@ -511,7 +511,11 @@ assert len(d["items"])>20 and not any("skip" in i for i in d["items"]), d' || { 
 
 echo "== bootstrap checker =="
 # the self-hosted typechecker must check itself and representative sources
-for f in bootstrap/check bootstrap/codegen examples/features.oxl tests/match.oxl std/collections \
+# tests/container_heap.oxl rides along as the main-package case for
+# check.oxl's `recv == nil` method-sugar gate: it declares len/push/pop
+# methods in package main — without the gate the self checker would
+# misread the builtins as method calls.
+for f in bootstrap/check bootstrap/codegen examples/features.oxl tests/match.oxl tests/container_heap.oxl std/collections \
     std/container/heap std/container/list std/container/ring; do
     out=$("$OXL" run bootstrap/cmd/check -- "$f")
     [ "$out" = "ok" ] || { echo "FAIL checker $f: $out"; exit 1; }

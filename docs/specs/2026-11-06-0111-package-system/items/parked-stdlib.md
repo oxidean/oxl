@@ -7,6 +7,14 @@ machinery they need.
 
 ## Needs reflection / `any` runtime values — the language lacks it
 
+**Partially un-parked → milestone R**
+(`docs/specs/2026-11-11-type-descriptors/`): compiler-emitted type
+descriptors land the machinery most of these packages waited on.
+Returning under R2–R6: `fmt` `%v`, `reflect` lite, `encoding/gob`,
+`encoding/xml`, `text/template`, and `database/sql`'s `scan[T]`
+half. Staying parked: `html/template` (out of R's scope) and
+`database/sql`'s driver-registry half (R6 ships the lite scan only).
+
 - `fmt` `%v`-anything, `reflect`, `encoding/gob`, `encoding/xml`
   (tagged-field driven), `database/sql` (driver-registry + `Scan(any)`)
   — oxl's type system is static + generic with no runtime type
@@ -23,9 +31,9 @@ machinery they need.
 - Plugin loading, compiler-self packages (ast/parser/token class),
   `runtime` internals,
   `runtime/pprof` — runtime/codecs introspection doesn't exist.
-- `unsafe` in the memory-unsafe sense — oxl `unsafe` is an
-  ownership-check opt-out
-  block, not `Pointer` arithmetic.
+- `unsafe` in the memory-unsafe sense — oxl `unsafe` is a
+  scoping-block marker that silences no checks (`docs/semantics/
+  ownership.md`), not `Pointer` arithmetic.
 
 ## Replaced by language semantics — porting them would be wrong
 
@@ -54,6 +62,8 @@ machinery they need.
   precision machinery deferred until a real consumer exists.
 
 ## Parked pending runtime type descriptors
+
+**Un-parked → milestone R** (`docs/specs/2026-11-11-type-descriptors/`).
 
 - `fmt %v` (issue #28) — a generic default-format verb needs runtime
   reflection over the value's type; `err` codes, `own` graph nodes,

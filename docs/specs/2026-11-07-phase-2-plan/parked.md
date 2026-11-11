@@ -25,6 +25,14 @@ firing moves the item into the milestone map via a new work item.
   alone isn't the bar; hundreds of mono'd bodies sharing a shape in
   one compile is).
 
+## Pin primitive (address-stable values)
+
+- **Why parked:** the G spec deferred it — the runtime does not move
+  objects, so pinning is a contract surface rather than a mechanism;
+  no consumer needed address stability yet.
+- **Reopen trigger:** fired — spec in flight as its own work item;
+  retire this section when the pin spec merges.
+
 ## Parked stdlib list (`docs/specs/2026-11-06-0111-package-system/items/parked-stdlib.md`)
 
 - reflection-class packages (`fmt %v`, `gob`, `xml`, `database/sql`,

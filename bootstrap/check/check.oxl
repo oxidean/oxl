@@ -390,6 +390,7 @@ struct ClChk {
     callees: own SList,
     mcalls: own SList,
     refs: own SList,
+    binds: own SList,
     seeded: int,
     next: own ClChk,
 }
@@ -4501,7 +4502,7 @@ fn ret_susp(ck: ref Ck, vals: ref parser.NList) -> bool {
 // check_closures because the susp set only exists post-fixpoint.
 fn closure_expr(ck: mut Ck, params: ref parser.NList, body: ref parser.Node, env: mut Env) -> int {
     // deferred susp scan — collect callees + seeded before checking body
-    cc := new(ClChk{callees: nil, mcalls: nil, refs: nil, seeded: 0, next: nil})
+    cc := new(ClChk{callees: nil, mcalls: nil, refs: nil, binds: nil, seeded: 0, next: nil})
     cl_scan_node(ck, body, cc)
     let ps: own IList = nil
     let pnames: own SList = nil
@@ -4540,6 +4541,18 @@ fn closure_expr(ck: mut Ck, params: ref parser.NList, body: ref parser.Node, env
     }
     for caps != nil {
         cn := caps.v
+        // a name bound inside the closure resolves to the local bind
+        // lexically — never a capture even when an enclosing borrowed
+        // name with the same stem exists
+        hd := cn
+        di := find(cn, ".")
+        if di >= 0 {
+            hd = substr(cn, 0, di)
+        }
+        if sl_has(cc.binds, hd) {
+            caps = caps.next
+            continue
+        }
         cm := cn
         for len(cm) > 0 {
             if sl_has(pnames, cm) {
@@ -4653,6 +4666,10 @@ fn cl_scan_expr(ck: mut Ck, e: ref parser.Node, cc: mut ClChk) {
             if len(bn) > 0 {
                 qn := resolve_named(ck, bn)
                 cc.callees = scons(qn, cc.callees)
+                // the pre-resolve callee path (`w.pause`) also feeds
+                // capture analysis — a package fn `w` would otherwise
+                // hide a borrowed local receiver behind `pkg.w.pause`
+                cc.refs = scons(bn, cc.refs)
                 if is_susp_builtin(qn) {
                     cc.seeded = 1
                 }
@@ -4725,7 +4742,8 @@ fn cl_scan_expr(ck: mut Ck, e: ref parser.Node, cc: mut ClChk) {
             a := arms
             for a != nil {
                 match a.v {
-                    parser.Node.MArm{body} => {
+                    parser.Node.MArm{pat, body} => {
+                        cl_pat_binds(pat, cc)
                         cl_scan_node(ck, body, cc)
                     }
                     _ => {
@@ -4734,7 +4752,18 @@ fn cl_scan_expr(ck: mut Ck, e: ref parser.Node, cc: mut ClChk) {
                 a = a.next
             }
         }
-        parser.Node.Closure{body} => {
+        parser.Node.Closure{params, body} => {
+            pl := params
+            for pl != nil {
+                match pl.v {
+                    parser.Node.Param{name} => {
+                        cc.binds = scons(name, cc.binds)
+                    }
+                    _ => {
+                    }
+                }
+                pl = pl.next
+            }
             cl_scan_node(ck, body, cc)
         }
         _ => {
@@ -4760,12 +4789,43 @@ fn cl_scan_node(ck: mut Ck, body: ref parser.Node, cc: mut ClChk) {
     }
 }
 
+// pattern binds also bind inside the closure — walk Pat/PatBind nodes
+fn cl_pat_binds(pat: ref parser.Node, cc: mut ClChk) {
+    if pat == nil {
+        return
+    }
+    match pat {
+        parser.Node.Pat{binds} => {
+            bl := binds
+            for bl != nil {
+                match bl.v {
+                    parser.Node.Name{n} => {
+                        if n != "_" {
+                            cc.binds = scons(n, cc.binds)
+                        }
+                    }
+                    _ => {
+                    }
+                }
+                bl = bl.next
+            }
+        }
+        parser.Node.PatBind{name} => {
+            cc.binds = scons(name, cc.binds)
+        }
+        _ => {
+        }
+    }
+}
+
 fn cl_scan_stmt(ck: mut Ck, s: ref parser.Node, cc: mut ClChk) {
     match s {
-        parser.Node.Let{init} => {
+        parser.Node.Let{name, init} => {
+            cc.binds = scons(name, cc.binds)
             cl_scan_expr(ck, init, cc)
         }
-        parser.Node.Bind{init} => {
+        parser.Node.Bind{name, init} => {
+            cc.binds = scons(name, cc.binds)
             cl_scan_expr(ck, init, cc)
         }
         parser.Node.Assign{target, val} => {
@@ -4775,7 +4835,18 @@ fn cl_scan_stmt(ck: mut Ck, s: ref parser.Node, cc: mut ClChk) {
         parser.Node.ExprStmt{e} => {
             cl_scan_expr(ck, e, cc)
         }
-        parser.Node.Let2{call} => {
+        parser.Node.Let2{names, call} => {
+            // names arrive comma-joined ("a,b") — each binds locally
+            nm := names
+            for len(nm) > 0 {
+                ci := find(nm, ",")
+                if ci < 0 {
+                    cc.binds = scons(nm, cc.binds)
+                    break
+                }
+                cc.binds = scons(substr(nm, 0, ci), cc.binds)
+                nm = substr(nm, ci + 1, len(nm))
+            }
             cl_scan_expr(ck, call, cc)
         }
         parser.Node.Ret{vals} => {
@@ -4828,7 +4899,10 @@ fn cl_scan_stmt(ck: mut Ck, s: ref parser.Node, cc: mut ClChk) {
             a := arms
             for a != nil {
                 match a.v {
-                    parser.Node.SArm{ch, ms, body} => {
+                    parser.Node.SArm{ch, bind, ms, body} => {
+                        if len(bind) > 0 {
+                            cc.binds = scons(bind, cc.binds)
+                        }
                         cl_scan_expr(ck, ch, cc)
                         cl_scan_expr(ck, ms, cc)
                         cl_scan_node(ck, body, cc)

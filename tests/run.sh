@@ -1536,6 +1536,8 @@ out=$("$OXL" run tests/closure_mcall.oxl)
 [ "$(tail -1 <<<"$out")" = "closure mcall ok" ] || { echo "FAIL closure_mcall: $out"; exit 1; }
 out=$("$OXL" run tests/closure_fnfield.oxl)
 [ "$(tail -1 <<<"$out")" = "closure fnfield ok" ] || { echo "FAIL closure_fnfield: $out"; exit 1; }
+out=$("$OXL" run tests/closure_shadow.oxl)
+[ "$(tail -1 <<<"$out")" = "closure shadow ok" ] || { echo "FAIL closure_shadow: $out"; exit 1; }
 out=$("$OXL" run tests/zero_str.oxl)
 [ "$(tail -1 <<<"$out")" = "zero str ok" ] || { echo "FAIL zero_str: $out"; exit 1; }
 
@@ -1758,7 +1760,7 @@ if command -v node >/dev/null 2>&1; then
     # each file's last-line success marker is grepped — an err-path
     # regression that prints + exits 0 (gui_dom's `run err:` shape)
     # can't pass silently
-    for f in conc_ping conc_scale select select_fair chan_own chanbuf chanbuf_close scope_exit orphan_join defer_order pairfwd match methods fnval d5_qual stdmods_test susp_closure closure_mcall closure_fnfield zero_str gui_mock gui_lifecycle gui_overflow gui_select gui_stress gui_cancel gui_dom gui_delay_stop; do
+    for f in conc_ping conc_scale select select_fair chan_own chanbuf chanbuf_close scope_exit orphan_join defer_order pairfwd match methods fnval d5_qual stdmods_test susp_closure closure_mcall closure_fnfield closure_shadow zero_str gui_mock gui_lifecycle gui_overflow gui_select gui_stress gui_cancel gui_dom gui_delay_stop; do
         case "$f" in
             conc_ping)      marker='bounces=' ;;
             conc_scale)     marker='done' ;;
@@ -1779,6 +1781,7 @@ if command -v node >/dev/null 2>&1; then
             susp_closure)   marker='susp closure ok' ;;
             closure_mcall)  marker='closure mcall ok' ;;
             closure_fnfield) marker='closure fnfield ok' ;;
+            closure_shadow) marker='closure shadow ok' ;;
             zero_str)       marker='zero str ok' ;;
             gui_mock)       marker='done' ;;
             gui_lifecycle)  marker='lifecycle ok' ;;

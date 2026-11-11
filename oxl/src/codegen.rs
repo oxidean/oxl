@@ -1296,7 +1296,7 @@ impl<'a> Gen<'a> {
                                 // through its fp; the type side needs
                                 // the field's declared return
                                 if let Some((objp, mname)) = n.rsplit_once('.') {
-                                    if let Some(oe) = unflatten(objp, f.span) {
+                                    if let Some(oe) = self.obj_expr(objp, f.span) {
                                         let ot = self.dt(&self.expr_ty(&oe));
                                         if let Some(Ty::Fn(_, r)) = self.field_ty(&ot, mname) {
                                             return *r;
@@ -2216,7 +2216,10 @@ impl<'a> Gen<'a> {
                 // (`recv`), same rule as defer_caps
                 let mut m = n.as_str();
                 loop {
-                    if pnames.contains(m) {
+                    // a name bound inside the closure resolves to the
+                    // local bind lexically — it is never a capture even
+                    // when an enclosing name with the same stem exists
+                    if pnames.contains(m) || scan.binds.contains(m) {
                         return None;
                     }
                     match self.lookup(m) {
@@ -2737,7 +2740,8 @@ impl<'a> Gen<'a> {
             let bound = self.fslots.iter().rev().any(|s| s.contains_key(head))
                 || self.bind_env.borrow().iter().any(|s| s.contains_key(head))
                 || self.env.iter().any(|s| s.contains_key(head))
-                || self.globals.contains_key(head);
+                || self.globals.contains_key(head)
+                || self.enums.contains_key(head);
             if bound {
                 let mut e = Expr { kind: ExprKind::Ident(head.to_string()), span };
                 let mut rest = &path[cut..];
@@ -3018,7 +3022,7 @@ impl<'a> Gen<'a> {
                         // `x.m()` may be a call through a fn-valued field —
                         // expr the unflattened field path if it types Fn
                         if let Some((objp, mname)) = name.rsplit_once('.') {
-                            if let Some(oe) = unflatten(objp, f.span) {
+                            if let Some(oe) = self.obj_expr(objp, f.span) {
                                 let ot = self.dt(&self.expr_ty(&oe));
                                 if let Some(Ty::Fn(..)) = self.field_ty(&ot, mname) {
                                     let fe = Expr {
@@ -3951,6 +3955,11 @@ impl<'a> Gen<'a> {
                 }
                 Some(c) => {
                     let _ = writeln!(self.out, "    else if ({c}) {{");
+                }
+                None if first => {
+                    // bare-bind first arm is unconditional — `else`
+                    // with no `if` mangles the chain
+                    let _ = writeln!(self.out, "    if (1) {{");
                 }
                 None => {
                     let _ = writeln!(self.out, "    else {{");

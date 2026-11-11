@@ -1836,6 +1836,7 @@ fn gdefer(g: mut G, call: own parser.Node) {
     }
     sc := new(GS)
     sc.l = nil
+    sc.binds = nil
     gscan_e(g, sc, rewritten)
     let caps: own GBnd = nil
     u := sc.l
@@ -3486,7 +3487,7 @@ fn gspawn_args(g: mut G, qn: str, dst: str, argvs: ref GAv) {
 }
 
 // ---------- closures (seed closure_expr + BodyScan) ----------
-struct GS { l: own check.SList }
+struct GS { l: own check.SList, binds: own check.SList }
 
 fn gsc_add(s: mut GS, n: str) {
     if len(n) == 0 {
@@ -3570,7 +3571,20 @@ fn gscan_e(g: mut G, s: mut GS, e: ref parser.Node) {
             gscan_e(g, s, lo)
             gscan_e(g, s, hi)
         }
-        parser.Node.Closure{body} => {
+        parser.Node.Closure{params, body} => {
+            pl := params
+            for pl != nil {
+                match pl.v {
+                    parser.Node.Param{name} => {
+                        if !check.sl_has(s.binds, name) {
+                            s.binds = check.scons(name, s.binds)
+                        }
+                    }
+                    _ => {
+                    }
+                }
+                pl = pl.next
+            }
             gscan_b(g, s, body)
         }
         _ => {
@@ -3586,6 +3600,27 @@ fn gscan_pat(g: mut G, s: mut GS, pat: ref parser.Node) {
         parser.Node.PatLit{v} => {
             gscan_e(g, s, v)
         }
+        parser.Node.Pat{binds} => {
+            // pattern binds are closure-locals for capture purposes
+            bl := binds
+            for bl != nil {
+                match bl.v {
+                    parser.Node.Name{n} => {
+                        if n != "_" && !check.sl_has(s.binds, n) {
+                            s.binds = check.scons(n, s.binds)
+                        }
+                    }
+                    _ => {
+                    }
+                }
+                bl = bl.next
+            }
+        }
+        parser.Node.PatBind{name} => {
+            if !check.sl_has(s.binds, name) {
+                s.binds = check.scons(name, s.binds)
+            }
+        }
         _ => {
         }
     }
@@ -3596,13 +3631,30 @@ fn gscan_s(g: mut G, s: mut GS, st: ref parser.Node) {
         return
     }
     match st {
-        parser.Node.Let{init} => {
+        parser.Node.Let{name, init} => {
+            if !check.sl_has(s.binds, name) {
+                s.binds = check.scons(name, s.binds)
+            }
             gscan_e(g, s, init)
         }
-        parser.Node.Bind{init} => {
+        parser.Node.Bind{name, init} => {
+            if !check.sl_has(s.binds, name) {
+                s.binds = check.scons(name, s.binds)
+            }
             gscan_e(g, s, init)
         }
-        parser.Node.Let2{call} => {
+        parser.Node.Let2{names, call} => {
+            // names arrive comma-joined — each binds locally
+            nm := names
+            for len(nm) > 0 {
+                ci := find(nm, ",")
+                if ci < 0 {
+                    s.binds = check.scons(nm, s.binds)
+                    break
+                }
+                s.binds = check.scons(substr(nm, 0, ci), s.binds)
+                nm = substr(nm, ci + 1, len(nm))
+            }
             gscan_e(g, s, call)
         }
         parser.Node.Assign{target, val} => {
@@ -3659,7 +3711,10 @@ fn gscan_s(g: mut G, s: mut GS, st: ref parser.Node) {
             al := arms
             for al != nil {
                 match al.v {
-                    parser.Node.SArm{ch, ms, body} => {
+                    parser.Node.SArm{ch, bind, ms, body} => {
+                        if len(bind) > 0 && !check.sl_has(s.binds, bind) {
+                            s.binds = check.scons(bind, s.binds)
+                        }
                         gscan_e(g, s, ch)
                         gscan_e(g, s, ms)
                         gscan_b(g, s, body)
@@ -3723,6 +3778,7 @@ fn gclosure(g: mut G, params: ref parser.NList, body: ref parser.Node) -> str {
     sid := itoa(id)
     sc := new(GS)
     sc.l = nil
+    sc.binds = nil
     gscan_b(g, sc, body)
     let caps: own GBnd = nil
     u := sc.l
@@ -3732,6 +3788,11 @@ fn gclosure(g: mut G, params: ref parser.NList, body: ref parser.Node) -> str {
         // at every prefix length, and globals emit directly
         n := u.v
         for len(n) > 0 {
+            // bound inside the closure body => resolves to the local
+            // bind lexically — never a capture
+            if check.sl_has(sc.binds, n) {
+                break
+            }
             if gscan_param(params, n) {
                 break
             }

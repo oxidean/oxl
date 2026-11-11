@@ -903,12 +903,18 @@ fn jmatch_stmt(g: mut G, scrut: ref parser.Node, arms: ref parser.NList) {
 fn jclosure(g: mut G, params: ref parser.NList, body: ref parser.Node) -> str {
     sc := new(GS)
     sc.l = nil
+    sc.binds = nil
     gscan_b(g, sc, body)
     let caps: own GBnd = nil
     u := sc.l
     for u != nil {
         n := u.v
         for len(n) > 0 {
+            // bound inside the closure body => resolves to the local
+            // bind lexically — never a capture
+            if check.sl_has(sc.binds, n) {
+                break
+            }
             // closure params shadow enclosing binds at every prefix
             // length — a shadowed name is never captured
             if gscan_param(params, n) {

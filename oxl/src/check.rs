@@ -1215,7 +1215,10 @@ impl<'a> Checker<'a> {
         let mut cut = path.len();
         loop {
             let head = &path[..cut];
-            if env.get(head).is_some() || self.globals.contains_key(head) {
+            if env.get(head).is_some()
+                || self.globals.contains_key(head)
+                || self.enums.contains_key(head)
+            {
                 let mut e = Expr { kind: ExprKind::Ident(head.to_string()), span };
                 let mut rest = &path[cut..];
                 while let Some(seg) = rest.strip_prefix('.') {
@@ -1501,7 +1504,9 @@ impl<'a> Checker<'a> {
                 for n in scan.refs.union(&scan.callees) {
                     let mut m = n.as_str();
                     let t = loop {
-                        if pnames.contains(m) {
+                        // a name bound inside the closure resolves to
+                        // the local bind lexically — never a capture
+                        if pnames.contains(m) || scan.binds.contains(m) {
                             break None;
                         }
                         match env.get(m) {

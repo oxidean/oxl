@@ -1,0 +1,29 @@
+package main
+
+// Closure-local binds shadow enclosing receivers: a `w` bound inside
+// the closure resolves lexically to the local — it is not a capture
+// even when the enclosing `w` is borrowed (mut). Both drivers must
+// accept and codegen must emit only the local decl.
+
+struct Worker { n: int }
+
+fn (w Worker) pause() -> int {
+    return w.n
+}
+
+fn (w mut Worker) run() -> int {
+    c := { ||
+        w := Worker{n: 1}
+        return w.pause()
+    }
+    return c()
+}
+
+fn main() {
+    w := Worker{n: 0}
+    if w.run() != 1 {
+        println("FAIL closure shadow")
+        return
+    }
+    println("closure shadow ok")
+}

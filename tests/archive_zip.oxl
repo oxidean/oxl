@@ -79,4 +79,16 @@ fn test_corrupt() {
     testing.expect(e4 != nil, "corrupt payload fails crc")
 }
 
+fn test_open_badindex() {
+    [z, e] = zip.newreader(fixture() as []byte)
+    ck(e, "newreader")
+    // lookup() misses hand back -1 — feeding it to open() must
+    // error, not index out of bounds
+    [_o, e2] = z.open(z.lookup("missing"))
+    testing.expect(e2 != nil, "open(-1) errors")
+    testing.expect_streq(errors.msg(e2), "zip: bad member index", "bad index message")
+    [_o2, e3] = z.open(99)
+    testing.expect(e3 != nil, "open(99) errors")
+}
+
 fn main() {}

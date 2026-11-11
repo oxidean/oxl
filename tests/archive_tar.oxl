@@ -185,4 +185,196 @@ fn test_skip_payload() {
     testing.expect_streq(s, "B", "after contents")
 }
 
+// --- hostile-input coverage: crafted blocks, truncation, oversize ---
+fn foct(b: []byte, off: int, width: int, v: int) {
+    i := width - 2
+    x := v
+    for i >= 0 {
+        b[off + i] = 48 + x % 8
+        x = x / 8
+        i = i - 1
+    }
+    b[off + width - 1] = 0
+}
+
+fn fstr(b: []byte, off: int, s: str) {
+    sb := s as []byte
+    i := 0
+    for i < len(sb) {
+        b[off + i] = sb[i]
+        i = i + 1
+    }
+}
+
+fn fixsum(b: []byte) {
+    i := 148
+    for i < 156 {
+        b[i] = 32
+        i = i + 1
+    }
+    sum := 0
+    i = 0
+    for i < 512 {
+        sum = sum + b[i]
+        i = i + 1
+    }
+    foct(b, 148, 8, sum)
+}
+
+// mkhdr builds a real 512-byte header block — valid checksum so
+// parse() reaches whatever the field under test carries.
+fn mkhdr(name: str, size: int, tf: int) -> own []byte {
+    b := mkslice(byte, 512)
+    fstr(b, 0, name)
+    foct(b, 100, 8, 420)
+    foct(b, 108, 8, 1000)
+    foct(b, 116, 8, 100)
+    foct(b, 124, 12, size)
+    foct(b, 136, 12, 1700000000)
+    b[156] = tf
+    fstr(b, 257, "ustar")
+    fstr(b, 263, "00")
+    fstr(b, 265, "jesse")
+    fstr(b, 297, "users")
+    fixsum(b)
+    return new(b)
+}
+
+fn test_truncated_midheader() {
+    buf := bytes.newbuffer()
+    w := new(tar.newwriter(buf.aswriter()))
+    write_one(w, "f.txt", "hello")
+    ck(w.close(), "trunc close")
+    data := buf.str() as []byte
+    // header + member block land; the second zero block is cut at
+    // 476 bytes — mid-structure EOF must error, not report clean end
+    rb := bytes.newbuffer()
+    [_rd, _re] = rb.write(data[0:1500])
+    tr := tar.newreader(rb.asreader())
+    [h, e] = tr.next()
+    ck(e, "first member")
+    [_h2, e2] = tr.next()
+    testing.expect(e2 != nil && e2 != io.eof(), "mid-header EOF errors")
+    testing.expect_streq(errors.msg(e2), "tar: unexpected EOF in header block", "mid-header message")
+}
+
+fn test_truncated_member() {
+    buf := bytes.newbuffer()
+    w := new(tar.newwriter(buf.aswriter()))
+    big := ""
+    i := 0
+    for i < 600 {
+        big = big + "a"
+        i = i + 1
+    }
+    write_one(w, "big.bin", big)
+    ck(w.close(), "close")
+    data := buf.str() as []byte
+    // header + only 188 of the 600-byte payload
+    rb := bytes.newbuffer()
+    [_rd, _re] = rb.write(data[0:700])
+    tr := tar.newreader(rb.asreader())
+    [h, e] = tr.next()
+    ck(e, "member header")
+    testing.expect_eq(h.size, 600, "declared size")
+    piece := mkslice(byte, 700)
+    [rn, re] = tr.read(piece)
+    ck(re, "partial payload kept")
+    testing.expect_eq(rn, 188, "partial count")
+    [_rn2, re2] = tr.read(piece)
+    testing.expect(re2 != nil && re2 != io.eof(), "short member errors")
+    testing.expect_streq(errors.msg(re2), "tar: unexpected EOF in member payload", "member EOF message")
+}
+
+fn test_pax_badlen() {
+    // an 'x' record whose declared length overruns its block — the
+    // override is ignored, not trapped on
+    x := mkhdr("x", 10, tar.TPAX)
+    payload := mkslice(byte, 512)
+    pr := "99 x      " as []byte
+    i := 0
+    for i < len(pr) {
+        payload[i] = pr[i]
+        i = i + 1
+    }
+    real := mkhdr("real.txt", 0, tar.TREG)
+    zero := mkslice(byte, 1024)
+    rb := bytes.newbuffer()
+    [_rd, _re] = rb.write((x as str + payload as str + real as str + zero as str) as []byte)
+    tr := tar.newreader(rb.asreader())
+    [h, e] = tr.next()
+    ck(e, "next past bad pax")
+    testing.expect_streq(h.name, "real.txt", "header after bad pax")
+}
+
+fn test_meta_oversize() {
+    // declared meta size over the 16 MiB cap — rejected before alloc
+    x := mkhdr("x", 20000000000, tar.TPAX)
+    zero := mkslice(byte, 1024)
+    rb := bytes.newbuffer()
+    [_rd, _re] = rb.write((x as str + zero as str) as []byte)
+    tr := tar.newreader(rb.asreader())
+    [_h, e] = tr.next()
+    testing.expect(e != nil, "oversize meta errors")
+    testing.expect_streq(errors.msg(e), "tar: meta block too large", "oversize message")
+}
+
+fn test_b256_size() {
+    zero := mkslice(byte, 1024)
+    // negative base-256 (0xFF-prefixed) — sign rejected in parnum
+    b := mkhdr("n.bin", 0, tar.TREG)
+    i := 124
+    for i < 136 {
+        b[i] = 255
+        i = i + 1
+    }
+    fixsum(b)
+    rb := bytes.newbuffer()
+    [_rd, _re] = rb.write((b as str + zero as str) as []byte)
+    tr := tar.newreader(rb.asreader())
+    [_h, e] = tr.next()
+    testing.expect(e != nil, "negative base-256 errors")
+    // positive base-256 magnitude that overflows int64
+    b2 := mkhdr("o.bin", 0, tar.TREG)
+    b2[124] = 128
+    i = 125
+    for i < 136 {
+        b2[i] = 255
+        i = i + 1
+    }
+    fixsum(b2)
+    rb2 := bytes.newbuffer()
+    [_rd2, _re2b] = rb2.write((b2 as str + zero as str) as []byte)
+    tr2 := tar.newreader(rb2.asreader())
+    [_h2, e2] = tr2.next()
+    testing.expect(e2 != nil, "base-256 overflow errors")
+}
+
+fn test_signed_checksum() {
+    // a >=0x80 name byte + a signed-byte checksum (legacy writer
+    // form) verifies alongside the unsigned sum
+    b := mkhdr("plain", 0, tar.TREG)
+    b[0] = 200
+    sum := 0
+    i := 0
+    for i < 512 {
+        c := b[i]
+        if i >= 148 && i < 156 {
+            c = 32
+        }
+        if c > 127 {
+            c = c - 256
+        }
+        sum = sum + c
+        i = i + 1
+    }
+    foct(b, 148, 8, sum)
+    zero := mkslice(byte, 1024)
+    rb := bytes.newbuffer()
+    [_rd, _re] = rb.write((b as str + zero as str) as []byte)
+    tr := tar.newreader(rb.asreader())
+    [_h, e] = tr.next()
+    ck(e, "signed checksum verifies")
+}
+
 fn main() {}

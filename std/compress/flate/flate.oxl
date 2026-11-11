@@ -249,9 +249,6 @@ fn (d mut Reader) fill() -> err {
         d.sn = d.sn - d.si
         d.si = 0
     }
-    if d.sn >= len(d.sbuf) {
-        return errors.new("flate: internal buffer full")
-    }
     i := 0
     for i < 100 {
         [n, e] = d.src.read(d.sbuf[d.sn:])
@@ -280,7 +277,10 @@ fn (d mut Reader) take(n: int) -> [int, err] {
     for d.nbits < n {
         if d.si >= d.sn {
             e := d.fill()
-            if e != nil {
+            // a co-return can latch an error AND keep bytes — consume
+            // them first; the latched d.stuck resurfaces when a fill
+            // genuinely arrives empty
+            if e != nil && d.si >= d.sn {
                 if e == io.eof() {
                     return 0, truncated()
                 }
@@ -477,6 +477,9 @@ fn (d mut Reader) dyntabs() -> err {
         return e1
     }
     ndist := hdist + 1
+    if nlen > 286 || ndist > 30 {
+        return corrupt("too many length or distance symbols")
+    }
     [hclen, e2] = d.take(4)
     if e2 != nil {
         return e2

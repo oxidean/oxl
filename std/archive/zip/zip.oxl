@@ -99,7 +99,8 @@ fn (z ref Reader) nfiles() -> int {
     return len(z.files)
 }
 
-/// file returns the i-th member record.
+/// file returns the i-th member record. i must be valid — from
+/// nfiles() or a successful lookup() (which returns -1 on a miss).
 fn (z ref Reader) file(i: int) -> File {
     return z.files[i]
 }
@@ -120,6 +121,9 @@ fn (z ref Reader) lookup(name: str) -> int {
 /// header, returns stored bytes or flate-inflates deflate members,
 /// and verifies CRC-32 and size. [contents, err].
 fn (z ref Reader) open(i: int) -> [own []byte, err] {
+    if i < 0 || i >= len(z.files) {
+        return nil, errors.new("zip: bad member index")
+    }
     f := z.files[i]
     if (f.flags & 1) != 0 {
         return nil, errors.new("zip: encrypted member")

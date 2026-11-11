@@ -67,6 +67,9 @@ fn (z mut Reader) xfull(buf: []byte) -> err {
             got = got + n
             dry = 0
         }
+        if got >= len(buf) {
+            return nil
+        }
         if e != nil {
             return e
         }
@@ -85,6 +88,9 @@ fn (z mut Reader) xfull(buf: []byte) -> err {
 fn (z mut Reader) trailer() -> err {
     buf := mkslice(byte, 4)
     e := z.xfull(buf)
+    if e == io.eof() {
+        return errors.new("zlib: unexpected EOF in trailer")
+    }
     if e != nil {
         return e
     }

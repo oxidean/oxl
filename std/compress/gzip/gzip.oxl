@@ -60,6 +60,9 @@ fn (g mut Reader) xfull(buf: []byte) -> err {
             got = got + n
             dry = 0
         }
+        if got >= len(buf) {
+            return nil
+        }
         if e != nil {
             return e
         }
@@ -281,9 +284,6 @@ fn (g mut Reader) read(b: []byte) -> [int, err] {
                 return gave, nil
             }
             return 0, io.eof()
-        }
-        if n <= 0 && gave == len(b) {
-            return gave, nil
         }
         // else: next member armed — keep filling b
     }

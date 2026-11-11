@@ -169,4 +169,53 @@ fn test_zlib_badadler() {
     testing.expect_streq(errors.msg(e), "zlib: adler32 mismatch", "adler mismatch message")
 }
 
+// a reader may co-return its last bytes WITH io.eof — those bytes
+// still count; the stream must decode, not die "unexpected EOF"
+struct coreturner { b: []byte, i: int }
+
+fn (s mut coreturner) read(b: []byte) -> [int, err] {
+    if s.i >= len(s.b) {
+        return 0, io.eof()
+    }
+    n := len(s.b) - s.i
+    if n > len(b) {
+        n = len(b)
+    }
+    j := 0
+    for j < n {
+        b[j] = s.b[s.i + j]
+        j = j + 1
+    }
+    s.i = s.i + n
+    if s.i >= len(s.b) {
+        return n, io.eof()
+    }
+    return n, nil
+}
+
+fn (s mut coreturner) asreader() -> io.Reader {
+    return s
+}
+
+fn test_coreturn() {
+    blob := hx_b("cb48cdc9c95728cf2fca490100") // fixed deflate "hello world"
+    cr := coreturner{b: blob as []byte, i: 0}
+    fr := flate.newreader(cr.asreader())
+    [s, e] = drain_all(fr.asreader(), 1024)
+    ck(e, "co-returning source inflates")
+    testing.expect_streq(s, "hello world", "co-return payload")
+}
+
+fn test_zlib_shorttrailer() {
+    // the adler32 trailer cut to 2 bytes — wrapped error, never a
+    // clean (unverified) end
+    blob := hx_b("789ccb48cdc9c957a8cac94c02001595")
+    sr := slicereader{b: blob as []byte, i: 0}
+    [z, e] = zlib.newreader(sr.asreader())
+    ck(e, "zlib newreader")
+    [_s, e2] = drain_all(z.asreader(), 1024)
+    testing.expect(e2 != nil && e2 != io.eof(), "short trailer errors")
+    testing.expect_streq(errors.msg(e2), "zlib: unexpected EOF in trailer", "short trailer message")
+}
+
 fn main() {}

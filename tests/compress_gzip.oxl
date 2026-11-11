@@ -10,6 +10,8 @@ import "std/compress/gzip"
 
 import "std/encoding/hex"
 
+import "std/hash"
+
 import "std/errors"
 
 import "std/testing"
@@ -116,6 +118,21 @@ fn test_truncated() {
     // valid header, payload cut short
     [_o, e] = gzip.decompress(hx_b("1f8b08000000000002ffcb48cdc9c9") as []byte)
     testing.expect(e != nil, "truncated payload errors")
+}
+
+// handcrafted member exercising FEXTRA + FHCRC — the header flags
+// the canned blobs don't carry: magic, method, FLG=0x06, MTIME, XFL,
+// OS, then XLEN+extra, the header crc16, deflate, crc32+isize
+fn test_fextra_fhcrc() {
+    hdr := hx("1f8b08060000000002ff040061626364") // base + XLEN/"abcd"
+    hc := hash.crc32(hdr) % 65536 // FHCRC = crc16(hdr)
+    f2 := mkslice(byte, 2)
+    f2[0] = hc % 256
+    f2[1] = hc / 256
+    blob := hdr as str + f2 as str + hx_b("cb48cdc9c95748afca2c0000196ad2df0a000000")
+    [out, e] = gzip.decompress(blob as []byte)
+    ck(e, "FEXTRA+FHCRC decompress")
+    testing.expect_streq(out as str, "hello gzip", "flagged member payload")
 }
 
 fn main() {}

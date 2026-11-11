@@ -1,0 +1,152 @@
+package main
+
+// std acceptance: net/url — RFC 3986 parse/stringify, percent
+// escaping tables, Values, and RFC 3986 reference resolution.
+import "std/net/url"
+
+import "std/testing"
+
+import "std/errors"
+
+fn ck(e: err, m: str) {
+    testing.expect(e == nil, m + ": " + errors.msg(e))
+}
+
+fn ckparse(raw: str, m: str) -> own url.URL {
+    [u, e] = url.parse(raw)
+    ck(e, m + " parse " + raw)
+    return u
+}
+
+fn test_escape() {
+    // separate tables: query turns space into '+', a path segment
+    // into %20 — and '+' itself is literal only inside a segment
+    testing.expect_streq(url.queryescape("a b+c/d"), "a+b%2Bc%2Fd", "queryescape")
+    testing.expect_streq(url.pathescape("a b+c/d"), "a%20b+c%2Fd", "pathescape")
+    testing.expect_streq(url.pathescape("+"), "+", "pathescape keeps +")
+    testing.expect_streq(url.queryescape("+"), "%2B", "queryescape escapes +")
+    testing.expect_streq(url.queryescape(""), "", "escape empty")
+    [d, e] = url.queryunescape("a+b%2Bc%2Fd")
+    ck(e, "queryunescape")
+    testing.expect_streq(d, "a b+c/d", "queryunescape round-trip")
+    [p, e2] = url.pathunescape("a%20b+c%2Fd")
+    ck(e2, "pathunescape")
+    testing.expect_streq(p, "a b+c/d", "pathunescape round-trip")
+    [q2, e3] = url.queryunescape("%zz")
+    testing.expect(e3 != nil, "queryunescape rejects bad hex")
+    [q3, e4] = url.queryunescape("abc%")
+    testing.expect(e4 != nil, "queryunescape rejects trailing %")
+}
+
+fn test_parse() {
+    u := ckparse("https://user:pw@host:8080/p/a%20b?q=1&x=2#frag", "full")
+    testing.expect_streq(u.scheme, "https", "scheme")
+    testing.expect_streq(u.host, "host:8080", "host")
+    testing.expect_streq(u.user, "user", "user")
+    testing.expect_streq(u.password, "pw", "password")
+    testing.expect(u.hasuser && u.haspass, "userinfo flags")
+    testing.expect_streq(u.path, "/p/a b", "path decoded")
+    testing.expect_streq(u.rawquery, "q=1&x=2", "rawquery")
+    testing.expect_streq(u.fragment, "frag", "fragment")
+    testing.expect_streq(u.userinfo(), "user:pw", "userinfo")
+    testing.expect(u.isabs(), "isabs")
+    testing.expect_streq(u.hostname(), "host", "hostname")
+    testing.expect_streq(u.port(), "8080", "port")
+    testing.expect_streq(u.request_uri(), "/p/a%20b?q=1&x=2", "request_uri")
+    testing.expect_streq(u.string(), "https://user:pw@host:8080/p/a%20b?q=1&x=2#frag", "string round-trip")
+    // relative + opaque-ish inputs
+    rel := ckparse("/just/a/path?x=1", "rel")
+    testing.expect(!rel.isabs(), "rel not abs")
+    testing.expect_streq(rel.string(), "/just/a/path?x=1", "rel string")
+    proto := ckparse("//cdn.example.com/lib.js", "proto-rel")
+    testing.expect_streq(proto.host, "cdn.example.com", "proto-rel host")
+    testing.expect_streq(proto.string(), "//cdn.example.com/lib.js", "proto-rel string")
+    mail := ckparse("mailto:nobody@example.com", "mailto")
+    testing.expect_streq(mail.scheme, "mailto", "mailto scheme")
+    // fragment chars survive raw
+    f := ckparse("http://h/p#a b&c=d", "frag chars")
+    testing.expect_streq(f.fragment, "a b&c=d", "fragment decoded")
+    // parse errors
+    [_, e1] = url.parse("http://h/p%zz")
+    testing.expect(e1 != nil, "bad path escape errors")
+    [_, e2] = url.parse(":")
+    testing.expect(e2 != nil, "bare colon errors")
+    // userinfo with an empty host is legal (Go parses it)
+    [uh, e3] = url.parse("http://h:p@/")
+    ck(e3, "userinfo + empty host")
+    testing.expect_streq(uh.userinfo(), "h:p", "empty-host userinfo")
+    testing.expect_streq(uh.host, "", "empty host")
+    hp := url.splithostport("[::1]:8080")
+    testing.expect_streq(hp.host, "::1", "splithostport v6 host")
+    testing.expect_streq(hp.port, "8080", "splithostport v6 port")
+}
+
+fn test_values() {
+    [vs, e] = url.parsequery("a=1&b=two+words&a=2&bare&c=x%3Dy")
+    ck(e, "parsequery")
+    testing.expect_streq(url.vget(vs, "a"), "1", "vget first")
+    testing.expect_streq(url.vget(vs, "b"), "two words", "vget plus")
+    testing.expect_streq(url.vget(vs, "c"), "x=y", "vget escaped")
+    testing.expect(url.vhas(vs, "bare"), "bare key present")
+    testing.expect_streq(url.vget(vs, "bare"), "", "bare key empty")
+    testing.expect(!url.vhas(vs, "nope"), "absent key")
+    all := url.vgetall(vs, "a")
+    testing.expect_eq(len(all), 2, "vgetall count")
+    testing.expect_streq(all[0] + all[1], "12", "vgetall order")
+    testing.expect_eq(url.vlen(vs), 5, "vlen pairs")
+    keys := url.vkeys(vs)
+    testing.expect_eq(len(keys), 4, "vkeys distinct")
+    testing.expect_streq(keys[0] + keys[1] + keys[2] + keys[3], "abbarec", "vkeys sorted")
+    // Encode sorts keys, escapes values
+    enc := url.vencode(vs)
+    testing.expect_streq(enc, "a=1&a=2&b=two+words&bare=&c=x%3Dy", "vencode")
+    // Set/Del
+    url.vset(vs, "a", "only")
+    testing.expect_eq(url.vlen(vs), 4, "vset replaces")
+    url.vdel(vs, "a")
+    testing.expect(!url.vhas(vs, "a"), "vdel")
+    // build from scratch + u.Query()
+    w := url.newvalues()
+    url.vadd(w, "k", "v one")
+    testing.expect_streq(url.vencode(w), "k=v+one", "vadd encode")
+    u2 := ckparse("http://h/?x=1&x=2", "query()")
+    [q, qe] = u2.query()
+    ck(qe, "u.query")
+    testing.expect_eq(url.vlen(q), 2, "u.query count")
+    // malformed query still returns pairs + error
+    [vs2, e2] = url.parsequery("ok=1;%zz")
+    testing.expect(e2 != nil, "parsequery error surfaces")
+}
+
+fn rr(base: ref url.URL, r: ref url.URL) -> str {
+    rv := url.resolve_reference(base, r)
+    return rv.string()
+}
+
+fn test_resolve() {
+    base := ckparse("http://a/b/c/d;p?q", "base")
+    // RFC 3986 §5.4.2 abnormal cases Go resolves identically
+    cases := "g;h|g;x/y|..g|http://a/g"
+    r1 := ckparse("g", "r1")
+    testing.expect_streq(rr(base, r1), "http://a/b/c/g", "resolve g")
+    r2 := ckparse("./g", "r2")
+    testing.expect_streq(rr(base, r2), "http://a/b/c/g", "resolve ./g")
+    r3 := ckparse("g/", "r3")
+    testing.expect_streq(rr(base, r3), "http://a/b/c/g/", "resolve g/")
+    r4 := ckparse("/g", "r4")
+    testing.expect_streq(rr(base, r4), "http://a/g", "resolve /g")
+    r5 := ckparse("//h/x", "r5")
+    testing.expect_streq(rr(base, r5), "http://h/x", "resolve //h/x")
+    r6 := ckparse("?y", "r6")
+    testing.expect_streq(rr(base, r6), "http://a/b/c/d;p?y", "resolve ?y")
+    r7 := ckparse("#s", "r7")
+    testing.expect_streq(rr(base, r7), "http://a/b/c/d;p?q#s", "resolve #s")
+    r8 := ckparse("../g", "r8")
+    testing.expect_streq(rr(base, r8), "http://a/b/g", "resolve ../g")
+    r9 := ckparse("../../g", "r9")
+    testing.expect_streq(rr(base, r9), "http://a/g", "resolve ../../g")
+    r10 := ckparse("https://x/y", "r10")
+    testing.expect_streq(rr(base, r10), "https://x/y", "absolute wins")
+    r11 := ckparse("g:h", "r11")
+    testing.expect_streq(rr(base, r11), "g:h", "scheme letter path wins")
+}

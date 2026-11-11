@@ -1,0 +1,73 @@
+package main
+
+// std acceptance: log/slog — leveled structured records on std/log's
+// emit path: text k=v handler, JSON handler, bound attrs, groups.
+// Emitted lines go to stderr (timestamps vary); these tests assert
+// the API shapes and let run.sh grep the stderr line shapes.
+import "std/log/slog"
+
+import "std/testing"
+
+import "std/errors"
+
+fn test_levels() {
+    testing.expect_eq(slog.lvl_debug(), -4, "lvl_debug")
+    testing.expect_eq(slog.lvl_info(), 0, "lvl_info")
+    testing.expect_eq(slog.lvl_warn(), 4, "lvl_warn")
+    testing.expect_eq(slog.lvl_error(), 8, "lvl_error")
+    testing.expect(slog.lvl_debug() < slog.lvl_info(), "debug < info")
+    testing.expect(slog.lvl_warn() < slog.lvl_error(), "warn < error")
+}
+
+fn test_attrs() {
+    a := slog.str_("name", "oxl")
+    a.next = slog.int_("n", 7)
+    testing.expect_streq(a.k, "name", "str key")
+    testing.expect_streq(a.s, "oxl", "str value")
+    testing.expect_eq(a.next.i, 7, "chained int")
+    b := slog.bool_("ok", true)
+    testing.expect(b.b, "bool attr")
+    e := slog.err_("e", errors.new("boom"))
+    testing.expect_streq(e.s, "boom", "err attr msg")
+    g := slog.group("inner", slog.str_("x", "y"))
+    testing.expect_streq(g.k, "inner", "group key")
+    testing.expect_streq(g.kids.s, "y", "group kid")
+    // chain links lists tail-to-tail
+    c := slog.chain(slog.str_("a", "1"), slog.chain(slog.int_("b", 2), slog.float_("c", 1.5)))
+    testing.expect_eq(c.next.next.kind, 2, "chain order") // float kind
+    testing.expect_streq(c.next.k, "b", "chain mid key")
+}
+
+fn test_handlers() {
+    // text handler — lines land on stderr for run.sh to grep
+    l := slog.text_handler(slog.lvl_info())
+    l2 := l.with(slog.str_("app", "demo"))
+    l3 := l2.with_group("req")
+    l3.info("started", slog.chain(slog.str_("method", "GET"), slog.int_("status", 200)))
+    // below-threshold record drops silently
+    l3.debug("hidden", nil)
+    l3.warn("quoted", slog.str_("note", "has space"))
+    testing.expect(true, "text emits did not crash")
+}
+
+fn test_json() {
+    j := slog.json_handler(slog.lvl_debug())
+    j2 := j.with(slog.int_("pid", 42))
+    j3 := j2.with_group("http")
+    j3.error("failed", slog.chain(slog.group("hdr", slog.str_("ct", "json")), slog.bool_("retry", true)))
+    j3.debug("dbg", slog.str_("k", "v"))
+    testing.expect(true, "json emits did not crash")
+}
+
+fn test_default() {
+    d := slog.default_logger()
+    testing.expect(d != nil, "default logger exists")
+    d2 := slog.default_logger()
+    testing.expect(d == d2, "default is stable")
+    // set_default swaps the package-level logger
+    slog.set_default(slog.json_handler(slog.lvl_warn()))
+    slog.info("dropped", nil) // below warn — silent
+    slog.error("default-json", slog.str_("src", "set_default"))
+    slog.set_default(d) // restore
+    testing.expect(true, "set_default round-trip")
+}

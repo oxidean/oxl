@@ -226,6 +226,36 @@ printf '%s
 for t in test_echo test_closer test_refused test_lookup test_badip; do
     grep -q "$t ... ok" <<<"$out" || { echo "FAIL net: $out"; exit 1; }
 done
+out=$("$OXL" test tests/net_url.oxl)
+printf '%s
+' "$out" >&2
+for t in test_escape test_parse test_values test_resolve; do
+    grep -q "$t ... ok" <<<"$out" || { echo "FAIL net_url: $out"; exit 1; }
+done
+out=$("$OXL" test tests/net_mail.oxl)
+printf '%s
+' "$out" >&2
+for t in test_parseaddress test_parseaddresslist test_string; do
+    grep -q "$t ... ok" <<<"$out" || { echo "FAIL net_mail: $out"; exit 1; }
+done
+out=$("$OXL" test tests/mime.oxl)
+printf '%s
+' "$out" >&2
+for t in test_extensions test_parsemediatype test_formatmediatype; do
+    grep -q "$t ... ok" <<<"$out" || { echo "FAIL mime: $out"; exit 1; }
+done
+# slog records land on stderr (timestamps vary) — capture 2>&1 so the
+# emitted text/json shapes are asserted too
+out=$("$OXL" test tests/log_slog.oxl 2>&1)
+printf '%s
+' "$out" >&2
+for t in test_levels test_attrs test_handlers test_json test_default; do
+    grep -q "$t ... ok" <<<"$out" || { echo "FAIL log_slog: $out"; exit 1; }
+done
+grep -q 'level=INFO msg=started app=demo req.method=GET req.status=200' <<<"$out" || { echo "FAIL slog text shape: $out"; exit 1; }
+grep -q 'req.note="has space"' <<<"$out" || { echo "FAIL slog text quoting: $out"; exit 1; }
+grep -q '"level":"ERROR","msg":"failed","pid":42,"http":{"hdr":{"ct":"json"},"retry":true}' <<<"$out" || { echo "FAIL slog json shape: $out"; exit 1; }
+grep -q '"msg":"default-json","src":"set_default"' <<<"$out" || { echo "FAIL slog set_default: $out"; exit 1; }
 
 echo "== oxl test: regexp (s5) =="
 out=$("$OXL" test tests/regexp_test.oxl)

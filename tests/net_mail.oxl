@@ -1,0 +1,119 @@
+package main
+
+// std acceptance: net/mail — RFC 5322 mailbox parse/format, display
+// names, groups, comments, and RFC 2047 encoded words.
+import "std/net/mail"
+
+import "std/testing"
+
+import "std/errors"
+
+fn ck(e: err, m: str) {
+    testing.expect(e == nil, m + ": " + errors.msg(e))
+}
+
+fn test_parseaddress() {
+    [a, e] = mail.parseaddress("Gogh Fir <gf@example.com>")
+    ck(e, "name-addr")
+    testing.expect_streq(a.name, "Gogh Fir", "display name")
+    testing.expect_streq(a.address, "gf@example.com", "addr-spec")
+    // bare addr-spec
+    [b, e2] = mail.parseaddress("bare@example.com")
+    ck(e2, "bare")
+    testing.expect_streq(b.name, "", "no name")
+    testing.expect_streq(b.address, "bare@example.com", "bare addr")
+    // quoted display name keeps the comma inside
+    [c, e3] = mail.parseaddress("\"Fir, Gogh\" <gf@example.com>")
+    ck(e3, "quoted name")
+    testing.expect_streq(c.name, "Fir, Gogh", "quoted display name")
+    // (comment) after the address doubles as the display name
+    [d, e4] = mail.parseaddress("gf@example.com (Gogh Fir)")
+    ck(e4, "comment name")
+    testing.expect_streq(d.name, "Gogh Fir", "comment name")
+    // CFWS comments between phrase words are skipped
+    [cm, e5] = mail.parseaddress("Gogh (the) Fir <gf@example.com>")
+    ck(e5, "cfws")
+    testing.expect_streq(cm.name, "Gogh Fir", "cfws name")
+    testing.expect_streq(cm.address, "gf@example.com", "cfws addr")
+    // a leading comment is NOT skipped (Go behaves the same)
+    [_, ce] = mail.parseaddress("(hi) gf@example.com")
+    testing.expect(ce != nil, "leading comment errors")
+    // dot-atom local + multi-label domain
+    [da, e6] = mail.parseaddress("a.b.c@x.y.example.com")
+    ck(e6, "dot-atom")
+    testing.expect_streq(da.address, "a.b.c@x.y.example.com", "dot-atom")
+    // quoted local part
+    [ql, e7] = mail.parseaddress("\"quoted local\"@example.com")
+    ck(e7, "quoted local")
+    testing.expect_streq(ql.address, "quoted local@example.com", "quoted local")
+    // RFC 2047 encoded word in the name
+    [ew, e8] = mail.parseaddress("=?UTF-8?Q?Gogh_=C3=A9?= <g@e.com>")
+    ck(e8, "encoded word")
+    testing.expect_streq(ew.name, "Gogh é", "Q-decoded name")
+    // malformed
+    [_, m1] = mail.parseaddress("")
+    testing.expect(m1 != nil, "empty errors")
+    [_, m2] = mail.parseaddress("no-at-sign")
+    testing.expect(m2 != nil, "missing @ errors")
+    [_, m3] = mail.parseaddress("bad@")
+    testing.expect(m3 != nil, "empty domain errors")
+    [_, m4] = mail.parseaddress("a@b trailing")
+    testing.expect(m4 != nil, "trailing garbage errors")
+    [_, m5] = mail.parseaddress("two@a, b@b")
+    testing.expect(m5 != nil, "two addresses error")
+}
+
+fn test_parseaddresslist() {
+    [l, e] = mail.parseaddresslist("a@x.io, \"Bob, Jr.\" <b@y.io>, G: c@z.io, d@z.io ;")
+    ck(e, "list")
+    testing.expect_eq(len(l), 4, "list length")
+    testing.expect_streq(l[0].address, "a@x.io", "first")
+    testing.expect_streq(l[1].name, "Bob, Jr.", "quoted in list")
+    testing.expect_streq(l[2].address, "c@z.io", "group member 1")
+    testing.expect_streq(l[3].address, "d@z.io", "group member 2")
+    // trailing comma tolerated (obs-addr-list)
+    [l2, e2] = mail.parseaddresslist("a@x.io,")
+    ck(e2, "trailing comma")
+    testing.expect_eq(len(l2), 1, "trailing comma count")
+    // empty group parses to nothing
+    [l3, e3] = mail.parseaddresslist("Undisclosed:;, a@x.io")
+    ck(e3, "empty group")
+    testing.expect_eq(len(l3), 1, "empty group len")
+    [_, m1] = mail.parseaddresslist("a@x.io b@y.io")
+    testing.expect(m1 != nil, "missing comma errors")
+}
+
+fn test_string() {
+    [a, _e] = mail.parseaddress("Gogh Fir <gf@example.com>")
+    testing.expect_streq(a.string(), "\"Gogh Fir\" <gf@example.com>", "string name-addr")
+    [b, _e2] = mail.parseaddress("bare@example.com")
+    testing.expect_streq(b.string(), "<bare@example.com>", "string bare")
+    // round-trip through the parser
+    [rt, e] = mail.parseaddress(a.string())
+    ck(e, "round-trip parse")
+    testing.expect_streq(rt.name, "Gogh Fir", "round-trip name")
+    testing.expect_streq(rt.address, "gf@example.com", "round-trip addr")
+    // name needing RFC 2047 — Q-encoding for printable names
+    n := new(mail.Address)
+    n.name = "Gogh é"
+    n.address = "g@e.com"
+    enc := n.string()
+    testing.expect_streq(enc, "=?UTF-8?Q?Gogh_=C3=A9?= <g@e.com>", "Q-encoded name")
+    [back, e2] = mail.parseaddress(enc)
+    ck(e2, "encoded round-trip")
+    testing.expect_streq(back.name, "Gogh é", "decoded round-trip")
+    // name with specials base64-encodes whole (Go's rule)
+    q := new(mail.Address)
+    q.name = "a \"b\" é"
+    q.address = "g@e.com"
+    testing.expect_streq(q.string(), "=?UTF-8?B?YSAiYiIgw6k=?= <g@e.com>", "B-encoded name")
+    // local part that isn't dot-atom gets quoted
+    lq := new(mail.Address)
+    lq.name = ""
+    lq.address = "two words@x.io"
+    testing.expect_streq(lq.string(), "<\"two words\"@x.io>", "quoted local")
+    // display comment form formats back
+    [cm, e3] = mail.parseaddress("gf@example.com (Gogh Fir)")
+    ck(e3, "comment parse")
+    testing.expect_streq(cm.string(), "\"Gogh Fir\" <gf@example.com>", "comment to string")
+}

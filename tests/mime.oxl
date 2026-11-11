@@ -1,0 +1,113 @@
+package main
+
+// std acceptance: mime — extension tables, media-type parse/format,
+// quoted values, RFC 2231 encoded/continued params.
+import "std/mime"
+
+import "std/testing"
+
+import "std/errors"
+
+fn ck(e: err, m: str) {
+    testing.expect(e == nil, m + ": " + errors.msg(e))
+}
+
+fn test_extensions() {
+    testing.expect_streq(mime.typebyextension(".html"), "text/html; charset=utf-8", "html")
+    testing.expect_streq(mime.typebyextension(".JSON"), "application/json", "json case-insensitive")
+    testing.expect_streq(mime.typebyextension(".png"), "image/png", "png")
+    testing.expect_streq(mime.typebyextension(".wasm"), "application/wasm", "wasm")
+    testing.expect_streq(mime.typebyextension(".nope"), "", "unknown ext")
+    testing.expect_streq(mime.typebyextension(""), "", "empty ext")
+    [exts, e] = mime.extensionsbytype("text/html")
+    ck(e, "extensionsbytype")
+    testing.expect_eq(len(exts), 2, "html exts count")
+    testing.expect_streq(exts[0], ".htm", "html ext 0")
+    testing.expect_streq(exts[1], ".html", "html ext 1")
+    // media-type params are ignored for lookup
+    [e2, ee] = mime.extensionsbytype("text/plain; charset=us-ascii")
+    ck(ee, "extensionsbytype params")
+    testing.expect_streq(e2[0], ".txt", "txt ext")
+    [e3, ee3] = mime.extensionsbytype("image/jpeg")
+    ck(ee3, "jpeg")
+    testing.expect_eq(len(e3), 2, "jpeg count")
+    testing.expect_streq(e3[0] + e3[1], ".jpeg.jpg", "jpeg exts sorted")
+    [_, bad] = mime.extensionsbytype("not a type")
+    testing.expect(bad != nil, "bad media type errors")
+}
+
+fn test_parsemediatype() {
+    [mt, e] = mime.parsemediatype("text/html; charset=utf-8")
+    ck(e, "basic")
+    testing.expect_streq(mt.typ, "text/html", "type")
+    testing.expect_streq(mime.pget(mt.params, "charset"), "utf-8", "charset")
+    // case-insensitive type + attr names; values keep case
+    [mt2, e2] = mime.parsemediatype("Text/HTML; Charset=UTF-8")
+    ck(e2, "case")
+    testing.expect_streq(mt2.typ, "text/html", "type lowered")
+    testing.expect_streq(mime.pget(mt2.params, "charset"), "UTF-8", "value case kept")
+    // quoted-string value
+    [mt3, e3] = mime.parsemediatype("attachment; filename=\"a b.txt\"")
+    ck(e3, "quoted")
+    testing.expect_streq(mime.pget(mt3.params, "filename"), "a b.txt", "quoted value")
+    // quoted escapes — MSIE rule: \ only escapes a tspecial
+    [mt4, e4] = mime.parsemediatype("x/y; a=\"b\\\"c\"")
+    ck(e4, "quoted escape")
+    testing.expect_streq(mime.pget(mt4.params, "a"), "b\"c", "escaped quote")
+    // bare type with no params
+    [mt5, e5] = mime.parsemediatype("application/json")
+    ck(e5, "bare")
+    testing.expect(mt5.params == nil, "no params")
+    // trailing semicolon is not an error
+    [mt6, e6] = mime.parsemediatype("text/plain;")
+    ck(e6, "trailing semi")
+    testing.expect_streq(mt6.typ, "text/plain", "trailing semi type")
+    // RFC 2231 single encoded param
+    [mt7, e7] = mime.parsemediatype("attachment; filename*=utf-8''%E2%82%AC.txt")
+    ck(e7, "2231 single")
+    testing.expect_streq(mime.pget(mt7.params, "filename"), "€.txt", "2231 decoded")
+    // RFC 2231 continuations merge in order
+    [mt8, e8] = mime.parsemediatype("attachment; filename*0=\"foo\"; filename*1=\"bar\"; filename*2*=%20baz")
+    ck(e8, "2231 cont")
+    testing.expect_streq(mime.pget(mt8.params, "filename"), "foobar baz", "continuation")
+    // errors
+    [_, m1] = mime.parsemediatype("")
+    testing.expect(m1 != nil, "empty errors")
+    [_, m2] = mime.parsemediatype("text")
+    testing.expect(m2 == nil, "bare token is a media type")
+    [_, m3] = mime.parsemediatype("text/")
+    testing.expect(m3 != nil, "missing subtype errors")
+    [_, m4] = mime.parsemediatype("te xt/html")
+    testing.expect(m4 != nil, "space in type errors")
+    [_, m5] = mime.parsemediatype("text/html; a=1; a=2")
+    testing.expect(m5 != nil, "duplicate param errors")
+    [_, m6] = mime.parsemediatype("text/html; =v")
+    testing.expect(m6 != nil, "empty attr errors")
+}
+
+fn test_formatmediatype() {
+    p := new(mime.Param)
+    p.k = "charset"
+    p.v = "utf-8"
+    p.next = nil
+    testing.expect_streq(mime.formatmediatype("text/html", p), "text/html; charset=utf-8", "format basic")
+    // params sort by attribute name
+    q := new(mime.Param)
+    q.k = "zeta"
+    q.v = "1"
+    q.next = p
+    testing.expect_streq(mime.formatmediatype("Text/HTML", q), "text/html; charset=utf-8; zeta=1", "format sorted+lowered")
+    // a value with specials RFC-2231-encodes
+    r := new(mime.Param)
+    r.k = "filename"
+    r.v = "a b.txt"
+    r.next = nil
+    testing.expect_streq(mime.formatmediatype("attachment", r), "attachment; filename*=utf-8''a%20b.txt", "format encoded")
+    // invalid input formats to ""
+    testing.expect_streq(mime.formatmediatype("not a type", nil), "", "format rejects bad type")
+    testing.expect_streq(mime.formatmediatype("text/html", nil), "text/html", "format no params")
+    // round-trip: formatted output re-parses
+    [rt, e] = mime.parsemediatype(mime.formatmediatype("attachment", r))
+    ck(e, "round-trip")
+    testing.expect_streq(mime.pget(rt.params, "filename"), "a b.txt", "round-trip value")
+}

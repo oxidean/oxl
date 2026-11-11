@@ -14,15 +14,23 @@ you want verdicted, and again after the last fix commit.
       (demand-driven — no `tdesc`, no table), deduplicated, emitted
       into the binary's static data by `codegen.rs` AND
       `codegen.oxl` (records per the contract incl. `elem_ptr` for
-      `[]own T` element slots and named-variant payload names);
+      `[]own T` element slots and named-variant payload names;
+      indices in first-mention order through the existing
+      decl/inst emission traversal — the fixpoint diffs emitted C
+      byte-level — and initializers spelled `sizeof(struct
+      o_s_*)`/`offsetof(...)`, which keeps layout C-truth AND
+      pulls desc-referenced decls live through the textual-edge
+      reachability that prunes dead decls);
       `tdesc(T)` intrinsic folded at instantiation (yields the
       descriptor index) plus sibling `tqual(T)` (0/own/ref/mut —
       `%v`'s `&{…}` mechanism, frozen decision per the contract);
       `value_of`/`value_of_mut` intrinsics + the scope-bound-`Value`
       rules in both checkers — the *provenance* rule (a `Value`
       returns only when derived from a `ref`/`mut`/`Value` param;
-      locally-derived Values never return/store/spawn) plus the
-      no-struct-literal fabrication guard, NOT a reuse of the
+      no `Value` of any provenance stores into a file-scope
+      global, a heap shape, or `spawn`) plus the fabrication
+      guard — no struct literals AND no field writes on a `Value`
+      outside `std/reflect`, NOT a reuse of the
       signature-level `ref` bans — note the pre-existing diag-parity
       gap this sits on: check.rs bans `ref`/`mut` under `Ret::One`
       only while check.oxl also bans `Ret::Pair`; the `type_of`
@@ -30,29 +38,39 @@ you want verdicted, and again after the last fix commit.
       precedent — NOT a callable generic, params bind only from
       args); `rt_desc_*` descriptor accessors (the lazy read lane
       `Type`/`Field` methods wrap, incl. `rt_desc_v_base` for the
-      codegen-pinned union-blob offset — never a fixed +8), the
+      codegen-pinned union-blob offset — never a fixed +8,
+      `rt_desc_v_f_name` for named payload slots, and
+      `rt_desc_alloc`, the decode lane's zeroed-pointee mint), the
       `rt_field_*` extern read AND `rt_field_set_*` write helpers in
-      ALL width lanes (i64/i32/u8/f64/str/ptr — `bool` fields and
-      enum tags are C `int` 4B, `byte` 1B; an i64-only lane would
-      misread every one); parity test
+      ALL width lanes (i64/i32/u8/f64/str/cstr/ptr — `bool`
+      fields and enum tags are C `int` 4B, `byte` 1B; an i64-only
+      lane would misread every one); parity test
       `tests/desc_parity.oxl` asserting
       name/kind/size/fields/offsets/variants for fixture struct and
       enum types under both drivers, wired into `tests/run.sh`.
       Exit: table emits on tdesc-reach, intrinsics resolve, offsets
       match C layout on both drivers.
 - [ ] **R2 — `std/reflect` lite + `fmt %v` (closes #28).**
-      `std/reflect` (`Type`/`Field`/`Value`, `type_of`, `value_of`,
-      kind-checked reads); `std/fmt`: `sprintv`/`printv`/`vfmt`
-      verbs `%v` `%+v` `%T` `%#v` — `%v` prints Go's default forms
-      (`{v1 v2}` for structs, `&{…}` for ptrs, scalar forms per
-      kind, variant name for enums), `%+v` adds field names
-      (`{f1:v1 f2:v2}`), `%T` the type name, `%#v` the
-      source-literal form for the repr kinds that have one.
+      `std/reflect` (`Type`/`Field`/`Variant`/`Value`, `type_of`,
+      `value_of`/`value_of_mut`, kind-checked reads/writes incl.
+      the enum lanes `tag`/`set_tag`/`vfield`/`fname`, the decode
+      mint `alloc_field`, and the cstr/PTR lane); `std/fmt`:
+      `sprintv`/`printv`/`vfmt` verbs `%v` `%+v` `%T` `%#v` — `%v`
+      prints Go's default forms (`{v1 v2}` for structs, `&{…}`
+      for ptrs, scalar forms per kind, variant name for enums),
+      `%+v` adds field names (`{f1:v1 f2:v2}`), `%T` the type
+      name, `%#v` the source-literal form for the repr kinds that
+      have one.
       `tests/fmt_v.oxl` + `tests/reflect.oxl` gate every kind,
       wired into `tests/run.sh`.
 - [ ] **R3 — typed error payloads (completes #27).** `std/errors`:
       `box[T any](v: T)` minting int64 codes backed by the rt err
-      registry (binds T from `v` — that is what `tdesc(T)` needs).
+      registry — `box` is a global compiler-lowered builtin in
+      the `value_of`/`mkslice` family (no extern signature can
+      carry a generic `T`/`own` payload into an int slot; binds T
+      from `v` — that is what `tdesc(T)` needs). `as` stays an
+      ordinary generic fn — `value_of_mut(out)` already yields
+      the writable `*out` address its rt extern consumes.
       Rt change, named here because today's `RtErrEnt`
       (`{next, mlen, cause, msg}`) has no payload slots: extend the
       entry with `{td, pdata}` — a box IS an `err` end to end and
@@ -63,16 +81,28 @@ you want verdicted, and again after the last fix commit.
       box answers `as` exactly once — the only move-safe shape (a
       shallow copy would alias `own` handles, a borrow can't be
       expressed); `as` walks the `unwrap` chain like Go's As —
-      first descriptor match wins;
-      `docs/semantics/errors.md` gains a section recording the
-      box lane.
+      first descriptor match wins; matching is exact-descriptor —
+      an iface-typed `out` matches only a box that stored that
+      same iface descriptor (no implementability walk:
+      descriptors carry no method sets, so `as` on an iface
+      target is strictly weaker than Go's, by design);
+      `docs/semantics/errors.md` is created with a section
+      recording the box lane — incl. payload lifetime: boxed
+      payloads live in the capped, never-freed `RtErrEnt`
+      registry (`RT_ERR_MAX` 65536, no dedupe — `as` clears the
+      slots it consumes but frees nothing), so `box` is for error
+      paths, not hot loops.
       `tests/errors_as.oxl`: box → as round-trip incl. no-match
       and wrapped-chain cases, wired into `tests/run.sh`.
 - [ ] **R4 — `encoding/gob`.** Descriptor-driven struct → bytes →
       struct round-trip (the canonical hard consumer — if the walk
       is wrong here, nothing downstream is trusted): wire format
       per Go's gob shape (type preamble + field-number deltas),
-      `[]byte`/`str`/scalars/nested structs/slices.
+      `[]byte`/`str`/scalars/nested structs/slices, enums (tag +
+      payload slots) and `own`-ptr fields — decode mints pointees
+      via `alloc_field`. Consumes R2's `std/reflect` walk surface
+      (`field`/`vfield`/`set_*`/`alloc_field`), so it lands after
+      R2.
       `tests/enc_gob.oxl`: round-trips incl. skip-zero, nested,
       and decode-under-missing-field tolerance; wired into
       `tests/run.sh`.
@@ -86,7 +116,8 @@ you want verdicted, and again after the last fix commit.
       `tests/run.sh`.
 - [ ] **R6 — `database/sql` lite + closeout.** `scan[T any](rows,
       out: mut []T)` column-order-onto-fields + `std/reflect`
-      surface documented in `docs/`; parked-stdlib.md re-measured
+      surface documented in `docs/` — `tests/db_sql.oxl`, wired
+      into `tests/run.sh`; parked-stdlib.md re-measured
       (remaining descriptor-gated items: `runtime/pprof`, plugin
       loading — recorded with their own triggers);
       `docs/reflection.md` user doc. Milestone archived.
@@ -94,9 +125,11 @@ you want verdicted, and again after the last fix commit.
 ## Sequencing
 
 R1 is the compiler-risk stage (both drivers must emit identical
-layouts). R2 retires the headline feature early. R4 deliberately
-precedes R5/R6 — gob's arbitrary-shape round-trip is the strongest
-correctness signal the walk machinery can get before it is spent on
-easier consumers. R3 is independent of R4–R6 and needs only R1
+layouts). R2 retires the headline feature early and lays the
+`std/reflect` surface R4/R5/R6 all consume — every later stage
+orders after it. R4 deliberately precedes R5/R6 — gob's
+arbitrary-shape round-trip is the strongest correctness signal
+the walk machinery can get before it is spent on easier
+consumers. R3 is independent of R4–R6 and needs only R1
 (`tdesc` + the registry change) — it may land any time after R1,
 in parallel with R2.

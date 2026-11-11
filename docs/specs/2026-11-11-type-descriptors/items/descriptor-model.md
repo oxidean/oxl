@@ -8,7 +8,10 @@ transitively, every type its descriptor points at (`elem`,
 `fields[].td`). Emission is demand-driven, not per instantiation:
 `hello.oxl` names no `tdesc` and stays table-free, matching the
 repo's dead-code/size discipline. Records are deduplicated by type
-identity:
+identity; indices are assigned in first-mention order — the
+sequence each driver meets `tdesc` references in its existing
+decl/instantiation emission traversal — so the fixpoint's
+byte-level C diff sees identical tables:
 
 ```
 TypeDesc {
@@ -41,8 +44,11 @@ Named payloads (`E.V{ a: t }`) keep their declared names — gob/xml
 need them for named-payload variants — and positional payloads get
 `name: ""`. Payload-carrying enums are
 walkable end to end: `%v` prints `circle(3.0)`, gob/XML round-trip
-them, and `reflect` exposes them — a name-only variant table would
-make every payload invisible to all three consumers.
+them (decode writes the tag through the `rt_field_set_i32` lane on
+`v.addr` — `v.set_tag(i)` — then payload slots through
+`v.vfield(vi, fi)` Values), and `reflect` exposes them — a
+name-only variant table would make every payload invisible to all
+three consumers.
 
 `FieldDesc.ptr` is `1` when the declared field type carries `own`
 (the only qualifier legal in field position — `ref`/`mut` can't be
@@ -50,6 +56,16 @@ heap-stored): the slot then holds a pointer to `td`'s layout, so
 `field(i)` dereferences the slot once and yields the pointee
 `Value`. A nil `own` slot yields `err_nil` — never a read of a
 zeroed address. `ptr` is `0` everywhere else.
+
+Table initializers spell `sizeof(struct o_s_*)` /
+`offsetof(struct o_s_*, f)` / `offsetof(struct o_en_*, u.v*)` —
+never precomputed integers. Two effects are pinned: emitted
+layout stays C-truth on each driver, and because the unit pass
+decides dead-decl reachability on the emitted text itself — any
+`o_*` name a live unit spells is a use edge (`codegen.rs`) — the
+sizeof/offsetof spellings double as the edges that pull every
+desc-referenced decl live. A descriptor naming a type keeps that
+type emitted.
 
 `kind` values: `INT, FLOAT, BOOL, STR, BYTE, SLICE, MAP, STRUCT,
 PTR, CHAN, IFACE, FN, ERR, ENUM, VOID` — order frozen once R1 lands
@@ -95,11 +111,29 @@ context `tdesc` takes a concrete type operand identically.
 Non-generic code can also name it: `tdesc(int)` is legal anywhere a
 constant int is.
 
+`tqual(T)` is the sibling intrinsic at the same fold site: it
+yields `0`/`1`/`2`/`3` for an unqualified/`own`/`ref`/`mut`
+binding of `T` — the generic binding carries the qualifier, so a
+`sprintv[own Point]` instantiation statically knows to print the
+`&{…}` form and `value_of` knows the handle needs one deref.
+Qualified-`T` normalization is pinned the same way for both:
+`tdesc(own T)`/`tdesc(ref T)`/`tdesc(mut T)` resolve to the
+wrapped `T`'s descriptor (the value described is a `T` — the
+qualifier lives on the slot, not the layout) while `tqual`
+returns which slot shape was bound.
+
 `type_of` on the public surface is a **builtin special form**, not a
 callable fn — generic type parameters bind only from call
 arguments, so `type_of[T any]()` would be uncallable; the
 `mkslice(byte, n)` parsing precedent applies: `type_of(Point)` takes
-a type operand and folds to `Type{tdesc(Point)}`. Inside a generic
+a type operand and folds to `Type{tdesc(Point)}`. The operand
+grammar is mkslice's exactly — an Ident type name or a type
+literal, so `type_of([]byte)`, `type_of(own Point)`, and
+`type_of(chan own T)` (inside a generic body) all parse;
+`type_of`/`value_of`/`value_of_mut`/`box` are global builtins in
+the `mkslice`/`push` family, resolved by the checker with no
+import — a package signature could never express a type operand
+or the ref→int/`own`→slot lowering. Inside a generic
 body `type_of(T)` resolves per instantiation identically. `Type`
 and `Field` are table handles — `std/reflect` wraps `rt_desc_*`
 accessors in methods rather than materializing `[]Field`/`str`
@@ -115,15 +149,21 @@ there is no other way to turn a reference into an address (no
 generic externs are not a surface R opens). "Only the intrinsics"
 is enforced: the language has no private fields, so the
 scope-bound flag additionally rejects `reflect.Value{...}`
-struct literals outside `std/reflect` — fabrication would
-otherwise be arbitrary-memory access. Field walks add `off` to
+struct literals AND field writes on a `Value` outside
+`std/reflect` — `v.addr`/`v.mut` are public ints, so either
+lane would otherwise mint an address/writability the intrinsics
+never blessed (field reads stay open). The `poke8`/`poke16`/
+`poke32` builtins already write arbitrary memory by design, so
+the guard protects the `td`↔`addr` invariant the kind-checked
+lanes rely on, not the address space. Field walks add `off` to
 `addr` and propagate `mut`; reads go through externs that
 interpret `addr` per the desc's kind:
 
 Field reads — trivial C loads interpreting `addr` per the desc's kind:
 
 ```
-extern fn rt_field_i64(addr: int) -> int     // INT lane (8B)
+extern fn rt_field_i64(addr: int) -> int     // INT + ERR lane (8B —
+                                             //  ERR yields the code)
 extern fn rt_field_i32(addr: int) -> int     // BOOL + enum tag lane
                                              // (C `int`, 4B — an i64
                                              // load would pull adjacent
@@ -131,6 +171,10 @@ extern fn rt_field_i32(addr: int) -> int     // BOOL + enum tag lane
 extern fn rt_field_u8(addr: int) -> int      // BYTE lane (1B)
 extern fn rt_field_f64(addr: int) -> float
 extern fn rt_field_str(addr: int) -> str       // borrow — same lifetime as v
+extern fn rt_field_cstr(addr: int) -> str      // PTR lane — rt-str build
+                                               //  over the stored char*
+                                               //  (strlen — NOT an RtStr
+                                               //  header load)
 extern fn rt_field_ptr(addr: int) -> int       // raw field address
 ```
 
@@ -166,33 +210,49 @@ extern fn rt_desc_f_ptr(td: int, i: int) -> int // 1: slot is a ptr
 extern fn rt_desc_v_nfields(td: int, vi: int) -> int   // enum payload
 extern fn rt_desc_v_f_td(td: int, vi: int, fi: int) -> int
 extern fn rt_desc_v_f_off(td: int, vi: int, fi: int) -> int
+extern fn rt_desc_v_f_name(td: int, vi: int, fi: int) -> str
+                                             // "" for positional slots
 extern fn rt_desc_v_base(td: int) -> int     // union blob base offset —
                                              // codegen-pinned offsetof(u);
                                              // NOT a fixed constant (tag is
                                              // C `int` 4B; alignment varies)
+extern fn rt_desc_alloc(td: int) -> int      // decode lane's object mint —
+                                             // zeroed rt_alloc_own of the
+                                             // desc's `size`, returned as
+                                             // the raw address; store into
+                                             // an own field slot via
+                                             // rt_field_set_ptr, then walk
+                                             // it as {td, addr, mut:1}
 ```
 
 All are trivial C; the ONLY unsafe surface is inside `std/reflect`
 (`unsafe` blocks around the addr arithmetic). The emitted `align`
-field is consumed only by the C helpers' own address math — no
+field is for the parity test and external ABI readers — rt
+helpers do no align math (offsets are already absolute) and no
 oxl-side accessor is needed.
 
 **`Value` lifetime is enforced, not conventional — via
-provenance, not the `ref` signature bans.** Two ints carry no
+provenance, not the `ref` signature bans.** Three ints carry no
 borrow marker, so the checker can't rely on the `ref` rules
 alone — and a literal reuse of those rules would also reject this
 surface's own `-> [Value, err]` methods (check.oxl bans `ref`/
 `mut` under `Ret::Pair` too; `[]T` returns are banned under both).
-The pinned rule: `reflect.Value` is a **scope-bound type** — a
+The pinned rule: `reflect.Value` is a **scope-bound type** — the
+flag attaches at the decl (the checker marks `std/reflect`'s
+`Value` struct by decl site; no marker syntax ships in v1) — a
 `Value` may be returned only when it derives from one of the
 function's `ref`/`mut`/`Value` parameters (the checker tracks
-Value provenance through assignments and `field`/`index` walks,
-the same machinery it uses for borrow provenance). A `Value`
+Value provenance through assignments and `field`/`index`/`vfield`
+walks — new, Value-only machinery; today's borrow rules are
+type-position bans, not a provenance pass). A `Value`
 derived from a *local* `own` — `c := new(v); return value_of(c)`
 is the real dangling case, since `p`-derived Values address
-caller-owned storage — may not be returned, stored in `own`/heap
-shapes, or sent to `spawn`. `v.field(i)`/`v.index(i)` yield
-scope-bound `Value`s deriving from `v`. Inside `std/reflect` this
+caller-owned storage — may not be returned, and no `Value` of
+any provenance may be stored into a file-scope global, stored in
+`own`/heap shapes, or sent to `spawn` (param-derived Values
+dangle in those slots identically — return is the only escape
+the rule opens). `v.field(i)`/`v.index(i)`/`v.vfield(vi, fi)`
+yield scope-bound `Value`s deriving from `v`. Inside `std/reflect` this
 is enough machinery to write the whole walk; outside, a `Value`
 can live only as long as its source's scope. Kind mismatches
 return a `reflect.err_kind` err code, never garbage. (`err_kind`,
@@ -212,13 +272,18 @@ return a `reflect.err_kind` err code, never garbage. (`err_kind`,
 
 `SLICE` values are walkable: `v.len()` reads the slice header's
 `len`, `v.index(i)` yields a scope-bound `Value` at
-`data + i*elem.size`. `index` rejects `i < 0 || i >= v.len()` with
+`data + i*stride`, where `stride` is pointer size when `elem_ptr`
+is set (the slot holds a pointer to `elem`'s layout and derefs
+once, like `FieldDesc.ptr`) or `elem.size` for inline elements.
+`index` rejects `i < 0 || i >= v.len()` with
 `err_oob` BEFORE the address math — the emitted address must never
 leave the slice's data window. The contract pins the emitted header layout
 — `RtSlice{ptr:int, len:int, cap:int, heap:int}` (`rt.h`) — as the
 read surface; both drivers already agree since they share the C
 layout. `CHAN`, `FN`, and `IFACE` kind values are read-opaque:
 `v.len()`/`v.index(i)`/typed reads on them return `err_kind`.
+`PTR` is not opaque — `v.str()` reads it through `rt_field_cstr`;
+`ERR` reads its code through `v.int()` (the i64 lane).
 
 ## Fixpoint parity
 

@@ -86,7 +86,7 @@ The poll-machine lowering per `items/suspension.md`:
   drain, `is_root` → `rt_is_root`.
 - `spawn`/`go`/`goin`/`spawnBlocking`: susp callees →
   `rt_task_new`/`rt_task_new_in` + `rt_spawn_task`/`rt_spawnb_task`;
-  non-susp callees → args struct + `o_tramp`-band `ptr(ptr)` thunks
+  non-susp callees → args struct + `l_tr_`-band `ptr(ptr)` thunks
   + `rt_spawn`/`rt_spawnb` — identical split to the C lane.
 - Chans: `rt_mkchan`/`rt_mkchan_scoped` (+ `o_drop_*` elem dtors),
   `send`/`recv`/`try_send`/`close`, `rt_send_poll`/`rt_recv_poll`,

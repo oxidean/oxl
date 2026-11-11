@@ -3,10 +3,12 @@
 ## Scope
 
 The parked LLVM backend from `docs/specs/2026-11-07-phase-2-plan/
-parked.md`, un-parked on the second-consumer trigger: milestone W
-landed a `--target js` emit lane behind the codegen seam, so the seam
-is proven — two sibling emitters consume `check.CkRes` today
-(`bootstrap/codegen/codegen.oxl`, `bootstrap/codegen/js.oxl`). A third
+parked.md`, un-parked on the second-consumer trigger: milestone W's
+`--target js` emit lane — in flight on `feat/milestone-w` (PR #66),
+sequenced to merge before L starts — puts a second emitter behind the
+codegen seam, so the seam is proven: two sibling emitters consume
+`check.CkRes` (`bootstrap/codegen/codegen.oxl`,
+`bootstrap/codegen/js.oxl`). A third
 lane is no longer a hypothetical the seam was designed for; it is a
 pattern with two instances. Lands as `bootstrap/codegen/llvm.oxl` +
 a `oxl --target llvm` driver lane + a clang-gated test section. No new

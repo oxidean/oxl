@@ -18,7 +18,7 @@ Two layout domains with different rules:
   the same triple. No guessing at C layout: identical field lists at
   identical widths on identical datalayout is the whole argument.
 - **Lane-owned types are self-consistent.** `%o_s_*`, `%o_en_*`,
-  `%o_ret_*`, `%o_frm_*` (past the `RtFrame` header), `%o_denv_*`,
+  `%o_ret_*`, `%o_frm_*` (past the `RtFrame` header), `%o_env_*`,
   vtab arrays: no C code ever sees their layout, so the lane picks
   the simplest self-consistent form — noted per type below.
 
@@ -88,8 +88,9 @@ define void @oxl_main() { … }
   assumed, and it assumes 8 with over-reservation being safe.
 - **Symbols keep the C lane's names.** `o_f_`, `o_s_`, `o_en_`,
   `o_ret_`, `o_vret_`, `o_frm_`, `o_poll_`, `o_g_`, `o_cl_`,
-  `o_denv_`, `o_def_` (defer thunks), `o_vt_`, `o_drop_`,
-  `o_tramp`-band spawn thunks, `oxl_main`. The `o_*` scheme is what
+  `o_env_` (closure env structs), `o_denv_`, `o_def_` (defer
+  thunks), `o_vt_`, `o_drop_`, `l_tr_`-band spawn thunks over
+  `o_args_` structs, `oxl_main`. The `o_*` scheme is what
   G1 registers as defs; spelled under `@`/`%` the token scan
   (`gscan`'s `[A-Za-z_][A-Za-z0-9_]*` walk) picks them up
   identically — `@o_f_main` yields token `o_f_main`. Extern names
@@ -145,7 +146,7 @@ define void @oxl_main() { … }
 - Externs: `declare` per used extern (G1-dropped when unused),
   spelled with the `gcty`-mapped signature; `[T, err]` extern rets
   degrade to `i64` exactly like `gret_c(is_oxl=false)`.
-- `cl` closures: `%o_denv_<fn>_<i>` env struct + `o_cl_<id>`
+- `cl` closures: `%o_env_<fn>` env struct + `o_cl_<id>`
   (`define` taking `(ptr env, …)` + a captured-env alloca/copy —
   same copy-capture semantics; `RtFnv` pairs `{env, fp}` emitted as
   the constant pair or a computed pair where env is dynamic).
@@ -281,9 +282,10 @@ exceeds a real alignment.
 - `int` arithmetic is unguarded exactly where C is: `mul`/`add`/
   `sub` wrap (the C lane's unsigned-mul UB dodge has no IR analog —
   plain ops wrap by definition); `sdiv`/`srem` emit unguarded —
-  a zero divisor faults in the backend's `idiv` the same way the
-  C lane's `/` SIGFPEs. Making it a `rt_trap` would be an
-  observable divergence, not a safety win. Byte-width ops keep the
+  division by zero is IR poison whose fault behavior is whatever
+  the backend's `idiv` lowering produces (in practice the same
+  SIGFPE-class fault the C lane's `/` gives). Making it a
+  `rt_trap` would be an observable divergence, not a safety win. Byte-width ops keep the
   C lane's `& 0xff` result masking (`(uint8_t)(l op r)` →
   `and i32 …, 255` then `trunc i8`).
 - `usleep` stays a real block — inline `call void @rt_usleep(i64)`,

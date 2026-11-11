@@ -387,9 +387,9 @@ fn needsquote(s: str) -> bool {
             continue
         }
         d := utf8.decode(s, i)
-        // malformed input decodes (RuneError, 1) — quotes via the
-        // \ufffd path in quotetxt, matching Go's needsQuoting
-        if d.n == 1 && d.r == 65533 {
+        // RuneError (malformed input or a real U+FFFD) quotes via
+        // the \ufffd path in quotetxt, matching Go's needsQuoting
+        if d.r == 65533 {
             return true
         }
         if !runeprint(d.r) {
@@ -417,15 +417,24 @@ fn quotetxt(s: str) -> str {
             out = out + "\\r"
         } else if c == 9 {
             out = out + "\\t"
+        } else if c == 7 {
+            out = out + "\\a"
+        } else if c == 8 {
+            out = out + "\\b"
+        } else if c == 11 {
+            out = out + "\\v"
+        } else if c == 12 {
+            out = out + "\\f"
         } else if c < 32 || c == 127 {
             out = out + "\\x" + substr("0123456789abcdef", c / 16, c / 16 + 1) + substr("0123456789abcdef", c % 16, c % 16 + 1)
         } else if c >= 128 {
             d := utf8.decode(s, i)
-            if d.n == 1 && d.r == 65533 {
-                // invalid UTF-8 escapes as the literal �
-                // marker (Go's strconv shape)
+            if d.r == 65533 {
+                // RuneError escapes as the literal � marker;
+                // advance d.n so a real U+FFFD (n=3) is consumed
+                // whole, malformed bytes take n=1 (Go's strconv shape)
                 out = out + "\\ufffd"
-                i = i + 1
+                i = i + d.n
                 continue
             }
             if !runeprint(d.r) {

@@ -104,5 +104,18 @@ fn test_quoting() {
     b4 = push(b4, 128)
     b4 = push(b4, 139)
     slog.error("quote-check", slog.str_("zwsp", b4 as str))
+    // short escapes \a \b \v \f and a VALID U+FFFD (EF BF BD)
+    // — both take the \ufffd/\xNN-free paths Go's strconv uses
+    b5 := mkslice(byte, 0)
+    b5 = push(b5, 7)
+    b5 = push(b5, 8)
+    b5 = push(b5, 11)
+    b5 = push(b5, 12)
+    slog.error("quote-check", slog.str_("esc", b5 as str))
+    b6 := mkslice(byte, 0)
+    b6 = push(b6, 239)
+    b6 = push(b6, 191)
+    b6 = push(b6, 189)
+    slog.error("quote-check", slog.str_("ufffd", b6 as str))
     testing.expect(true, "quoting emits did not crash")
 }

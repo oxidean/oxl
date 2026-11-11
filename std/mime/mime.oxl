@@ -493,9 +493,21 @@ fn parsemediatype(v: str) -> [own MediaType, err] {
         value := substr(kv.a, eq + 1, len(kv.a))
         if find(key, "*") >= 0 {
             basename := substr(key, 0, find(key, "*"))
-            // any repeated continuation member is a dup, Go-parity
+            lb := lwr(basename)
+            // multipart/ and the RFC 2045 charset/boundary params
+            // never take RFC 2231 continuations — skip them like Go
+            if find(mt, "multipart/") == 0 || lb == "charset" || lb == "boundary" {
+                rest = kv.rest
+                continue
+            }
+            // Go-parity: only CONFLICTING continuation repeats error;
+            // an identical repeat is a no-op (no extra Cont node)
             m := contfindv(cont, key)
             if m.found {
+                if m.v == value {
+                    rest = kv.rest
+                    continue
+                }
                 return nil, errors.new("mime: duplicate parameter name")
             }
             c := new(Cont)

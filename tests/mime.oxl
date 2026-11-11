@@ -83,6 +83,14 @@ fn test_parsemediatype() {
     testing.expect(m5 != nil, "duplicate param errors")
     [_, m6] = mime.parsemediatype("text/html; =v")
     testing.expect(m6 != nil, "empty attr errors")
+    // RFC 2231 params on multipart/ and charset/boundary are
+    // skipped — the plain params win like Go's ParseMediaType
+    [mt10, e10] = mime.parsemediatype("multipart/form-data; boundary*=utf-8''xyz; boundary=abc")
+    ck(e10, "multipart boundary*")
+    testing.expect_streq(mime.pget(mt10.params, "boundary"), "abc", "multipart boundary kept")
+    [mt11, e11] = mime.parsemediatype("text/html; charset*=utf-8''utf-8; charset=us-ascii")
+    ck(e11, "charset*")
+    testing.expect_streq(mime.pget(mt11.params, "charset"), "us-ascii", "charset kept")
     // empty extended value decodes to "" without dropping (Go's
     // decode2231Enc("") yields ("", true))
     [mt9, e9] = mime.parsemediatype("attachment; filename*=utf-8''")
@@ -131,7 +139,10 @@ fn test_dupparam() {
     testing.expect_streq(mime.pget(m1.params, "a"), "1", "same-value kept")
     [_, e2] = mime.parsemediatype("text/plain; a=1; a=2")
     testing.expect(e2 != nil, "diff-value dup rejects")
-    // continuation member dup
+    // continuation member dup — identical repeats are a no-op
+    [m5, e5] = mime.parsemediatype("text/plain; filename*0=a; filename*0=a")
+    ck(e5, "same member dup parses")
+    testing.expect_streq(mime.pget(m5.params, "filename"), "a", "same member kept")
     [_, e3] = mime.parsemediatype("text/plain; filename*0=a; filename*0=b")
     testing.expect(e3 != nil, "member dup rejects")
     // distinct keys still parse

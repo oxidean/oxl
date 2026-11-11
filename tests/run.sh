@@ -262,6 +262,8 @@ grep -q '"empty"' <<<"$out" && { echo "FAIL slog empty group: $out"; exit 1; }
 grep -q '"gone"' <<<"$out" && { echo "FAIL slog bound empty group: $out"; exit 1; }
 grep -q 'bad="\\ufffd"' <<<"$out" || { echo "FAIL slog ufffd quoting: $out"; exit 1; }
 grep -q 'del="\\x7f"' <<<"$out" || { echo "FAIL slog del quoting: $out"; exit 1; }
+grep -q 'esc="\\a\\b\\v\\f"' <<<"$out" || { echo "FAIL slog short escapes: $out"; exit 1; }
+grep -q 'ufffd="\\ufffd"' <<<"$out" || { echo "FAIL slog valid ufffd: $out"; exit 1; }
 true
 
 echo "== oxl test: regexp (s5) =="

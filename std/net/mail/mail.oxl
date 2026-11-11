@@ -331,9 +331,10 @@ fn try_addrspec(p: mut P) -> [str, err] {
 }
 
 // consumedomainliteral reads `[...]` — domain literals:
-// `[127.0.0.1]` (IPv4 dotted quad), `[IPv6:::1]` (RFC 5321 tagged
-// IPv6 — an oxl superset; Go's mail rejects the tag), or a bare
-// `[::1]` (Go's accepted form). Validated by net.isip4/isip6.
+// `[127.0.0.1]` (IPv4 dotted quad) or `[IPv6:...]` tagged
+// literals whose tag parses as an IP — IPv6 or IPv4, so
+// `[IPv6:1.2.3.4]` is accepted. A bare `[::1]` is rejected,
+// matching Go's mail. Validated by net.isip4/isip6.
 // Other bracket contents fail — a literal that can't route is
 // worse than no literal.
 fn consumedomainliteral(p: mut P) -> [str, err] {
@@ -356,17 +357,17 @@ fn consumedomainliteral(p: mut P) -> [str, err] {
         return "", errors.new("mail: empty domain literal")
     }
     if substr(inner, 0, 5) == "IPv6:" {
+        tag := substr(inner, 5, len(inner))
         // isip6 admits a %zone suffix (RFC 6874, needed by url
         // brackets) where Go's ParseIP rejects it in domain
         // literals — a deliberate ultra-edge divergence
-        if !net.isip6(substr(inner, 5, len(inner))) {
+        if !(net.isip6(tag) || net.isip4(tag)) {
             return "", errors.new("mail: invalid IPv6 domain literal")
         }
         return "[" + inner + "]", nil
     }
-    if net.isip6(inner) {
-        return "[" + inner + "]", nil
-    }
+    // bare bracketed IPv6 ("[::1]") is rejected like Go — only
+    // dotted quads pass the untagged path
     if !net.isip4(inner) {
         return "", errors.new("mail: invalid IPv4 domain literal")
     }
@@ -936,7 +937,7 @@ fn (a ref Address) string() -> str {
     }
     // encoded-words can't carry quotes/parens in the display name —
     // base64 hides them entirely (Go's rule)
-    if find_from(a.name, "\"", 0) >= 0 || find_from(a.name, "#", 0) >= 0 || find_from(a.name, "$", 0) >= 0 || find_from(a.name, "%", 0) >= 0 || find_from(a.name, "&", 0) >= 0 || find_from(a.name, "'", 0) >= 0 || find_from(a.name, "(", 0) >= 0 || find_from(a.name, ")", 0) >= 0 || find_from(a.name, ",", 0) >= 0 || find_from(a.name, ".", 0) >= 0 || find_from(a.name, ":", 0) >= 0 || find_from(a.name, ";", 0) >= 0 || find_from(a.name, "<", 0) >= 0 || find_from(a.name, ">", 0) >= 0 || find_from(a.name, "@", 0) >= 0 || find_from(a.name, "[", 0) >= 0 || find_from(a.name, "]", 0) >= 0 || find_from(a.name, "^", 0) >= 0 || find_from(a.name, "`", 0) >= 0 || find_from(a.name, "{", 0) >= 0 || find_from(a.name, "|", 0) >= 0 || find_from(a.name, "}", 0) >= 0 || find_from(a.name, "~", 0) >= 0 {
+    if find_from(a.name, "\"", 0) >= 0 || find_from(a.name, "#", 0) >= 0 || find_from(a.name, "$", 0) >= 0 || find_from(a.name, "%", 0) >= 0 || find_from(a.name, "&", 0) >= 0 || find_from(a.name, "'", 0) >= 0 || find_from(a.name, "(", 0) >= 0 || find_from(a.name, ")", 0) >= 0 || find_from(a.name, ",", 0) >= 0 || find_from(a.name, ".", 0) >= 0 || find_from(a.name, ":", 0) >= 0 || find_from(a.name, ";", 0) >= 0 || find_from(a.name, "<", 0) >= 0 || find_from(a.name, ">", 0) >= 0 || find_from(a.name, "@", 0) >= 0 || find_from(a.name, "[", 0) >= 0 || find_from(a.name, "]", 0) >= 0 || find_from(a.name, "^", 0) >= 0 || find_from(a.name, "`", 0) >= 0 || find_from(a.name, "{", 0) >= 0 || find_from(a.name, "|", 0) >= 0 || find_from(a.name, "}", 0) >= 0 || find_from(a.name, "~", 0) >= 0 || find_from(a.name, "\\", 0) >= 0 {
         return ewords_b(a.name) + " " + s
     }
     return ewords_q(a.name) + " " + s

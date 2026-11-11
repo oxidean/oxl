@@ -160,10 +160,11 @@ fn test_domainliteral() {
     [a2, e2] = mail.parseaddress("a@[IPv6:::1]")
     ck(e2, "ipv6 literal")
     testing.expect(find(a2.address, "[IPv6:::1]") >= 0, "ipv6 kept")
-    // Go's bare bracketed IPv6 form is also accepted
-    [a3, e3] = mail.parseaddress("a@[::1]")
-    ck(e3, "bare ipv6 literal")
-    testing.expect(find(a3.address, "[::1]") >= 0, "bare ipv6 kept")
+    // Go accepts `[IPv6:...]` tagged literals when the tag parses
+    // as an IP — IPv4 included — but rejects bare bracketed IPv6
+    [a3, e3] = mail.parseaddress("a@[IPv6:1.2.3.4]")
+    ck(e3, "tagged ipv4 literal")
+    testing.expect(find(a3.address, "[IPv6:1.2.3.4]") >= 0, "tagged literal kept")
     // rejects: unclosed, empty, bad ipv4, lowercase ipv6 tag
     [_, r1] = mail.parseaddress("a@[")
     testing.expect(r1 != nil, "unclosed rejects")
@@ -173,6 +174,8 @@ fn test_domainliteral() {
     testing.expect(r3 != nil, "bad ipv4 rejects")
     [_, r4] = mail.parseaddress("a@[ipv6:::1]")
     testing.expect(r4 != nil, "lowercase ipv6 tag rejects")
+    [_, r6] = mail.parseaddress("a@[::1]")
+    testing.expect(r6 != nil, "bare ipv6 rejects")
     // a tab inside a display comment separates words, not strips
     [a5, e5] = mail.parseaddress("a@x (Foo\tBar)")
     ck(e5, "comment tab")

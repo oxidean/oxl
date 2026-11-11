@@ -9,8 +9,9 @@ implementation must not improvise.
 
 | field | value |
 |---|---|
+| `random` | 32 bytes fresh `rt_csrand` — per ClientHello; the downgrade-sentinel surface on the ServerHello side |
 | `legacy_version` | 0x0303 (TLS 1.2 encoding position; 1.3 rides `supported_versions`) |
-| `legacy_session_id` | 32 bytes of fresh `rt_csrand` — compat mode §4.1.2; the ServerHello must echo it verbatim (`legacy_session_id_echo` check, `unexpected_message` else) |
+| `legacy_session_id` | 32 bytes of fresh `rt_csrand` — compat mode §4.1.2; the ServerHello must echo it verbatim (`legacy_session_id_echo` check, `illegal_parameter` else — §4.1.3) |
 | `legacy_compression_methods` | single `0x00` (null) — required field, always this value |
 | `supported_versions` | 0x0304 only |
 | `cipher_suites` | `TLS_AES_128_GCM_SHA256` (0x1301), `TLS_CHACHA20_POLY1305_SHA256` (0x1303), `TLS_AES_256_GCM_SHA384` (0x1302) — in that order |
@@ -42,13 +43,18 @@ ClientHello
      extension verbatim (§4.2.2), rebuild CH with a key_share for
      the demanded group if it's x25519/secp256r1/secp384r1
      (`illegal_parameter` alert else); transcript carries the HRR
-     message_hash. A second HRR → `unexpected_message` alert]
+     message_hash; ClientHello#2 reuses the SAME
+     legacy_session_id as #1. A second HRR → `unexpected_message` alert]
   → ServerHello        — must carry `supported_versions`=0x0304
                           (its mandatory pin; a 0x0303-only ServerHello
                           is a 1.2 answer → `protocol_version` alert).
-                          Suite/group echoes must ∈ offered, any
-                          extension we didn't offer →
-                          illegal_parameter; else alert.
+                          Suite echo must ∈ offered; the
+                          selected group must be one whose
+                          key_share we actually sent (post-HRR:
+                          the HRR-demanded group — a group merely
+                          listed in supported_groups carries no
+                          ECDHE secret); any extension we didn't
+                          offer → illegal_parameter; else alert.
                           The peer's key_share validates BEFORE use:
                           x25519 → RFC 7748 all-zero output check
                           (`illegal_parameter` alert — the RFC's
@@ -60,8 +66,10 @@ ClientHello
   → [CertificateRequest mid-flight — answered with an empty
      Certificate message (certificate_list len 0, §4.4.2.4 —
      the RFC-mandated answer; a server requiring client auth
-     then alerts `certificate_required`). mTLS itself stays
-     out of scope.]
+     then alerts `certificate_required`) placed immediately
+     before our CertificateVerify/Finished flight, echoing the
+     request's certificate_request_context verbatim. mTLS
+     itself stays out of scope.]
   → Certificate         — each cert_parse'd; leaf + untrusted chain;
                           per-entry extensions (OCSP staples, SCTs)
                           parsed over, ignored
@@ -72,8 +80,10 @@ ClientHello
                           signature_algorithms and be a CV-legal
                           alg (see below) — else alert. A local
                           verify/chain failure answers with an
-                          alert — bad_certificate for sig/parse,
-                          certificate_expired for validity — not a
+                          alert — CertificateVerify *signature*
+                          failure → decrypt_error (§4.4.3);
+                          chain-signature/parse → bad_certificate;
+                          validity → certificate_expired — not a
                           bare close
   → Finished            — verify_data == HMAC(finished_key, transcript)
   → [client Finished]   — handshake complete; app traffic keys live
@@ -91,7 +101,8 @@ Post-handshake, consume quietly:
   sends it).
 - **KeyUpdate** — `update_requested` → apply peer keys and answer
   `update_not_requested`; `update_not_requested` → apply only.
-  Never initiated by us.
+  Never initiated by us — a sent KeyUpdate rotates the SENDER's
+  traffic secret, so our send keys never rotate in v1.
 - CertificateRequest post-handshake — protocol-illegal here
   (`post_handshake_auth` is never offered), so the strict read is
   `unexpected_message`. We answer leniently instead — the same
@@ -103,14 +114,18 @@ Post-handshake, consume quietly:
 
 ## Key schedule
 
-Standard RFC 8446 §7.1 chain, all through `hkdf.expand_label`:
+Standard RFC 8446 §7.1 chain, all through `expand_label` — `std/net/tls`'s TLS-shaped variant ("tls13 " prefix; plan.md pins the residence):
 
 ```
 early secret   = extract(0, zeros)
 handshake sec  = extract(der(early), ecdhe_shared)
-  → c_hs_traffic / s_hs_traffic  (keys+iv for handshake flight)
+  → c_hs_traffic / s_hs_traffic  (keys+iv for handshake flight —
+     labels "c hs traffic"/"s hs traffic", transcript scoped
+     CH..ServerHello)
 master secret  = extract(der(handshake), zeros)
-  → c_ap_traffic / s_ap_traffic  (keys+iv for app data)
+  → c_ap_traffic / s_ap_traffic  (keys+iv for app data — labels
+     "c ap traffic"/"s ap traffic", transcript scoped
+     CH..server Finished)
 ```
 
 with `finished_key = expand_label(hs_traffic, "finished", "", hlen)`
@@ -130,11 +145,17 @@ the whole HKDF chain against an external answer.
 - `TLSCiphertext`: 5-byte header `{type=23, version=0x0303, len}`;
   fragment ≤ 16384 + 256 expansion — larger inbound →
   `record_overflow` alert.
+- AEAD-open failure → `bad_record_mac` alert (never a bare
+  close — the record layer's only integrity verdict).
 - Handshake messages reassemble across record boundaries and
   coalesce within one record — a Certificate flight routinely
   exceeds one fragment, and several handshake messages may share
   one. The handshake reader buffers until each message's 4-byte
   header length is complete — never assume record == message.
+  The buffer is bounded: pending handshake bytes cap at 256 KiB
+  before a flight completes — a peer streaming fragments without
+  finishing trips `record_overflow` (pre-auth memory stays
+  flat).
 - Nonce: `iv ^ (seq` zero-padded to iv len`)`; seq per direction,
   never reused, reset at each secret epoch; wrap → `err_proto`
   (a seq can never legally wrap in our lifetime anyway).

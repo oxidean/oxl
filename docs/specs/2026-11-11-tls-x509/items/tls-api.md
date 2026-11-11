@@ -20,6 +20,11 @@ struct Config {
                            // skipped — only legal alongside a
                            // non-nil verify, enforced at client().
     roots: x509.Roots,     // Roots{cas: nil} ⇒ load_system_roots()
+                           // — lazily, only when chain verification
+                           // actually runs: a non-nil `verify`
+                           // replaces it, so no security/powershell
+                           // exec ever fires for verify-carrying
+                           // clients
     alpn: []str,           // empty ⇒ no ALPN extension
     verify: Verifier,      // nil ⇒ x509.verify + match_hostname.
                            // Non-nil ⇒ replaces BOTH (chain AND
@@ -105,8 +110,8 @@ struct Url { host: str, port: int, path: str, secure: int }
 struct Client { tmo: int, tlscfg: tls.Config }
 // NB: oxl struct literals are exhaustive — adding `tlscfg` breaks
 // every `Client{tmo: N}` literal in the wild. Accepted churn
-// (one-line fix per site); a `new_client(tmo)` helper exists
-// for literals that want the default.
+// (one-line fix per site); X7 ships a `new_client(tmo)` helper
+// for callers that want the default config.
 // request(): u.secure ⇒ tls.dial_timeout(u.host, u.port, cl.tmo,
 // cl.tlscfg) — cfg.server_name defaulted to u.host when
 // empty, cfg.alpn defaulted to ["http/1.1"] when empty;

@@ -17,12 +17,17 @@ struct Cert {                       // a parsed certificate; fields
     //  only; path linking compares DER, never these strings
     issuer_der: own []byte, subject_der: own []byte,
     //  the raw Name encodings — OWNED copies (not slices into
-    //  `raw`; the cert may outlive its parse buffer)
+    //  `raw`; the cert may outlive its parse buffer). Every `str`/
+    //  `[]str` field above carries the same owned-backing rule —
+    //  contents copied out at parse, never views into `raw`
     not_before: int, not_after: int,//  epoch seconds (UTCTime/GenTime)
     dns_names: own []str,           //  SAN dNSName entries, lowercased
     ip_addrs: own []str,            //  SAN iPAddress entries —
                                    //  v4 dotted quad, v6 RFC 5952
-                                   //  canonical (lowercase, ::)
+                                   //  canonical (lowercase, ::);
+                                   //  match_hostname normalizes the
+                                   //  URL's `[v6]` literal to the
+                                   //  same form before comparing
     is_ca: int,                     //  BasicConstraints cA
     max_path: int,                  //  pathLenConstraint, -1 = unset
     ku: int,                        //  KeyUsage bitmask, -1 = absent

@@ -1,0 +1,236 @@
+package main
+
+// compress acceptance: std/compress/flate + std/compress/zlib —
+// raw-deflate streams in every block flavor (stored, fixed Huffman,
+// dynamic Huffman, multi-block sync-flush), one-shot and streaming
+// reads, truncation reporting, and the zlib header+adler32 wrapper.
+import "std/io"
+
+import "std/compress/flate"
+
+import "std/compress/zlib"
+
+import "std/encoding/hex"
+
+import "std/errors"
+
+import "std/testing"
+
+fn ck(e: err, m: str) {
+    testing.expect(e == nil, m + ": " + errors.msg(e))
+}
+
+fn hx(s: str) -> own []byte {
+    [b, e] = hex.decode(s)
+    ck(e, "hex decode")
+    return b
+}
+
+struct slicereader { b: []byte, i: int }
+
+fn (s mut slicereader) read(b: []byte) -> [int, err] {
+    if s.i >= len(s.b) {
+        return 0, io.eof()
+    }
+    n := len(s.b) - s.i
+    if n > len(b) {
+        n = len(b)
+    }
+    j := 0
+    for j < n {
+        b[j] = s.b[s.i + j]
+        j = j + 1
+    }
+    s.i = s.i + n
+    return n, nil
+}
+
+fn (s mut slicereader) asreader() -> io.Reader {
+    return s
+}
+
+// drain_all reads r to EOF in small chunks — exercises incremental
+// decode, not just the happy path.
+fn drain_all(r: io.Reader, chunk: int) -> [str, err] {
+    out := mkslice(byte, 0)
+    tmp := mkslice(byte, chunk)
+    for true {
+        [n, e] = r.read(tmp)
+        j := 0
+        for j < n {
+            out = push(out, tmp[j])
+            j = j + 1
+        }
+        if e == io.eof() {
+            return out as str, nil
+        }
+        if e != nil {
+            return out as str, e
+        }
+    }
+    return out as str, nil
+}
+
+// hx_b decodes to str — []byte can't cross the return boundary, so
+// call sites cast it back (zero-copy view either way).
+fn hx_b(s: str) -> str {
+    return hx(s) as str
+}
+
+// python: zlib.compressobj(6, zlib.DEFLATED, -15) over b"hello world"
+fn test_fixed() {
+    [out, e] = flate.inflate(hx_b("cb48cdc9c95728cf2fca490100") as []byte)
+    ck(e, "inflate fixed")
+    testing.expect_streq(out as str, "hello world", "fixed huffman payload")
+}
+
+// python: level 0 stored block
+fn test_stored() {
+    [out, e] = flate.inflate(hx_b("011100eeff73746f7265642062797465732068657265") as []byte)
+    ck(e, "inflate stored")
+    testing.expect_streq(out as str, "stored bytes here", "stored payload")
+}
+
+// python: level 9 over 600 skewed-random bytes -> BTYPE=10 dynamic
+fn test_dynamic() {
+    blob := hx_b("25928b9282400c04bf7590780e4a021af1f1f5d77bb75014fbc864d259b5a314c513ca681fd61e0f35b3b6c5725b7229ddae7b6a193b154edf65bbf22887fdcd16521d818a2e5135e7a3a5f9a71965045593cb8e6722a330d22d3ea1b89b5f457e6bf8e8ec988a24b53fdc4c2bf92cc9e81a11eda9b6f7a421ed539633bc6656a772970ee2fb9484fc1570757d704e86462d56954f3a17a9b08b6296aa9209892ad7728db736dfb7ae2303364dbdcf06c17ced49f526aad400430438b1e41e432bb492e70c91b062c357c603f9578f5c3c52aa30c1610afcc4c8889f05bc600ee8355b978183fdfed9abafac63b0eb8f147460ee9ca505439137e7b0011bdf0c66ce0084c604403032588062c7053d33f0f2bfaba3bbd87ff6be45e595f28f711926c26fee2767a891ae5143c60b64d2178fa3c3fda1a5ad694eaf1be86810e5beb849f0e7be947e01")
+    [out, e] = flate.inflate(blob as []byte)
+    ck(e, "inflate dynamic")
+    testing.expect_eq(len(out), 600, "dynamic output size")
+    testing.expect_streq(hash32(out as str), "1387841930", "dynamic content stable")
+    // streaming over 7-byte reads yields the same bytes
+    sr := slicereader{b: blob as []byte, i: 0}
+    d := flate.newreader(sr.asreader())
+    [s2, e2] = drain_all(d.asreader(), 7)
+    ck(e2, "dynamic stream read")
+    testing.expect_streq(s2, out as str, "dynamic stream == one-shot")
+}
+
+fn hash32(s: str) -> str {
+    // light checksum for the bulky dynamic payload
+    h := 5381
+    i := 0
+    for i < len(s) {
+        h = (h * 33 + byteat(s, i)) % 2147483647
+        i = i + 1
+    }
+    return itoa(h)
+}
+
+// python: compress + Z_SYNC_FLUSH + compress — two blocks
+fn test_multiblock() {
+    [out, e] = flate.inflate(hx_b("4a4c4c04000000ffff4b4a4a0200") as []byte)
+    ck(e, "inflate multiblock")
+    testing.expect_streq(out as str, "aaabbb", "multiblock payload")
+}
+
+// python: Z_FIXED block, Z_FULL_FLUSH, dynamic block (default
+// strategy on repetitive text), Z_FULL_FLUSH, Z_FIXED final block —
+// the second fixed block must re-arm the fixed tables, not inherit
+// the dynamic block's.
+fn test_mixedblocks() {
+    // 'HELLO ' + 'pack my box with five dozen liquor jugs. ' * 174
+    // + 'pack my box with five dozen liquorWORLD'
+    [out, e] = flate.inflate(hx_b("f270f5f1f15700000000ffffeccac90143501400c0565e057a2211be906f89b57a6d38cc9c672c5fdf18cea8f2117bfab7f1495b1def7cd5bfe8d3b4e639bab5598a1845511445511445511445511445511445511445517c7abc010000ffff0bf70ff2710100") as []byte)
+    ck(e, "inflate mixedblocks")
+    testing.expect_eq(len(out), 7179, "mixedblocks length")
+    testing.expect_streq(out[0:6] as str, "HELLO ", "mixedblocks prefix")
+    testing.expect_streq(out[6:47] as str, "pack my box with five dozen liquor jugs. ", "mixedblocks body unit")
+    testing.expect_streq(out[7140:7179] as str, "pack my box with five dozen liquorWORLD", "mixedblocks final fixed block")
+}
+
+fn test_empty() {
+    // python: compressobj over b"" -> one fixed block, end mark only
+    [out, e] = flate.inflate(hx_b("0300") as []byte)
+    ck(e, "inflate empty")
+    testing.expect_eq(len(out), 0, "empty payload")
+}
+
+fn test_truncated() {
+    [_o, e] = flate.inflate(hx_b("cb48cdc9c95728cf2fca") as []byte)
+    testing.expect(e != nil, "truncated stream errors")
+    testing.expect_streq(errors.msg(e), "flate: unexpected EOF", "truncation message")
+}
+
+fn test_zlib() {
+    // python: zlib.compress(b"hello zlib", 6)
+    [out, e] = zlib.decompress(hx_b("789ccb48cdc9c957a8cac94c0200159503e6") as []byte)
+    ck(e, "zlib decompress")
+    testing.expect_streq(out as str, "hello zlib", "zlib payload")
+}
+
+fn test_zlib_stream() {
+    blob := hx_b("789ccb48cdc9c957a8cac94c0200159503e6")
+    sr := slicereader{b: blob as []byte, i: 0}
+    [z, e] = zlib.newreader(sr.asreader())
+    ck(e, "zlib newreader")
+    [s, e2] = drain_all(z.asreader(), 3)
+    ck(e2, "zlib drain")
+    testing.expect_streq(s, "hello zlib", "zlib streamed payload")
+}
+
+fn test_zlib_badheader() {
+    // FLG corrupted so CMF*256+FLG is not a multiple of 31
+    [_o, e] = zlib.decompress(hx_b("78ffcb48cdc9c957a8cac94c0200159503e6") as []byte)
+    testing.expect(e != nil, "bad zlib header errors")
+    [_o2, e2] = zlib.decompress(hx_b("78") as []byte)
+    testing.expect(e2 != nil, "short zlib header errors")
+}
+
+fn test_zlib_badadler() {
+    // valid stream, last adler byte flipped
+    [_o, e] = zlib.decompress(hx_b("789ccb48cdc9c957a8cac94c0200159503e7") as []byte)
+    testing.expect(e != nil, "bad adler errors")
+    testing.expect_streq(errors.msg(e), "zlib: adler32 mismatch", "adler mismatch message")
+}
+
+// a reader may co-return its last bytes WITH io.eof — those bytes
+// still count; the stream must decode, not die "unexpected EOF"
+struct coreturner { b: []byte, i: int }
+
+fn (s mut coreturner) read(b: []byte) -> [int, err] {
+    if s.i >= len(s.b) {
+        return 0, io.eof()
+    }
+    n := len(s.b) - s.i
+    if n > len(b) {
+        n = len(b)
+    }
+    j := 0
+    for j < n {
+        b[j] = s.b[s.i + j]
+        j = j + 1
+    }
+    s.i = s.i + n
+    if s.i >= len(s.b) {
+        return n, io.eof()
+    }
+    return n, nil
+}
+
+fn (s mut coreturner) asreader() -> io.Reader {
+    return s
+}
+
+fn test_coreturn() {
+    blob := hx_b("cb48cdc9c95728cf2fca490100") // fixed deflate "hello world"
+    cr := coreturner{b: blob as []byte, i: 0}
+    fr := flate.newreader(cr.asreader())
+    [s, e] = drain_all(fr.asreader(), 1024)
+    ck(e, "co-returning source inflates")
+    testing.expect_streq(s, "hello world", "co-return payload")
+}
+
+fn test_zlib_shorttrailer() {
+    // the adler32 trailer cut to 2 bytes — wrapped error, never a
+    // clean (unverified) end
+    blob := hx_b("789ccb48cdc9c957a8cac94c02001595")
+    sr := slicereader{b: blob as []byte, i: 0}
+    [z, e] = zlib.newreader(sr.asreader())
+    ck(e, "zlib newreader")
+    [_s, e2] = drain_all(z.asreader(), 1024)
+    testing.expect(e2 != nil && e2 != io.eof(), "short trailer errors")
+    testing.expect_streq(errors.msg(e2), "zlib: unexpected EOF in trailer", "short trailer message")
+}
+
+fn main() {}

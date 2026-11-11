@@ -1,0 +1,195 @@
+package zip
+
+// std/archive/zip — read end of ZIP files. The whole archive is held
+// in memory (the central directory sits at the end, so random access
+// is inherent): newreader parses the directory, file()/lookup() give
+// the members, open() inflates one member and verifies its CRC-32.
+// Stored and deflate members are supported; encryption and multi-disk
+// archives are rejected.
+// open() inflates a whole member before its usize/CRC verify —
+// untrusted archives can over-claim a tiny member into a large
+// allocation, so verify member metadata before opening.
+import "std/errors"
+
+import "std/compress/flate"
+
+import "std/hash"
+
+import "std/encoding/binary"
+
+/// File is one member's central-directory record. Sizes are
+/// compressed/uncompressed byte counts; meth is 0 (stored) or 8
+/// (deflate). lho/doff are archive offsets (local header / payload).
+/// name is verbatim archive bytes — sanitize it (reject absolute
+/// paths and "..") before it touches a filesystem.
+struct File {
+    name: str,
+    meth: int,
+    flags: int,
+    crc: int,
+    csize: int,
+    usize: int,
+    mtime: int,
+    mdate: int,
+    lho: int,
+    dir: int,
+}
+
+/// Reader is a parsed archive — files are read-only views into it.
+struct Reader {
+    data: own []byte, // whole archive, owned copy
+    files: []File,
+    comment: str,
+}
+
+/// newreader parses the archive held in b: finds the end-of-central-
+/// directory record within the last 64 KiB, then walks the central
+/// directory. The archive bytes are copied, so b may be reused.
+fn newreader(b: []byte) -> [Reader, err] {
+    z := Reader{data: new(b), files: mkslice(File, 0), comment: ""}
+    if len(b) < 22 {
+        return z, errors.new("zip: too small for end record")
+    }
+    // scan the tail for the EOCD signature 0x06054b50
+    lo := len(b) - 22 - 65535
+    if lo < 0 {
+        lo = 0
+    }
+    eocd := -1
+    i := len(b) - 22
+    for i >= lo {
+        // a real EOCD's declared comment length reaches exactly EOF —
+        // a signature inside a *comment* fails that check and the
+        // scan keeps walking backwards
+        if binary.le_u32(z.data, i) == 101010256 && i + 22 + binary.le_u16(z.data, i + 20) == len(z.data) {
+            eocd = i
+            break
+        }
+        i = i - 1
+    }
+    if eocd < 0 {
+        return z, errors.new("zip: no end of central directory")
+    }
+    if binary.le_u16(z.data, eocd + 4) != 0 || binary.le_u16(z.data, eocd + 6) != 0 {
+        return z, errors.new("zip: multi-disk archives unsupported")
+    }
+    n := binary.le_u16(z.data, eocd + 10)
+    cdsize := binary.le_u32(z.data, eocd + 12)
+    cdoff := binary.le_u32(z.data, eocd + 16)
+    if n == 65535 || cdsize == 4294967295 || cdoff == 4294967295 {
+        return z, errors.new("zip: zip64 unsupported")
+    }
+    // entries-on-this-disk must equal the total once multi-disk is
+    // rejected — a mismatch is the same split-archive shape
+    // the directory must fit before the EOCD it was located from
+    if cdoff + cdsize > eocd {
+        return z, errors.new("zip: central directory overruns end record")
+    }
+    if binary.le_u16(z.data, eocd + 8) != n {
+        return z, errors.new("zip: multi-disk archives unsupported")
+    }
+    clen := binary.le_u16(z.data, eocd + 20)
+    if clen > 0 && eocd + 22 + clen <= len(z.data) {
+        z.comment = z.data[eocd + 22:eocd + 22 + clen] as str
+    }
+    i = 0
+    p := cdoff
+    for i < n {
+        if p + 46 > len(z.data) || binary.le_u32(z.data, p) != 33639248 {
+            return z, errors.new("zip: bad central directory")
+        }
+        nl := binary.le_u16(z.data, p + 28)
+        el := binary.le_u16(z.data, p + 30)
+        cl := binary.le_u16(z.data, p + 32)
+        if p + 46 + nl + el + cl > cdoff + cdsize {
+            return z, errors.new("zip: truncated central directory")
+        }
+        f := File{name: z.data[p + 46:p + 46 + nl] as str, meth: binary.le_u16(z.data, p + 10), flags: binary.le_u16(z.data, p + 8), crc: binary.le_u32(z.data, p + 16), csize: binary.le_u32(z.data, p + 20), usize: binary.le_u32(z.data, p + 24), mtime: binary.le_u16(z.data, p + 12), mdate: binary.le_u16(z.data, p + 14), lho: binary.le_u32(z.data, p + 42), dir: 0}
+        if nl > 0 && z.data[p + 46 + nl - 1] == 47 {
+            f.dir = 1
+        }
+        if f.csize == 4294967295 || f.usize == 4294967295 {
+            return z, errors.new("zip: zip64 member unsupported")
+        }
+        z.files = push(z.files, f)
+        p = p + 46 + nl + el + cl
+        i = i + 1
+    }
+    return z, nil
+}
+
+/// nfiles is the member count.
+fn (z ref Reader) nfiles() -> int {
+    return len(z.files)
+}
+
+/// file returns the i-th member record — the same bounds contract
+/// as open(): an out-of-range i is an error, not a trap. [file, err]
+fn (z ref Reader) file(i: int) -> [File, err] {
+    if i < 0 || i >= len(z.files) {
+        f := File{name: "", meth: 0, flags: 0, crc: 0, csize: 0, usize: 0, mtime: 0, mdate: 0, lho: 0, dir: 0}
+        return f, errors.new("zip: bad member index")
+    }
+    return z.files[i], nil
+}
+
+/// lookup finds a member by exact name; -1 when absent.
+fn (z ref Reader) lookup(name: str) -> int {
+    i := 0
+    for i < len(z.files) {
+        if z.files[i].name == name {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+/// open reads member i fully: skips to its payload via the local
+/// header, returns stored bytes or flate-inflates deflate members,
+/// and verifies CRC-32 and size. [contents, err].
+fn (z ref Reader) open(i: int) -> [own []byte, err] {
+    if i < 0 || i >= len(z.files) {
+        return nil, errors.new("zip: bad member index")
+    }
+    f := z.files[i]
+    if (f.flags & 65) != 0 {
+        return nil, errors.new("zip: encrypted member")
+    }
+    if f.meth != 0 && f.meth != 8 {
+        return nil, errors.new("zip: unsupported compression method")
+    }
+    p := f.lho
+    if p + 30 > len(z.data) || binary.le_u32(z.data, p) != 67324752 {
+        return nil, errors.new("zip: bad local header")
+    }
+    // local flags/method must agree with the central directory —
+    // a crafted mismatch redirects which decoder the member gets
+    if binary.le_u16(z.data, p + 6) != f.flags || binary.le_u16(z.data, p + 8) != f.meth {
+        return nil, errors.new("zip: local/central header mismatch")
+    }
+    nl := binary.le_u16(z.data, p + 26)
+    el := binary.le_u16(z.data, p + 28)
+    doff := p + 30 + nl + el
+    if doff + f.csize > len(z.data) {
+        return nil, errors.new("zip: truncated member data")
+    }
+    raw := z.data[doff:doff + f.csize]
+    out := new(mkslice(byte, 0))
+    if f.meth == 0 {
+        out = new(raw)
+    } else {
+        [d, e] = flate.inflate(raw)
+        if e != nil {
+            return nil, e
+        }
+        out = d
+    }
+    if len(out) != f.usize {
+        return nil, errors.new("zip: size mismatch")
+    }
+    if hash.crc32(out[:]) != f.crc {
+        return nil, errors.new("zip: crc32 mismatch")
+    }
+    return out, nil
+}

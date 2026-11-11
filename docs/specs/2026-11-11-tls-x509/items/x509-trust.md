@@ -168,8 +168,9 @@ only source of trust.
    - Windows: exec `powershell.exe -NoProfile -Command`
      emitting each `Cert:\LocalMachine\Root` and
      `Cert:\CurrentUser\Root` cert's `RawData` base64'd — parse
-     the PEM-shaped output. One exec at first use per process,
-     cached in the returned `Roots`.
+     the PEM-shaped output. One exec at first use per process —
+     memoized in a module-level `shared` cell; the returned
+     `Roots` is a per-call value, not the cache.
 4. **Fail:** no source yields ≥1 root → `err_roots` naming
    `OXL_SSL_CERT_FILE` as the override — never a silent empty
    pool (an empty pool would make every chain `err_root` with a
@@ -179,7 +180,9 @@ only source of trust.
 pin to *zero* anchors — everything verifies `err_root`) ⇒
 `Config.roots` empty ⇒ `client` calls `load_system_roots()` once
 per handshake (cheap on POSIX; the exec paths amortize to one
-spawn — callers that care hold a `Roots` and reuse it). A
+spawn per process via the `shared` memo — the returned `Roots`
+is a per-call value, so reuse of the memo is automatic, not a
+caller obligation). A
 non-empty `roots` short-circuits all of the above — that's the
 pinning path: `roots.load_pem(myca)` + empty env gives exactly
 one trust anchor.

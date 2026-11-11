@@ -39,10 +39,14 @@ send and accept only hashlen).
 
 ```
 ClientHello
-  → [HelloRetryRequest — at most once; echo any `cookie`
-     extension verbatim (§4.2.2), rebuild CH with a key_share for
-     the demanded group if it's x25519/secp256r1/secp384r1
-     (`illegal_parameter` alert else); transcript carries the HRR
+  → [HelloRetryRequest — recognized by the fixed ServerHello.random
+     magic value, exempt from the downgrade-sentinel check (its
+     random is the magic, not a real ServerHello). At most once;
+     echo any `cookie` extension verbatim (§4.2.2), rebuild CH with
+     a key_share for the demanded group if it's
+     x25519/secp256r1/secp384r1 (`illegal_parameter` alert else); a
+     cookie-only HRR carries no key_share demand ⇒ ClientHello#2
+     reuses the existing shares; transcript carries the HRR
      message_hash; ClientHello#2 reuses the SAME
      legacy_session_id as #1. A second HRR → `unexpected_message` alert]
   → ServerHello        — must carry `supported_versions`=0x0304
@@ -149,6 +153,10 @@ the whole HKDF chain against an external answer.
 - `TLSCiphertext`: 5-byte header `{type=23, version=0x0303, len}`;
   fragment ≤ 16384 + 256 expansion — larger inbound →
   `record_overflow` alert.
+- Post-ServerHello the outer type is always application_data(23) —
+  handshake/alert content arrives only as the inner type; a
+  plaintext handshake(22) or alert(21) record at that point →
+  `unexpected_message` alert.
 - AEAD-open failure → `bad_record_mac` alert (never a bare
   close — the record layer's only integrity verdict).
 - Handshake messages reassemble across record boundaries and

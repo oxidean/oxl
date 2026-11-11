@@ -143,7 +143,9 @@ last fix commit.
       vs permissive HTTP/1.1 stacks, side-channel posture per
       shape §Risk, non-goals + their triggers); `parked-stdlib.md`/`parked.md` drop the
       `crypto/tls`/`x509`/asymmetric rows plus the `crypto/rand`
-      and `math/big` rows X1/X3 implement, and record what moved to
+      and `math/big` entries X1/X3 implement — those two share one
+      parked row with `time/tzdata` and `syscall`, so drop only
+      the two entries, not the row — and record what moved to
       live triggers (TLS server, resumption, revocation, constant-
       time pass); `docs/product/roadmap.md`'s TLS/x509 parked row
       → shipped (the `— SHIPPED` pattern; the row lands with

@@ -24,7 +24,10 @@ struct Config {
                            // actually runs: a non-nil `verify`
                            // replaces it, so no security/powershell
                            // exec ever fires for verify-carrying
-                           // clients
+                           // clients; the store load itself is a
+                           // process-level memo (module `shared`
+                           // cell) — the `Roots` you hold is a
+                           // per-call value
     alpn: []str,           // empty ⇒ no ALPN extension
     verify: Verifier,      // nil ⇒ x509.verify + match_hostname.
                            // Non-nil ⇒ replaces BOTH (chain AND
@@ -51,6 +54,9 @@ fn dial_timeout(host: str, port: int, tmo_ms: int, cfg: Config) ->
     // lands.
     // = net.dial_timeout + client(c, cfg); on handshake failure the inner
     // socket is closed before returning the err — no half-open leak.
+    // Inherits net.dial_timeout's IPv4-only transport
+    // (lookup_ipv4): IPv6 literals are only reachable via
+    // `client` on a conn std cannot currently produce.
 
 fn default_cfg() -> Config
     // roots: Roots{cas: nil} (lazy system-store load at first

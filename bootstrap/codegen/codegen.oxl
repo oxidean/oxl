@@ -57,6 +57,16 @@ fn gbnd(n: str, ce: str, t: int, next: own GBnd) -> own GBnd {
     return c
 }
 
+fn gbnd_has(l: ref GBnd, n: str) -> bool {
+    for l != nil {
+        if l.n == n {
+            return true
+        }
+        l = l.next
+    }
+    return false
+}
+
 // match arm decode: has=0 → unconditional (else), has=1 → `if (cond)`
 struct GArm { has: int, cond: str, binds: own GBnd }
 
@@ -1625,23 +1635,27 @@ fn gcall_plan(g: mut G, f: ref parser.Node, args: ref parser.NList) -> own GCP {
         parser.Node.Field{obj, name} => {
             ot := gsub(g, xty(g, obj))
             if ot >= 0 {
-                mt := check.method_target(g.ck, ot, name)
-                if mt.k == 1 {
-                    cp.k = 1
-                    cp.dotted = 1
-                    cp.q = mt.q
-                    return cp
-                }
-                if mt.k == 2 {
-                    cp.k = 2
-                    cp.dotted = 1
-                    cp.w = g.ck.tyv[ot].name
-                    cp.mname = name
-                    cp.midx = gimidx(g, cp.w, name)
-                    cp.ps = check.il_clone(mt.ps)
-                    cp.rk = mt.rk
-                    cp.r1 = mt.r1
-                    return cp
+                // `call` gives fields precedence — a field value call is
+                // not a method call, so never plan the method path
+                if check.field_ty(g.ck, ot, name) < 0 {
+                    mt := check.method_target(g.ck, ot, name)
+                    if mt.k == 1 {
+                        cp.k = 1
+                        cp.dotted = 1
+                        cp.q = mt.q
+                        return cp
+                    }
+                    if mt.k == 2 {
+                        cp.k = 2
+                        cp.dotted = 1
+                        cp.w = g.ck.tyv[ot].name
+                        cp.mname = name
+                        cp.midx = gimidx(g, cp.w, name)
+                        cp.ps = check.il_clone(mt.ps)
+                        cp.rk = mt.rk
+                        cp.r1 = mt.r1
+                        return cp
+                    }
                 }
             }
         }
@@ -3713,11 +3727,26 @@ fn gclosure(g: mut G, params: ref parser.NList, body: ref parser.Node) -> str {
     let caps: own GBnd = nil
     u := sc.l
     for u != nil {
-        if !gscan_param(params, u.v) {
-            t := gx_lookup(g, u.v)
-            if t >= 0 {
-                caps = gbnd(u.v, "", t, caps)
+        // a flattened `recv.m` ref arrives whole — the capturable
+        // binding is its longest bound prefix (`recv`); params shadow
+        // at every prefix length, and globals emit directly
+        n := u.v
+        for len(n) > 0 {
+            if gscan_param(params, n) {
+                break
             }
+            t := gx_lookup(g, n)
+            if t >= 0 {
+                if (n == u.v || g_local(g, n)) && !gbnd_has(caps, n) {
+                    caps = gbnd(n, "", t, caps)
+                }
+                break
+            }
+            ld := check.last_dot(n)
+            if ld < 0 {
+                break
+            }
+            n = substr(n, 0, ld)
         }
         u = u.next
     }

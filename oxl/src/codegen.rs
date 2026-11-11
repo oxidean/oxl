@@ -2197,13 +2197,27 @@ impl<'a> Gen<'a> {
         let mut captures: Vec<(String, Ty)> = scan
             .refs
             .union(&scan.callees)
-            .filter(|n| !pnames.contains(n.as_str()))
-            .filter_map(|n| match self.lookup(n) {
-                Ty::Unknown => None,
-                t => Some((n.clone(), t)),
+            .filter_map(|n| {
+                // flattened `recv.m` refs carry the whole dotted name —
+                // the capturable binding is the longest bound prefix
+                // (`recv`), same rule as defer_caps
+                let mut m = n.as_str();
+                loop {
+                    if pnames.contains(m) {
+                        return None;
+                    }
+                    match self.lookup(m) {
+                        Ty::Unknown => match m.rfind('.') {
+                            Some(i) => m = &m[..i],
+                            None => return None,
+                        },
+                        t => return Some((m.to_string(), t)),
+                    }
+                }
             })
             .collect();
         captures.sort_by(|a, b| a.0.cmp(&b.0));
+        captures.dedup_by(|a, b| a.0 == b.0);
         let ptys: Vec<Ty> = params.iter().map(|p| self.ty_of_ref(&p.ty)).collect();
         let ret = self.closure_ret_ty(body);
         let ret_c = self.cty(&ret);
@@ -2666,14 +2680,18 @@ impl<'a> Gen<'a> {
         if let Some((objp, mname)) = name.rsplit_once('.') {
             if let Some(oe) = self.obj_expr(objp, f.span) {
                 let ot = self.dt(&self.expr_ty(&oe));
-                if let Some(mt) = self.m_target(&ot, mname) {
-                    return match mt {
-                        MT::Fn(q) => CallPlan::Fn { q, recv: Some(oe) },
-                        MT::Vt(midx, ps, r) => CallPlan::Vt {
-                            obj: oe, w: self.iface_name(&ot).unwrap_or_default(),
-                            midx, mname: mname.to_string(), params: ps, ret: r,
-                        },
-                    };
+                // `call` gives fields precedence — a field value call is
+                // not a method call, so never plan the method path
+                if self.field_ty(&ot, mname).is_none() {
+                    if let Some(mt) = self.m_target(&ot, mname) {
+                        return match mt {
+                            MT::Fn(q) => CallPlan::Fn { q, recv: Some(oe) },
+                            MT::Vt(midx, ps, r) => CallPlan::Vt {
+                                obj: oe, w: self.iface_name(&ot).unwrap_or_default(),
+                                midx, mname: mname.to_string(), params: ps, ret: r,
+                            },
+                        };
+                    }
                 }
             }
         } else if let Some(a0) = args.first() {

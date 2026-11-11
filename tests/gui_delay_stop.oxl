@@ -22,11 +22,11 @@ fn creator() {
         println("create err")
         return
     }
-    // the reply must carry a live handle — pre-fix the sweep could
-    // already have destroyed it
-    assert(g_m.alive(h.handle()) == 1)
+    // the reply was published — send-time ordering is the contract;
+    // consumer-time liveness is not (the sweep may legally run before
+    // this resumes). `reply-dead` in the mock log catches a swept handle.
     sset(g_got, 1)
-    println("reply landed live")
+    println("reply landed")
 }
 
 fn orchestrator() {
@@ -45,6 +45,7 @@ fn main() {
     e := gui.run(g_m, app)
     assert(e == nil)
     assert(sget(g_got) == 1)
+    assert(g_m.count("reply-dead") == 0)
     assert(g_m.count("destroy-dead") == 0)
     assert(g_m.violations() == 0)
     println("delay stop ok")

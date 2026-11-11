@@ -1504,21 +1504,44 @@ impl<'a> Checker<'a> {
                             format!("closure captures `{n}` (`{}`) — borrowed refs may not be stored in heap objects (v0)", t.name())));
                     }
                 }
-                // method calls on captured receivers — `defer w.pause()`
-                // scans `w.pause`, but suspend holds `Worker.pause`
-                for (recv, m) in &scan.mcalls {
-                    if let Some(t) = env.get(recv) {
-                        if let MTarget::Fn(q) = self.method_target(&t, m) {
-                            scan.callees.insert(q);
-                        }
-                    }
-                }
-                self.closure_checks.push((e.span, scan.callees, scan.seeded, self.cur_file.clone()));
                 let saved = std::mem::replace(&mut self.closure_ret, Some(None));
                 env.push();
                 for (p, t) in params.iter().zip(ptys.iter()) {
                     env.set(p.name.clone(), t.clone(), p.span);
                 }
+                // method calls resolve in the closure's own scope —
+                // params shadow enclosing binds — and `call` gives
+                // fields precedence, so a fn-valued field is never a
+                // susp method callee
+                for (recv, m) in &scan.mcalls {
+                    if let Some(t) = env.get(recv) {
+                        if self.field_ty(&t, m).is_some() {
+                            continue;
+                        }
+                        if let MTarget::Fn(q) = self.method_target(&t, m) {
+                            scan.callees.insert(q);
+                        }
+                    }
+                }
+                // flattened `recv.m` callees arrive dotted — resolve the
+                // longest env-bound prefix the same way
+                let flat: Vec<String> = scan.callees.iter().cloned().collect();
+                for n in flat {
+                    let mut recv = n.as_str();
+                    while let Some(i) = recv.rfind('.') {
+                        recv = &recv[..i];
+                        if let Some(t) = env.get(recv) {
+                            let meth = &n[recv.len() + 1..];
+                            if self.field_ty(&t, meth).is_none() {
+                                if let MTarget::Fn(q) = self.method_target(&t, meth) {
+                                    scan.callees.insert(q);
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+                self.closure_checks.push((e.span, scan.callees, scan.seeded, self.cur_file.clone()));
                 self.block(body, env);
                 env.pop();
                 let inferred = std::mem::replace(&mut self.closure_ret, saved)

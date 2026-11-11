@@ -4502,22 +4502,6 @@ fn closure_expr(ck: mut Ck, params: ref parser.NList, body: ref parser.Node, env
     // deferred susp scan — collect callees + seeded before checking body
     cc := new(ClChk{callees: nil, mcalls: nil, seeded: 0, next: nil})
     cl_scan_node(ck, body, cc)
-    ml := cc.mcalls
-    for ml != nil {
-        i := find(ml.v, ".")
-        if i > 0 {
-            t := env_get(ck, env, substr(ml.v, 0, i))
-            if t >= 0 {
-                mt := method_target(ck, t, substr(ml.v, i + 1, len(ml.v)))
-                if mt.k != 0 {
-                    cc.callees = scons(mt.q, cc.callees)
-                }
-            }
-        }
-        ml = ml.next
-    }
-    cc.next = ck.clcks
-    ck.clcks = cc
     let ps: own IList = nil
     pl := params
     for pl != nil {
@@ -4549,6 +4533,57 @@ fn closure_expr(ck: mut Ck, params: ref parser.NList, body: ref parser.Node, env
         wl = wl.next
         pl = pl.next
     }
+    // method calls resolve in the closure's own scope — params shadow
+    // enclosing binds — and `call` gives fields precedence over methods,
+    // so a fn-valued field is never a susp method callee
+    ml := cc.mcalls
+    for ml != nil {
+        i := find(ml.v, ".")
+        if i > 0 {
+            n := substr(ml.v, i + 1, len(ml.v))
+            t := env_get(ck, env, substr(ml.v, 0, i))
+            if t >= 0 && field_ty(ck, t, n) < 0 {
+                mt := method_target(ck, t, n)
+                if mt.k != 0 {
+                    cc.callees = scons(mt.q, cc.callees)
+                }
+            }
+        }
+        ml = ml.next
+    }
+    // flattened `recv.m` callees arrive dotted — resolve the longest
+    // env-bound prefix the same way (strip until a bound name)
+    let flat: own SList = nil
+    cl := cc.callees
+    for cl != nil {
+        flat = scons(cl.v, flat)
+        cl = cl.next
+    }
+    for flat != nil {
+        orig := flat.v
+        recv := orig
+        for len(recv) > 0 {
+            ld := last_dot(recv)
+            if ld < 0 {
+                break
+            }
+            recv = substr(recv, 0, ld)
+            t := env_get(ck, env, recv)
+            if t >= 0 {
+                meth := substr(orig, len(recv) + 1, len(orig))
+                if field_ty(ck, t, meth) < 0 {
+                    mt := method_target(ck, t, meth)
+                    if mt.k != 0 {
+                        cc.callees = scons(mt.q, cc.callees)
+                    }
+                }
+                break
+            }
+        }
+        flat = flat.next
+    }
+    cc.next = ck.clcks
+    ck.clcks = cc
     block_node(ck, body, env)
     env_pop(env)
     r := ck.cl_ret

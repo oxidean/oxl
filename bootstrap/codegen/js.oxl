@@ -909,9 +909,14 @@ fn jclosure(g: mut G, params: ref parser.NList, body: ref parser.Node) -> str {
     for u != nil {
         n := u.v
         for len(n) > 0 {
+            // closure params shadow enclosing binds at every prefix
+            // length — a shadowed name is never captured
+            if gscan_param(params, n) {
+                break
+            }
             t := gx_lookup(g, n)
             if t >= 0 {
-                if g_local(g, n) {
+                if g_local(g, n) && !gbnd_has(caps, n) {
                     caps = gbnd(n, "", t, caps)
                 }
                 break

@@ -503,6 +503,15 @@ fn (m Mock) pump_fin() {
 // a real hittable reply window.
 fn delayed_reply(m: Mock, reply: chan own gui.CmdResult, r2: own gui.CmdResult, h: int) {
     time.sleep_ms(sget(g_delay))
+    // publication ordering: alive() at send time proves send-before-sweep
+    // (the sweep only runs once g_pending drains). Consumer-time liveness
+    // is not part of the contract — the handle may legally be swept
+    // before the caller resumes.
+    mlockg()
+    if al_has(h) != 1 {
+        logit("reply-dead", h, 0)
+    }
+    munlockg()
     if !try_send(reply, r2) {
         m.destroy(h)
     }

@@ -169,10 +169,10 @@ define void @oxl_main() { … }
   with max size under the §6 model); `<payloadTy>` is `i8` for
   all-unit enums. Max *size* alone doesn't bound alignment — a
   low-align largest variant would leave the slot under-aligned for
-  a sibling needing align 8 — so the enum's storage is emitted at
-  alignment 8 (an `i64` anchor/pad field or an explicit `align 8`
-  on the allocating op), which ≥ every variant's natural align
-  under §6. The pad makes the payload offset 8 unconditionally —
+  a sibling needing align 8 — so the enum type carries an `i64`
+  anchor/pad field raising its ABI alignment to 8 (an alloca-level
+  `align` would not propagate to nested struct/array fields),
+  which ≥ every variant's natural align under §6. The pad makes the payload offset 8 unconditionally —
   matching C's union offset whenever any variant carries an
   8-aligned field (the common case) and diverging harmlessly
   otherwise (lane-owned layout). Payload access is a

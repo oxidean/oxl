@@ -39,7 +39,7 @@ constraint, not a budget).
   provenance. Generic instantiation is emitter-side
   (`subst_ty` + per-lane bind maps + the `ginst_queue` mono queue);
   nothing in `CkRes` is C-shaped.
-- `js.oxl` demonstrated the mechanical reuse path: same `package
+- `js.oxl` will demonstrate the mechanical reuse path: same `package
   codegen`, same `o_*` symbol scheme, and the G1 reachability
   machinery (`gubegin`/`gudrain`/`gdef`/`gscan`) verbatim — its token
   scan is language-agnostic, and `.ll` text spells the same

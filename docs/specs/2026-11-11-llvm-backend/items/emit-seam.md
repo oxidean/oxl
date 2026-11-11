@@ -5,7 +5,7 @@ drops in behind the same `TAST → object` seam" — is now a
 two-consumer pattern in flight (the W lane is on `feat/milestone-w`,
 PR open). This item pins what the shared front-end hands
 a lane, how a lane registers, and what stays per-lane. The reference
-instance is `bootstrap/codegen/js.oxl` (milestone W); the LLVM lane
+instance is `bootstrap/codegen/js.oxl` (milestone W, in flight); the LLVM lane
 follows it mechanically and diverges only where IR differs from an
 ES module.
 

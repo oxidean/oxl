@@ -129,7 +129,9 @@ fn (z mut Reader) read(b: []byte) -> [int, err] {
         return n, te
     }
     z.done = 1
-    return 0, io.eof()
+    // deliver n alongside eof — a (data, eof) co-return from the
+    // flate layer would otherwise silently drop the tail bytes
+    return n, io.eof()
 }
 
 /// asreader boxes a borrow of this Reader as an io.Reader (`&z`).

@@ -27,16 +27,18 @@ fn test_read() {
     ck(e, "newreader")
     testing.expect_eq(z.nfiles(), 2, "member count")
 
-    f := z.file(0)
+    [f, fe] = z.file(0)
+    ck(fe, "file(0)")
     testing.expect_streq(f.name, "a.txt", "stored member name")
     testing.expect_eq(f.meth, 0, "stored method")
     testing.expect_eq(f.usize, 14, "stored usize")
     testing.expect_eq(f.dir, 0, "not a dir")
 
-    f = z.file(1)
-    testing.expect_streq(f.name, "b/b.txt", "deflate member name")
-    testing.expect_eq(f.meth, 8, "deflate method")
-    testing.expect_eq(f.usize, 110, "deflate usize")
+    [f2, fe2] = z.file(1)
+    ck(fe2, "file(1)")
+    testing.expect_streq(f2.name, "b/b.txt", "deflate member name")
+    testing.expect_eq(f2.meth, 8, "deflate method")
+    testing.expect_eq(f2.usize, 110, "deflate usize")
 }
 
 fn test_open() {

@@ -243,7 +243,7 @@ done
 out=$("$OXL" test tests/archive_tar.oxl)
 printf '%s
 ' "$out" >&2
-for t in test_roundtrip test_prefix_split test_pax_longname test_gnu_longname test_skip_payload test_truncated_midheader test_truncated_member test_pax_badlen test_meta_oversize test_b256_size test_signed_checksum; do
+for t in test_roundtrip test_prefix_split test_pax_longname test_gnu_longname test_skip_payload test_truncated_midheader test_truncated_member test_pax_badlen test_meta_oversize test_b256_size test_signed_checksum test_gnu_foreign; do
     grep -q "$t ... ok" <<<"$out" || { echo "FAIL tar: $out"; exit 1; }
 done
 out=$("$OXL" test tests/archive_zip.oxl)
@@ -251,6 +251,14 @@ printf '%s
 ' "$out" >&2
 for t in test_read test_open test_lookup test_corrupt test_open_badindex; do
     grep -q "$t ... ok" <<<"$out" || { echo "FAIL zip: $out"; exit 1; }
+done
+
+echo "== oxl test: hostile archive/compress inputs =="
+out=$("$OXL" test tests/archive_hostile.oxl)
+printf '%s
+' "$out" >&2
+for t in test_dist_oob test_overlap_ok test_btype3 test_oversub test_stored_badlen test_rep_noprev test_random test_gz_nonul_name test_gz_badhcrc test_gz_goodhcrc test_gz_fextra_short test_gz_trailgarbage test_gz_halfmember test_zip64 test_zip_mismatch test_zip_bigcsize test_tar_badsum test_tar_badoctal test_zlib_keepalive; do
+    grep -q "$t ... ok" <<<"$out" || { echo "FAIL hostile: $out"; exit 1; }
 done
 
 echo "== oxl test: regexp (s5) =="

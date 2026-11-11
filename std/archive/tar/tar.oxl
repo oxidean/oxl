@@ -100,7 +100,10 @@ fn parnum(b: []byte) -> [int, err] {
         i = i + 1
     }
     if any == 0 {
-        return 0, errors.new("tar: empty numeric field")
+        // an all-padding field is 0 — some legacy writers emit blank
+        // numerics and Go tolerates them; a blank checksum still
+        // fails verification downstream
+        return 0, nil
     }
     return v, nil
 }
@@ -114,12 +117,13 @@ struct Reader {
     lname: str, // pending name override ('x'/'L' records)
     llink: str, // pending link override ('x'/'K' records)
     done: int,
+    rerr: err, // latched terminal error — next() retries return it
 }
 
 /// newreader wraps r as a tar reader — the first next() call parses
 /// the first header.
 fn newreader(r: io.Reader) -> Reader {
-    return Reader{r: r, left: 0, pad: 0, lname: "", llink: "", done: 0}
+    return Reader{r: r, left: 0, pad: 0, lname: "", llink: "", done: 0, rerr: nil}
 }
 
 // xfull fills buf from the source — readfull with a spin guard.
@@ -331,13 +335,16 @@ fn paxname(rec: []byte, want: str) -> str {
             // bail before the accumulator can wrap int64 — no
             // conformant record length approaches 10 digits anyway
             if j - i >= 10 {
-                return ""
+                return best
             }
             v = v * 10 + (rec[j] - 48)
             j = j + 1
         }
         if j >= len(rec) || rec[j] != 32 || v <= 0 || j + 1 > i + v || i + v > len(rec) {
-            return ""
+            // a malformed record ends the scan but keeps the keys
+            // already parsed — dropping a good 'path=' is worse than
+            // tolerating trailing garbage
+            return best
         }
         body := rec[j + 1:i + v]
         // body is "key=value\n"
@@ -408,28 +415,33 @@ fn (t mut Reader) next() -> [Header, err] {
         e := t.skip(t.left)
         if e != nil {
             t.done = 1
+            t.rerr = e
             return h, e
         }
         t.left = 0
         e2 := t.skip(t.pad)
         if e2 != nil {
             t.done = 1
+            t.rerr = e2
             return h, e2
         }
         t.pad = 0
         [b, e3] = t.block()
         if e3 != nil {
             t.done = 1
+            t.rerr = e3
             return h, e3
         }
         [ph, e4] = t.parse(b)
         if e4 != nil {
             t.done = 1
+            t.rerr = e4
             return h, e4
         }
         if ph.size < 0 {
             t.done = 1
-            return h, errors.new("tar: negative size field")
+            t.rerr = errors.new("tar: negative size field")
+            return h, t.rerr
         }
         // meta members carry their payload in-band — fold it into
         // the pending overrides and continue to the real header
@@ -437,6 +449,7 @@ fn (t mut Reader) next() -> [Header, err] {
             e5 := t.pax(ph.size, ph.typeflag)
             if e5 != nil {
                 t.done = 1
+                t.rerr = e5
                 return h, e5
             }
             continue
@@ -444,6 +457,9 @@ fn (t mut Reader) next() -> [Header, err] {
         t.left = ph.size
         t.pad = (512 - ph.size % 512) % 512
         return ph, nil
+    }
+    if t.rerr != nil {
+        return h, t.rerr
     }
     return h, io.eof()
 }

@@ -113,10 +113,14 @@ fn (z ref Reader) nfiles() -> int {
     return len(z.files)
 }
 
-/// file returns the i-th member record. i must be valid — from
-/// nfiles() or a successful lookup() (which returns -1 on a miss).
-fn (z ref Reader) file(i: int) -> File {
-    return z.files[i]
+/// file returns the i-th member record — the same bounds contract
+/// as open(): an out-of-range i is an error, not a trap. [file, err]
+fn (z ref Reader) file(i: int) -> [File, err] {
+    if i < 0 || i >= len(z.files) {
+        f := File{name: "", meth: 0, flags: 0, crc: 0, csize: 0, usize: 0, mtime: 0, mdate: 0, lho: 0, dir: 0}
+        return f, errors.new("zip: bad member index")
+    }
+    return z.files[i], nil
 }
 
 /// lookup finds a member by exact name; -1 when absent.

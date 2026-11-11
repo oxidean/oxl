@@ -32,7 +32,7 @@ consumer recorded.
 | death path | source | pin's answer |
 |---|---|---|
 | `rt_free` from C/externs | `rt_str_free` precedent (`extra/gui/gtk/gtk.oxl`) | trap 11 while pinned |
-| `drop_elem` on `chan own T` | scope teardown, `close` drain, retracted `try_send` (rt.c:1507-1666) | same `rt_free` → trap 11; the send itself is a compile error while pinned, so the trap is a second line, not the primary check |
+| `drop_elem` on `chan own T` | scope teardown, `close` drain, retracted `try_send` (rt.c:1507-1970) | same `rt_free` → trap 11; the send itself is a compile error while pinned, so the trap is a second line, not the primary check |
 | scope close | arena bulk-free | N/A — `pin` requires `own`; `own` is never arena-backed (`alloc_in`'s `!own` guard, rt.c:77) |
 | future own-handle reclamation | ownership.md:29 reserves it ("does not emit ... today") | pinned objects are exactly the set that must be exempt — writing the pin contract now keeps a later reclamation pass honest |
 | process exit | OS teardown | out of scope — no guarantee can survive it |
@@ -80,15 +80,30 @@ shape in the bootstrap checker — check.oxl:395). Entries:
   "`b` moved while pinned — unpin it first": an `own` argument to an
   `own`/`iface` param, `send`/`try_send`, `return`, struct/enum
   field stores (`s.f = b`, `E.V{ f: b }`), and `spawn`/`goin` args
-  (already a move). This is the same list ownership.md calls move
-  sites, plus the pinned check layered on `move_for` (check.rs).
-  The pin-set merges through branches exactly like `moved`
-  (union at joins): a binding pinned on *any* reachable
-  fall-through path reads pinned at the join.
+  (already a move). This is the checker's move-site set
+  (`move_for`, check.rs) — a superset of the four ownership.md
+  enumerates — plus the pinned check layered on it.
+  The pin-set merges by **intersection** at joins: a binding
+  counts as pinned at a point iff it is pinned on *every*
+  non-diverging path reaching it (inside a pinning branch the
+  mark holds and move-site bans apply there). Union would be
+  unsound in both directions — `if c { pin(b) }` joining as
+  pinned would compile a `pin`-param arg whose else path never
+  pinned, and `pin(b); if c { unpin(b) }` joining as pinned
+  would compile an `unpin` that traps on the taken path. The
+  same balance rule `moved` applies to `for` bodies
+  (ownership.md) applies here: pins introduced inside a loop
+  body must be released inside it.
 - Legal while pinned: field/index reads and writes through the
   handle, `ref`/`mut` borrows (a borrow is not a move; the object
   stays put and borrowed access is unaffected), passing `b` to an
   extern `pin` param (the point), and — deliberately — scope exit.
+- **Derived bindings carry the mark.** `b2 := b` on an `own`
+  binding is not a move site (the `cur := head` aliasing idiom),
+  so the checker propagates `pinned` to same-object aliases
+  created while the mark holds — otherwise `send(ch, b2)` would
+  push a still-pinned object into `drop_elem` (trap 11 — the rt
+  backstop is the second line, not the contract).
 - **`pin` and `push`:** `s = push(s, v)` where `s` is a pinned
   `own []T` binding is a compile error — "push may relocate the
   pinned backing; unpin first" (`rt_slice_push` allocates a new
@@ -116,7 +131,7 @@ stays 24 bytes, no ABI change (ownership.md:71-81).
   pinned header while the backing is still counted keeps the trap
   ordering deterministic.
 
-Trap code 11 is the next free native code (2 = borrow moved-from/
+Trap code 11 is an unused native code (11) (2 = borrow moved-from/
 aliasing, 3 = assert, 9 = unreachable/enum-unwrap, 10 = slice
 bounds, 21 = JS blocking surface). Pin traps name the violation
 "pin contract."
@@ -179,15 +194,21 @@ destroy-notify rule.
 position, with a v0 restriction: legal **only wrapping `own` and
 only on `extern fn` parameters.**
 
-- Grammar: `pin` must be followed by `own`; `pin T` desugars to
+- Grammar: `pin` wraps only `own`; `pin T` is sugar for
   `pin own T`. Bare `pin`, `pin ref`, `pin mut` → compile error.
-- Seed driver: `TyKind::Pin(Box<TyRef>)` in ast.rs:160, a `Kw::Pin`
-  keyword (no `pin` identifiers exist in the corpus — verified
-  2026-11-11), parser.rs `ty()` qualifier branch, `ty_text` →
+- `pin` stays a contextual qualifier, never a keyword: the corpus
+  binds `pin` as an identifier (`cmd/oxl/getmod.oxl`'s
+  `[pin, pe] = pin_require(...)` — a `Kw::Pin`/`is_kw` entry would
+  break the toolchain itself). Both drivers match the *text*
+  `pin` in qualifier position inside `ty()`/`p_ty` only — the
+  same positional matching `own`/`ref`/`mut` already use — and
+  `pin`/`unpin` builtins are ident-dispatched calls like
+  `send`/`close`, so no call-site grammar change is needed.
+- Seed driver: `TyKind::Pin(Box<TyRef>)` in ast.rs:160, parser.rs
+  `ty()` qualifier branch on the `pin` ident, `ty_text` →
   `"pin own T"`.
-- Bootstrap driver: `lexlib.is_kw` + `p_ty`'s qualifier arm
-  (parser.oxl:1105) + `ty_parse`'s qualifier arm
-  (check.oxl:1980) + a `k_pin()` kind.
+- Bootstrap driver: `p_ty`'s qualifier arm (parser.oxl:1105) +
+  `ty_parse`'s qualifier arm (check.oxl:1980) + a `k_pin()` kind.
 - Checker: `pin` qualifier anywhere but an extern param →
   "`pin` is only legal on `extern fn` params (v0)". `pin` on a
   return type is a separate question (foreign-to-oxl ownership

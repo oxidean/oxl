@@ -19,12 +19,19 @@ That rule is load-bearing and today it holds by accident of usage:
 
 | surface | what crosses | retention? |
 |---|---|---|
-| `extra/gui/gtk` shim | int handles in; `str` text in (copied at boundary); `cstr` out (borrowed toolkit buffer → `str` copy); `RtFnv` via the pilot's `gui_connect` (shim **heap-copies** it, frees on destroy-notify) | none — C owns the copy |
+| `extra/gui/gtk` shim | int handles in; `str` text in (copied at boundary); `cstr` out (borrowed toolkit buffer → `str` copy); toolkit signals run through fixed `G_CALLBACK` trampolines onto a ring — no `RtFnv` crosses (gtk_shim.c). The pilot's `gui_connect` heap-copy + destroy-notify pattern (docs/gui-pilot.md) was retired with it | none — C owns the copies |
 | `std/net` | fds (ints); `RtSlice` into `rt_sock_read`/`rt_sock_write` — synchronous syscalls | none — duration borrow |
-| `std/os` `rt_fd_read`/`rt_fd_write`, `rt_proc_output` | `[]byte`/`mut []byte` buffers — synchronous; `rt_proc_output` drains into C-owned memory and copies back | none — duration borrow |
+| `std/os` `rt_fd_read`/`rt_fd_write`, `rt_proc_output` | `[]byte`/`mut []byte` buffers — synchronous; `rt_proc_output` drains into C buffers and hands them back as heap slices — ownership *moves* out (rt.c:4196) | none — duration borrow |
 | `rt_lookup_start` | `str` host | none — shim `memcpy`s it (rt.c) |
 | sqlite builtins | `str` paths/queries, `OxlStr` results — synchronous | none |
 | JS lane `__oxl_ffi` | `[]byte` → shared `Uint8Array` view; `own`/`ref`/`mut` → raw refs | GC makes it moot — a JS shim's "retention" is reachability, which is automatic and safe |
+
+The table names the retaining-candidate surfaces; the remaining
+~50 in-tree extern decls (`std/math`'s `rt_m_*`, `rt_free` decls
+in json/utf8/strings/fmt, `rt_err_*`, `rt_itoa`, `rt_timestr`,
+`rt_scope_*` in net/http, `rt_msleep` in extra/gui/mock, cmd +
+examples decls) are all synchronous non-retaining scalars/buffers
+of the same duration-borrow shape.
 
 Two existing rules make the duration-borrow safe end to end:
 synchronous externs can't outlive their caller's scope, and
@@ -78,7 +85,7 @@ Once `pin(b)` has run and `b` crossed a `pin` param:
 ```oxl
 extern fn rt_aio_submit(fd: int, buf: pin own void, off: int) -> int  // 0 = queued
 extern fn rt_aio_poll(fd: int) -> int      // -errno / 0 pending / n done
-extern fn rt_unpin(b: own void)            // rt export — C-callable either way
+extern fn rt_unpin(b: pin own void)        // rt export — C-callable; the `pin` param admits the pinned binding (`own void` would be a banned move site on it)
 
 // shape 1 — pinning task waits, oxl-side release:
 fn write_awaited(fd: int, b: own void) -> err {
@@ -123,9 +130,22 @@ pretend to deliver it.
 ## The trigger test
 
 `pin` implements when the first extern decl lands in-tree whose
-contract retains a caller pointer past return. The acceptance test
+contract retains a caller pointer past return — **where the
+retained thing is a freeable oxl object**. Two shapes already in
+the tree do not fire it: opaque never-freed rt handle words
+(`chan`/`scope`/`shared` — e.g. the JS lane's
+`oxl_dom_set_edge`/`rt-dom.mjs` `EDGE` stash retains an `RtChan*`
+that is never freed, so no use-after-free window exists) and any
+JS-lane retention (GC reachability is already safe). The trigger
+is precisely a C side holding a pointer that `rt_free`/`drop_elem`
+could reclaim. The acceptance test
 for the whole feature — written now, run then — is
-`tests/ffi_pin.oxl` plus a ~60-line `tests/ffi_pin_shim.c`:
+`tests/ffi_pin.oxl` plus a ~60-line `tests/ffi_pin_shim.c`. The
+P2 (rt-machinery-only) gate cannot use the sketched `.oxl` —
+`pin(b)`/`pin own void` params are P3/P4 surface — so P2's
+variant pins from C instead (`pt_hold` itself calls `rt_pin` on
+the stash inside the shim; zero language surface); the language-
+surface form below is the P3+ variant:
 
 ```oxl
 extern fn pt_hold(b: pin own void)         // stashes the pointer — retention
@@ -157,7 +177,11 @@ Compile-fail diagnostics (`tests/diag/`):
 `pin_expr.oxl` (`pin(mkbuf(n))` — non-binding), `pin_twice.oxl`,
 `unpin_unpinned.oxl`, `pin_arg_unpinned.oxl` (unpinned arg to a
 `pin` param), `pin_param_nonextern.oxl` (`pin` on an ordinary fn
-param), `pin_push.oxl` (`push` on pinned `own []T`).
+param), `pin_push.oxl` (`push` on pinned `own []T`),
+`pin_if_arm.oxl` (pin on one arm only — not pinned at join),
+`unpin_if_arm.oxl` (unpin on one arm — join mark keeps the
+pinned-path requirement), `pin_for_body.oxl` (unbalanced pin
+inside a loop body).
 
 The trigger firing also requires the *consuming* PR to land its
 decl first or in the same PR — `pin` ships behind a real caller,

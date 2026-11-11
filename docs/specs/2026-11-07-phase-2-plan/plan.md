@@ -91,9 +91,9 @@ for why the abstraction doesn't foreclose one.
 
 *Un-parked 2026-11-09* — its reopen trigger fired on G's merge:
 the G spec shipped the widget tree DOM-mappable, which was the
-guardrail keeping web parked. Spec merged at
-`docs/specs/2026-11-10-web-target/` (W0); work item WI-0007;
-implementation on `feat/milestone-w`.
+guardrail keeping web parked. Spec in flight on
+`feat/milestone-w` (W0, ships with the milestone);
+work item WI-0007; implementation on `feat/milestone-w`.
 
 **Scope sketch:** a second emit lane beside native C —
 `runtime/rt.js` semantic runtime (run queue, frame-task

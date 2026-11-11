@@ -28,7 +28,7 @@ Everything documented-but-unbuilt, grouped by how hard it is to schedule.
 ## Spec-sanctioned deferrals (reopen only on trigger)
 
 - **D4 shape-based generics** — deferred w/ measurement, re-measured
-  2026-11-11 (23 generic fns, ~35 unique (fn,T) instantiations, one
+  2026-11-11 (22 generic fns, ~35 unique (fn,T) instantiations, one
   shareable pair — still ~2 orders under the bar); reopens when
   shared-shape groups grow enough that mono dedup is a measured win.
 - **`parked-stdlib.md`** — reflect/gob/xml/database-sql/templates

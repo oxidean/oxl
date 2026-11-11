@@ -10,26 +10,33 @@ link through it. Programs that use the sqlite3 shims also need sqlite3 dev
 headers. The release tarball ships for Linux (x86_64); macOS (aarch64) and
 Windows (x86_64, via MinGW gcc or LLVM clang) are supported platforms that
 build from source. See the
-[README](https://github.com/oxidean/oxl/blob/main/README.md#building-the-toolchain).
+[README](https://github.com/oxidean/oxl/blob/main/README.md#building-from-source).
 
 <Steps>
-1. Download and extract the latest toolchain release:
+1. Install the toolchain and put it on `PATH` (see
+   [Install](/install/) for releases and the version manager):
 
    ```bash
-   curl -LO https://github.com/oxidean/oxl/releases/latest/download/oxl-toolchain-linux-x86_64.tar.gz
-   tar xzf oxl-toolchain-linux-x86_64.tar.gz && cd oxl-toolchain
+   curl -fsSL https://raw.githubusercontent.com/oxidean/oxl/main/scripts/install.sh | sh
+   export PATH="$HOME/.oxl/bin:$PATH"
    ```
 
-2. The tarball bundles the compiler, `std/`, and `examples/`. Try the
-   bundled hello world:
+2. Try the bundled hello world — installed toolchains carry `std/` and
+   `examples/` under `${OXL_HOME:-~/.oxl}/versions/<tag>/oxl-toolchain/`.
+   Ask the shim which tag is actually resolved — it may differ from
+   `default-version` when `OXL_TOOLCHAIN`, a `.oxl-version` file, or a
+   `toolchain` directive in `oxl.mod` selects another — then run the
+   example out of that one toolchain:
 
    ```bash
-   ./oxl run examples/hello.oxl    # compile + run (needs cc on PATH)
+   if cur=$(oxl toolchain current); then
+       tag=${cur%%	*}
+       oxl run "${OXL_HOME:-$HOME/.oxl}/versions/$tag/oxl-toolchain/examples/hello.oxl"
+   fi
    ```
 
-3. Put the toolchain on `PATH`, then write and run your own program.
-   Keep `std/` next to the `oxl` binary: that is where
-   `import "std/x"` resolves. Every file starts with a `package` clause,
+3. Write and run your own program. `import "std/x"` resolves against
+   `std/` next to the binary. Every file starts with a `package` clause,
    and `package main` marks an executable:
 
    ```text title="hello.oxl"
@@ -41,7 +48,6 @@ build from source. See the
    ```
 
    ```bash
-   export PATH="$PWD:$PATH"
    oxl run hello.oxl      # compile + run
    oxl build hello.oxl    # → native binary
    ```
@@ -63,7 +69,7 @@ git clone https://github.com/oxidean/oxl && cd oxl
 # resolve the latest published release tag via /releases/latest (curl
 # only, no auth); skip the checkout to build `main` instead:
 TAG=$(curl -sL -o /dev/null -w '%{url_effective}' \
-  https://github.com/oxidean/oxl/releases/latest | xargs basename)
+  https://github.com/oxidean/oxl/releases/latest | sed 's|.*/releases/tag/||')
 git checkout "$TAG" && cargo build --release --manifest-path oxl/Cargo.toml
 # binary: oxl/target/release/oxl; put it on PATH with std/ alongside
 ```

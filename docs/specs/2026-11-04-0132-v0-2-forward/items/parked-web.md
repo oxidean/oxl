@@ -1,6 +1,9 @@
 # Parked — Web compilation (JS/HTML/CSS)
 
-**Status: parked. Do not spec, do not implement.**
+**Status: trigger fired — milestone W** (spec
+`docs/specs/2026-11-10-web-target/`; the guardrail held — the GUI
+backend protocol ported to DOM with no toolkit-shaped
+assumptions). This note is historical.
 
 The design doc parks the web target explicitly. The only required
 guardrail for this milestone:

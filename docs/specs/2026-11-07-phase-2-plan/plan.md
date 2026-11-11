@@ -87,13 +87,15 @@ E's monorepo machinery.
 raw FFI calls); a second backend sketched or an honest written case
 for why the abstraction doesn't foreclose one.
 
+**Shipped as:** milestone G merged — `extra/gui` + GTK4 backend,
+`examples/gui-todo`.
+
 ## W — web compilation target (`--target js`)
 
 *Un-parked 2026-11-09* — its reopen trigger fired on G's merge:
 the G spec shipped the widget tree DOM-mappable, which was the
-guardrail keeping web parked. Spec in flight on
-`feat/milestone-w` (W0, ships with the milestone);
-work item WI-0007; implementation on `feat/milestone-w`.
+guardrail keeping web parked. Spec and implementation are in
+flight together on `feat/milestone-w` (PR open); work item WI-0007.
 
 **Scope sketch:** a second emit lane beside native C —
 `runtime/rt.js` semantic runtime (run queue, frame-task
@@ -115,6 +117,10 @@ guarded differences (repr, blocking traps) documented in
 `docs/web-target.md`; WI-0007 shipped.
 
 ## R — package registry — FOLDED INTO E
+
+*(letter later reclaimed by the type-descriptors milestone — spec
+merged `docs/specs/2026-11-11-type-descriptors/`; implementation
+WI-0008 in flight)*
 
 *2026-11-08:* rescoped to a **git-backed index** and folded into
 milestone E (stages E3–E5). `oxl get` consults the index via
@@ -141,15 +147,16 @@ in E's stage E6. Filed items:
 
 ## Parked
 
-See `parked.md` — LLVM backend, D4 shape-generics,
+See `parked.md` — LLVM backend, D4 shape-generics, pin primitive,
 parked-stdlib list. Each has an explicit reopen trigger; none is
 scheduled.
 
 ## Sequence
 
 ```
-T (shipped) ──► E ──► G ──► W  (R, P absorbed into E; W
-                               un-parked — G shipped the
-                               DOM-mappable widget tree)
-└── LLVM, D4, stdlib-list: parked on triggers
+T (shipped) ──► E ──► G ──► W  (registry-R, P absorbed into E;
+                               W un-parked — G shipped the
+                               DOM-mappable widget tree; R letter
+                               reused by type descriptors)
+└── LLVM, D4, pin, stdlib-list: parked on triggers
 ```

@@ -32,21 +32,22 @@ firing moves the item into the milestone map via a new work item.
   rather than a mechanism. (Distinct from the G spec's deferred
   thread-pin idea — same name, different ask; that one stayed
   parked inside the GUI spec.)
-- **Reopen trigger:** fired — spec in flight as its own work item;
-  retire this section when the pin spec merges.
+- **Reopen trigger:** fired — spec merged
+  (`docs/specs/2026-11-11-pin-primitive/`); retire this section when
+  the primitive ships.
 
 ## Parked stdlib list (`docs/specs/2026-11-06-0111-package-system/items/parked-stdlib.md`)
 
 - reflection-class packages (`fmt %v`, `gob`, `xml`, `database/sql`,
   templates): need runtime type descriptors — type-descriptor
-  milestone spec in flight (`docs/specs/2026-11-11-type-descriptors/`,
-  PR open), implementation tracked as WI-0008 (un-parks on
-  spec merge + impl)
+  milestone spec merged (`docs/specs/2026-11-11-type-descriptors/`);
+  implementation tracked as WI-0008 (un-parks on impl)
 - `crypto/tls`, `x509`, asymmetric crypto: a TLS stack is a project,
   not a package — spec in flight (`docs/specs/2026-11-11-tls-x509/`)
-- `compress`, `archive`, `net/url`, `container/heap` (grew to
-  `container/{heap,list,ring}` and friends): implementations in
-  flight on their own PRs — drop from this list on merge
+- `compress`/`archive` landed (`compress/{flate,zlib,gzip}`,
+  `archive/{tar,zip}`); `net/url`, `container/{heap,list,ring}`
+  implementations in flight on their own PRs — drop from this list
+  on merge
 - `image`: deferred until a real consumer exists
 - `context`: deliberate non-goal — `scope` carries cancellation and
   deadlines

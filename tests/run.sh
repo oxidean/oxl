@@ -369,6 +369,12 @@ echo "== collections (b6) =="
 out=$("$OXL" run tests/collections_test.oxl)
 [ "$(tail -1 <<<"$out")" = "collections ok" ] || { echo "FAIL collections: $out"; exit 1; }
 
+echo "== containers (b7) =="
+for t in heap list ring; do
+    out=$("$OXL" run tests/container_$t.oxl)
+    [ "$(tail -1 <<<"$out")" = "$t ok" ] || { echo "FAIL container/$t: $out"; exit 1; }
+done
+
 echo "== defer (b5) =="
 out=$("$OXL" run tests/defer_order.oxl)
 grep -q "defer order ok" <<<"$out" || { echo "FAIL defer order: $out"; exit 1; }
@@ -540,7 +546,12 @@ assert len(d["items"])>20 and not any("skip" in i for i in d["items"]), d' || { 
 
 echo "== bootstrap checker =="
 # the self-hosted typechecker must check itself and representative sources
-for f in bootstrap/check bootstrap/codegen examples/features.oxl tests/match.oxl std/collections; do
+# tests/container_heap.oxl rides along as the main-package case for
+# check.oxl's `recv == nil` method-sugar gate: it declares len/push/pop
+# methods in package main — without the gate the self checker would
+# misread the builtins as method calls.
+for f in bootstrap/check bootstrap/codegen examples/features.oxl tests/match.oxl tests/container_heap.oxl std/collections \
+    std/container/heap std/container/list std/container/ring; do
     out=$("$OXL" run bootstrap/cmd/check -- "$f")
     [ "$out" = "ok" ] || { echo "FAIL checker $f: $out"; exit 1; }
 done

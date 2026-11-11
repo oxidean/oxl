@@ -1,0 +1,283 @@
+package main
+
+// container/ring — circular list: walking both directions, move,
+// link splices a consumed ring in, unlink lifts a subring back out,
+// do visits every element. ref-vs-mut nesting borrows alias-trap
+// like container/list, so mut calls get their handles hoisted.
+import "std/container/ring"
+
+let walkacc = 0
+
+let walkn = 0
+
+// acc folds each visited payload into walkacc — do() callbacks are
+// plain fns, so a package global is the accumulator.
+fn acc(v: int) {
+    walkacc = walkacc * 10 + v
+    walkn = walkn + 1
+}
+
+fn main() {
+    // newring(n <= 0) is nil, like ring.New
+    z := ring.newring(0)
+    assert(z == nil)
+    assert(ring.newring(-3) == nil)
+
+    r := ring.newring(4)
+    assert(r != nil)
+    assert(r.len() == 4)
+
+    // set 10,20,30,40 around the cycle, then walk it
+    i := r.head()
+    v := 10
+    k := 0
+    for k < 4 {
+        r.setval(i, v)
+        v = v + 10
+        i = r.next(i)
+        k = k + 1
+    }
+    assert(i == r.head()) // the walk wrapped exactly once
+    i = r.head()
+    assert(r.val(i) == 10)
+    i = r.next(i)
+    assert(r.val(i) == 20)
+    // prev walks backward over the same boundary
+    p := r.prev(r.head())
+    assert(r.val(p) == 40)
+    // move forward, backward, and wrapping
+    assert(r.val(r.move(r.head(), 2)) == 30)
+    assert(r.val(r.move(r.head(), -1)) == 40)
+    // a step count equal to len walks home — n % len == 0
+    assert(r.move(r.head(), 4) == r.head())
+    assert(r.move(r.head(), -4) == r.head())
+    assert(r.val(r.move(r.head(), 5)) == 20)
+
+    // do visits every element in order
+    r.do(r.head(), acc)
+    assert(walkacc == 12340 && walkn == 4)
+
+    // link splices s in right after head: [10,1,2,20,30,40]
+    s := ring.newring(2)
+    si := s.head()
+    s.setval(si, 1)
+    s2 := s.next(si)
+    s.setval(s2, 2)
+    hd := r.head()
+    bd := r.link(hd, s)
+    assert(r.len() == 6)
+    assert(r.val(r.next(r.head())) == 1)
+    assert(r.val(bd) == 20) // link returns the element behind the splice
+    assert(r.val(r.prev(bd)) == 2)
+
+    // link(nil) is a no-op returning i.next — z is already nil
+    nx := r.next(r.head())
+    nxl := r.link(hd, z)
+    assert(nxl == nx)
+    assert(r.len() == 6)
+
+    // unlink lifts the [1,2] block back out, ring closes back up
+    out := r.unlink(hd, 2)
+    assert(out != nil)
+    assert(out.len() == 2)
+    assert(r.len() == 4)
+    assert(out.val(out.head()) == 1)
+    assert(out.val(out.next(out.head())) == 2)
+    assert(r.val(r.next(r.head())) == 20)
+
+    // unlink wraps across the head boundary: r=[10,20,30,40] head@10,
+    // anchoring at prev(head)=40 removes [10,20] — head moves to 40
+    pv := r.prev(r.head())
+    out2 := r.unlink(pv, 2)
+    assert(out2 != nil && out2.len() == 2)
+    assert(out2.val(out2.head()) == 10)
+    assert(r.len() == 2)
+    assert(r.val(r.head()) == 40)
+    assert(r.val(r.next(r.head())) == 30)
+
+    // removing nothing yields nil and leaves the ring alone
+    hh := r.head()
+    assert(r.unlink(hh, 2) == nil) // n == len removes none
+    assert(r.len() == 2)
+    assert(r.unlink(hh, 0) == nil)
+    assert(r.unlink(hh, -1) == nil)
+
+    // unlink down to a single element leaves a self-loop
+    one := r.unlink(hh, 1)
+    assert(one != nil)
+    assert(r.len() == 1)
+    assert(r.next(r.head()) == r.head())
+    assert(r.prev(r.head()) == r.head())
+
+    // freelist reuse across churn: unlink 5 of 8 then link them back
+    big := ring.newring(8)
+    j := big.head()
+    k = 0
+    for k < 8 {
+        big.setval(j, k)
+        j = big.next(j)
+        k = k + 1
+    }
+    bh := big.head()
+    out3 := big.unlink(bh, 5)
+    assert(out3 != nil && out3.len() == 5)
+    assert(out3.val(out3.head()) == 1)
+    assert(big.len() == 3)
+    assert(big.val(big.head()) == 0)
+    big.link(bh, out3) // [0,1,2,3,4,5,6,7] again
+    assert(big.len() == 8)
+    walkacc = 0
+    walkn = 0
+    big.do(big.head(), acc)
+    assert(walkacc == 1234567 && walkn == 8)
+
+    // link anchored away from head — off-head splice between a
+    // middle element and its old next
+    t := ring.newring(3)
+    th := t.head()
+    t.setval(th, 100)
+    tn := t.next(th)
+    t.setval(tn, 200)
+    tp := t.prev(th)
+    t.setval(tp, 300)
+    u := ring.newring(2)
+    uh := u.head()
+    u.setval(uh, 7)
+    un := u.next(uh)
+    u.setval(un, 8)
+    bd2 := t.link(tn, u) // splices {7,8} between 200 and 300
+    assert(t.len() == 5)
+    assert(t.val(bd2) == 300) // element behind the splice
+    assert(t.val(t.next(tn)) == 7 && t.val(t.prev(bd2)) == 8)
+    assert(t.val(t.prev(tn)) == 100)
+
+    // dead handles go inert — 999 is out-of-bounds, not a node
+    assert(big.next(999) == -1)
+    assert(big.val(999) == 0)
+    assert(big.move(999, 3) == -1)
+    assert(big.unlink(999, 1) == nil)
+    // do on a dead handle calls nothing — acc stays at its sum
+    pre := walkacc
+    big.do(999, acc)
+    assert(walkacc == pre)
+    // link on a dead i still consumes s — own can't be handed back
+    deadsrc := ring.newring(2)
+    assert(big.link(999, deadsrc) == -1)
+
+    // unlink wraps n mod len — asking for 7 on a 5-ring removes 2
+    wr := ring.newring(5)
+    wi := wr.head()
+    wv := 1
+    wk := 0
+    for wk < 5 {
+        wr.setval(wi, wv)
+        wv = wv + 1
+        wi = wr.next(wi)
+        wk = wk + 1
+    }
+    whd := wr.head() // hoisted — unlink(head()) borrows r twice
+    wout := wr.unlink(whd, 7)
+    assert(wout != nil && wout.len() == 2)
+    assert(wr.len() == 3)
+
+    // link into a singleton ring splices in order; do on a
+    // singleton visits its one element exactly once
+    sg1 := ring.newring(1)
+    sg1h := sg1.head()
+    sg1.setval(sg1h, 7)
+    sg2 := ring.newring(2)
+    sg2h := sg2.head()
+    sg2.setval(sg2h, 8)
+    sg2n := sg2.next(sg2h) // hoisted — setval(next()) nests ref under mut
+    sg2.setval(sg2n, 9)
+    sg1.link(sg1h, sg2)
+    assert(sg1.len() == 3)
+    walkacc = 0
+    walkn = 0
+    sg1.do(sg1h, acc)
+    assert(walkn == 3 && walkacc == 789)
+    solo := ring.newring(1)
+    sh := solo.head()
+    solo.setval(sh, 4)
+    walkacc = 0
+    walkn = 0
+    solo.do(sh, acc)
+    assert(walkn == 1 && walkacc == 4)
+
+    // zero-value ring adopts via link — the r.n==0 path migrates
+    // s's cycle wholesale in order; head leads the adopted cycle
+    zr := new(ring.Ring)
+    assert(zr.len() == 0 && zr.head() == -1)
+    src := ring.newring(3)
+    sh2 := src.head()
+    src.setval(sh2, 7)
+    sn2 := src.next(sh2)
+    src.setval(sn2, 8)
+    sn3 := src.next(sn2)
+    src.setval(sn3, 9)
+    zhd := zr.head()
+    ah := zr.link(zhd, src)
+    assert(ah != -1 && zr.len() == 3)
+    assert(ah == zr.head())
+    assert(zr.val(zr.head()) == 7)
+    assert(zr.val(zr.next(zr.head())) == 8)
+    assert(zr.val(zr.next(zr.next(zr.head()))) == 9)
+    assert(zr.next(zr.next(zr.next(zr.head()))) == zr.head())
+    // empty + nil stays empty; non-empty + empty returns i.next
+    zr2 := new(ring.Ring)
+    z2h := zr2.head()
+    assert(zr2.link(z2h, nil) == -1 && zr2.len() == 0)
+    en := ring.newring(1)
+    enh := en.head()
+    enn := en.next(enh)
+    esrc := new(ring.Ring)
+    assert(en.link(enh, esrc) == enn)
+
+    // a stale handle stays dead after its slot recycles — unlink
+    // frees the node (gen bumps), a later link re-arms it fresh
+    cr := ring.newring(3)
+    crh := cr.head()
+    cr.setval(crh, 1)
+    victim := cr.next(crh)
+    cr.setval(victim, 2)
+    uout := cr.unlink(crh, 1) // removes victim's element
+    assert(uout != nil)
+    assert(cr.val(victim) == 0 && cr.next(victim) == -1)
+    fresh := ring.newring(1)
+    fh := fresh.head()
+    fresh.setval(fh, 99)
+    cr.link(crh, fresh)
+    assert(cr.val(victim) == 0 && cr.next(victim) == -1)
+    assert(cr.len() == 3)
+
+    // bare gen-0 indices never name live slots — minted handles
+    // carry gen >= 1, so a raw slot index reads dead even when
+    // the slot is live
+    gr := ring.newring(1)
+    gh := gr.head()
+    gr.setval(gh, 5)
+    assert(gr.val(gh) == 5)
+    assert(gr.val(0) == 0 && gr.next(0) == -1)
+
+    // arena survives a nested growth scope: link allocs into r's
+    // arena inside scope{} and the ring stays readable after join
+    sr := ring.newring(3)
+    ss := ring.newring(2)
+    sh0 := sr.head()
+    sr.link(sh0, ss)
+    scope {
+        ss2 := ring.newring(1)
+        sh := sr.head()
+        sr.link(sh, ss2)
+    }
+    assert(sr.len() == 6)
+    k2 := 0
+    i3 := sr.head()
+    for k2 < 6 {
+        i3 = sr.next(i3)
+        k2 = k2 + 1
+    }
+    assert(i3 == sr.head())
+
+    println("ring ok")
+}

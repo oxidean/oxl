@@ -16,7 +16,9 @@ const ok = (cond, name) => {
   }
 }
 
-/* fake api surface — install() only touches env/F/rt_str/rt_str_cstr */
+/* fake api surface — install() touches env/F/rt_str/rt_str_cstr plus
+ * rt_trap_native, which outside the scheduler throws the checked
+ * {__oxl_trap, code} sentinel verbatim (rt.mjs's no-scope path) */
 const F = {}
 const env = {}
 install({
@@ -24,6 +26,7 @@ install({
   F,
   rt_str: (js) => js,
   rt_str_cstr: (s) => s,
+  rt_trap_native: (c) => { throw { __oxl_trap: true, code: BigInt(c) } },
 })
 
 /* ---- env surface ---- */

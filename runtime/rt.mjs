@@ -792,6 +792,16 @@ export function rt_task_data(t) {
  * parked tasks, cancels descendant subtrees, then throws — the JS
  * longjmp into run_task's catch. */
 
+/* rt_trap_native: the entry for FFI flavor stubs (unsupported-lane
+ * natives). Inside the scheduler it is rt_trap verbatim — scope
+ * marking, parked-peer wakes, the sentinel throw. Outside any scope
+ * (test harnesses, module init) there is nothing to mark or unwind,
+ * so the checked {__oxl_trap, code} sentinel is thrown directly. */
+export function rt_trap_native(code) {
+  if (tls_scope && tls_task) return rt_trap(code)
+  throw { __oxl_trap: true, code: BigInt(code) }
+}
+
 export function rt_trap(code) {
   const s = tls_scope
   const t = tls_task
@@ -2184,7 +2194,7 @@ export async function __oxl_boot(main_entry) {
  * exit, and the rest of __oxl_ffi without re-importing (import cycles
  * would deadlock the module graph) */
 function rt_exports_api() {
-  return { env, F: globalThis.__oxl_ffi, rt_str, rt_str_cstr, rt_trap }
+  return { env, F: globalThis.__oxl_ffi, rt_str, rt_str_cstr, rt_trap, rt_trap_native }
 }
 
 /* ---------------- test entry ----------------

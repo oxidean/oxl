@@ -1,0 +1,39 @@
+package main
+
+// Zero-str invariants on the js lane: {u8:null} used to TypeError
+// inside readers; susp-fn `let s: str` used to emit literal null.
+// Both must behave like the native {NULL,0,0} zero.
+fn susp_zerostr() {
+    let s: str
+    if len(s) != 0 {
+        println("FAIL susp let zero len")
+        exit(1)
+    }
+    println("empty=[" + s + "]")
+    t := s + "x"
+    if t != "x" {
+        println("FAIL zero concat: " + t)
+        exit(1)
+    }
+    msleep(1)
+}
+
+fn main() {
+    let s: str
+    if len(s) != 0 {
+        println("FAIL let zero len")
+        exit(1)
+    }
+    println("empty=[" + s + "]")
+    if s + "y" != "y" {
+        println("FAIL zero concat")
+        exit(1)
+    }
+    ss := mkslice(str, 2)
+    if len(ss[0]) != 0 || ss[1] + "z" != "z" {
+        println("FAIL mkslice str elements")
+        exit(1)
+    }
+    susp_zerostr()
+    println("zero str ok")
+}

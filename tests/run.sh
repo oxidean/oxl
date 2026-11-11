@@ -1527,6 +1527,14 @@ echo "== g1 typed chans + named scopes =="
 out=$("$OXL" run tests/chan_own.oxl)
 [ "$(tail -1 <<<"$out")" = "chan_own done" ] || { echo "FAIL chan_own: $out"; exit 1; }
 
+echo "== susp closures + zero values =="
+# closures in susp fns keep their own defer mark + snapshot captures;
+# bare `let` zero-inits its slot on both emitters
+out=$("$OXL" run tests/susp_closure.oxl)
+[ "$(tail -1 <<<"$out")" = "susp closure ok" ] || { echo "FAIL susp_closure: $out"; exit 1; }
+out=$("$OXL" run tests/zero_str.oxl)
+[ "$(tail -1 <<<"$out")" = "zero str ok" ] || { echo "FAIL zero_str: $out"; exit 1; }
+
 echo "== g1 gui: mock backend + cancel gate =="
 out=$("$OXL" run tests/gui_mock.oxl)
 [ "$(tail -1 <<<"$out")" = "done" ] || { echo "FAIL gui_mock: $out"; exit 1; }
@@ -1735,7 +1743,7 @@ echo "== w4 js driver lane =="
 if command -v node >/dev/null 2>&1; then
     # gui_* joined the lane in W5 — the susp-pump contract lets the
     # mock's cooperative pump drive the same gates single-threaded
-    for f in conc_ping conc_scale select select_fair chan_own chanbuf chanbuf_close scope_exit orphan_join defer_order pairfwd match methods fnval d5_qual stdmods_test gui_mock gui_lifecycle gui_overflow gui_select gui_stress gui_cancel gui_dom; do
+    for f in conc_ping conc_scale select select_fair chan_own chanbuf chanbuf_close scope_exit orphan_join defer_order pairfwd match methods fnval d5_qual stdmods_test susp_closure zero_str gui_mock gui_lifecycle gui_overflow gui_select gui_stress gui_cancel gui_dom; do
         out=$(with_timeout 60 "$SELFOXL" run --target js "tests/$f.oxl" 2>&1) || { echo "FAIL js lane $f: $out"; exit 1; }
     done
     for f in enc_test hash_test regexp_test float_test util_test stdlib_test collections_test enum_test defer_test os_test exec_test net_test flaglog_test extra_testutil; do

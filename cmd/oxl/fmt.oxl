@@ -1257,12 +1257,13 @@ fn fp_item(p: mut FPar) -> own FItem {
             hasty = 1
             ty = t.s
         }
-        if !fexpect_p(p, "=", "`=`") {
-            return nil
-        }
-        init := fp_expr(p, 0, 0)
-        if init == nil {
-            return nil
+        // init is optional — `let name: ty` zero-inits (bare `let`)
+        let init: own FX = nil
+        if feat_p(p, "=") {
+            init = fp_expr(p, 0, 0)
+            if init == nil {
+                return nil
+            }
         }
         return mkit(FIK.IGlobal{name: nm.v, hasty: hasty, ty: ty, init: init}, nm.lo)
     }
@@ -1423,12 +1424,13 @@ fn fp_stmt(p: mut FPar) -> own FStmt {
                 hasty = 1
                 ty = tt.s
             }
-            if !fexpect_p(p, "=", "`=`") {
-                return nil
-            }
-            init := fp_expr(p, 0, 0)
-            if init == nil {
-                return nil
+            // init is optional — `let name: ty` zero-inits (bare `let`)
+            let init: own FX = nil
+            if feat_p(p, "=") {
+                init = fp_expr(p, 0, 0)
+                if init == nil {
+                    return nil
+                }
             }
             s := mkst(FSK.SLet{name: nm.v, hasty: hasty, ty: ty, init: init}, sp, 0, 1)
             return s
@@ -2222,13 +2224,15 @@ fn fp_primary(p: mut FPar) -> own FX {
         return e
     }
     if fat_p(p, "{") {
-        // `{|p: t, ..| stmts}` closure — body block keeps the `{` span
+        // `{|p: t, ..| stmts}` closure — body block keeps the `{` span.
+        // `{ || stmts }` — `||` lexes as one Or token (seed parity)
         fbump(p)
-        if !feat_p(p, "|") {
+        empty := feat_p(p, "||")
+        if !empty && !feat_p(p, "|") {
             fexpect_p(p, "|", "`|`")
         }
         let params: own PL = nil
-        for !feat_p(p, "|") && !fat_eof(p) {
+        for !empty && !feat_p(p, "|") && !fat_eof(p) {
             pn := fident(p)
             if pn == nil {
                 return nil
@@ -2611,7 +2615,9 @@ fn fitem(f: mut Fmt2, it: own FItem) {
             if hasty == 1 {
                 s = s + ": " + ty
             }
-            s = s + " = " + fexpr(f, init, 0)
+            if init != nil {
+                s = s + " = " + fexpr(f, init, 0)
+            }
             fput(f, s)
         }
         FIK.IStruct{name, fields} => {
@@ -2830,7 +2836,13 @@ fn fsub(f: mut Fmt2) -> own Fmt2 {
 fn fstmt(f: mut Fmt2, st: own FStmt, ind: int) {
     match st.k {
         FSK.SLet{name, hasty, ty, init} => {
-            if hasty == 1 {
+            if init == nil {
+                if hasty == 1 {
+                    fput(f, "let " + name + ": " + ty)
+                } else {
+                    fput(f, "let " + name)
+                }
+            } else if hasty == 1 {
                 fput(f, "let " + name + ": " + ty + " = " + fexpr(f, init, ind))
             } else {
                 fput(f, name + " := " + fexpr(f, init, ind))

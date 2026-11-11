@@ -3862,8 +3862,13 @@ fn gs(g: mut G, s: ref parser.Node) {
             if ty == nil {
                 t = xty(g, init)
             }
-            v := gx(g, init)
-            v = gconv_v(g, init, v, t)
+            // bare `let` zero-inits: the compound literal is the typed
+            // zero for scalars and structs alike (str, slice, pair)
+            v := "(" + gcty(g, t) + "){0}"
+            if init != nil {
+                v = gx(g, init)
+                v = gconv_v(g, init, v, t)
+            }
             wln(g, "    " + gcty(g, t) + " " + name + " = " + v + ";")
             check.env_bind(g.env, name, t)
         }
@@ -4403,7 +4408,10 @@ fn gfstmt(g: mut G, s: ref parser.Node) {
             ct := gcty(g, t)
             fd := gfslot(g, name, ct)
             check.env_bind(g.env, name, t)
-            if len(g_call_susp(g, init)) > 0 {
+            if init == nil {
+                // bare `let` in a susp fn: typed zero for the slot
+                wln(g, "    fr->" + fd + " = (" + ct + "){0};")
+            } else if len(g_call_susp(g, init)) > 0 {
                 gfsusp_go(g, init, 1, fd, "")
             } else {
                 v := gx(g, init)

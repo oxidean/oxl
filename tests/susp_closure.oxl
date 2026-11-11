@@ -1,0 +1,64 @@
+package main
+
+// Susp-fn closures: a {} literal inside a susp fn is its own plain-fn
+// context — its defers drain the CLOSURE's mark (not the enclosing
+// frame's), and captured names bind the creation-time snapshot, not
+// the live frame slot.
+let order: str = ""
+
+fn mark(s: str) {
+    order = order + s
+}
+
+fn suspwork() {
+    order = ""
+    // enclosing-frame defer — must run at fn exit, AFTER the
+    // closure returns; a drain that pops it early reorders output
+    defer mark("outer;")
+    f := { |x: int|
+        defer mark("inner;")
+        mark("body;")
+        return x
+    }
+    f(0)
+    if order != "body;inner;" {
+        println("FAIL closure defer order: " + order)
+        exit(1)
+    }
+    msleep(1)
+}
+
+// captures snapshot creation values — a mutation after creation must
+// not leak into the earlier closure (copy-capture parity with native)
+fn captest() {
+    x := 1
+    f1 := { || return x }
+    x = 7
+    f2 := { || return x }
+    if f1() != 1 || f2() != 7 {
+        println("FAIL captures: f1=" + itoa(f1()) + " f2=" + itoa(f2()))
+        exit(1)
+    }
+    msleep(1)
+}
+
+// a susp call AFTER a closure must still suspend — closure emission
+// must not corrupt the enclosing frame's state slots
+fn frameintact() -> int {
+    acc := 0
+    bump := { |n: int| return acc + n }
+    acc = bump(5)
+    msleep(1)
+    acc = acc + bump(6)
+    return acc
+}
+
+fn main() {
+    suspwork()
+    captest()
+    if frameintact() != 11 {
+        println("FAIL frame slots after closure")
+        exit(1)
+    }
+    println("susp closure ok")
+}

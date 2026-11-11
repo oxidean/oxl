@@ -2987,10 +2987,13 @@ fn scan_stmt(st: &Stmt, s: &mut BodyScan) {
             scan_block(body, s);
         }
         Stmt::Unsafe { body, .. } => scan_block(body, s),
-        Stmt::Spawn { call, .. } | Stmt::Defer { call, .. } => {
+        Stmt::Spawn { call, .. } => {
             s.seeded = true;
             scan_expr(call, s);
         }
+        // defer is fn-scoped, not frame machinery: the closure drains its
+        // own _dmark at return, so it stays legal (unlike spawn/scope/etc.)
+        Stmt::Defer { call, .. } => scan_expr(call, s),
         Stmt::Select { arms, .. } => {
             s.seeded = true;
             for a in arms {

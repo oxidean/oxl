@@ -4049,6 +4049,9 @@ fn stmt(ck: mut Ck, s: ref parser.Node, env: mut Env) {
     }
     match s {
         parser.Node.Let{name, ty, init, lo, hi} => {
+            if init == nil && ty == nil {
+                diag(ck, "check", "`let` requires a type or an initializer")
+            }
             it := expr(ck, init, env)
             t := it
             if ty != nil {
@@ -4682,8 +4685,9 @@ fn cl_scan_stmt(ck: mut Ck, s: ref parser.Node, cc: mut ClChk) {
         parser.Node.Unsafe{body} => {
             cl_scan_node(ck, body, cc)
         }
+        // defer is fn-scoped, not frame machinery: the closure drains its
+        // own _dmark at return, so it stays legal (unlike spawn/scope/etc.)
         parser.Node.Defer{call} => {
-            cc.seeded = 1
             cl_scan_expr(ck, call, cc)
         }
         parser.Node.Spawn{e} => {

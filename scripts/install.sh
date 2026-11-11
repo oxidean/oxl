@@ -165,8 +165,13 @@ fetch() { # url out  — download url to file out
 # than resolve a tag that dies at the asset fetch
 tag_has_toolchain() { # tag -> 0 when the release lists an oxl-toolchain asset
     have curl || return 1
-    curl -fsSL --connect-timeout 15 --max-time 60 \
-        "$BASE/expanded_assets/$1" 2>/dev/null | grep -q 'oxl-toolchain-'
+    # an unreachable probe (file:// fixture base, offline mirror)
+    # cannot prove asset-lessness — accept and let the download
+    # step produce the real error; only a loaded page without the
+    # asset filters the tag out
+    page=$(curl -fsSL --connect-timeout 15 --max-time 60 \
+        "$BASE/expanded_assets/$1" 2>/dev/null) || return 0
+    printf '%s' "$page" | grep -q 'oxl-toolchain-'
 }
 
 # newest toolchain tag on the release feed, or nothing — paged because a

@@ -32,7 +32,8 @@ firing moves the item into the milestone map via a new work item.
 ## Parked stdlib list (`docs/specs/2026-11-06-0111-package-system/items/parked-stdlib.md`)
 
 - reflection-class packages (`fmt %v`, `gob`, `xml`, `database/sql`,
-  templates): need runtime type descriptors
+  templates): need runtime type descriptors — **trigger fired →
+  milestone R** (`docs/specs/2026-11-11-type-descriptors/`)
 - `crypto/tls`, `x509`, asymmetric crypto: a TLS stack is a project,
   not a package
 - `image`, `compress`, `archive`, `net/url`, `container/heap`:

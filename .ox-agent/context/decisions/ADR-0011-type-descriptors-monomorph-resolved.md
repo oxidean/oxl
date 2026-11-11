@@ -26,8 +26,10 @@ Spec-level forks resolved:
    carry vtables), no value payloads (those live behind
    `reflect.Value{td, addr}`).
 3. **One `unsafe` seam, confined to `std/reflect`** — `Value` reads
-   via `rt_field_*` externs; `value_of` takes `ref T` so a `Value`
-   cannot outlive its source under the arena/scope rules.
+   via `rt_field_*` externs; `value_of` is a compiler-lowered
+   intrinsic and `Value` a scope-bound type (same escape rules as
+   borrowed `ref`s — no return, no heap store, no spawn escape), so
+   a `Value` provably cannot outlive its source.
 4. **`err` stays int64; typed errors are additive `ErrBox`** — the
    descriptor tag on the box gives `errors.as[T]` the identity match
    Go gets from a dynamic type, without re-shaping the `err` chain.

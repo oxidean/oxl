@@ -7,6 +7,10 @@ machinery they need.
 
 ## Needs reflection / `any` runtime values — the language lacks it
 
+**Un-parked → milestone R** (`docs/specs/2026-11-11-type-descriptors/`):
+compiler-emitted type descriptors land the machinery these packages
+waited on; they return to the active milestone under R2–R6.
+
 - `fmt` `%v`-anything, `reflect`, `encoding/gob`, `encoding/xml`
   (tagged-field driven), `database/sql` (driver-registry + `Scan(any)`)
   — oxl's type system is static + generic with no runtime type
@@ -54,6 +58,8 @@ machinery they need.
   precision machinery deferred until a real consumer exists.
 
 ## Parked pending runtime type descriptors
+
+**Un-parked → milestone R** (`docs/specs/2026-11-11-type-descriptors/`).
 
 - `fmt %v` (issue #28) — a generic default-format verb needs runtime
   reflection over the value's type; `err` codes, `own` graph nodes,

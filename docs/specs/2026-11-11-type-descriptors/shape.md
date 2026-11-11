@@ -12,9 +12,13 @@ runtime type descriptors + the reflection-class stdlib they unlock —
 
 Not this spec: an `any` type or boxed values, variadic call forms,
 runtime type-id tags on every allocation, interface-dispatch
-reflection, `unsafe` pointer arithmetic as a language feature
-(existing `unsafe` is an ownership opt-out block, kept that way),
-`runtime/pprof`-class introspection.
+reflection (iface-typed `T` describes as IFACE and stops — no path
+to the concrete payload), `unsafe` pointer arithmetic as a language
+feature (existing `unsafe` is an ownership opt-out block, kept that
+way), `runtime/pprof`-class introspection, and the `--target js`
+emit lane: `addr:int` arithmetic and C `rt_field_*` loads don't
+port to JS, so R is native-lane only — js-lane descriptors/`%v`
+defer to their own trigger.
 
 ## Evidence
 
@@ -49,19 +53,29 @@ reflection, `unsafe` pointer arithmetic as a language feature
    (bounded by instantiated types, dedup'd per type).
 2. **Descriptors describe layout, not behavior.** A descriptor
    records: name, kind, size, field list `{name, offset,
-   type-desc-idx}` for structs, element desc for slice/chan/ptr/map
-   shapes. No method tables — ifaces already carry vtables; the
+   type-desc-idx}` for structs, element desc for slice/chan/ptr
+   shapes, variant names for enums. No method tables — ifaces already carry vtables; the
    descriptor surface composes with them rather than duplicating.
-3. **Reading field values crosses one unsafe seam.** `reflect.Value`
-   is `{tdesc, addr}` — an opaque field address. The read path is a
-   small set of extern helpers (`rt_field_*`) confined to `std/reflect`
+3. **Reading field values crosses one unsafe seam — with enforced
+   lifetime.** `reflect.Value` is `{tdesc, addr}` — an opaque field
+   address. `value_of` is a compiler-lowered intrinsic (no `addrof`
+   builtin exists to abuse) and `Value` is declared a scope-bound
+   type: the checker applies the same escape rules as borrowed
+   `ref`s (no return, no heap store, no spawn escape), so a `Value`
+   provably cannot outlive its source. The read path is a small set
+   of extern helpers (`rt_field_*`) confined to `std/reflect`
    internals behind `unsafe`; user code sees typed `Value` methods
-   (`v.int()`, `v.str()`, `v.field(i)`), never raw addresses.
+   (`v.int()`, `v.str()`, `v.field(i)`, `v.len()`/`v.index(i)`),
+   never raw addresses.
 4. **`errors.As` gets a typed box, `err` stays int64.** Go's As
-   matches a *dynamic* type; int64 codes have none. Additive
-   `ErrBox{code, tdesc, payload}` — `errors.box(v)`, `errors.as[T](e,
-   out)` walks the box's tag. The `err` chain (`wrap`/`unwrap`/`is`)
-   is untouched; `ErrBox` is the typed lane.
+   matches a *dynamic* type; int64 codes have none. `box(v)` mints
+   a fresh int64 code and stores `{tdesc(T), payload}` in the rt
+   err registry — the same out-of-band side table wrapped-err
+   payloads already use, so a box *is* an `err` end to end and
+   chains through `wrap`/`unwrap`/`is` untouched. `errors.as[T](e,
+   out)` reads the registry entry's tag and payload back. `ErrBox`
+   is the typed lane; the code/payload split stays in rt, not an
+   oxl struct (an oxl struct can't be an int64 `err`).
 5. **gob is the first hard consumer, not %v.** %v proves the table
    emits; gob proves the walk machinery is complete enough to trust
    (arbitrary nested struct → bytes → equal struct). Stages ordered
@@ -78,14 +92,16 @@ resolved per monomorphized instantiation.**
 
 ```oxl
 // std/reflect — public surface (v1)
-struct Field { name: str, off: int, td: int }     // td = desc idx
+struct Field { name: str, off: int, td: int, tag: str } // tag = "" when absent
 struct Type  { name: str, kind: int, size: int,
-               fields: []Field, elem: int }        // elem: slice/ptr/chan/map
-struct Value { td: int, addr: int }               // opaque; unsafe internals
+               fields: []Field, elem: int }        // elem: slice/ptr/chan
+struct Value { td: int, addr: int }               // opaque; scope-bound
 
 fn type_of[T any]() -> Type                 // tdesc(T) resolved at mono time
-fn value_of[T any](v: ref T) -> Value        // {tdesc, addr-of-v}
+fn value_of[T any](v: ref T) -> Value        // intrinsic → {tdesc, addr-of-v}
 fn (v Value) field(i: int) -> Value          // addr + fields[i].off
+fn (v Value) len() -> int                    // SLICE only (RtSlice.len)
+fn (v Value) index(i: int) -> Value          // SLICE only, scope-bound
 fn (v Value) int() -> int                    // kind-checked read
 fn (v Value) str() -> str                    // kind-checked read
 ```
@@ -93,7 +109,11 @@ fn (v Value) str() -> str                    // kind-checked read
 `fmt` grows `sprintv[T any](v: T) -> str` / `printv[T any]` +
 `vfmt[T](f: str, v: T)` covering `%v`/`%+v`/`%T`/`%#v` for a single
 typed value — the Go variadic-multi-arg form stays impossible (no
-variadics) and the doc says so.
+variadics) and the doc says so. By-value `v: T` can't coerce to
+`ref T` (`assignable` admits refs only from own/mut/ref args), so
+the bridge inside these wrappers is pinned: `c := new(v)` yields
+`own T`, which coerces to `ref T` for `value_of` — then `c` drops
+with the wrapper's scope, inside the `Value`'s scope-bound lifetime.
 
 Consumers walk: `gob.encode[T]` → field-wise binary per descriptor;
 `xml` → tag-named fields; `template` → `{{.Field}}` lookup by

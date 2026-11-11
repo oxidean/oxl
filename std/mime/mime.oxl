@@ -355,10 +355,9 @@ fn decode2231(v: str) -> own D31 {
     d := new(D31)
     d.ok = false
     d.v = ""
+    // an empty value isn't a valid 'charset'lang'text triple —
+    // Go's decode2231Enc drops the param entirely
     if len(v) == 0 {
-        // Go's decode2231Enc("") yields ("", true) — a quoted-empty
-        // * param must not drop
-        d.ok = true
         return d
     }
     // charset ' lang ' text — two splits
@@ -634,10 +633,14 @@ fn formatmediatype(t: str, params: ref Param) -> str {
         }
         buf = buf + lwr(a)
         value := pget(params, a)
+        // Go's needsEncoding: only controls (except tab) and
+        // non-ASCII force RFC 2231 — printable non-token chars like
+        // space or ';' take the ordinary quoted-string path below
         needenc := false
         j := 0
         for j < len(value) {
-            if !istokenchar(byteat(value, j)) {
+            c := byteat(value, j)
+            if (c < 32 && c != 9) || c > 126 {
                 needenc = true
                 break
             }

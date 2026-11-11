@@ -60,11 +60,13 @@ fn consumecomment(p: mut P) -> [str, err] {
     for !pempty(p) && depth != 0 {
         c := ppeek(p)
         if c == 92 && p.pos + 1 < len(p.s) {
-            p.pos = p.pos + 1 // drop '\', keep the byte it guarded
-            c = ppeek(p)
+            // drop '\', keep the guarded byte verbatim — it never
+            // reaches the depth checks (Go's else-if shape)
+            p.pos = p.pos + 1
+            comment = comment + substr(p.s, p.pos, p.pos + 1)
+            p.pos = p.pos + 1
+            continue
         }
-        // the guarded byte still counts for depth — Go's shared
-        // switch sees it either way
         if c == 40 {
             depth = depth + 1
         } else if c == 41 {
@@ -104,6 +106,46 @@ fn iswsp(c: int) -> bool {
 // multibyte rune reads as one vchar here since we work byte-wise)
 fn isvchar(c: int) -> bool {
     return c >= 33 && c <= 126 || c >= 128
+}
+
+// utf8seq returns the byte length of a valid UTF-8 sequence at i, or
+// 0 when the bytes can't form one — the rune-level reject Go's mail
+// parser applies (RuneError is not a vchar).
+fn utf8seq(s: str, i: int) -> int {
+    c := byteat(s, i)
+    if c < 128 {
+        return 1
+    }
+    n := 0
+    if c >= 194 && c <= 223 {
+        n = 2
+    } else if c >= 224 && c <= 239 {
+        n = 3
+    } else if c >= 240 && c <= 244 {
+        n = 4
+    } else {
+        return 0
+    }
+    if i + n > len(s) {
+        return 0
+    }
+    c1 := byteat(s, i + 1)
+    if c1 < 128 || c1 > 191 {
+        return 0
+    }
+    // overlong leads + surrogates + >U+10FFFF
+    if c == 224 && c1 < 160 || c == 237 && c1 > 159 || c == 240 && c1 < 144 || c == 244 && c1 > 143 {
+        return 0
+    }
+    k := 2
+    for k < n {
+        ck := byteat(s, i + k)
+        if ck < 128 || ck > 191 {
+            return 0
+        }
+        k = k + 1
+    }
+    return n
 }
 
 // isatext — atom characters; dot=true admits '.' (dot-atom)
@@ -161,7 +203,19 @@ fn lwr(s: str) -> str {
 // the leading/trailing/double-dot checks, matching Go's phrase atoms.
 fn consumeatom(p: mut P, dot: bool, permissive: bool) -> [str, err] {
     start := p.pos
-    for p.pos < len(p.s) && isatext(byteat(p.s, p.pos), dot) {
+    for p.pos < len(p.s) {
+        c := byteat(p.s, p.pos)
+        if c >= 128 {
+            n := utf8seq(p.s, p.pos)
+            if n == 0 {
+                return "", errors.new("mail: invalid utf-8 in address")
+            }
+            p.pos = p.pos + n
+            continue
+        }
+        if !isatext(c, dot) {
+            break
+        }
         p.pos = p.pos + 1
     }
     atom := substr(p.s, start, p.pos)
@@ -194,11 +248,26 @@ fn consumeqstring(p: mut P) -> [str, err] {
         }
         c := byteat(p.s, i)
         if escaped {
-            if !isvchar(c) && !iswsp(c) {
+            if c >= 128 {
+                n := utf8seq(p.s, i)
+                if n == 0 {
+                    return "", errors.new("mail: invalid utf-8 in quoted-string")
+                }
+                out = out + substr(p.s, i, i + n)
+                i = i + n - 1
+            } else if !isvchar(c) && !iswsp(c) {
                 return "", errors.new("mail: bad character in quoted-string")
+            } else {
+                out = out + substr(p.s, i, i + 1)
             }
-            out = out + substr(p.s, i, i + 1)
             escaped = false
+        } else if c >= 128 {
+            n := utf8seq(p.s, i)
+            if n == 0 {
+                return "", errors.new("mail: invalid utf-8 in quoted-string")
+            }
+            out = out + substr(p.s, i, i + n)
+            i = i + n - 1
         } else if isqtext(c) || iswsp(c) {
             out = out + substr(p.s, i, i + 1)
         } else if c == 34 {
@@ -279,6 +348,18 @@ fn decode2047(w: str) -> [own DWord, err] {
     if len(w) < 8 || substr(w, 0, 2) != "=?" {
         return dword(w, false), nil
     }
+    // exactly four '?' delimit the shape — a text-side '?' breaks it
+    qc := 0
+    qi := 0
+    for qi < len(w) {
+        if byteat(w, qi) == 63 {
+            qc = qc + 1
+        }
+        qi = qi + 1
+    }
+    if qc != 4 {
+        return dword(w, false), nil
+    }
     i := find_from(w, "?", 2)
     if i < 0 {
         return dword(w, false), nil
@@ -290,27 +371,38 @@ fn decode2047(w: str) -> [own DWord, err] {
     charset := lwr(substr(w, 2, i))
     enc := lwr(substr(w, i + 1, j))
     text := substr(w, j + 1, len(w) - 2)
-    if charset != "utf-8" && charset != "us-ascii" && charset != "iso-8859-1" {
-        return dword(w, true), errors.new("charset not supported: \"" + charset + "\"")
+    if len(charset) == 0 {
+        return dword(w, false), nil
     }
+    // Go dispatches the encoding first — a decode failure yields the
+    // literal word; only a decode success reaches the charset check
+    dtext := ""
     if enc == "b" {
         [d, e] = base64.decode(text)
         if e != nil {
             return dword(w, false), nil
         }
-        return dword(wordtext(d as str, charset), true), nil
+        dtext = d as str
+    } else if enc == "q" {
+        [dq, qe] = qdecode(text)
+        if qe != nil {
+            return dword(w, false), nil
+        }
+        dtext = dq
+    } else {
+        return dword(w, false), nil
     }
-    if enc == "q" {
-        return dword(wordtext(qdecode(text), charset), true), nil
+    if charset != "utf-8" && charset != "us-ascii" && charset != "iso-8859-1" {
+        return dword(w, true), errors.new("charset not supported: \"" + charset + "\"")
     }
-    return dword(w, false), nil
+    return dword(wordtext(dtext, charset), true), nil
 }
 
 // wordtext expands decoded bytes per charset — iso-8859-1 maps
 // byte-for-byte onto codepoints 0–255, so each high byte becomes a
 // two-byte UTF-8 sequence. utf-8/us-ascii pass through.
 fn wordtext(d: str, charset: str) -> str {
-    if charset != "iso-8859-1" {
+    if charset == "utf-8" {
         return d
     }
     out := mkslice(byte, 0)
@@ -319,6 +411,11 @@ fn wordtext(d: str, charset: str) -> str {
         c := byteat(d, i)
         if c < 128 {
             out = push(out, c)
+        } else if charset == "us-ascii" {
+            // out-of-charset byte -> U+FFFD, matching Go's reader
+            out = push(out, 239)
+            out = push(out, 191)
+            out = push(out, 189)
         } else {
             out = push(out, 192 + c / 64)
             out = push(out, 128 + c % 64)
@@ -328,9 +425,10 @@ fn wordtext(d: str, charset: str) -> str {
     return out as str
 }
 
-// qdecode — RFC 2047 Q-encoding: '_' space, =XX byte, rest literal
-// (a bad =XX keeps its characters, like Go's mime decoder).
-fn qdecode(t: str) -> str {
+// qdecode — RFC 2047 Q-encoding: '_' space, =XX byte, rest literal.
+// A malformed =XX or an out-of-range byte is a decode error like
+// Go's qDecode — decode2047 falls back to the literal word on it.
+fn qdecode(t: str) -> [str, err] {
     b := mkslice(byte, 0)
     i := 0
     for i < len(t) {
@@ -340,19 +438,27 @@ fn qdecode(t: str) -> str {
             i = i + 1
             continue
         }
-        if c == 61 && i + 2 < len(t) {
+        if c == 61 {
+            if i + 2 >= len(t) {
+                return "", errors.new("mail: truncated =XX in q-encoding")
+            }
             h := byteat(t, i + 1)
             l := byteat(t, i + 2)
-            if ishex(h) && ishex(l) {
-                b = push(b, unhex(h) * 16 + unhex(l))
-                i = i + 3
-                continue
+            if !ishex(h) || !ishex(l) {
+                return "", errors.new("mail: bad =XX in q-encoding")
             }
+            b = push(b, unhex(h) * 16 + unhex(l))
+            i = i + 3
+            continue
+        }
+        // printable ASCII plus the whitespace controls Go accepts
+        if (c <= 32 || c > 126) && c != 9 && c != 10 && c != 13 {
+            return "", errors.new("mail: bad character in q-encoding")
         }
         b = push(b, c)
         i = i + 1
     }
-    return b as str
+    return b as str, nil
 }
 
 fn ishex(c: int) -> bool {
@@ -781,9 +887,18 @@ fn ewords_b(name: str) -> str {
     out := ""
     i := 0
     for i < len(b) {
-        n := len(b) - i
-        if n > 45 {
-            n = 45
+        // grow the chunk to the largest rune-aligned span <= 45 —
+        // splitting a codepoint across words mojibakes per-word decoders
+        n := 0
+        for i + n < len(b) && n + utf8seq(name, i + n) <= 45 {
+            l := utf8seq(name, i + n)
+            if l == 0 {
+                l = 1
+            }
+            n = n + l
+        }
+        if n == 0 {
+            n = 1
         }
         if len(out) > 0 {
             out = out + " "
@@ -794,24 +909,38 @@ fn ewords_b(name: str) -> str {
     return out
 }
 
-// ewords_q cuts the Q-encoded payload on token boundaries — a
-// literal char or a whole =XX triple — so no =XX escapes mid-word.
+// ewords_q accumulates raw characters by their encoded cost (1 for a
+// literal/'_' space, 3 per byte for =XX escapes) so a word boundary
+// never lands inside one codepoint — per-word decoders stay happy.
 fn ewords_q(name: str) -> str {
-    p := qencode_word(name)
     out := ""
     cur := ""
+    cost := 0
     i := 0
-    for i < len(p) {
-        tk := 1
-        if byteat(p, i) == 61 && i + 2 < len(p) {
-            tk = 3
+    for i < len(name) {
+        n := utf8seq(name, i)
+        if n == 0 {
+            n = 1
         }
-        if len(cur) + tk > 63 {
+        // encoded cost of this character
+        c := byteat(name, i)
+        ec := 0
+        if n == 1 && c == 32 {
+            ec = 1 // '_'
+        } else if n == 1 && c >= 33 && c <= 126 && c != 61 && c != 63 && c != 95 {
+            ec = 1
+        } else {
+            ec = 3 * n
+        }
+        if cost + ec > 63 && len(cur) > 0 {
             out = out + "=?UTF-8?Q?" + cur + "?= "
             cur = ""
+            cost = 0
         }
-        cur = cur + substr(p, i, i + tk)
-        i = i + tk
+        // one codepoint's encoding is exactly ec chars
+        cur = cur + qencode_word(substr(name, i, i + n))
+        cost = cost + ec
+        i = i + n
     }
     if len(cur) > 0 {
         out = out + "=?UTF-8?Q?" + cur + "?="

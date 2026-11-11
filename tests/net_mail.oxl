@@ -116,12 +116,20 @@ fn test_string() {
     [cm, e3] = mail.parseaddress("gf@example.com (Gogh Fir)")
     ck(e3, "comment parse")
     testing.expect_streq(cm.string(), "\"Gogh Fir\" <gf@example.com>", "comment to string")
-    // escaped parens still count for comment depth (Go's shared
-    // switch sees them either way) — the backslash drops, the paren
-    // stays and holds the comment open
+    // escaped parens are consumed verbatim — they never reach the
+    // depth checks (Go's else-if shape). A balanced \(b\) pair can't
+    // tell the two semantics apart; these cases can:
     [xp, e4] = mail.parseaddress("gf@example.com (a \\(b\\) c)")
     ck(e4, "escaped-paren comment")
     testing.expect_streq(xp.name, "a (b) c", "escaped-paren name")
+    // a guarded ')' does not close — the real one after it does
+    [xq, eq] = mail.parseaddress("gf@example.com (x\\) y)")
+    ck(eq, "escaped-close comment")
+    testing.expect_streq(xq.name, "x) y", "escaped-close name")
+    // a guarded '(' does not open — the next bare ')' ends the comment
+    // and leaves ' z)' behind, which is a parse error in Go too
+    [_xr, er] = mail.parseaddress("gf@example.com (x \\(y) z)")
+    testing.expect(er != nil, "escaped-open trailing junk errors")
     // iso-8859-1 encoded word decodes byte-for-byte onto codepoints
     [lw, e5] = mail.parseaddress("=?iso-8859-1?Q?Andr=E9?= <a@e.com>")
     ck(e5, "latin-1 word")

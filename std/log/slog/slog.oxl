@@ -9,8 +9,9 @@ package slog
 //     // {"time":"...T...","level":"INFO","msg":"started","port":"8080"}
 //
 // A Logger carries a handler (text or json), a level threshold, and
-// bound attrs — with()/with_group() return new loggers that share
-// the handler, like Go's With/WithGroup.
+// bound attrs — with()/with_group() return new loggers with the same
+// handler configuration; they are independent copies, so set_level on
+// one does not propagate (Go's With/WithGroup shape).
 import "std/errors"
 
 import "std/os"
@@ -277,7 +278,7 @@ fn needsquote(s: str) -> bool {
     i := 0
     for i < len(s) {
         c := byteat(s, i)
-        if c <= 32 || c >= 127 || c == 34 || c == 61 {
+        if c <= 32 || c == 127 || c == 34 || c == 61 {
             return true
         }
         i = i + 1
@@ -340,17 +341,30 @@ fn aval(a: ref Attr) -> str {
 }
 
 // textattr renders one attr (groups recurse with the key prefix).
+fn qkey(k: str) -> str {
+    if needsquote(k) {
+        return quotetxt(k)
+    }
+    return k
+}
+
+// textattr renders one attr (groups recurse with the key prefix; an
+// empty group key inlines its kids, per the Go handler contract).
 fn textattr(prefix: str, a: ref Attr) -> str {
     if a.kind == k_group {
         out := ""
+        kp := prefix
+        if len(a.k) > 0 {
+            kp = prefix + qkey(a.k) + "."
+        }
         kid := a.kids
         for kid != nil {
-            out = out + textattr(prefix + a.k + ".", kid)
+            out = out + textattr(kp, kid)
             kid = kid.next
         }
         return out
     }
-    return " " + prefix + a.k + "=" + aval(a)
+    return " " + prefix + qkey(a.k) + "=" + aval(a)
 }
 
 fn render_text(l: ref Logger, lvl: int, msg: str, a: own Attr) -> str {
@@ -359,7 +373,9 @@ fn render_text(l: ref Logger, lvl: int, msg: str, a: own Attr) -> str {
     b := l.bound
     for b != nil {
         if b.kind == k_mark {
-            prefix = prefix + b.k + "."
+            if len(b.k) > 0 {
+                prefix = prefix + qkey(b.k) + "."
+            }
             b = b.next
             continue
         }
@@ -387,12 +403,38 @@ fn jval(a: ref Attr) -> own json.Json {
     return json.jstr(a.s) // k_str, k_err
 }
 
+// renders reports whether an attr emits anything — a group renders
+// only when some descendant is a real leaf, so all-empty nesting
+// elides the whole chain, not just the leaves
+fn renders(a: ref Attr) -> bool {
+    if a.kind != k_group {
+        return true
+    }
+    kid := a.kids
+    for kid != nil {
+        if renders(kid) {
+            return true
+        }
+        kid = kid.next
+    }
+    return false
+}
+
 // jattr writes one attr into a Json object — groups build a nested
 // object and add it under the group's key.
 fn jattr(parent: mut json.Json, a: ref Attr) {
     if a.kind == k_group {
-        if a.kids == nil {
+        if !renders(a) {
             return // Go omits empty groups in both handlers
+        }
+        if len(a.k) == 0 {
+            // empty key inlines the kids into the parent object
+            kid := a.kids
+            for kid != nil {
+                jattr(parent, kid)
+                kid = kid.next
+            }
+            return
         }
         sub := json.jobj()
         kid := a.kids
@@ -421,17 +463,52 @@ fn render_json(l: ref Logger, lvl: int, msg: str, a: own Attr) -> str {
     json.jadd(root, "level", json.jstr(levelname(lvl)))
     json.jadd(root, "msg", json.jstr(msg))
     parent := root
+    // group markers materialize lazily — an open group that never
+    // gains an attr emits no object at all, like Go's handler
+    pending := mkslice(str, 0)
     b := l.bound
     for b != nil {
         if b.kind == k_mark {
-            g := json.jobj()
-            json.jadd(parent, b.k, g)
-            parent = lastchild(parent)
+            pending = push(pending, b.k)
             b = b.next
             continue
         }
+        for len(pending) > 0 {
+            gk := pending[0]
+            pending = pending[1:len(pending)]
+            if len(gk) == 0 {
+                continue
+            }
+            g := json.jobj()
+            json.jadd(parent, gk, g)
+            parent = lastchild(parent)
+        }
         jattr(parent, b)
         b = b.next
+    }
+    // call-site attrs land under the currently-open group — pending
+    // marks materialize only when an attr that actually renders
+    // follows them (a group of nothing emits nothing)
+    anyrender := false
+    c := a
+    for c != nil {
+        if renders(c) {
+            anyrender = true
+            break
+        }
+        c = c.next
+    }
+    if anyrender {
+        for len(pending) > 0 {
+            gk := pending[0]
+            pending = pending[1:len(pending)]
+            if len(gk) == 0 {
+                continue
+            }
+            g := json.jobj()
+            json.jadd(parent, gk, g)
+            parent = lastchild(parent)
+        }
     }
     for a != nil {
         jattr(parent, a)

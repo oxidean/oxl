@@ -1759,7 +1759,7 @@ if command -v node >/dev/null 2>&1; then
             orphan_join)    marker='orphan-join ok' ;;
             defer_order)    marker='defer order ok' ;;
             pairfwd)        marker='pairfwd ok' ;;
-            match)          marker='other' ;;
+            match)          marker='match ok' ;;
             methods)        marker='methods ok' ;;
             fnval)          marker='fnval ok' ;;
             d5_qual)        marker='d5 qual ok' ;;

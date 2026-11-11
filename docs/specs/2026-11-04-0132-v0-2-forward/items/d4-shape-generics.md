@@ -55,9 +55,16 @@ pure complexity. Revisit when generic definitions or emitted
 instantiations reach an order of magnitude more (rough threshold:
 hundreds of mono'd bodies sharing a shape in one compile).
 
-Re-measured 2026-11-11 (grown corpus): 23 generic fn defs;
-~7 emitted instantiations total (`first__{int,float}`,
-`Id_ident__int`, `use__{Lower,Upper}`, `sort_{sifto,sort}__str`);
-one shareable pair (`first__{int,float}` — word shapes;
+## Re-measured 2026-11-11 (grown corpus)
+
+23 generic fn defs (19 in `std/` — sort 6, slices 9, cmp 3, rand 1 —
+plus 4 in tests/corpus incl. one generic method; the run.sh
+reject fixture excluded). ~35 unique (fn,T) instantiations
+corpus-wide; the heaviest single compile (`tests/util_test.oxl`)
+emits ~26 mono'd bodies — `cmp_{compare,min,max}`,
+`sort_{sort,sifto,is_sorted,sortfn,sift,reverse}`, `slices_*`
+over `{int,str,float,byte}`. The driver build itself emits only
+the `sort_*__str` set, which is what the earlier enumeration
+counted. One shareable pair: `first__{int,float}` (word shapes);
 `use__{Lower,Upper}` shares layout but its `Writer` bound breaks
-the shape signature). Still ~2 orders under the bar; stays parked.
+the shape signature. Still ~2 orders under the bar; stays parked.

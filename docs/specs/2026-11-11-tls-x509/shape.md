@@ -2,8 +2,8 @@
 
 ## Scope
 
-Milestone L (a fresh letter — R was reclaimed by the descriptor spec,
-T/G/E/W are taken) un-parks the `crypto/tls` + `x509` row from
+Milestone X (x509’s letter — fresh; R was reclaimed by the descriptor
+spec, T/G/E/W are taken, and L went to the LLVM lane spec) un-parks the `crypto/tls` + `x509` row from
 `docs/specs/2026-11-07-phase-2-plan/parked.md` and
 `docs/specs/2026-11-06-0111-package-system/items/parked-stdlib.md`.
 The trigger fired: `std/net/http`'s client is the first consumer
@@ -158,7 +158,7 @@ doc comment already says so. Nothing cryptographic may consume it.
 ## Risk
 
 - **From-spec correctness** is the dominant risk, not performance:
-  gates are external vectors at every layer, and L6 gates on a real
+  gates are external vectors at every layer, and X6 gates on a real
   `openssl s_server` handshake where available — self-consistency
   alone is never the exit.
 - **Side channels**: `.oxl` arithmetic compiles through C but offers
@@ -216,7 +216,7 @@ struct Client { tmo: int, tlscfg: tls.Config }
 // tls.dial_timeout vs net.dial_timeout on u.secure
 ```
 
-Stage map: `plan.md` (L0 spec → L7 https + closeout). Contracts:
+Stage map: `plan.md` (X0 spec → X7 https + closeout). Contracts:
 `items/x509-trust.md` (the trust story), `items/tls13-wire.md`
 (record/handshake/key-schedule), `items/tls-api.md` (package
 surfaces + err taxonomy).

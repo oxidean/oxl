@@ -1,6 +1,6 @@
 # items/tls13-wire.md — TLS 1.3 record, handshake, and key schedule contract
 
-L6's deliverable. Everything on the wire is RFC 8446; this file pins
+X6's deliverable. Everything on the wire is RFC 8446; this file pins
 the subset offered, the message flow implemented, the key schedule
 derivation, and the alert/error semantics — the parts a from-spec
 implementation must not improvise.

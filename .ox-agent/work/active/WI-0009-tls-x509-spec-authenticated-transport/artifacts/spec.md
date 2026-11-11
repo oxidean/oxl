@@ -1,6 +1,6 @@
-# Spec — milestone L: TLS/x509 — authenticated transport
+# Spec — milestone X: TLS/x509 — authenticated transport
 
-Status: draft for review (L0)
+Status: draft for review (X0)
 
 ## Problem
 
@@ -46,6 +46,6 @@ guarantee (documented posture instead).
 
 ## Stage map
 
-L0 spec → L1 entropy+sha512+hkdf → L2 AES-GCM+ChaCha20-Poly1305 →
-L3 bignum+rsa → L4 curves → L5 x509 → L6 std/net/tls → L7 https +
+X0 spec → X1 entropy+sha512+hkdf → X2 AES-GCM+ChaCha20-Poly1305 →
+X3 bignum+rsa → X4 curves → X5 x509 → X6 std/net/tls → X7 https +
 closeout. Detail in `docs/specs/2026-11-11-tls-x509/plan.md`.

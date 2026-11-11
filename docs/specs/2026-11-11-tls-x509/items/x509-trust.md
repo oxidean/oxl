@@ -1,6 +1,6 @@
 # items/x509-trust.md — the x509 trust contract
 
-L5's deliverable and the reason the trigger exists: the roadmap says
+X5's deliverable and the reason the trigger exists: the roadmap says
 the spec "must cover the x509 trust story, not just a wrapping API."
 This file is that story, pinned end to end — parse, path build,
 verify, roots, hostname, expiry, and the revocation stance.
@@ -81,7 +81,7 @@ OID) yields `err_alg` at verify. `SPKI_*`: `rsa`, `ec_p256`,
    the same way whether it's leaf, intermediate, or a root that
    signed anything). Signature over `tbs` verifies under the
    issuer's SPKI → else `err_sig`. Verification is *real* — RSA
-   v1.5/PSS, ECDSA P-256/P-384, Ed25519 — through L3/L4.
+   v1.5/PSS, ECDSA P-256/P-384, Ed25519 — through X3/X4.
 3. **CA checks on every issuer link.** `is_ca` → else
    `err_ca`. `ku` present → must carry keyCertSign. `max_path` ≥
    subordinate-CA count below it → else `err_path`.

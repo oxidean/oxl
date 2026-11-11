@@ -9,9 +9,9 @@ lands with the suite green. Automatic reviews are disabled repo-wide
 PR after pushing the head you want verdicted, and again after the
 last fix commit.
 
-- [ ] **L0 — spec** — *(this PR)* — this directory, WI-0009
+- [ ] **X0 — spec** — *(this PR)* — this directory, WI-0009
       artifacts, ADR-0012 for the spec-level forks.
-- [ ] **L1 — entropy + hash ground.** `rt_csrand` in rt.c
+- [ ] **X1 — entropy + hash ground.** `rt_csrand` in rt.c
       (getrandom/`arc4random_buf`/`BCryptGenRandom`, built under
       `-DOXL_CRYPTO` — driver `needs_crypto` scan on `rt_csrand`
       + `-lbcrypt` on Windows only; TLS itself is pure .oxl and
@@ -30,7 +30,7 @@ last fix commit.
       ground (l1) ==`.
       Exit: vectors green on all three CI legs; `bcrypt` link only
       when emitted text names the extern.
-- [ ] **L2 — AEAD ciphers.** `std/crypto/aes` (AES-128/192/256 key
+- [ ] **X2 — AEAD ciphers.** `std/crypto/aes` (AES-128/192/256 key
       expansion + *encrypt-only* block — GCM never decrypts);
       `std/crypto/aesgcm` (`seal(key,iv,aad,pt)`/`open(...)`
       AEAD, GHASH over GF(2^128) in i64 hi/lo pairs, tag check in
@@ -43,8 +43,8 @@ last fix commit.
       vectors + a wrong-tag reject). Perf gate: seal/open
       of a 4 MiB buffer sustains ≥ 5 MiB/s (loose bound, asserted
       by wall clock).
-      Wired `== oxl test: aead (l2) ==`. *Parallel-ok with L1.*
-- [ ] **L3 — `bignum` + `rsa` verify.** `std/crypto/bignum`
+      Wired `== oxl test: aead (l2) ==`. *Parallel-ok with X1.*
+- [ ] **X3 — `bignum` + `rsa` verify.** `std/crypto/bignum`
       (unsigned-magnitude over i64 limbs, base ≤2^26 so schoolbook
       products + accumulators stay < 2^63; `mod`/`modmul`/
       `modexp`/`modinv`/`cmp`; documented "crypto-internal
@@ -59,22 +59,22 @@ last fix commit.
       (test_rsav15/test_rsapss — checked-in signatures minted by
       `scripts/gen_tls_fixtures.sh` incl. bad-padding rejects).
       Perf gate: RSA-4096 verify < 250 ms on the slowest CI leg.
-      Wired `== oxl test: bignum+rsa (l3) ==`. *Depends on L1
+      Wired `== oxl test: bignum+rsa (l3) ==`. *Depends on X1
       (sha512 for sha384/512 sigs).*
-- [ ] **L4 — curves.** `std/crypto/x25519` (RFC 7748 Montgomery
+- [ ] **X4 — curves.** `std/crypto/x25519` (RFC 7748 Montgomery
       ladder; ref10-style 10-limb i64 field, `scalarmult(sk,pk)`
       public surface only), `std/crypto/nistec` covering P-256 *and*
-      P-384 (prime-field ops on L3's bignum, scalar-mul ECDH,
+      P-384 (prime-field ops on X3's bignum, scalar-mul ECDH,
       ECDSA verify, SEC1 uncompressed-point decode), `std/crypto/
       ed25519` (RFC 8032 verify-only — shares the 25519 field with
-      x25519, Edwards point ops, SHA-512 from L1).
+      x25519, Edwards point ops, SHA-512 from X1).
       `tests/x25519_test.oxl` (test_x25519 — RFC 7748 §5.2 vectors
       + ECDH symmetry), `tests/nistec_test.oxl` (test_ecdh_p256/
       p384, test_ecdsa — known-answer verify + tamper reject),
       `tests/ed25519_test.oxl` (test_ed25519 — RFC 8032 test 1–3).
       Perf gate: x25519 < 50 ms, ECDSA-P256 verify < 150 ms per op.
-      Wired `== oxl test: curves (l4) ==`. *Depends on L1, L3.*
-- [ ] **L5 — `std/crypto/x509`.** Contract `items/x509-trust.md`:
+      Wired `== oxl test: curves (l4) ==`. *Depends on X1, X3.*
+- [ ] **X5 — `std/crypto/x509`.** Contract `items/x509-trust.md`:
       DER reader (unexported), `parse_cert`, `Cert` struct, chain
       build + verify (`verify(leaf, untrusted, roots, name, at)`),
       `Roots` pool (`load_pem`, `append`, `load_system_roots` —
@@ -94,10 +94,10 @@ last fix commit.
       (env beats store is the pinned order, so the assertions hold
       on every leg regardless of the host's roots). Wired
       `== oxl test: x509 (l5) ==`.
-      *Depends on L1, L3, L4.*
+      *Depends on X1, X3, X4.*
       Exit: every fixture asserts its pinned verdict; env-override
       precedence proven in-suite.
-- [ ] **L6 — `std/net/tls`.** Contract `items/tls13-wire.md` +
+- [ ] **X6 — `std/net/tls`.** Contract `items/tls13-wire.md` +
       `items/tls-api.md`: record layer (fragment cap, AEAD nonce =
       iv ^ seq, inner-type strip), handshake state machine
       (ClientHello → HRR≤1 → server flight → CertificateVerify →
@@ -119,7 +119,7 @@ last fix commit.
       is absent (node-gate precedent).
       Exit: replay + interop green; handshake crypto < 1 s end to
       end on CI.
-- [ ] **L7 — https + closeout.** `std/net/http`: `Url.secure`,
+- [ ] **X7 — https + closeout.** `std/net/http`: `Url.secure`,
       `https://` in `parse_url` (port 443), `Client.tlscfg`,
       `secure` → `tls.dial_timeout` (with `tlscfg.server_name`
       defaulted to the URL host; ALPN `["http/1.1"]`).
@@ -136,11 +136,11 @@ last fix commit.
 
 ## Sequencing
 
-L1 first (everything hashes or draws entropy). L2 parallel-ok with
-L1 (no dependency). L3 then L4 (x509 needs every signature scheme;
-curves reuse L3's bignum for the prime fields). L5 assembles the
-trust story; L6 is the wire — each retires a real risk before the
-next spends it. L7 is deliberately thin: one seam in `http` plus
+X1 first (everything hashes or draws entropy). X2 parallel-ok with
+X1 (no dependency). X3 then X4 (x509 needs every signature scheme;
+curves reuse X3's bignum for the prime fields). X5 assembles the
+trust story; X6 is the wire — each retires a real risk before the
+next spends it. X7 is deliberately thin: one seam in `http` plus
 the closeout, so the https diff stays reviewable on its own.
 
 ## Parking rules (new triggers this spec creates)

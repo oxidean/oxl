@@ -4,7 +4,7 @@ Status: accepted (WI-0009) — 2026-11-11
 
 ## Decision
 
-Milestone L un-parks `crypto/tls` + `x509` for the driving consumer
+Milestone X un-parks `crypto/tls` + `x509` for the driving consumer
 (`std/net/http` `https://`): a client-side **TLS 1.3-only** stack
 written fresh in `.oxl` from RFC 8446 + companion RFCs, over one new
 rt.c veneer (`rt_csrand`), with the x509 trust story as a real
@@ -51,7 +51,7 @@ Spec-level forks resolved (detail in
 
 ## Consequences
 
-- Seven implementation stages (L1–L7): entropy+hashes → AEAD →
+- Seven implementation stages (X1–X7): entropy+hashes → AEAD →
   bignum+rsa → curves → x509 → tls wire → https seam; each a PR
   through the review loop with suite-green gates.
 - rt.c grows exactly one always-needed extern (`rt_csrand`,

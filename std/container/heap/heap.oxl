@@ -16,11 +16,11 @@ package heap
 // `&h` per call so the plain struct stays usable:
 //
 //   struct IntHeap { v: []int }
-//   fn (h mut IntHeap) Len() -> int { return len(h.v) }
-//   fn (h mut IntHeap) Less(i: int, j: int) -> bool { return h.v[i] < h.v[j] }
-//   fn (h mut IntHeap) Swap(i: int, j: int) { t := h.v[i]; h.v[i] = h.v[j]; h.v[j] = t }
-//   fn (h mut IntHeap) Push(x: int) { h.v = push(h.v, x) }
-//   fn (h mut IntHeap) Pop() -> int {
+//   fn (h mut IntHeap) len() -> int { return len(h.v) }
+//   fn (h mut IntHeap) less(i: int, j: int) -> bool { return h.v[i] < h.v[j] }
+//   fn (h mut IntHeap) swap(i: int, j: int) { t := h.v[i]; h.v[i] = h.v[j]; h.v[j] = t }
+//   fn (h mut IntHeap) push(x: int) { h.v = push(h.v, x) }
+//   fn (h mut IntHeap) pop() -> int {
 //       n := len(h.v)
 //       x := h.v[n - 1]
 //       h.v = h.v[:n - 1]
@@ -39,25 +39,25 @@ package heap
 //   v := heap.pop(ih)
 
 /// Interface is the heap contract — heap.Interface: sort.Interface's
-/// index-based ordering plus the storage ops. Less(i, j) orders the
-/// elements at positions i and j; Push appends x as element Len()
-/// (before the sift), Pop removes and returns element Len()-1 (after
+/// index-based ordering plus the storage ops. less(i, j) orders the
+/// elements at positions i and j; push appends x as element len()
+/// (before the sift), pop removes and returns element len()-1 (after
 /// the sift) — the package calls them at the sift boundaries only.
-/// The methods are capitalized like Go's — parity, so an Interface
-/// impl's method set reads identically and can't clash with the
-/// lowercase builtins either way.
+/// Method names are lowercase per the std convention (io.Reader.read,
+/// list.len) — a method's T.m qualification can't clash with the
+/// same-named builtins either way.
 interface Interface {
-    Len() -> int,
-    Less(i: int, j: int) -> bool,
-    Swap(i: int, j: int),
-    Push(x: int),
-    Pop() -> int,
+    len() -> int,
+    less(i: int, j: int) -> bool,
+    swap(i: int, j: int),
+    push(x: int),
+    pop() -> int,
 }
 
 /// init establishes the heap invariant over the impl's current
 /// elements — heap.Init, O(n).
 fn init(h: Interface) {
-    n := h.Len()
+    n := h.len()
     i := n / 2 - 1
     for i >= 0 {
         down(h, i, n)
@@ -67,8 +67,8 @@ fn init(h: Interface) {
 
 /// push adds x and restores the invariant — heap.Push, O(log n).
 fn push(h: Interface, x: int) {
-    h.Push(x)
-    up(h, h.Len() - 1)
+    h.push(x)
+    up(h, h.len() - 1)
 }
 
 /// pop removes and returns the minimum — heap.Pop, O(log n).
@@ -76,29 +76,29 @@ fn push(h: Interface, x: int) {
 /// Swap(0, -1) indexing traps first, the same way indexing an empty
 /// slice does.
 fn pop(h: Interface) -> int {
-    n := h.Len() - 1
-    h.Swap(0, n)
+    n := h.len() - 1
+    h.swap(0, n)
     down(h, 0, n)
-    return h.Pop()
+    return h.pop()
 }
 
 /// remove removes the element at index i and returns it —
 /// heap.Remove, O(log n).
 fn remove(h: Interface, i: int) -> int {
-    n := h.Len() - 1
+    n := h.len() - 1
     if n != i {
-        h.Swap(i, n)
+        h.swap(i, n)
         if !down(h, i, n) {
             up(h, i)
         }
     }
-    return h.Pop()
+    return h.pop()
 }
 
 /// fix restores the invariant after the element at index i changed
 /// its ordering — heap.Fix, O(log n); cheaper than init.
 fn fix(h: Interface, i: int) {
-    if !down(h, i, h.Len()) {
+    if !down(h, i, h.len()) {
         up(h, i)
     }
 }
@@ -109,10 +109,10 @@ fn up(h: Interface, j0: int) {
     j := j0
     for true {
         i := (j - 1) / 2
-        if i == j || !h.Less(j, i) {
+        if i == j || !h.less(j, i) {
             break
         }
-        h.Swap(i, j)
+        h.swap(i, j)
         j = i
     }
 }
@@ -130,13 +130,13 @@ fn down(h: Interface, i0: int, n: int) -> bool {
         }
         j := j1 // left child
         j2 := j1 + 1
-        if j2 < n && h.Less(j2, j1) {
+        if j2 < n && h.less(j2, j1) {
             j = j2 // right child orders first
         }
-        if !h.Less(j, i) {
+        if !h.less(j, i) {
             break
         }
-        h.Swap(i, j)
+        h.swap(i, j)
         i = j
     }
     return i > i0

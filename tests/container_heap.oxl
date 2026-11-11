@@ -8,25 +8,25 @@ import "std/container/heap"
 // IntHeap is the doc-example impl: a min-heap over a plain []int.
 struct IntHeap { v: []int }
 
-fn (h mut IntHeap) Len() -> int {
+fn (h mut IntHeap) len() -> int {
     return len(h.v)
 }
 
-fn (h mut IntHeap) Less(i: int, j: int) -> bool {
+fn (h mut IntHeap) less(i: int, j: int) -> bool {
     return h.v[i] < h.v[j]
 }
 
-fn (h mut IntHeap) Swap(i: int, j: int) {
+fn (h mut IntHeap) swap(i: int, j: int) {
     t := h.v[i]
     h.v[i] = h.v[j]
     h.v[j] = t
 }
 
-fn (h mut IntHeap) Push(x: int) {
+fn (h mut IntHeap) push(x: int) {
     h.v = push(h.v, x)
 }
 
-fn (h mut IntHeap) Pop() -> int {
+fn (h mut IntHeap) pop() -> int {
     n := len(h.v)
     x := h.v[n - 1]
     h.v = h.v[:n - 1]
@@ -42,25 +42,25 @@ fn (h mut IntHeap) asheap() -> heap.Interface {
 // MaxHeap flips less — ordering is the impl's choice, not the package's.
 struct MaxHeap { v: []int }
 
-fn (h mut MaxHeap) Len() -> int {
+fn (h mut MaxHeap) len() -> int {
     return len(h.v)
 }
 
-fn (h mut MaxHeap) Less(i: int, j: int) -> bool {
+fn (h mut MaxHeap) less(i: int, j: int) -> bool {
     return h.v[i] > h.v[j]
 }
 
-fn (h mut MaxHeap) Swap(i: int, j: int) {
+fn (h mut MaxHeap) swap(i: int, j: int) {
     t := h.v[i]
     h.v[i] = h.v[j]
     h.v[j] = t
 }
 
-fn (h mut MaxHeap) Push(x: int) {
+fn (h mut MaxHeap) push(x: int) {
     h.v = push(h.v, x)
 }
 
-fn (h mut MaxHeap) Pop() -> int {
+fn (h mut MaxHeap) pop() -> int {
     n := len(h.v)
     x := h.v[n - 1]
     h.v = h.v[:n - 1]
@@ -76,25 +76,25 @@ fn (h mut MaxHeap) asheap() -> heap.Interface {
 // the caller's records" shape.
 struct PQ { id: []int, pri: []int }
 
-fn (q mut PQ) Len() -> int {
+fn (q mut PQ) len() -> int {
     return len(q.id)
 }
 
-fn (q mut PQ) Less(i: int, j: int) -> bool {
+fn (q mut PQ) less(i: int, j: int) -> bool {
     return q.pri[q.id[i]] < q.pri[q.id[j]]
 }
 
-fn (q mut PQ) Swap(i: int, j: int) {
+fn (q mut PQ) swap(i: int, j: int) {
     t := q.id[i]
     q.id[i] = q.id[j]
     q.id[j] = t
 }
 
-fn (q mut PQ) Push(x: int) {
+fn (q mut PQ) push(x: int) {
     q.id = push(q.id, x)
 }
 
-fn (q mut PQ) Pop() -> int {
+fn (q mut PQ) pop() -> int {
     n := len(q.id)
     x := q.id[n - 1]
     q.id = q.id[:n - 1]
@@ -137,7 +137,7 @@ fn main() {
     assert(heap.pop(h.asheap()) == 4)
     assert(heap.pop(h.asheap()) == 7)
     assert(heap.pop(h.asheap()) == 9)
-    assert(h.Len() == 0)
+    assert(h.len() == 0)
 
     // init heapifies a scrambled backing, then the drain is sorted
     h2 := IntHeap{v: mkslice(int, 0)}
@@ -154,7 +154,7 @@ fn main() {
     heap.init(h2.asheap())
     assert(h2.v[0] == 1)
     drainsorted(h2.asheap(), 10)
-    assert(h2.Len() == 0)
+    assert(h2.len() == 0)
 
     // the own→iface handle: new(IntHeap) moves in once, then all
     // ops go through the one interface binding
@@ -167,7 +167,7 @@ fn main() {
     got := heap.remove(ih, 1)
     assert(got == 20)
     drainsorted(ih, 3)
-    assert(ih.Len() == 0)
+    assert(ih.len() == 0)
 
     // remove boundary indices — the n == i last-element fast path
     // skips the sift entirely, and the root is the index most
@@ -178,10 +178,10 @@ fn main() {
     h4.v = push(h4.v, 30)
     h4.v = push(h4.v, 40)
     heap.init(h4.asheap())
-    assert(heap.remove(h4.asheap(), h4.Len() - 1) == 40)
+    assert(heap.remove(h4.asheap(), h4.len() - 1) == 40)
     assert(heap.remove(h4.asheap(), 0) == 10)
     drainsorted(h4.asheap(), 2)
-    assert(h4.Len() == 0)
+    assert(h4.len() == 0)
 
     // fix re-orders after an in-place priority change — the borrow
     // handle leaves the backing reachable so v[] can be edited

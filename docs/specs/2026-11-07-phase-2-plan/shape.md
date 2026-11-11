@@ -31,8 +31,8 @@ retires it.
 | **R** | package registry | central index + `oxl publish`/`oxl get` against it |
 | **P** | polish | small tracked debt, pulled opportunistically |
 
-Parked: LLVM backend, D4 shape-generics, the parked-stdlib
-list — see `parked.md`.
+Parked: LLVM backend, D4 shape-generics, pin primitive, the
+parked-stdlib list — see `parked.md`.
 
 ## Sequencing rationale
 

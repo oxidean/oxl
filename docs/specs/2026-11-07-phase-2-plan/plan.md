@@ -98,12 +98,12 @@ guardrail keeping web parked. Spec and implementation are in
 flight together on `feat/milestone-w` (PR open); work item WI-0007.
 
 **Scope sketch:** a second emit lane beside native C —
-`runtime/rt.js` semantic runtime (run queue, frame-task
+`runtime/rt.mjs` semantic runtime (run queue, frame-task
 scheduler, scope trees + cancel, err registry), `js` emitter for
 the full surface incl. `susp` poll state-machines and
 chans/select/named scopes, driver `--target js` on
-build/run/test, node lane env shims (`rt-node.js`) with
-`rt-browser.js` err-stubs, `extra/gui/dom` backend +
+build/run/test, node lane env shims (`rt-node.mjs`) with
+`rt-browser.mjs` err-stubs, `extra/gui/dom` backend +
 `examples/web-todo`. Blocking forms trap (`rt_trap(21)`), no
 Worker/SAB lane.
 

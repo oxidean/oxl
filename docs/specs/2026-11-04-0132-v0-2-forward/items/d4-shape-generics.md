@@ -68,7 +68,7 @@ emit queue — `bootstrap/codegen/codegen.oxl` — plus per-file call-site
 inspection); the heaviest single compile (`tests/util_test.oxl`)
 emits ~26 mono'd bodies — `cmp_{compare,min,max}`,
 `sort_{sort,sifto,is_sorted,sortfn,sift,reverse}`, `slices_*`
-over `{int,str,float,byte}`. The driver build itself emits only
+over `int`. The driver build itself emits only
 the `sort_*__str` set, which is what the earlier enumeration
 counted. One shareable pair: `first__{int,float}` (word shapes);
 `use__{Lower,Upper}` shares layout but its `Writer` bound breaks

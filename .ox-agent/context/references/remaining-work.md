@@ -33,7 +33,8 @@ Everything documented-but-unbuilt, grouped by how hard it is to schedule.
   shared-shape groups grow enough that mono dedup is a measured win.
 - **`parked-stdlib.md`** — reflect/gob/xml/database-sql/templates
   (need runtime type descriptors), crypto/tls/x509, image/compress/
-  archive, net/url, container/heap, context (non-goal: `scope` covers).
+  archive, net/url, container/heap, context (non-goal: `scope` covers);
+  see `parked.md` for current status.
 
 ## Small code-level debt (documented in comments, untracked)
 

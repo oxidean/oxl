@@ -47,6 +47,10 @@ extern fn oxl_dom_ev_aux() -> int
 
 extern fn oxl_dom_fire(h: int, kind: int)
 
+extern fn oxl_dom_unlisten(h: int, kind: int)
+
+extern fn oxl_dom_set_edge(c: chan)
+
 extern fn oxl_dom_tag(h: int) -> cstr
 
 extern fn oxl_dom_style(h: int, name: str, v: str)
@@ -110,7 +114,12 @@ fn al_del(h: int) {
 // backend — the DOM flavor the emitted page uses: #app when present,
 // <body> otherwise; under node the provider is headless already.
 fn backend() -> Dom {
-    return Dom{stopf: mkshared(0), wakech: mkchan()}
+    d := Dom{stopf: mkshared(0), wakech: mkchan()}
+    // hand the provider our wake chan — a real DOM event posts an
+    // edge there so the pump's park wakes on input, not on the
+    // defensive 50ms timeout (headless fire() does the same below)
+    oxl_dom_set_edge(d.wakech)
+    return d
 }
 
 // headless — explicit test-entry name; the provider tree is the same
@@ -211,6 +220,9 @@ fn (d Dom) attach(parent: int, child: int) {
 }
 
 fn (d Dom) detach(parent: int, child: int) {
+    if d.tag(parent) == "ul" {
+        oxl_dom_unlisten(child, D_ROWCLICK)
+    }
     oxl_dom_detach(parent, child)
 }
 
@@ -342,6 +354,11 @@ fn (d Dom) deliver(events: mut gui.EventBuf, h: int, k: int, aux: int) {
         if oxl_dom_read_has(h, gui.P_TEXT) == 1 {
             e.data = gui.EventData.Text(str(oxl_dom_read_str(h, gui.P_TEXT)))
         }
+    }
+    // unknown provider kinds carry no meaningful event — dropping
+    // beats posting a phantom `clicked` (the enum zero variant)
+    if e.kind == gui.EventKind.clicked && k != D_CLICK {
+        return
     }
     events.post(e)
 }

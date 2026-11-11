@@ -32,7 +32,16 @@ function hEl(tag) {
     },
   }
 }
-const hAppend = (p, c) => { c.parent = p; p.children.push(c) }
+/* appendChild move semantics: re-parenting pulls the child out of
+ * its previous parent first */
+const hAppend = (p, c) => {
+  if (c.parent) {
+    const i = c.parent.children.indexOf(c)
+    if (i >= 0) c.parent.children.splice(i, 1)
+  }
+  c.parent = p
+  p.children.push(c)
+}
 const hDetach = (p, c) => {
   const i = p.children.indexOf(c)
   if (i >= 0) p.children.splice(i, 1)
@@ -44,7 +53,15 @@ const D_CLICK = 1n, D_INPUT = 2n, D_ENTER = 3n, D_ROWCLICK = 4n, D_CLOSE = 5n
 
 /* event queue — pump_iter drains via oxl_dom_ev_* */
 const EQ = []
-const pushEv = (el, kind, aux) => EQ.push({ h: el.__oxl_h, kind, aux })
+/* pump edge — dom.backend() hands its wake chan in via set_edge so a
+ * real DOM event lands as a scheduler nudge, not just an EQ row the
+ * defensive 50ms timeout eventually finds */
+let EDGE = null
+let TRYSEND = null
+const pushEv = (el, kind, aux) => {
+  EQ.push({ h: el.__oxl_h, kind, aux })
+  if (EDGE && TRYSEND) TRYSEND(EDGE, 1n)
+}
 
 /* prop ids — extra/gui/gui.oxl's P_* table (stable ints) */
 const P_TEXT = 1n, P_TITLE = 2n, P_PLACEHOLDER = 3n, P_ROWS = 4n
@@ -83,6 +100,7 @@ let STR = (s) => String(s)
 /* ---- install: fills __oxl_ffi.oxl_dom_* ---- */
 export function install(api) {
   if (api && api.rt_str_cstr) STR = api.rt_str_cstr
+  if (api && api.rt_try_send) TRYSEND = api.rt_try_send
   const F = (typeof globalThis.__oxl_ffi === 'object' && globalThis.__oxl_ffi !== null)
     ? globalThis.__oxl_ffi
     : (globalThis.__oxl_ffi = {})
@@ -151,6 +169,7 @@ export function install(api) {
     const el = get(h)
     if (!el) return -1n
     if (BigInt(id) === P_ROWS) {
+      if (tagOf(el) !== 'ul') return -1n
       return BigInt(el.children.length)
     }
     return -1n
@@ -166,23 +185,22 @@ export function install(api) {
     const lk = el.__oxl_lk || (el.__oxl_lk = new Set())
     if (lk.has(k)) return
     lk.add(k)
+    const lf = el.__oxl_lf || (el.__oxl_lf = new Map())
+    const reg = (ev, f) => { el.addEventListener(ev, f); lf.set(k, [ev, f]) }
     if (k === D_CLICK) {
-      const f = () => pushEv(el, D_CLICK, 0n)
-      el.addEventListener('click', f)
+      reg('click', () => pushEv(el, D_CLICK, 0n))
       return
     }
     if (k === D_INPUT) {
-      const f = () => pushEv(el, D_INPUT, 0n)
-      el.addEventListener('input', f)
+      reg('input', () => pushEv(el, D_INPUT, 0n))
       return
     }
     if (k === D_ENTER) {
-      const f = (e) => { if ((e && e.key) === 'Enter') pushEv(el, D_ENTER, 0n) }
-      el.addEventListener('keydown', f)
+      reg('keydown', (e) => { if ((e && e.key) === 'Enter') pushEv(el, D_ENTER, 0n) })
       return
     }
     if (k === D_ROWCLICK) {
-      const f = (e) => {
+      reg('click', (e) => {
         if (REAL && e && e.target) {
           for (let x = e.target; x && x !== el; x = x.parentNode) {
             if (x.__oxl_h) return
@@ -191,15 +209,32 @@ export function install(api) {
         const p = REAL ? el.parentNode : el.parent
         const idx = p ? Array.prototype.indexOf.call(p.children, el) : -1
         pushEv(el, D_ROWCLICK, BigInt(idx < 0 ? 0 : idx))
-      }
-      el.addEventListener('click', f)
+      })
       return
     }
     if (k === D_CLOSE) {
-      const f = () => pushEv(el, D_CLOSE, 0n)
-      el.addEventListener('oxl-close', f)
+      reg('oxl-close', () => pushEv(el, D_CLOSE, 0n))
       return
     }
+  }
+
+  /* detach must be able to drop a listener — the dedup set and the
+   * fn table are kept in sync */
+  F.oxl_dom_unlisten = (h, kind) => {
+    const el = get(h)
+    if (!el) return
+    const k = BigInt(kind)
+    const lf = el.__oxl_lf
+    if (!lf || !lf.has(k)) return
+    const [ev, f] = lf.get(k)
+    if (REAL) {
+      el.removeEventListener(ev, f)
+    } else {
+      const l = el.listeners.get(ev)
+      if (l) { const i = l.indexOf(f); if (i >= 0) l.splice(i, 1) }
+    }
+    lf.delete(k)
+    if (el.__oxl_lk) el.__oxl_lk.delete(k)
   }
 
   /* event queue drain */
@@ -207,6 +242,8 @@ export function install(api) {
   F.oxl_dom_ev_pop = () => { if (EQ.length) EQ.shift() }
   F.oxl_dom_ev_kind = () => (EQ.length ? EQ[0].kind : 0n)
   F.oxl_dom_ev_aux = () => (EQ.length ? EQ[0].aux : 0n)
+
+  F.oxl_dom_set_edge = (ch) => { EDGE = ch }
 
   /* headless dispatch — tests drive the listener path end-to-end;
    * a no-op under REAL (real pages dispatch via DOM events) */

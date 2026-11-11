@@ -108,7 +108,11 @@ fn pkg_args(start: int) -> PkgArgs {
 fn flag_value(name: str) -> str {
     i := 2
     for i + 1 < argc() {
-        if argv(i) == name {
+        a := argv(i)
+        if a == "--" {
+            break
+        }
+        if a == name {
             return argv(i + 1)
         }
         i = i + 1
@@ -116,8 +120,12 @@ fn flag_value(name: str) -> str {
     pfx := name + "="
     i = 2
     for i < argc() {
-        if strings.startswith(argv(i), pfx) {
-            return substr(argv(i), len(pfx), len(argv(i)))
+        a := argv(i)
+        if a == "--" {
+            break
+        }
+        if strings.startswith(a, pfx) {
+            return substr(a, len(pfx), len(a))
         }
         i = i + 1
     }
@@ -127,7 +135,11 @@ fn flag_value(name: str) -> str {
 fn has_flag(name: str) -> int {
     i := 2
     for i < argc() {
-        if argv(i) == name {
+        a := argv(i)
+        if a == "--" {
+            break
+        }
+        if a == name {
             return 1
         }
         i = i + 1
@@ -530,14 +542,14 @@ fn emit_and_js(jssrc: str, out: str, entry: str) -> int {
         eprintln("cannot create output dir " + od + ": " + errors.msg(me))
         return 0
     }
-    we := write_text(out, jssrc)
-    if we != 0 {
-        eprintln("cannot write " + out + ": " + rt_errstr(we))
-        return 0
-    }
     rt := runtime_dir(entry, "/runtime/rt.mjs")
     if len(rt) == 0 {
         eprintln("cannot locate runtime/rt.mjs — no runtime/ tree above " + check.dir_of(argv(0)) + " or " + entry)
+        return 0
+    }
+    we := write_text(out, jssrc)
+    if we != 0 {
+        eprintln("cannot write " + out + ": " + rt_errstr(we))
         return 0
     }
     names := mkslice(str, 0)
@@ -774,6 +786,12 @@ fn main() {
         exit(2)
     }
     c := argv(1)
+    // --html only writes a page beside a js build's .mjs — flag the
+    // misuse on every other shape instead of silently swallowing it
+    if has_flag("--html") == 1 && (c != "build" || target_is_js() == 0) {
+        eprintln("--html needs `oxl build --target js`")
+        exit(2)
+    }
     if c == "build" {
         cmd_build()
     } else if c == "run" {

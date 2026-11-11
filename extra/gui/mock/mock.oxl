@@ -60,6 +60,9 @@ fn backend() -> Mock {
     g_props = nil
     g_alive = nil
     g_script = nil
+    // rows are computed off the edge table — it must reset with the
+    // rest or a second backend() session reads stale counts
+    g_edges = nil
     g_failed = mkshared(0)
     g_delay = mkshared(0)
     g_pumped = mkshared(0)
@@ -179,6 +182,12 @@ fn edge_sync_rows(parent: int) {
     prop_put(parent, gui.P_ROWS, gui.PropVal.Num(edge_count(parent)))
 }
 
+// a fresh list has no edges yet — rows() must still answer 0 rather
+// than trip the missing-prop error
+fn edge_seed_rows(parent: int) {
+    prop_put(parent, gui.P_ROWS, gui.PropVal.Num(0))
+}
+
 fn edge_add(parent: int, child: int) {
     e := new(CE)
     e.parent = parent
@@ -241,6 +250,9 @@ fn (m Mock) new(kind: gui.WidgetKind, props: own []gui.Prop) -> [int, err] {
     sset(m.hnext, sget(m.hnext) + 1)
     h := sget(m.hnext)
     al_add(h)
+    if kind == gui.WidgetKind.list {
+        edge_seed_rows(h)
+    }
     if props != nil {
         i := 0
         for i < len(props) {

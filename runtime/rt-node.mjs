@@ -102,10 +102,12 @@ export function install(api) {
       try { return s_of_js(fs.realpathSync(path_of(p))) } catch { return s_of_js(path.resolve(path_of(p))) }
     },
     rt_readfile: (p) => {
-      const b = fs.readFileSync(path_of(p))
-      const u8 = new Uint8Array(b.length)
-      u8.set(b)
-      return { u8, off: 0, len: u8.length }
+      try {
+        const b = fs.readFileSync(path_of(p))
+        const u8 = new Uint8Array(b.length)
+        u8.set(b)
+        return { u8, off: 0, len: u8.length }
+      } catch { return { u8: new Uint8Array(0), off: 0, len: 0 } }
     },
     rt_writefile: (p, data) => {
       try {

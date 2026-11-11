@@ -1769,10 +1769,10 @@ if command -v node >/dev/null 2>&1; then
             gui_mock)       marker='done' ;;
             gui_lifecycle)  marker='lifecycle ok' ;;
             gui_overflow)   marker='overflow ok' ;;
-            gui_select)     marker='done' ;;
-            gui_stress)     marker='done' ;;
+            gui_select)     marker='select ok' ;;
+            gui_stress)     marker='stress ok' ;;
             gui_cancel)     marker='cancel ok' ;;
-            gui_dom)        marker='done' ;;
+            gui_dom)        marker='activated' ;;
         esac
         out=$(with_timeout 60 "$SELFOXL" run --target js "tests/$f.oxl" 2>&1) || { echo "FAIL js lane $f: $out"; exit 1; }
         grep -q "$marker" <<<"$out" || { echo "FAIL js lane $f marker '$marker': $out"; exit 1; }

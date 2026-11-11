@@ -767,7 +767,7 @@ export function rt_cancelled() {
 
 /* the gui.run gate: set only on the rt_run_root-entered task */
 export function rt_is_root() {
-  return tls_task && tls_task.is_root ? 1 : 0
+  return !!(tls_task && tls_task.is_root)
 }
 
 /* the caller's innermost live scope as an opaque handle (curscope()) */
@@ -1069,23 +1069,23 @@ function chan_pop_send(ch) {
 export function rt_try_send(ch, v) {
   if (ch.closed) {
     if (ch.drop_elem) ch.drop_elem(v)
-    return 0
+    return false
   }
   const r = chan_pop_recv(ch)
   if (r) {
     r.chan_res = v
     rt_task_wake(r)
-    return 1
+    return true
   }
-  if (sel_fire(ch, v)) return 1
+  if (sel_fire(ch, v)) return true
   if (ch.count < ch.cap) {
     ch.buf[(ch.head + ch.count) % ch.cap] = v
     ch.count++
-    return 1
+    return true
   }
   // trecv slot: no thread receivers in JS — fall to fail
   if (ch.drop_elem) ch.drop_elem(v)
-  return 0
+  return false
 }
 
 /* frame-task recv: READY delivers via task.chan_res; PENDING parks */
@@ -2194,7 +2194,7 @@ export async function __oxl_boot(main_entry) {
  * exit, and the rest of __oxl_ffi without re-importing (import cycles
  * would deadlock the module graph) */
 function rt_exports_api() {
-  return { env, F: globalThis.__oxl_ffi, rt_str, rt_str_cstr, rt_trap, rt_trap_native }
+  return { env, F: globalThis.__oxl_ffi, rt_str, rt_str_cstr, rt_trap, rt_trap_native, rt_try_send }
 }
 
 /* ---------------- test entry ----------------

@@ -82,7 +82,7 @@ let g_en: gui.Entry = gui.Entry{h: 0}
 
 let g_add: gui.Button = gui.Button{h: 0}
 
-let g_d: dom.Dom = dom.headless()
+let g_d: dom.Dom = dom.backend()
 
 let g_selftest = 0
 

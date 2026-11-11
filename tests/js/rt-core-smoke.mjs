@@ -102,7 +102,7 @@ ck('err dedupe', e1 === e2)
 const w = rt.rt_err_wrap(rt.rt_str('wrap'), e1)
 ck('wrap distinct', w !== e1 && rt.rt_err_cause(w) === e1)
 ck('err msg', rt.rt_streq(rt.rt_err_msg(e1), rt.rt_str('boom')) === 1)
-ck('is_root in boot', rt.rt_is_root() === 0) // outside task now
+ck('is_root in boot', rt.rt_is_root() === false) // outside task now
 const ch = rt.rt_mkchan(0)
 ck('chan closed0', rt.rt_chan_is_closed(ch) === 0n)
 rt.rt_close(ch)

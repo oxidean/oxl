@@ -271,6 +271,7 @@ resolve() { # echoes "tag<TAB>source" or nothing
     done
     d=$(pwd -P) || die "cannot resolve the working directory"
     while :; do
+        [ -e "$d/oxl.mod" ] && [ ! -f "$d/oxl.mod" ] && die "cannot read $d/oxl.mod"
         if [ -f "$d/oxl.mod" ]; then
             # manifest-parser parity: `//` comments (line start or
             # after whitespace) are stripped — `#` is not a comment.
@@ -471,20 +472,21 @@ tc_list() {
 if [ "${1:-}" = toolchain ]; then
     shift
     case "${1:-}" in
-        install)   [ -z "${3:-}" ] || die "usage: oxl toolchain install <tag|latest>"
-                   tc_install "${2:?usage: oxl toolchain install <tag|latest>}" ;;
+        install)   [ -z "${3:-}" ] || die 2 "usage: oxl toolchain install <tag|latest>"
+                   [ -n "${2:-}" ] || die 2 "usage: oxl toolchain install <tag|latest>"
+                   tc_install "$2" ;;
         uninstall) shift; tc_uninstall "$@" ;;
         use)       shift; tc_use "$@" ;;
-        list|ls)   [ -z "${2:-}" ] || die "usage: oxl toolchain list"
+        list|ls)   [ -z "${2:-}" ] || die 2 "usage: oxl toolchain list"
                    tc_list ;;
-        default)   [ -z "${2:-}" ] || die "usage: oxl toolchain default"
+        default)   [ -z "${2:-}" ] || die 2 "usage: oxl toolchain default"
                    { [ -f "$OXL_HOME/default-version" ] && [ -s "$OXL_HOME/default-version" ]; } \
                        || die "no default — \`oxl toolchain use <tag>\`"
                    [ -r "$OXL_HOME/default-version" ] \
                        || die "cannot read $OXL_HOME/default-version"
                    def=$(head -n1 "$OXL_HOME/default-version" | tr -d '\r\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
                    vtag "$def" || die "invalid version in default-version: $def" ;;
-        current)   [ -z "${2:-}" ] || die "usage: oxl toolchain current"
+        current)   [ -z "${2:-}" ] || die 2 "usage: oxl toolchain current"
             r=$(resolve); [ -n "$r" ] || die "no version resolved — set one with \`oxl toolchain use <tag>\`"
             tag=${r%%$TAB*}; src=${r#*$TAB}
             if [ -x "$(exe_for "$tag")" ]; then st=installed; else st="NOT INSTALLED — \`oxl toolchain install $tag\`"; fi

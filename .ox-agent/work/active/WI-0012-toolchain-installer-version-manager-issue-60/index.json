@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "id": "WI-0006",
+  "id": "WI-0012",
   "title": "toolchain installer + version manager (issue #60)",
   "state": "implementing",
   "profile": "normal",

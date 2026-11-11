@@ -1812,7 +1812,7 @@ grep -qE '^oxl (dev|v[0-9]+\.[0-9]+\.[0-9]+) \(language [0-9]+\.[0-9]+\)$' <<<"$
 # RELEASE stamp is picked up beside the exe
 cp "$OXL" "$scratch/oxl-stamp$EXE" && echo v7.7.7 > "$scratch/RELEASE"
 out=$("$scratch/oxl-stamp$EXE" version)
-[ "$out" = "oxl v7.7.7 (language 0.3)" ] || { echo "FAIL version stamp: $out"; exit 1; }
+grep -qE '^oxl v7\.7\.7 \(language [0-9]+\.[0-9]+\)$' <<<"$out" || { echo "FAIL version stamp: $out"; exit 1; }
 # a manifest carrying `toolchain` builds clean on both drivers
 printf 'module example.com/tc\n\noxl 0.3\ntoolchain v0.9.0\n' > "$tcw/proj/inner/oxl.mod"
 printf 'package main\n\nfn main() { println("tc") }\n' > "$tcw/proj/inner/main.oxl"

@@ -1,4 +1,4 @@
-# Plan — toolchain installer + version manager (WI-0006)
+# Plan — toolchain installer + version manager (WI-0012)
 
 Single-PR delivery, staged commits. Each stage lands suite-green.
 

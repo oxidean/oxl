@@ -341,14 +341,20 @@ fn (t mut Reader) parse(b: []byte) -> [Header, err] {
             return h, errors.new("tar: bad devminor field")
         }
         h.devminor = dmin
-        pre := nulstr(b[345:500])
-        if len(pre) > 0 {
-            // prefix(<=155) + '/' + name(<=100) — the format maximum
-            // is exactly 256; the writer emits up to it
-            if len(pre) + 1 + len(h.name) > 256 {
-                return h, errors.new("tar: name too long")
+        // prefix exists only in the POSIX "ustar\0" variant — the GNU
+        // oldgnu "ustar " layout puts atime/ctime/offset metadata at
+        // 345:500 instead, and its long names arrive via 'L'/'K'
+        // records, so parsing it here would fabricate a bogus prefix
+        if b[262] == 0 {
+            pre := nulstr(b[345:500])
+            if len(pre) > 0 {
+                // prefix(<=155) + '/' + name(<=100) — the format
+                // maximum is exactly 256; the writer emits up to it
+                if len(pre) + 1 + len(h.name) > 256 {
+                    return h, errors.new("tar: name too long")
+                }
+                h.name = pre + "/" + h.name
             }
-            h.name = pre + "/" + h.name
         }
     }
     return h, nil
@@ -408,6 +414,8 @@ fn paxname(rec: []byte, want: str) -> str {
 // framing.
 fn paxdec(rec: []byte, want: str) -> [int, err] {
     i := 0
+    best := 0
+    found := 0
     for i < len(rec) {
         j := i
         v := 0
@@ -464,10 +472,16 @@ fn paxdec(rec: []byte, want: str) -> [int, err] {
                 if neg == 1 {
                     num = 0 - num
                 }
-                return num, nil
+                // last record wins — POSIX overrides are ordered, and
+                // paxname already resolves path/linkpath the same way
+                best = num
+                found = 1
             }
         }
         i = i + v
+    }
+    if found == 1 {
+        return best, nil
     }
     return 0, io.eof()
 }

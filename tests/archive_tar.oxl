@@ -312,6 +312,62 @@ fn test_pax_badlen() {
     testing.expect_streq(h.name, "real.txt", "header after bad pax")
 }
 
+fn test_pax_numericoverride() {
+    // pax 'x' records override the ustar numeric fields — size is
+    // framing-critical: the member's payload is sized by the pax
+    // value, not the header's octal field
+    rec := "10 size=5\n20 mtime=1234567890\n" as []byte
+    xpayload := mkslice(byte, 512)
+    i := 0
+    for i < len(rec) {
+        xpayload[i] = rec[i]
+        i = i + 1
+    }
+    x := mkhdr("x", len(rec), tar.TPAX)
+    real := mkhdr("f.txt", 0, tar.TREG)
+    body := mkslice(byte, 512)
+    hello := "hello" as []byte
+    j := 0
+    for j < 5 {
+        body[j] = hello[j]
+        j = j + 1
+    }
+    zero := mkslice(byte, 1024)
+    rb := bytes.newbuffer()
+    [_rd, _re] = rb.write((x as str + xpayload as str + real as str + body as str + zero as str) as []byte)
+    tr := tar.newreader(rb.asreader())
+    [h, e] = tr.next()
+    ck(e, "pax member header")
+    testing.expect_eq(h.size, 5, "pax size override")
+    testing.expect_eq(h.mtime, 1234567890, "pax mtime override")
+    [s, re] = io.readall(tr.asreader())
+    ck(re, "pax member payload")
+    testing.expect_streq(s, "hello", "pax-sized payload")
+    // last record wins when the same key repeats
+    rec2 := "10 size=3\n10 size=7\n" as []byte
+    xp2 := mkslice(byte, 512)
+    k := 0
+    for k < len(rec2) {
+        xp2[k] = rec2[k]
+        k = k + 1
+    }
+    x2 := mkhdr("x", len(rec2), tar.TPAX)
+    real2 := mkhdr("g.txt", 0, tar.TREG)
+    body2 := mkslice(byte, 512)
+    seven := "1234567" as []byte
+    l := 0
+    for l < 7 {
+        body2[l] = seven[l]
+        l = l + 1
+    }
+    rb2 := bytes.newbuffer()
+    [_rd2, _re2] = rb2.write((x2 as str + xp2 as str + real2 as str + body2 as str + zero as str) as []byte)
+    tr2 := tar.newreader(rb2.asreader())
+    [h2, e2] = tr2.next()
+    ck(e2, "second pax member")
+    testing.expect_eq(h2.size, 7, "last-wins size override")
+}
+
 fn test_meta_oversize() {
     // declared meta size over the 16 MiB cap — rejected before alloc
     x := mkhdr("x", 2000000000, tar.TPAX)

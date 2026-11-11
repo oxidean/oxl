@@ -1961,7 +1961,7 @@ relport=$(cat "$scratch/relserve.port")
 out=$(OXL_HOME="$tch2" OXL_RELEASE_BASE="http://127.0.0.1:$relport/releases" \
     "$SHIM2" toolchain install latest 2>&1)
 rc=$?
-kill "$relsrv" 2>/dev/null; wait "$relsrv" 2>/dev/null
+kill "$relsrv" 2>/dev/null || true; wait "$relsrv" 2>/dev/null || true
 [ "$rc" = 0 ] && grep -q "installed v9.9.7" <<<"$out" \
     && [ -x "$tch2/versions/v9.9.7/oxl-toolchain/oxl" ] || {
     echo "FAIL latest pagination: rc=$rc $out"; exit 1; }

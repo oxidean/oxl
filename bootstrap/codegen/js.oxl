@@ -1513,8 +1513,11 @@ fn jdefer(g: mut G, call: own parser.Node) {
                 al := args
                 for al != nil {
                     t := xty(g, al.v)
-                    an := "_da" + itoa(di) + "_" + itoa(i)
+                    an := "$da" + itoa(di) + "_" + itoa(i)
                     v := jx(g, al.v)
+                    // $-stem: legal JS ident, unreachable from oxl
+                    // source idents — internal namespace that jname
+                    // passes through, keeping decl and ref identical
                     wln(g, "    const " + an + " = " + v + ";")
                     check.env_bind(g.env, an, t)
                     nargs = parser.ncons(new(parser.Node.Name{n: an, lo: 0, hi: 0}), nargs)

@@ -48,7 +48,7 @@ check_attribution() {
     # privacy relay get flagged), and a vendor token inside a bare email
     # (no <display name>) — bot forms like
     # "Co-authored-by: 175728472+Copilot@users.noreply.github.com".
-    if printf '%s\n' "$_co" | grep -qiE '\[bot\]|(^|[<.[:space:]_+-])bot@|ai-integration|noreply@(anthropic|openai)\.|@(anthropic|openai|cognition|devin|codeium|windsurf|claude-code|cursor|gemini|chatgpt|codex|copilot)\.(com|ai|dev|io)([[:space:]>]|$)|:[[:space:]]*[^<[:space:]]*('"$_VENDOR"')[^<[:space:]]*@|[a-z0-9._+-]*(ai[-_.](agent|assistant)|(agent|assistant)[-_.]ai)[a-z0-9._+-]*@'; then
+    if printf '%s\n' "$_co" | grep -qiE '\[bot\]|(^|[<.[:space:]_+-])bot@|ai-integration|noreply@(anthropic|openai)\.|@(anthropic|openai|cognition|devin|codeium|windsurf|claude-code|cursor|gemini|chatgpt|codex|copilot)\.(com|ai|dev|io)([[:space:]>]|$)|:[[:space:]]*[^<[:space:]]*('"$_VENDOR"')[^<[:space:]]*@|[a-z0-9._+-]*(ai[-_.](agent|assistant)|(agent|assistant)[-_.]ai)([._+-][a-z0-9]+|[0-9]+)*@'; then
         err "AI Co-authored-by trailer"
     # A bare vendor identity as the display name — "Co-authored-by:
     # Claude <noreply@anthropic.com>" hits the domain rule above; this
@@ -90,7 +90,7 @@ check_attribution() {
         err "AI self-attribution"
     fi
     # vendor-stamped HTML comments smuggled into the message
-    if printf '%s\n' "$_msg" | grep -iqE '<!--[^>]*(generated|made|created|authored|written|produced|co-?authored|attributed|🤖)[^>]*'; then
+    if printf '%s\n' "$_msg" | grep -iqE '<!--[^>]*('"$_VENDOR"'|generated|made|created|authored|written|produced|built|powered|co-?authored|attributed|🤖)[^>]*'; then
         err "attribution HTML comment"
     fi
     # zero-width / invisible markers: U+200B..D, U+2060, U+FEFF as raw

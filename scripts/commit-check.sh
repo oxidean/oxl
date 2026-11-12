@@ -48,7 +48,7 @@ check_attribution() {
     # privacy relay get flagged), and a vendor token inside a bare email
     # (no <display name>) — bot forms like
     # "Co-authored-by: 175728472+Copilot@users.noreply.github.com".
-    if printf '%s\n' "$_co" | grep -qiE '\[bot\]|(^|[<.[:space:]_+-])bot@|ai-integration|noreply@(anthropic|openai)\.|@(anthropic|openai|cognition|devin|codeium|windsurf|claude-code|cursor|gemini|chatgpt|codex|copilot)\.(com|ai|dev|io)([[:space:]>]|$)|:[[:space:]]*[^<[:space:]]*('"$_VENDOR"')[^<[:space:]]*@|[a-z0-9._+-]*(ai[-_.](agent|assistant)|(agent|assistant)[-_.]ai)[a-z0-9._+-]*@'; then
+    if printf '%s\n' "$_co" | grep -qiE '\[bot\]|(^|[<.[:space:]_+-])bot@|ai-integration|noreply@(anthropic|openai)\.|@(anthropic|openai|cognition|devin|codeium|windsurf|claude-code|cursor|gemini|chatgpt|codex|copilot)\.(com|ai|dev|io)([[:space:]>]|$)|:[[:space:]]*[^<[:space:]]*('"$_VENDOR"')[^<[:space:]]*@|[a-z0-9._+-]*(ai[-_.](agent|assistant)|(agent|assistant)[-_.]ai)([._+-][a-z0-9]+|[0-9]+)*@'; then
         err "AI Co-authored-by trailer"
     # A bare vendor identity as the display name — "Co-authored-by:
     # Claude <noreply@anthropic.com>" hits the domain rule above; this
@@ -89,8 +89,19 @@ check_attribution() {
     if printf '%s\n' "$_msg" | grep -iqE '\b(as an ai|i generated this|authored by \[?('"$_VENDOR"'))\b'; then
         err "AI self-attribution"
     fi
-    # vendor-stamped HTML comments smuggled into the message
-    if printf '%s\n' "$_msg" | grep -iqE '<!--[^>]*(generated|made|created|authored|written|produced|co-?authored|attributed|🤖)[^>]*'; then
+    # vendor-stamped HTML comments smuggled into the message —
+    # line grep misses a marker on a different line than '<!--',
+    # so extract comment bodies (multiline-aware) and scan joined
+    _comments=$(printf '%s\n' "$_msg" | awk '
+        { l = $0
+          while (length(l)) {
+            if (in_c) {
+              if (match(l, /-->/)) { printf "%s\n", substr(l,1,RSTART-1); l = substr(l,RSTART+3); in_c = 0 }
+              else { printf "%s ", l; l = "" }
+            } else if (match(l, /<!--/)) { l = substr(l,RSTART+4); in_c = 1 }
+            else l = ""
+          } }')
+    if printf '%s' "$_comments" | grep -iqE '('"$_VENDOR"'|generated|made|created|authored|written|produced|built|powered|co-?authored|attributed|🤖)'; then
         err "attribution HTML comment"
     fi
     # zero-width / invisible markers: U+200B..D, U+2060, U+FEFF as raw

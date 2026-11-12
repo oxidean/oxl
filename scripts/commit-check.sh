@@ -96,7 +96,7 @@ check_attribution() {
         { l = $0
           while (length(l)) {
             if (in_c) {
-              if (match(l, /-->/)) { printf "%s", substr(l,1,RSTART-1); l = substr(l,RSTART+3); in_c = 0 }
+              if (match(l, /-->/)) { printf "%s\n", substr(l,1,RSTART-1); l = substr(l,RSTART+3); in_c = 0 }
               else { printf "%s ", l; l = "" }
             } else if (match(l, /<!--/)) { l = substr(l,RSTART+4); in_c = 1 }
             else l = ""

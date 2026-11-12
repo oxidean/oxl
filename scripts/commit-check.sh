@@ -89,8 +89,19 @@ check_attribution() {
     if printf '%s\n' "$_msg" | grep -iqE '\b(as an ai|i generated this|authored by \[?('"$_VENDOR"'))\b'; then
         err "AI self-attribution"
     fi
-    # vendor-stamped HTML comments smuggled into the message
-    if printf '%s\n' "$_msg" | grep -iqE '<!--[^>]*('"$_VENDOR"'|generated|made|created|authored|written|produced|built|powered|co-?authored|attributed|🤖)[^>]*'; then
+    # vendor-stamped HTML comments smuggled into the message —
+    # line grep misses a marker on a different line than '<!--',
+    # so extract comment bodies (multiline-aware) and scan joined
+    _comments=$(printf '%s\n' "$_msg" | awk '
+        { l = $0
+          while (length(l)) {
+            if (in_c) {
+              if (match(l, /-->/)) { printf "%s", substr(l,1,RSTART-1); l = substr(l,RSTART+3); in_c = 0 }
+              else { printf "%s ", l; l = "" }
+            } else if (match(l, /<!--/)) { l = substr(l,RSTART+4); in_c = 1 }
+            else l = ""
+          } }')
+    if printf '%s' "$_comments" | grep -iqE '('"$_VENDOR"'|generated|made|created|authored|written|produced|built|powered|co-?authored|attributed|🤖)'; then
         err "attribution HTML comment"
     fi
     # zero-width / invisible markers: U+200B..D, U+2060, U+FEFF as raw

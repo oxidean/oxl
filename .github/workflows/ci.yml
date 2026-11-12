@@ -13,6 +13,9 @@ permissions:
 
 jobs:
   build-test:
+    # edited re-fires only commit-lint — the matrix doesn't need to
+    # re-run on title/body changes
+    if: github.event.action != 'edited'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false

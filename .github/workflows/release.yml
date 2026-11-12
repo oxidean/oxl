@@ -236,10 +236,9 @@ jobs:
           # state" while the job still has budget.
           deadline=$((SECONDS + 3000))
           while [ "$SECONDS" -lt "$deadline" ]; do
-            # Held runs surface as status=waiting, status=action_required, or
-            # conclusion=action_required depending on API shape — match all
-            # three, and scope to this head SHA so stale runs on older heads
-            # are never approved.
+            # Held runs surface under different markers across API shapes —
+            # match all reported forms, and scope to the current head SHA so
+            # stale runs on older heads are never approved.
             held="$(gh api "repos/${{ github.repository }}/actions/runs" -X GET \
               -f "branch=$branch" -f event=pull_request -f "head_sha=$expected_sha" \
               -f per_page=50 \
@@ -281,17 +280,29 @@ jobs:
               CLEAN) merged_gate=1; break ;;
               UNSTABLE) if [ "$pending" = "0" ]; then merged_gate=1; break; fi ;;
               # BEHIND fails the merge outright when the ruleset requires
-              # up-to-date branches — update the branch and keep polling
-              # rather than burning the merge retries.
+              # up-to-date branches. update-branch via the API won't spawn
+              # checks under GITHUB_TOKEN, so merge main locally and push —
+              # the synchronize runs arrive held like the original ones and
+              # the approve loop picks them up once expected_sha tracks the
+              # new head.
               BEHIND)
                 if [ "$pending" = "0" ]; then
                   if [ "$updates" -lt 3 ]; then
                     updates=$((updates+1))
-                    if gh api -X PUT \
-                      "repos/${{ github.repository }}/pulls/$pr/update-branch" >/dev/null 2>&1; then
-                      echo "bump PR #$pr BEHIND — requested branch update ($updates/3)"
+                    if git merge --abort 2>/dev/null; git fetch origin main -q \
+                      && git -c user.name="github-actions[bot]" \
+                           -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+                           merge --no-edit origin/main >/dev/null 2>&1 \
+                      && git push -f origin "$branch" >/dev/null 2>&1; then
+                      expected_sha="$(git rev-parse HEAD)"
+                      # The PR follows the branch — headRefOid lags the push
+                      # briefly, so keep the old number if re-resolution
+                      # hasn't caught up yet.
+                      newpr="$(resolve_pr || true)"
+                      [ -n "$newpr" ] && pr="$newpr"
+                      echo "bump PR #$pr BEHIND — merged main and pushed ($updates/3)"
                     else
-                      echo "::warning::update-branch refused for bump PR #$pr — retrying"
+                      echo "::warning::could not merge main into bump branch — retrying"
                     fi
                   else
                     echo "::error::bump PR #$pr could not be brought up to date — rerun the release"

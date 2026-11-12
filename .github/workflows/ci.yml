@@ -4,12 +4,18 @@ on:
   push:
     branches: [main]
   pull_request:
+    # edited re-fires the gate on title/body changes — otherwise a
+    # post-green metadata edit could land attribution unchecked.
+    types: [opened, synchronize, reopened, edited]
 
 permissions:
   contents: read
 
 jobs:
   build-test:
+    # edited re-fires only commit-lint — the matrix doesn't need to
+    # re-run on title/body changes
+    if: github.event.action != 'edited'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -95,8 +101,10 @@ jobs:
           # a stray start marker could hide attribution after it.
           open_m='<!-- This is an auto-generated comment: release notes by coderabbit.ai -->'
           close_m='<!-- end of auto-generated comment: release notes by coderabbit.ai -->'
-          opens=$(grep -cF "$open_m" pr-body.txt || :)
-          closes=$(grep -cF "$close_m" pr-body.txt || :)
+          # -oF counts occurrences, not matching lines — same-line
+          # pairs would read as one open and one close to -c.
+          opens=$(grep -oF "$open_m" pr-body.txt | wc -l || :)
+          closes=$(grep -oF "$close_m" pr-body.txt | wc -l || :)
           if [ "$opens" != "$closes" ]; then
             echo "commit-check: unbalanced CodeRabbit release-notes markers in PR body" >&2
             exit 1
@@ -117,6 +125,12 @@ jobs:
               }
               printf "%s", out rest
             }' pr-body.txt > pr-body-clean.txt
+          # equal counts but wrong order leave markers behind in the
+          # cleaned body — a stray open/close is not a managed block.
+          if grep -qF "$open_m" pr-body-clean.txt || grep -qF "$close_m" pr-body-clean.txt; then
+            echo "commit-check: misordered CodeRabbit release-notes markers in PR body" >&2
+            exit 1
+          fi
           scripts/commit-check.sh --scan-file pr-body-clean.txt
       - name: lint push range
         if: github.event_name == 'push'

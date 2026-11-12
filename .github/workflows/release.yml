@@ -249,7 +249,9 @@ jobs:
           while [ "$SECONDS" -lt "$deadline" ]; do
             # Held runs surface under different markers across API shapes —
             # match all reported forms, and scope to the current head SHA so
-            # stale runs on older heads are never approved.
+            # stale runs on older heads are never approved. -X GET keeps the
+            # -f fields as query params; without it gh api posts them as a
+            # body and the runs endpoint 404s, killing the approve pass.
             if held_json="$(gh api "repos/${{ github.repository }}/actions/runs" -X GET \
                 -f "branch=$branch" -f event=pull_request -f "head_sha=$expected_sha" \
                 -f per_page=50 2>/dev/null)"; then

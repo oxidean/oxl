@@ -7,7 +7,6 @@ package main
 // in bare temp bindings: plain-fn match arms, stmt-match scrutinee
 // temps, pair destructures, call-arg TDZ scopes, and closures
 // (whose bodies rebind captures as bare lets even inside susp fns).
-
 fn work(x: int) -> int {
     return x + 1
 }

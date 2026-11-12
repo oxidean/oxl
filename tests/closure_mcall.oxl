@@ -1,0 +1,67 @@
+package main
+
+// Closure-suspension mcall resolution: `recv.m()` inside a closure
+// resolves against the closure's own scope — params shadow enclosing
+// binds — and `call`'s field-vs-method precedence applies, so a
+// fn-valued field is never recorded as a susp method callee.
+let order: str = ""
+
+fn mark(s: str) {
+    order = order + s
+}
+
+struct Worker {}
+
+fn (w Worker) pause() {
+    msleep(1)
+} // susp method
+
+struct Param {}
+
+fn (p Param) pause() {
+    mark("param;")
+} // plain method, same name
+
+struct Ticker { tick: fn() }
+
+fn (t Ticker) tick() {
+    msleep(1)
+} // susp method, field shadows it
+
+// a closure param shadowing an enclosing receiver resolves the param's
+// own type — Param.pause (plain), never Worker.pause (susp)
+fn shadowtest(w: Worker) {
+    f := { |w: Param| w.pause() }
+    f(Param{})
+}
+
+// `call` gives the field precedence — the susp method never enters the
+// callee set, so the closure stays plain-fn legal
+fn fieldtest() {
+    t := Ticker{tick: { || mark("field;") }}
+    f := { || t.tick() }
+    f()
+}
+
+// deferred plain method calls on a captured receiver resolve and stay
+// legal — only a susp callee would trip the gate
+fn defertest() {
+    p := Param{}
+    f := { ||
+        defer p.pause()
+        mark("ran;")
+    }
+    f()
+}
+
+fn main() {
+    shadowtest(Worker{})
+    fieldtest()
+    defertest()
+    if order != "param;field;ran;param;" {
+        println("FAIL closure mcall resolution: " + order)
+        exit(1)
+    }
+    msleep(1)
+    println("closure mcall ok")
+}

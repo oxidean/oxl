@@ -89,7 +89,7 @@ pub fn unflatten(path: &str, span: Span) -> Option<Expr> {
 pub struct Global {
     pub name: String,
     pub ty: Option<TyRef>,
-    pub init: Expr,
+    pub init: Option<Expr>,
     pub span: Span,
 }
 
@@ -237,7 +237,7 @@ pub enum Bind {
 
 #[derive(Clone, Debug)]
 pub enum Stmt {
-    Let { name: String, ty: Option<TyRef>, init: Expr, span: Span },
+    Let { name: String, ty: Option<TyRef>, init: Option<Expr>, span: Span },
     Let2 { a: Bind, b: Bind, call: Expr, span: Span },
     Assign { target: Expr, val: Expr, span: Span },
     Expr(Expr),

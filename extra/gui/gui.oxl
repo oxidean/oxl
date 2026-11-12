@@ -18,6 +18,7 @@ import "std/sync"
 // session — a queued payload never aliases storage that can die
 // underneath it (poster arenas, shim ring buffers)
 extern fn rt_str_own(s: str) -> str
+
 extern fn rt_str_scope(s: str) -> str
 
 extern fn rt_str_free(s: str)
@@ -327,7 +328,8 @@ fn (b mut EventBuf) post(e: own Event) -> int {
             // must hold the owned copy, not the poster's borrowed str
             e.data = EventData.Text(eb_intern_l(b, t))
         }
-        _ => {}
+        _ => {
+        }
     }
     if e.kind == EventKind.text_changed && b.q != nil {
         if b.q.v.kind == EventKind.text_changed && b.q.v.target == e.target {
@@ -498,7 +500,8 @@ fn (b mut CmdBuf) post(c: own Cmd) -> int {
                 PropVal.Text(t) => {
                     c.prop.val = PropVal.Text(cb_intern_l(b, t))
                 }
-                _ => {}
+                _ => {
+                }
             }
             if c.props != nil {
                 i := 0
@@ -507,7 +510,8 @@ fn (b mut CmdBuf) post(c: own Cmd) -> int {
                         PropVal.Text(t) => {
                             c.props[i].val = PropVal.Text(cb_intern_l(b, t))
                         }
-                        _ => {}
+                        _ => {
+                        }
                     }
                     i = i + 1
                 }
@@ -530,6 +534,16 @@ interface Backend {
     detach(parent: int, child: int),
     destroy(h: int),
     pump(events: mut EventBuf, cmds: mut CmdBuf),
+    // cooperative-scheduler driving: a backend that answers 1 cannot
+    // own a blocking loop (the js lane has no blocking waits inside a
+    // vtable call) — run drives one bounded pump_iter per pass on its
+    // own susp frame and parks on pump_edge between passes. stop,
+    // wake and event injection must all post an edge there.
+    susp_pump() -> int,
+    pump_iter(events: mut EventBuf, cmds: mut CmdBuf) -> int,
+    pump_edge() -> chan,
+    stopped() -> int,
+    pump_fin(),
     stop(),
     wake(),
 }
@@ -571,13 +585,17 @@ fn last_dropped_cell() {
 struct PN { c: chan own CmdResult, next: own PN }
 
 let g_rp: own PN = nil
+
 let g_rp_n: int = 0
+
 let g_rp_mu: shared = nil
 
 struct SC { s: shared, next: own SC }
 
 let g_cells: own SC = nil
+
 let g_cells_n: int = 0
+
 let g_cell_mu: shared = nil
 
 // flag cells for per-call sent/settled markers — mkshared has no free
@@ -836,6 +854,29 @@ fn watcher(b: Backend, rt: chan) {
     recv(rt)
 }
 
+// susp-frame pump driver: same "only returns after stop" contract a
+// blocking pump has, expressed as bounded passes plus an edge park.
+// A miss parks one bounded select — the wake latch covers posts that
+// beat the park, and the timeout stays defensive-only: every edge
+// (cmd post -> wake -> nudge, inject -> nudge, stop -> nudge) lands on
+// the backend's chan.
+fn pump_task(b: Backend, events: mut EventBuf, cmds: mut CmdBuf) {
+    edge := b.pump_edge()
+    for 1 == 1 {
+        worked := b.pump_iter(events, cmds)
+        if b.stopped() == 1 {
+            break
+        }
+        if worked == 0 && cmds.take_wake() == 0 {
+            select {
+                recv(edge) => {}
+                timeout(50) => {}
+            }
+        }
+    }
+    b.pump_fin()
+}
+
 // ---- run ----
 
 // run-side teardown accounting: every still-unsent entry is counted
@@ -958,7 +999,11 @@ fn run(b: Backend, app: fn(chan own Event)) -> err {
         g_sess.disp = disp
         goin(disp, dispatch_loop())
         app(ev)
-        g_sess.b.pump(g_eb, g_cb)
+        if g_sess.b.susp_pump() == 1 {
+            pump_task(g_sess.b, g_eb, g_cb)
+        } else {
+            g_sess.b.pump(g_eb, g_cb)
+        }
         close(g_sess.retire)
         cb_shutdown()
         sync.mlock(g_eb.mu)
@@ -996,14 +1041,30 @@ fn run(b: Backend, app: fn(chan own Event)) -> err {
 
 fn kind_i(k: WidgetKind) -> int {
     match k {
-        WidgetKind.window => { return 0 }
-        WidgetKind.vbox => { return 1 }
-        WidgetKind.hbox => { return 2 }
-        WidgetKind.label => { return 3 }
-        WidgetKind.button => { return 4 }
-        WidgetKind.entry => { return 5 }
-        WidgetKind.list => { return 6 }
-        WidgetKind.scrolled => { return 7 }
+        WidgetKind.window => {
+            return 0
+        }
+        WidgetKind.vbox => {
+            return 1
+        }
+        WidgetKind.hbox => {
+            return 2
+        }
+        WidgetKind.label => {
+            return 3
+        }
+        WidgetKind.button => {
+            return 4
+        }
+        WidgetKind.entry => {
+            return 5
+        }
+        WidgetKind.list => {
+            return 6
+        }
+        WidgetKind.scrolled => {
+            return 7
+        }
     }
 }
 
@@ -1320,7 +1381,8 @@ fn read_prop(h: int, id: int) -> [PropVal, err] {
             r.val = PropVal.Text(rt_str_scope(t))
             rt_str_free(t)
         }
-        _ => {}
+        _ => {
+        }
     }
     return r.val, nil
 }

@@ -310,8 +310,10 @@ impl<'a> Fmt<'a> {
                 if let Some(t) = &g.ty {
                     self.out.push_str(&format!(": {}", self.ty(t)));
                 }
-                let init = self.expr(&g.init, 0, 0);
-                self.out.push_str(&format!(" = {init}"));
+                if let Some(i) = &g.init {
+                    let init = self.expr(i, 0, 0);
+                    self.out.push_str(&format!(" = {init}"));
+                }
             }
             Item::Struct(s) => {
                 let members: Vec<(u32, String)> = s
@@ -491,10 +493,14 @@ impl<'a> Fmt<'a> {
             Stmt::ExitBoundary { .. } => unreachable!("codegen-internal marker"),
             Stmt::Let { name, ty, init, .. } => {
                 let t = ty.as_ref().map(|t| self.ty(t));
-                let init = self.expr(init, 0, ind);
-                match t {
-                    Some(t) => self.out.push_str(&format!("let {name}: {t} = {init}")),
-                    None => self.out.push_str(&format!("{name} := {init}")),
+                let init = init.as_ref().map(|i| self.expr(i, 0, ind));
+                match (t, init) {
+                    (Some(t), Some(i)) => {
+                        self.out.push_str(&format!("let {name}: {t} = {i}"))
+                    }
+                    (Some(t), None) => self.out.push_str(&format!("let {name}: {t}")),
+                    (None, Some(i)) => self.out.push_str(&format!("{name} := {i}")),
+                    (None, None) => self.out.push_str(&format!("let {name}")),
                 }
             }
             Stmt::Let2 { a, b, call, .. } => {

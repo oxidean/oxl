@@ -13,10 +13,12 @@ import "std/errors"
 
 import "std/sync"
 
-// root-task pump blocks on the rt sleep — a susp
-// `msleep` would need a task frame the vtable lacks
-extern fn rt_msleep(ms: int)
+import "std/time"
 
+// susp-pump backend: run drives pump_iter on its own frame and parks
+// on wakech between passes — wake/stop/inject all post an edge, so no
+// synchronous spin ever pins the cooperative (js) scheduler. A vtable
+// method can never suspend, which is why the park lives in gui.oxl.
 extern fn rt_str_free(s: str)
 
 // ---- recorded protocol log ----
@@ -31,7 +33,7 @@ struct AE { h: int, next: own AE }
 // ---- scripted event queue (FIFO via head-append + reverse on pop) ----
 struct QE { v: own gui.Event, next: own QE }
 
-struct Mock { mu: shared, stopf: shared, hnext: shared }
+struct Mock { mu: shared, stopf: shared, hnext: shared, wakech: chan }
 
 let g_mu: shared = nil
 
@@ -47,17 +49,26 @@ let g_failed: shared = nil // inject a creation error when nonzero
 
 let g_delay: shared = nil // ms to sleep before replying (cancel tests)
 
+let g_pending: shared = nil // in-flight delayed replies — stopped() holds
+
+let g_pumped: shared = nil // once-flag: the "pump" ledger entry logs once
+
 let g_viol: shared = nil // dead-target protocol violations recorded
 
 fn backend() -> Mock {
-    m := Mock{mu: sync.mutex(), stopf: mkshared(0), hnext: mkshared(0)}
+    m := Mock{mu: sync.mutex(), stopf: mkshared(0), hnext: mkshared(0), wakech: mkchan()}
     g_mu = m.mu
     g_log = nil
     g_props = nil
     g_alive = nil
     g_script = nil
+    // rows are computed off the edge table — it must reset with the
+    // rest or a second backend() session reads stale counts
+    g_edges = nil
     g_failed = mkshared(0)
     g_delay = mkshared(0)
+    g_pending = mkshared(0)
+    g_pumped = mkshared(0)
     g_viol = mkshared(0)
     return m
 }
@@ -174,6 +185,12 @@ fn edge_sync_rows(parent: int) {
     prop_put(parent, gui.P_ROWS, gui.PropVal.Num(edge_count(parent)))
 }
 
+// a fresh list has no edges yet — rows() must still answer 0 rather
+// than trip the missing-prop error
+fn edge_seed_rows(parent: int) {
+    prop_put(parent, gui.P_ROWS, gui.PropVal.Num(0))
+}
+
 fn edge_add(parent: int, child: int) {
     e := new(CE)
     e.parent = parent
@@ -236,6 +253,9 @@ fn (m Mock) new(kind: gui.WidgetKind, props: own []gui.Prop) -> [int, err] {
     sset(m.hnext, sget(m.hnext) + 1)
     h := sget(m.hnext)
     al_add(h)
+    if kind == gui.WidgetKind.list {
+        edge_seed_rows(h)
+    }
     if props != nil {
         i := 0
         for i < len(props) {
@@ -330,8 +350,13 @@ fn (m Mock) exec(c: own gui.Cmd) {
         r2.e = nil
         r2.handle = h
         r2.val = gui.PropVal.Num(0)
-        rt_msleep(sget(g_delay))
-        if !try_send(c.reply, r2) {
+        if sget(g_delay) > 0 {
+            // exec runs under a vtable call and cannot suspend — the
+            // delay rides a spawned task instead: same hold-the-reply
+            // window, cancel-aware sleep, identical lost-reply path
+            sadd(g_pending, 1)
+            spawn delayed_reply(m, c.reply, r2, h)
+        } else if !try_send(c.reply, r2) {
             m.destroy(h)
         }
         return
@@ -416,36 +441,81 @@ fn (m Mock) exec(c: own gui.Cmd) {
 }
 
 fn (m Mock) pump(events: mut gui.EventBuf, cmds: mut gui.CmdBuf) {
-    mlockg()
-    logit("pump", 0, 0)
-    munlockg()
+    // unreachable — susp_pump() == 1 means run drives pump_iter on its
+    // own susp frame; a blocking loop here would starve the js lane
+    assert(1 == 0)
+}
+
+fn (m Mock) susp_pump() -> int {
+    return 1
+}
+
+// one bounded pass: drain injected events into the buf, then drain +
+// exec every queued cmd. Returns whether any cmd work ran — the core
+// parks its frame on pump_edge only after an idle pass.
+fn (m Mock) pump_iter(events: mut gui.EventBuf, cmds: mut gui.CmdBuf) -> int {
+    if sget(g_pumped) == 0 {
+        sset(g_pumped, 1)
+        mlockg()
+        logit("pump", 0, 0)
+        munlockg()
+    }
     for 1 == 1 {
-        // drain injected events into the buf — never blocks
-        for 1 == 1 {
-            e := m.pop_script()
-            if e == nil {
-                break
-            }
-            events.post(e)
-        }
-        q := cmds.drain()
-        worked := 0
-        for q != nil {
-            c := q.v
-            r := q.next
-            q.next = nil
-            m.exec(c)
-            q = r
-            worked = 1
-        }
-        if sget(m.stopf) == 1 {
+        e := m.pop_script()
+        if e == nil {
             break
         }
-        if worked == 0 {
-            rt_msleep(1)
-        }
+        events.post(e)
     }
+    q := cmds.drain()
+    worked := 0
+    for q != nil {
+        c := q.v
+        r := q.next
+        q.next = nil
+        m.exec(c)
+        q = r
+        worked = 1
+    }
+    return worked
+}
+
+fn (m Mock) pump_edge() -> chan {
+    return m.wakech
+}
+
+fn (m Mock) stopped() -> int {
+    if sget(m.stopf) == 0 {
+        return 0
+    }
+    if sget(g_pending) > 0 {
+        return 0
+    }
+    return 1
+}
+
+fn (m Mock) pump_fin() {
     m.sweep()
+}
+
+// holds a create reply for g_delay ms on its own task frame — the
+// pump's exec path stays non-suspending while cancel tests still get
+// a real hittable reply window.
+fn delayed_reply(m: Mock, reply: chan own gui.CmdResult, r2: own gui.CmdResult, h: int) {
+    time.sleep_ms(sget(g_delay))
+    // publication ordering: alive() at send time proves send-before-sweep
+    // (the sweep only runs once g_pending drains). Consumer-time liveness
+    // is not part of the contract — the handle may legally be swept
+    // before the caller resumes.
+    mlockg()
+    if al_has(h) != 1 {
+        logit("reply-dead", h, 0)
+    }
+    munlockg()
+    if !try_send(reply, r2) {
+        m.destroy(h)
+    }
+    sadd(g_pending, -1)
 }
 
 // live-handle sweep — pump does not return with live handles.
@@ -466,9 +536,12 @@ fn (m Mock) sweep() {
 
 fn (m Mock) stop() {
     sset(m.stopf, 1)
+    try_send(m.wakech, 1)
 }
 
-fn (m Mock) wake() {}
+fn (m Mock) wake() {
+    try_send(m.wakech, 1)
+}
 
 // ---- test scripting + inspection ----
 
@@ -480,6 +553,7 @@ fn (m Mock) inject(e: own gui.Event) {
     q.next = g_script
     g_script = q
     munlockg()
+    try_send(m.wakech, 1)
 }
 
 fn (m Mock) pop_script() -> own gui.Event {

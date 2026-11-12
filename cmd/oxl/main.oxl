@@ -72,6 +72,23 @@ fn report_diags(diags: []check.DBox) {
 // .oxl files (the file-list rule); argi is where program args begin
 struct PkgArgs { fs: []str, argi: int }
 
+// driver-flag vocabulary shared by pkg_args and run's child-argv
+// scan — returns tokens consumed, 0 when a is not a driver flag.
+// Flags are driver vocabulary anywhere before `--` (never forwarded
+// to a run child): the documented `run f.oxl --target js` puts them
+// after the sources. `--` is the only program-arg boundary for
+// flag-shaped tokens — a program wanting `--html` in argv gets it
+// via `run f.oxl -- --html`.
+fn flag_toks(a: str) -> int {
+    if a == "--target" || a == "-o" {
+        return 2
+    }
+    if a == "--html" || strings.startswith(a, "--target=") {
+        return 1
+    }
+    return 0
+}
+
 struct PkgSrc { dir: str, files: []str }
 
 fn pkg_args(start: int) -> PkgArgs {
@@ -79,6 +96,19 @@ fn pkg_args(start: int) -> PkgArgs {
     i := start
     for i < argc() && argv(i) != "--" {
         a := argv(i)
+        // driver flags interleave ahead of the sources — skip them
+        // (and a separate value where the flag takes one); once the
+        // source list has begun, any further token ends it (flags
+        // after the sources stay driver vocabulary via flag_value,
+        // and run's child-argv scan strips them rather than ending
+        // the program's own args)
+        if len(fs) == 0 {
+            n := flag_toks(a)
+            if n > 0 {
+                i = i + n
+                continue
+            }
+        }
         if len(fs) == 0 && os.isdir(a) {
             fs = push(fs, a)
             i = i + 1
@@ -91,6 +121,63 @@ fn pkg_args(start: int) -> PkgArgs {
         i = i + 1
     }
     return PkgArgs{fs: fs, argi: i}
+}
+
+// `--target <v>` / `--target=<v>`; "" when absent. Flag reads stop at
+// `--` — past that boundary argv belongs to the program, so a
+// `--target` the program carries can't hijack the driver's lane pick.
+fn flag_value(name: str) -> str {
+    i := 2
+    for i + 1 < argc() {
+        a := argv(i)
+        if a == "--" {
+            break
+        }
+        if a == name {
+            return argv(i + 1)
+        }
+        i = i + 1
+    }
+    pfx := name + "="
+    i = 2
+    for i < argc() {
+        a := argv(i)
+        if a == "--" {
+            break
+        }
+        if strings.startswith(a, pfx) {
+            return substr(a, len(pfx), len(a))
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn has_flag(name: str) -> int {
+    i := 2
+    for i < argc() {
+        a := argv(i)
+        if a == "--" {
+            break
+        }
+        if a == name {
+            return 1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+fn target_is_js() -> int {
+    t := flag_value("--target")
+    if len(t) > 0 && t != "js" && t != "c" && t != "native" {
+        eprintln("unknown --target " + t + " (want js or native)")
+        exit(1)
+    }
+    if t == "js" {
+        return 1
+    }
+    return 0
 }
 
 // source args -> package source: one dir = dir package, files = the
@@ -135,7 +222,11 @@ fn compile_res(r: own check.CkRes, testm: int) -> own CRes {
         report_diags(r.ck.diags)
         return res
     }
-    res.c = codegen.emit(r, testm)
+    if target_is_js() == 1 {
+        res.c = codegen.emit_js(r, testm)
+    } else {
+        res.c = codegen.emit(r, testm)
+    }
     res.ok = 1
     return res
 }
@@ -205,7 +296,7 @@ fn write_text(path: str, data: str) -> int {
 // ancestors of the executable first (a shipped or in-repo binary),
 // then ancestors of the compiled package (a self driver run from a
 // scratch dir still finds the SOURCE tree).
-fn runtime_at(base: str) -> str {
+fn runtime_at(base: str, marker: str) -> str {
     d := base
     for len(d) > 0 {
         // "." is never a canonical ancestor — dir_of degrades a drive
@@ -213,7 +304,7 @@ fn runtime_at(base: str) -> str {
         if d == "." {
             break
         }
-        if os.exists(d + "/runtime/rt.c") {
+        if os.exists(d + marker) {
             return d
         }
         if d == "/" {
@@ -224,29 +315,29 @@ fn runtime_at(base: str) -> str {
     return ""
 }
 
-fn runtime_dir(entry: str) -> str {
+fn runtime_dir(entry: str, marker: str) -> str {
     // exe-dir probe first — a PATH-invoked oxl finds its shipped
     // runtime/. Skipped when exepath fails: dir_of("") is "." and
     // canon_or would silently anchor the probe at the cwd.
     d := ""
     exe := rt_exepath()
     if len(exe) > 0 {
-        d = runtime_at(check.canon_or(check.dir_of(exe)))
+        d = runtime_at(check.canon_or(check.dir_of(exe)), marker)
     }
     // bare argv(0) (PATH invocation) carries no dir component —
     // dir_of yields "." which canon_or turns into the cwd
     av := argv(0)
     if len(d) == 0 && strings.contains(av, "/") {
-        d = runtime_at(check.canon_or(check.dir_of(av)))
+        d = runtime_at(check.canon_or(check.dir_of(av)), marker)
     }
     if len(d) == 0 {
-        d = runtime_at(check.canon_or(entry))
+        d = runtime_at(check.canon_or(entry), marker)
     }
     if len(d) == 0 {
         // last resort: the invocation cwd — a seed-built driver run
         // from inside a checkout (scratch exe, out-of-tree sources)
         // still finds the checkout's runtime/
-        d = runtime_at(check.canon_or("."))
+        d = runtime_at(check.canon_or("."), marker)
     }
     return d
 }
@@ -354,7 +445,7 @@ fn emit_and_cc(csrc: str, out: str, entry: str) -> int {
         eprintln("cannot write " + cfile + ": " + rt_errstr(we))
         return 0
     }
-    rt := runtime_dir(entry)
+    rt := runtime_dir(entry, "/runtime/rt.c")
     if len(rt) == 0 {
         eprintln("cannot locate runtime/rt.c — no runtime/ tree above " + check.dir_of(argv(0)) + " or " + entry)
         return 0
@@ -460,6 +551,91 @@ fn emit_and_cc(csrc: str, out: str, entry: str) -> int {
     return 0
 }
 
+// ---------- js lane (W4) ----------
+// emit_and_js mirrors emit_and_cc's layout: the module text lands at
+// `out`, the ES-module runtime (rt.mjs + the env shims it imports
+// dynamically) is copied beside it — the emitted `import './rt.mjs'`
+// resolves relative to the module file.
+fn emit_and_js(jssrc: str, out: str, entry: str) -> int {
+    od := check.dir_of(out)
+    me := os.mkdir_all(od)
+    if me != nil {
+        eprintln("cannot create output dir " + od + ": " + errors.msg(me))
+        return 0
+    }
+    rt := runtime_dir(entry, "/runtime/rt.mjs")
+    if len(rt) == 0 {
+        eprintln("cannot locate runtime/rt.mjs — no runtime/ tree above " + check.dir_of(argv(0)) + " or " + entry)
+        return 0
+    }
+    we := write_text(out, jssrc)
+    if we != 0 {
+        eprintln("cannot write " + out + ": " + rt_errstr(we))
+        return 0
+    }
+    names := mkslice(str, 0)
+    names = push(names, "rt.mjs")
+    names = push(names, "rt-node.mjs")
+    names = push(names, "rt-browser.mjs")
+    names = push(names, "rt-dom.mjs")
+    i := 0
+    for i < len(names) {
+        src := readfile(rt + "/runtime/" + names[i])
+        if len(src) == 0 {
+            eprintln("cannot read runtime/" + names[i])
+            return 0
+        }
+        we = write_text(od + "/" + names[i], src)
+        if we != 0 {
+            eprintln("cannot write " + od + "/" + names[i] + ": " + rt_errstr(we))
+            return 0
+        }
+        i = i + 1
+    }
+    if has_flag("--html") == 1 {
+        we = write_text(out + ".html", js_html(out))
+        if we != 0 {
+            eprintln("cannot write " + out + ".html: " + rt_errstr(we))
+            return 0
+        }
+    }
+    return 1
+}
+
+// the --html scaffold: a module script tag pulls the emitted .mjs; the
+// DOM backend targets #app when present
+fn js_html(out: str) -> str {
+    b := out
+    i := len(out) - 1
+    for i >= 0 {
+        if substr(out, i, i + 1) == "/" || substr(out, i, i + 1) == "\\" {
+            b = substr(out, i + 1, len(out))
+            break
+        }
+        i = i - 1
+    }
+    return "<!doctype html>\n<meta charset=\"utf-8\">\n<title>oxl</title>\n<div id=\"app\"></div>\n<script type=\"module\" src=\"./" + b + "\"></script>\n"
+}
+
+// `out` for the js lane: -o respected verbatim, else a.mjs beside the
+// native a.out default — the scan stops at `--` (program argv)
+fn js_out_name() -> str {
+    i := 0
+    for i < argc() {
+        if argv(i) == "--" {
+            break
+        }
+        if argv(i) == "-o" {
+            if i + 1 < argc() {
+                return argv(i + 1)
+            }
+            break
+        }
+        i = i + 1
+    }
+    return "a.mjs"
+}
+
 // child exit -> the driver's own exit (seed `st.code().unwrap_or(1)`).
 // POSIX signaled children come back 128+sig through exec.run — the
 // seed's ExitStatus::code() is None there, so they report 1 (real
@@ -483,6 +659,9 @@ fn child_code(st: int, e: err) -> int {
 fn out_arg() -> str {
     i := 0
     for i < argc() {
+        if argv(i) == "--" {
+            break
+        }
         if argv(i) == "-o" {
             if i + 1 < argc() {
                 return argv(i + 1)
@@ -497,6 +676,16 @@ fn out_arg() -> str {
 fn cmd_build() {
     pa := pkg_args(2)
     src := pkg_src(pa.fs)
+    if target_is_js() == 1 {
+        res := compile(src)
+        if res.ok == 0 {
+            exit(1)
+        }
+        if emit_and_js(res.c, js_out_name(), entry_dir(src)) == 0 {
+            exit(1)
+        }
+        return
+    }
     out := exe_out_name(out_arg())
     res := compile(src)
     if res.ok == 0 {
@@ -519,19 +708,55 @@ fn cmd_run() {
         exit(1)
     }
     out := exe_out_name(dir + "/a.out")
-    if emit_and_cc(res.c, out, entry_dir(src)) == 0 {
+    if target_is_js() == 1 {
+        out = dir + "/out.mjs"
+        if emit_and_js(res.c, out, entry_dir(src)) == 0 {
+            exit(1)
+        }
+    } else if emit_and_cc(res.c, out, entry_dir(src)) == 0 {
         exit(1)
     }
-    // everything after the sources is the program's argv — with or
-    // without a `--` separator (seed cmd_run)
+    // everything after the sources is the program's argv — minus
+    // consumed driver flags (`f.oxl --target js` selects the lane
+    // without leaking the flag); `--` hands the rest over verbatim,
+    // the program's only way to carry a flag-shaped token
     ai := pa.argi
-    if ai < argc() && argv(ai) == "--" {
+    cargs := mkslice(str, 0)
+    dd := 0
+    for ai < argc() {
+        a := argv(ai)
+        if dd == 1 {
+            cargs = push(cargs, a)
+        } else if a == "--" {
+            dd = 1
+        } else {
+            n := flag_toks(a)
+            if n > 0 {
+                ai = ai + n
+                continue
+            }
+            cargs = push(cargs, a)
+        }
         ai = ai + 1
     }
-    cargs := mkslice(str, 0)
-    for ai < argc() {
-        cargs = push(cargs, argv(ai))
-        ai = ai + 1
+    if target_is_js() == 1 {
+        // node argv[1] slot — out.mjs leads; prepend without a
+        // trailing "" — process.argv.slice(1) must equal the
+        // native lane's argv exactly
+        nc := mkslice(str, len(cargs) + 1)
+        nc[0] = out
+        i := 0
+        for i < len(cargs) {
+            nc[i + 1] = cargs[i]
+            i = i + 1
+        }
+        child := exec.cmd("node", nc)
+        [st, e] = child.run()
+        if e != nil {
+            eprintln("node exec failed: " + errors.msg(e))
+        }
+        os.remove_all(dir)
+        exit(child_code(st, e))
     }
     child := exec.cmd(out, cargs)
     [st, e] = child.run()
@@ -551,6 +776,21 @@ fn cmd_test() {
         exit(1)
     }
     out := exe_out_name(dir + "/a.out")
+    if target_is_js() == 1 {
+        out = dir + "/out.mjs"
+        if emit_and_js(res.c, out, entry_dir(src)) == 0 {
+            exit(1)
+        }
+        nargs := mkslice(str, 0)
+        nargs = push(nargs, out)
+        child := exec.cmd("node", nargs)
+        [st, e] = child.run()
+        if e != nil {
+            eprintln("node exec failed: " + errors.msg(e))
+        }
+        os.remove_all(dir)
+        exit(child_code(st, e))
+    }
     if emit_and_cc(res.c, out, entry_dir(src)) == 0 {
         exit(1)
     }
@@ -595,10 +835,16 @@ fn cmd_list() {
 
 fn main() {
     if argc() < 2 {
-        eprintln("oxl — one toolchain binary\n\n  oxl build [<pkg dir>|<file.oxl>...] [-o out]\n  oxl run [<pkg dir>|<file.oxl>...]\n  oxl test [<pkg dir>|<file.oxl>...]\n  oxl fmt <file.oxl>...\n  oxl doc <file.oxl>\n  oxl get <path>@<query>\n  oxl publish v<semver>\n  oxl mod <init|tidy|verify|list> ...\n  oxl list -m all\n  oxl version\n  oxl lsp")
+        eprintln("oxl — one toolchain binary\n\n  oxl build [<pkg dir>|<file.oxl>...] [-o out] [--target js] [--html]\n  oxl run [<pkg dir>|<file.oxl>...] [--target js]\n  oxl test [<pkg dir>|<file.oxl>...] [--target js]\n  oxl fmt <file.oxl>...\n  oxl doc <file.oxl>\n  oxl get <path>@<query>\n  oxl publish v<semver>\n  oxl mod <init|tidy|verify|list> ...\n  oxl list -m all\n  oxl version\n  oxl lsp")
         exit(2)
     }
     c := argv(1)
+    // --html only writes a page beside a js build's .mjs — flag the
+    // misuse on every other shape instead of silently swallowing it
+    if has_flag("--html") == 1 && (c != "build" || target_is_js() == 0) {
+        eprintln("--html needs `oxl build --target js`")
+        exit(2)
+    }
     if c == "build" {
         cmd_build()
     } else if c == "run" {

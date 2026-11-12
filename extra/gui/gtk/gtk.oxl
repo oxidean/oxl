@@ -339,6 +339,27 @@ fn deliver(events: mut gui.EventBuf, h: int, k: int, aux: int) {
 // nonblocking while work flows (a command burst must not starve the
 // ring), blocking when idle — gx_wake/interrupts or a shim wake flag
 // left by wake()/stop() break the wait.
+// blocking backend — gx_iter owns the wait, so run calls pump
+// directly; the susp-driving surface exists only for cooperative
+// schedulers and is never reached here.
+fn (g Gtk) susp_pump() -> int {
+    return 0
+}
+
+fn (g Gtk) pump_iter(events: mut gui.EventBuf, cmds: mut gui.CmdBuf) -> int {
+    return 0
+}
+
+fn (g Gtk) pump_edge() -> chan {
+    return mkchan()
+}
+
+fn (g Gtk) stopped() -> int {
+    return 0
+}
+
+fn (g Gtk) pump_fin() {}
+
 fn (g Gtk) pump(events: mut gui.EventBuf, cmds: mut gui.CmdBuf) {
     aff_check("pump")
     for 1 == 1 {

@@ -44,19 +44,36 @@ Milestone map: [docs/specs/2026-11-07-phase-2-plan/](../specs/2026-11-07-phase-2
 - **G — portable GUI layer** in the language (charter path) as
   `extra/gui` + `extra/gui/gtk` — shipped; spec:
   `docs/specs/2026-11-09-gui-layer/`
-- **R — runtime type descriptors + reflection**: compiler-emitted
-  `TypeDesc` table, `std/reflect` lite, `fmt %v` (#28), typed
-  `errors.As` (#27), then `gob`/`xml`/`template`/`sql` — spec:
+- **R — runtime type descriptors + reflection**: spec merged —
+  compiler-emitted `TypeDesc` table, `std/reflect` lite, `fmt %v`
+  (#28), typed `errors.As` (#27), then `gob`/`xml`/`template`/`sql`;
+  impl WI-0008 in flight — spec:
   `docs/specs/2026-11-11-type-descriptors/`
-- **W — web/JS compilation target**: in flight — `--target js`,
-  JS runtime + emitter, `extra/gui/dom` backend, `web-todo`
-  reference app; spec+impl on `feat/milestone-w` (PR open)
+- **W — web compilation target**: shipped — `--target js` emit
+  (node + browser flavors), `extra/gui/dom` backend, `web-todo`
+  reference app; spec: `docs/specs/2026-11-10-web-target/`
 - **L — LLVM emit lane**: spec — `bootstrap/codegen/llvm.oxl`
   textual-IR emitter behind the `CkRes` seam, `--target llvm` +
   `--triple`, shared frame/poll suspension lowering, rt.c under
   clang, IR fixpoint; spec:
   `docs/specs/2026-11-11-llvm-backend/`
-- Parked on triggers: D4 shape-generics, parked-stdlib list
+- Parked on triggers (each unparks when its trigger fires, then
+  takes the normal spec → work-item → PR loop):
+  - D4 shape-generics — spec item exists
+    (`docs/specs/2026-11-04-0132-v0-2-forward/items/d4-shape-generics.md`);
+    trigger: generic-heavy builds show measurable bloat or compile-
+    time pain — pure backend optimization, semantics unchanged.
+  - TLS/x509 — spec in flight on `docs/tls-x509-spec`;
+    trigger: first consumer needing authenticated or encrypted
+    transport beyond cleartext `net`; spec must cover the x509
+    trust story, not just a wrapping API.
+  - `pin` primitive — spec merged
+    (`docs/specs/2026-11-11-pin-primitive/`); trigger: FFI or IO
+    needs address-stable values (OS async handles, self-referential
+    own graphs).
+  - parked-stdlib list — per module, trigger: a real consumer
+    demands it; `compress`/`archive`/`net`/`container` landed,
+    files one work item each.
 
 (The compiler already compiles itself — see `docs/self-hosting.md`;
 "T" retires the Rust seed driver, not the compiler.)

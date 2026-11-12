@@ -1,0 +1,144 @@
+package main
+
+// gui_dom — the headless dom backend's contract test (W6): every
+// widget kind constructible, props round-trip through the element
+// store, fired DOM events land as core Events through the real
+// listener->queue->pump_iter->EventBuf path, and teardown sweeps.
+import "github.com/oxidean/oxl/extra/gui"
+
+import "github.com/oxidean/oxl/extra/gui/dom"
+
+import "std/errors"
+
+let g_d: dom.Dom = dom.headless()
+
+fn app_main(events: chan own gui.Event) {
+    [w, e1] = gui.window("todo")
+    [vb, e2] = gui.vbox()
+    [en, e3] = gui.entry("what needs doing")
+    [b, e4] = gui.button("add")
+    [sc, e5] = gui.scrolled()
+    [li, e6] = gui.list()
+    [lb, e7] = gui.label("ready")
+    if e1 != nil || e2 != nil || e3 != nil || e4 != nil || e5 != nil || e6 != nil || e7 != nil {
+        println("create err")
+        gui.stop()
+        return
+    }
+    gui.append(w, vb)
+    gui.append(vb, en)
+    gui.append(vb, b)
+    gui.append(w, sc)
+    gui.append(sc, li)
+    gui.append(vb, lb)
+    // every kind maps to its tag per the contract
+    if g_d.tag(b.handle()) != "button" {
+        println("button tag err")
+        gui.stop()
+        return
+    }
+    if g_d.tag(li.handle()) != "ul" {
+        println("list tag err")
+        gui.stop()
+        return
+    }
+    // creation-time props must read back — the backend registers the
+    // handle before applying props or set_prop flags a dead target
+    [bp, be] = gui.read_prop(b.handle(), gui.P_TEXT)
+    bt := ""
+    match bp {
+        gui.PropVal.Text(s0) => {
+            bt = s0
+        }
+        _ => {
+        }
+    }
+    if be != nil || bt != "add" {
+        println("button creation text err")
+        gui.stop()
+        return
+    }
+    [lp, le] = gui.read_prop(lb.handle(), gui.P_TEXT)
+    lt := ""
+    match lp {
+        gui.PropVal.Text(s1) => {
+            lt = s1
+        }
+        _ => {
+        }
+    }
+    if le != nil || lt != "ready" {
+        println("label creation text err")
+        gui.stop()
+        return
+    }
+    // text prop round-trip through the element store
+    en.set_text("write tests")
+    [t, te] = en.text()
+    if te != nil || t != "write tests" {
+        println("entry text err")
+        gui.stop()
+        return
+    }
+    // rows: P_ROWS is the live child count
+    [n, ne] = li.rows()
+    if ne != nil || n != 0 {
+        println("rows0 err")
+        gui.stop()
+        return
+    }
+    println("tree ok")
+
+    // fire a click on the button — clicked event through delivery
+    g_d.fire(b.handle(), dom.D_CLICK)
+    for 1 == 1 {
+        ev := recv(events)
+        if ev == nil {
+            break
+        }
+        if ev.kind == gui.EventKind.clicked && ev.target == b.handle() {
+            println("clicked")
+            // second phase: input + Enter on the entry
+            g_d.fire(en.handle(), dom.D_INPUT)
+            g_d.fire(en.handle(), dom.D_ENTER)
+        }
+        if ev.kind == gui.EventKind.text_changed && ev.target == en.handle() {
+            // the payload must be the fire-time text, not "" — the
+            // event is popped before deliver reads its string
+            ok := 0
+            match ev.data {
+                gui.EventData.Text(t) => {
+                    if t == "write tests" {
+                        ok = 1
+                    }
+                }
+                _ => {
+                }
+            }
+            if ok == 1 {
+                println("text_changed")
+            } else {
+                println("text_changed payload err")
+            }
+        }
+        if ev.kind == gui.EventKind.activated && ev.target == en.handle() {
+            println("activated")
+            gui.stop()
+            return
+        }
+    }
+}
+
+fn app(events: chan own gui.Event) {
+    spawn app_main(events)
+}
+
+fn main() {
+    g_d = dom.headless()
+    e := gui.run(g_d, app)
+    if e != nil {
+        println("run err: " + errors.msg(e))
+        return
+    }
+    println("done")
+}

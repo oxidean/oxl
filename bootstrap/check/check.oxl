@@ -386,7 +386,14 @@ struct DBox { kind: str, msg: str, file: str, off: int }
 // analyzes unsaved text (Rust `over` in load_pkg)
 struct OverEnt { path: str, text: str, next: own OverEnt }
 
-struct ClChk { callees: own SList, seeded: int, next: own ClChk }
+struct ClChk {
+    callees: own SList,
+    mcalls: own SList,
+    refs: own SList,
+    binds: own SList,
+    seeded: int,
+    next: own ClChk,
+}
 
 struct It { node: own parser.Node, mod: str, file: str }
 
@@ -4050,6 +4057,9 @@ fn stmt(ck: mut Ck, s: ref parser.Node, env: mut Env) {
     }
     match s {
         parser.Node.Let{name, ty, init, lo, hi} => {
+            if init == nil && ty == nil {
+                diag(ck, "check", "`let` requires a type or an initializer")
+            }
             it := expr(ck, init, env)
             t := it
             if ty != nil {
@@ -4493,16 +4503,16 @@ fn ret_susp(ck: ref Ck, vals: ref parser.NList) -> bool {
 // check_closures because the susp set only exists post-fixpoint.
 fn closure_expr(ck: mut Ck, params: ref parser.NList, body: ref parser.Node, env: mut Env) -> int {
     // deferred susp scan — collect callees + seeded before checking body
-    cc := new(ClChk{callees: nil, seeded: 0, next: nil})
+    cc := new(ClChk{callees: nil, mcalls: nil, refs: nil, binds: nil, seeded: 0, next: nil})
     cl_scan_node(ck, body, cc)
-    cc.next = ck.clcks
-    ck.clcks = cc
     let ps: own IList = nil
+    let pnames: own SList = nil
     pl := params
     for pl != nil {
         match pl.v {
             parser.Node.Param{name, ty} => {
                 ps = icons(ty_parse(ck, ty_str(ty)), ps)
+                pnames = scons(name, pnames)
             }
             _ => {
             }
@@ -4510,6 +4520,61 @@ fn closure_expr(ck: mut Ck, params: ref parser.NList, body: ref parser.Node, env
         pl = pl.next
     }
     ps = irev(ps)
+    // captures are copied by value into a heap env struct — a borrowed
+    // ref/mut would outlive its borrow region, so reject them like
+    // ref/mut fields in heap objects (seed closure capture check).
+    // flattened `recv.m` names arrive dotted — the capturable binding
+    // is the longest env-bound prefix (`recv`)
+    let caps: own SList = nil
+    rl := cc.refs
+    for rl != nil {
+        if !sl_has(caps, rl.v) {
+            caps = scons(rl.v, caps)
+        }
+        rl = rl.next
+    }
+    cl2 := cc.callees
+    for cl2 != nil {
+        if !sl_has(caps, cl2.v) {
+            caps = scons(cl2.v, caps)
+        }
+        cl2 = cl2.next
+    }
+    for caps != nil {
+        cn := caps.v
+        // a name bound inside the closure resolves to the local bind
+        // lexically — never a capture even when an enclosing borrowed
+        // name with the same stem exists
+        hd := cn
+        di := find(cn, ".")
+        if di >= 0 {
+            hd = substr(cn, 0, di)
+        }
+        if sl_has(cc.binds, hd) {
+            caps = caps.next
+            continue
+        }
+        cm := cn
+        for len(cm) > 0 {
+            if sl_has(pnames, cm) {
+                break
+            }
+            cvt := env_get(ck, env, cm)
+            if cvt >= 0 {
+                cvk := ck.tyv[cvt].k
+                if cvk == k_ref() || cvk == k_mut() {
+                    diag(ck, "check", "closure captures `" + cn + "` (`" + ty_name(ck, cvt) + "`) — borrowed refs may not be stored in heap objects (v0)")
+                }
+                break
+            }
+            cld := last_dot(cm)
+            if cld < 0 {
+                break
+            }
+            cm = substr(cm, 0, cld)
+        }
+        caps = caps.next
+    }
     s_in := ck.in_cl
     s_ret := ck.cl_ret
     ck.in_cl = 1
@@ -4528,6 +4593,57 @@ fn closure_expr(ck: mut Ck, params: ref parser.NList, body: ref parser.Node, env
         wl = wl.next
         pl = pl.next
     }
+    // method calls resolve in the closure's own scope — params shadow
+    // enclosing binds — and `call` gives fields precedence over methods,
+    // so a fn-valued field is never a susp method callee
+    ml := cc.mcalls
+    for ml != nil {
+        i := find(ml.v, ".")
+        if i > 0 {
+            n := substr(ml.v, i + 1, len(ml.v))
+            t := env_get(ck, env, substr(ml.v, 0, i))
+            if t >= 0 && field_ty(ck, t, n) < 0 {
+                mt := method_target(ck, t, n)
+                if mt.k != 0 {
+                    cc.callees = scons(mt.q, cc.callees)
+                }
+            }
+        }
+        ml = ml.next
+    }
+    // flattened `recv.m` callees arrive dotted — resolve the longest
+    // env-bound prefix the same way (strip until a bound name)
+    let flat: own SList = nil
+    cl := cc.callees
+    for cl != nil {
+        flat = scons(cl.v, flat)
+        cl = cl.next
+    }
+    for flat != nil {
+        orig := flat.v
+        recv := orig
+        for len(recv) > 0 {
+            ld := last_dot(recv)
+            if ld < 0 {
+                break
+            }
+            recv = substr(recv, 0, ld)
+            t := env_get(ck, env, recv)
+            if t >= 0 {
+                meth := substr(orig, len(recv) + 1, len(orig))
+                if field_ty(ck, t, meth) < 0 {
+                    mt := method_target(ck, t, meth)
+                    if mt.k != 0 {
+                        cc.callees = scons(mt.q, cc.callees)
+                    }
+                }
+                break
+            }
+        }
+        flat = flat.next
+    }
+    cc.next = ck.clcks
+    ck.clcks = cc
     block_node(ck, body, env)
     env_pop(env)
     r := ck.cl_ret
@@ -4551,11 +4667,28 @@ fn cl_scan_expr(ck: mut Ck, e: ref parser.Node, cc: mut ClChk) {
             if len(bn) > 0 {
                 qn := resolve_named(ck, bn)
                 cc.callees = scons(qn, cc.callees)
+                // the pre-resolve callee path (`w.pause`) also feeds
+                // capture analysis — a package fn `w` would otherwise
+                // hide a borrowed local receiver behind `pkg.w.pause`
+                cc.refs = scons(bn, cc.refs)
                 if is_susp_builtin(qn) {
                     cc.seeded = 1
                 }
             } else {
                 cl_scan_expr(ck, f, cc)
+            }
+            match f {
+                parser.Node.Field{obj, name} => {
+                    match obj {
+                        parser.Node.Name{n} => {
+                            cc.mcalls = scons(n + "." + name, cc.mcalls)
+                        }
+                        _ => {
+                        }
+                    }
+                }
+                _ => {
+                }
             }
             al := args
             for al != nil {
@@ -4572,6 +4705,9 @@ fn cl_scan_expr(ck: mut Ck, e: ref parser.Node, cc: mut ClChk) {
         }
         parser.Node.As{e} => {
             cl_scan_expr(ck, e, cc)
+        }
+        parser.Node.Name{n} => {
+            cc.refs = scons(n, cc.refs)
         }
         parser.Node.Field{obj} => {
             cl_scan_expr(ck, obj, cc)
@@ -4607,7 +4743,8 @@ fn cl_scan_expr(ck: mut Ck, e: ref parser.Node, cc: mut ClChk) {
             a := arms
             for a != nil {
                 match a.v {
-                    parser.Node.MArm{body} => {
+                    parser.Node.MArm{pat, body} => {
+                        cl_pat_binds(pat, cc)
                         cl_scan_node(ck, body, cc)
                     }
                     _ => {
@@ -4616,7 +4753,18 @@ fn cl_scan_expr(ck: mut Ck, e: ref parser.Node, cc: mut ClChk) {
                 a = a.next
             }
         }
-        parser.Node.Closure{body} => {
+        parser.Node.Closure{params, body} => {
+            pl := params
+            for pl != nil {
+                match pl.v {
+                    parser.Node.Param{name} => {
+                        cc.binds = scons(name, cc.binds)
+                    }
+                    _ => {
+                    }
+                }
+                pl = pl.next
+            }
             cl_scan_node(ck, body, cc)
         }
         _ => {
@@ -4642,12 +4790,43 @@ fn cl_scan_node(ck: mut Ck, body: ref parser.Node, cc: mut ClChk) {
     }
 }
 
+// pattern binds also bind inside the closure — walk Pat/PatBind nodes
+fn cl_pat_binds(pat: ref parser.Node, cc: mut ClChk) {
+    if pat == nil {
+        return
+    }
+    match pat {
+        parser.Node.Pat{binds} => {
+            bl := binds
+            for bl != nil {
+                match bl.v {
+                    parser.Node.Name{n} => {
+                        if n != "_" {
+                            cc.binds = scons(n, cc.binds)
+                        }
+                    }
+                    _ => {
+                    }
+                }
+                bl = bl.next
+            }
+        }
+        parser.Node.PatBind{name} => {
+            cc.binds = scons(name, cc.binds)
+        }
+        _ => {
+        }
+    }
+}
+
 fn cl_scan_stmt(ck: mut Ck, s: ref parser.Node, cc: mut ClChk) {
     match s {
-        parser.Node.Let{init} => {
+        parser.Node.Let{name, init} => {
+            cc.binds = scons(name, cc.binds)
             cl_scan_expr(ck, init, cc)
         }
-        parser.Node.Bind{init} => {
+        parser.Node.Bind{name, init} => {
+            cc.binds = scons(name, cc.binds)
             cl_scan_expr(ck, init, cc)
         }
         parser.Node.Assign{target, val} => {
@@ -4657,7 +4836,18 @@ fn cl_scan_stmt(ck: mut Ck, s: ref parser.Node, cc: mut ClChk) {
         parser.Node.ExprStmt{e} => {
             cl_scan_expr(ck, e, cc)
         }
-        parser.Node.Let2{call} => {
+        parser.Node.Let2{names, call} => {
+            // names arrive comma-joined ("a,b") — each binds locally
+            nm := names
+            for len(nm) > 0 {
+                ci := find(nm, ",")
+                if ci < 0 {
+                    cc.binds = scons(nm, cc.binds)
+                    break
+                }
+                cc.binds = scons(substr(nm, 0, ci), cc.binds)
+                nm = substr(nm, ci + 1, len(nm))
+            }
             cl_scan_expr(ck, call, cc)
         }
         parser.Node.Ret{vals} => {
@@ -4683,8 +4873,9 @@ fn cl_scan_stmt(ck: mut Ck, s: ref parser.Node, cc: mut ClChk) {
         parser.Node.Unsafe{body} => {
             cl_scan_node(ck, body, cc)
         }
+        // defer is fn-scoped, not frame machinery: the closure drains its
+        // own _dmark at return, so it stays legal (unlike spawn/scope/etc.)
         parser.Node.Defer{call} => {
-            cc.seeded = 1
             cl_scan_expr(ck, call, cc)
         }
         parser.Node.Spawn{e} => {
@@ -4709,7 +4900,10 @@ fn cl_scan_stmt(ck: mut Ck, s: ref parser.Node, cc: mut ClChk) {
             a := arms
             for a != nil {
                 match a.v {
-                    parser.Node.SArm{ch, ms, body} => {
+                    parser.Node.SArm{ch, bind, ms, body} => {
+                        if len(bind) > 0 {
+                            cc.binds = scons(bind, cc.binds)
+                        }
                         cl_scan_expr(ck, ch, cc)
                         cl_scan_expr(ck, ms, cc)
                         cl_scan_node(ck, body, cc)

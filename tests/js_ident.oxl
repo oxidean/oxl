@@ -1,0 +1,98 @@
+package main
+
+// `_`-leading user identifiers are legal oxl but must never collide
+// with the JS emitter's own temporaries (_ms/_mr/_ms<n>/_r<n>/_p/
+// _c<n>/_t<n>/_sc<n>/_sv<n>/_fw<n>/__rc/…). jname escapes them to
+// u_* — this file exercises the emission scopes that wrap user code
+// in bare temp bindings: plain-fn match arms, stmt-match scrutinee
+// temps, pair destructures, call-arg TDZ scopes, and closures
+// (whose bodies rebind captures as bare lets even inside susp fns).
+fn work(x: int) -> int {
+    return x + 1
+}
+
+fn pairfn() -> [int, err] {
+    return 7, nil
+}
+
+fn plain() -> int {
+    _ms := 1
+    _mr := 2
+    _ms0 := 3
+    _ms1 := 4
+    _r0 := 5
+    _r1 := 6
+    __rc := 14
+    _c0 := 8
+
+    // expr match: `const _ms`/`let _mr` temps wrap the arm bodies
+    k := 3
+    m := match k {
+        3 => _ms * 1000 + _mr * 100 + _ms0 * 10 + _ms1
+        _ => 0
+    }
+
+    // stmt match: scrutinee temp is _ms<n>
+    s := 0
+    match k {
+        3 => {
+            s = s + _ms0 + _ms1
+        }
+        _ => {
+        }
+    }
+
+    // pair destructure: `const _r<n>` temp
+    [pv, _e] = pairfn()
+
+    // call args inside the __rc IIFE
+    w := work(__rc + _c0)
+
+    // closure body: captures rebind as bare `let` — its own temps
+    // (_ms/_mr again) must not hit the user's names either
+    cap := _ms + _r0
+    f := { ||
+        mm := match k {
+            3 => cap * 10 + _mr
+            _ => 0
+        }
+        return mm + w
+    }
+    v := f()
+
+    // m=1234 s=7 pv=7 w=23 v=(6*10+2)+23=85
+    return m + s + pv + v
+}
+
+fn suspwork() -> int {
+    _ms := 1
+    _c0 := 2
+    _t0 := 3
+    // closure inside a susp fn: captures rebind bare, match temps
+    // live in the same scope
+    f := { ||
+        mm := match _ms {
+            1 => _c0 * 100 + _t0 * 10 + _ms
+            _ => 0
+        }
+        return mm
+    }
+    x := f()
+    msleep(1)
+    return x
+}
+
+fn main() {
+    p := plain()
+    // p = 1234 + 7 + 7 + 85 = 1333
+    if p != 1333 {
+        println("FAIL js ident plain: " + itoa(p))
+        exit(1)
+    }
+    // suspwork: mm = 2*100+3*10+1 = 231 (closure-in-susp)
+    if suspwork() != 231 {
+        println("FAIL js ident susp")
+        exit(1)
+    }
+    println("js ident ok")
+}

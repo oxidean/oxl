@@ -1,0 +1,20 @@
+package main
+
+// fn-valued fields shadow same-named methods: `t.tick()` calls the
+// field, and the let binding must take the field's declared return
+// type — the codegen used to declare it int64_t and the C failed to
+// compile when the field returned str
+struct Ticker { tick: fn() -> str }
+
+fn (t Ticker) tick() -> int {
+    return 1
+}
+
+fn main() {
+    t := Ticker{tick: { || return "hello" }}
+    s := t.tick()
+    println(s)
+    // the method stays reachable through the type path
+    println(Ticker.tick(t))
+    println("closure fnfield ok")
+}

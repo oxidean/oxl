@@ -586,8 +586,13 @@ impl<'a> Checker<'a> {
                 }
                 Item::Import(_) => {} // resolved by the driver before checking
                 Item::Global(g) => {
+                    if g.init.is_none() && g.ty.is_none() {
+                        self.diags.push(Diag::err(g.span, "check",
+                            "`let` requires a type or an initializer"));
+                    }
                     let mut env = Env::new();
-                    let it = self.expr(&g.init, &mut env);
+                    let it = g.init.as_ref().map(|i| self.expr(i, &mut env))
+                        .unwrap_or(Ty::Unknown);
                     let t = if let Some(tr) = &g.ty {
                         let want = self.resolve(tr);
                         self.assignable(&want, &it, g.span);
@@ -693,7 +698,12 @@ impl<'a> Checker<'a> {
         match s {
             Stmt::ExitBoundary { .. } => unreachable!("codegen-internal marker"),
             Stmt::Let { name, ty, init, span } => {
-                let it = self.expr(init, env);
+                if init.is_none() && ty.is_none() {
+                    self.diags.push(Diag::err(*span, "check",
+                        "`let` requires a type or an initializer"));
+                }
+                let it = init.as_ref().map(|e| self.expr(e, env))
+                    .unwrap_or(Ty::Unknown);
                 let t = if let Some(tr) = ty {
                     let want = self.resolve(tr);
                     self.assignable(&want, &it, *span);
@@ -1205,7 +1215,10 @@ impl<'a> Checker<'a> {
         let mut cut = path.len();
         loop {
             let head = &path[..cut];
-            if env.get(head).is_some() || self.globals.contains_key(head) {
+            if env.get(head).is_some()
+                || self.globals.contains_key(head)
+                || self.enums.contains_key(head)
+            {
                 let mut e = Expr { kind: ExprKind::Ident(head.to_string()), span };
                 let mut rest = &path[cut..];
                 while let Some(seg) = rest.strip_prefix('.') {
@@ -1484,22 +1497,69 @@ impl<'a> Checker<'a> {
                 }
                 // captures are copied by value into a heap env struct —
                 // a borrowed ref/mut would outlive its borrow region, so
-                // reject them like ref/mut fields in heap objects
+                // reject them like ref/mut fields in heap objects.
+                // flattened `recv.m` callees arrive dotted — the
+                // capturable binding is the longest env-bound prefix
+                // (`recv`), same rule codegen's capture walk uses
                 for n in scan.refs.union(&scan.callees) {
-                    if pnames.contains(n) {
-                        continue;
-                    }
-                    if let Some(t @ (Ty::Ref(_) | Ty::Mut(_))) = env.get(n) {
+                    let mut m = n.as_str();
+                    let t = loop {
+                        // a name bound inside the closure resolves to
+                        // the local bind lexically — never a capture
+                        if pnames.contains(m) || scan.binds.contains(m) {
+                            break None;
+                        }
+                        match env.get(m) {
+                            Some(t) => break Some(t),
+                            None => match m.rfind('.') {
+                                Some(i) => m = &m[..i],
+                                None => break None,
+                            },
+                        }
+                    };
+                    if let Some(t @ (Ty::Ref(_) | Ty::Mut(_))) = t {
                         self.diags.push(Diag::err(e.span, "check",
                             format!("closure captures `{n}` (`{}`) — borrowed refs may not be stored in heap objects (v0)", t.name())));
                     }
                 }
-                self.closure_checks.push((e.span, scan.callees, scan.seeded, self.cur_file.clone()));
                 let saved = std::mem::replace(&mut self.closure_ret, Some(None));
                 env.push();
                 for (p, t) in params.iter().zip(ptys.iter()) {
                     env.set(p.name.clone(), t.clone(), p.span);
                 }
+                // method calls resolve in the closure's own scope —
+                // params shadow enclosing binds — and `call` gives
+                // fields precedence, so a fn-valued field is never a
+                // susp method callee
+                for (recv, m) in &scan.mcalls {
+                    if let Some(t) = env.get(recv) {
+                        if self.field_ty(&t, m).is_some() {
+                            continue;
+                        }
+                        if let MTarget::Fn(q) = self.method_target(&t, m) {
+                            scan.callees.insert(q);
+                        }
+                    }
+                }
+                // flattened `recv.m` callees arrive dotted — resolve the
+                // longest env-bound prefix the same way
+                let flat: Vec<String> = scan.callees.iter().cloned().collect();
+                for n in flat {
+                    let mut recv = n.as_str();
+                    while let Some(i) = recv.rfind('.') {
+                        recv = &recv[..i];
+                        if let Some(t) = env.get(recv) {
+                            let meth = &n[recv.len() + 1..];
+                            if self.field_ty(&t, meth).is_none() {
+                                if let MTarget::Fn(q) = self.method_target(&t, meth) {
+                                    scan.callees.insert(q);
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+                self.closure_checks.push((e.span, scan.callees, scan.seeded, self.cur_file.clone()));
                 self.block(body, env);
                 env.pop();
                 let inferred = std::mem::replace(&mut self.closure_ret, saved)
@@ -2586,9 +2646,10 @@ impl<'a> Checker<'a> {
                 // spawn doesn't suspend the caller — but its args might
                 Stmt::Spawn { call, .. } => expr_susp(call),
                 Stmt::Defer { call, .. } => expr_susp(call),
-                Stmt::Expr(e) | Stmt::Assign { val: e, .. } | Stmt::Let { init: e, .. } => {
+                Stmt::Expr(e) | Stmt::Assign { val: e, .. } => {
                     expr_susp(e)
                 }
+                Stmt::Let { init, .. } => init.as_ref().map(expr_susp).unwrap_or(false),
                 Stmt::Let2 { call, .. } => expr_susp(call),
                 Stmt::Select { .. } => true, // always a suspend point
                 Stmt::Return { vals, .. } => vals.iter().any(expr_susp),
@@ -2713,9 +2774,12 @@ impl<'a> Checker<'a> {
             b.stmts.iter().any(|s| match s {
                 Stmt::ExitBoundary { .. } => false,
                 Stmt::Scope { .. } | Stmt::Select { .. } => true,
-                Stmt::Expr(e) | Stmt::Assign { val: e, .. } | Stmt::Let { init: e, .. }
+                Stmt::Expr(e) | Stmt::Assign { val: e, .. }
                 | Stmt::Defer { call: e, .. } | Stmt::Spawn { call: e, .. } => {
                     expr_has_susp(e, susp)
+                }
+                Stmt::Let { init, .. } => {
+                    init.as_ref().map(|e| expr_has_susp(e, susp)).unwrap_or(false)
                 }
                 Stmt::Let2 { call, .. } => expr_has_susp(call, susp),
                 Stmt::Return { vals, .. } => vals.iter().any(|v| expr_has_susp(v, susp)),
@@ -2815,8 +2879,11 @@ impl<'a> Checker<'a> {
                         scan_match(call, susp, diags, false);
                     }
                     Stmt::Expr(e) => scan_match(e, susp, diags, true),
-                    Stmt::Let { init, .. } | Stmt::Assign { val: init, .. } => {
+                    Stmt::Assign { val: init, .. } => {
                         scan_match(init, susp, diags, false)
+                    }
+                    Stmt::Let { init, .. } => {
+                        if let Some(i2) = init { scan_match(i2, susp, diags, false) }
                     }
                     Stmt::Let2 { call, .. } => scan_match(call, susp, diags, false),
                     Stmt::Spawn { call, scope, span, .. } => {
@@ -2880,7 +2947,7 @@ impl<'a> Checker<'a> {
                     }
                 }
                 Item::Global(g) => {
-                    if expr_has_susp(&g.init, susp) {
+                    if g.init.as_ref().map(|i| expr_has_susp(i, susp)).unwrap_or(false) {
                         self.diags.push(Diag::err(g.span, "check",
                             "global initializer cannot suspend — move it into fn main"));
                     }
@@ -2942,6 +3009,10 @@ pub(crate) struct BodyScan {
     pub refs: HashSet<String>,
     pub binds: HashSet<String>,
     pub callees: HashSet<String>,
+    /// `recv.m(...)` shapes where recv is a plain identifier — the
+    /// closure arm resolves them to `Type.m` via env + method_target;
+    /// callees alone can't hold them pre-resolution
+    pub mcalls: HashSet<(String, String)>,
     pub seeded: bool,
 }
 
@@ -2956,7 +3027,7 @@ fn scan_stmt(st: &Stmt, s: &mut BodyScan) {
         Stmt::ExitBoundary { .. } => unreachable!("codegen-internal marker"),
         Stmt::Let { name, init, .. } => {
             s.binds.insert(name.clone());
-            scan_expr(init, s);
+            if let Some(i2) = init { scan_expr(i2, s) }
         }
         Stmt::Let2 { a, b, call, .. } => {
             for bd in [a, b] {
@@ -2987,10 +3058,13 @@ fn scan_stmt(st: &Stmt, s: &mut BodyScan) {
             scan_block(body, s);
         }
         Stmt::Unsafe { body, .. } => scan_block(body, s),
-        Stmt::Spawn { call, .. } | Stmt::Defer { call, .. } => {
+        Stmt::Spawn { call, .. } => {
             s.seeded = true;
             scan_expr(call, s);
         }
+        // defer is fn-scoped, not frame machinery: the closure drains its
+        // own _dmark at return, so it stays legal (unlike spawn/scope/etc.)
+        Stmt::Defer { call, .. } => scan_expr(call, s),
         Stmt::Select { arms, .. } => {
             s.seeded = true;
             for a in arms {
@@ -3025,6 +3099,11 @@ fn scan_expr(e: &Expr, s: &mut BodyScan) {
                     s.seeded = true;
                 }
             } else {
+                if let ExprKind::Field { obj, name } = &f.kind {
+                    if let ExprKind::Ident(n) = &obj.kind {
+                        s.mcalls.insert((n.clone(), name.clone()));
+                    }
+                }
                 scan_expr(f, s);
             }
             args.iter().for_each(|a| scan_expr(a, s));

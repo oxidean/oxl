@@ -174,8 +174,7 @@ impl<'a> Parser<'a> {
         if self.eat_kw(Kw::Let) {
             let (name, sp) = self.ident()?;
             let ty = if self.eat_p(P::Colon) { Some(self.ty()?) } else { None };
-            self.expect_p(P::Assign, "`=`");
-            let init = self.expr(0, false)?;
+            let init = if self.eat_p(P::Assign) { Some(self.expr(0, false)?) } else { None };
             return Some(Item::Global(Global { name, ty, init, span: sp }));
         }
         if self.eat_kw(Kw::Extern) {
@@ -490,8 +489,7 @@ impl<'a> Parser<'a> {
                 self.bump();
                 let (name, _) = self.ident()?;
                 let ty = if self.eat_p(P::Colon) { Some(self.ty()?) } else { None };
-                self.expect_p(P::Assign, "`=`");
-                let init = self.expr(0, false)?;
+                let init = if self.eat_p(P::Assign) { Some(self.expr(0, false)?) } else { None };
                 Some(Stmt::Let { name, ty, init, span: sp })
             }
             Tok::Kw(Kw::If) => {
@@ -584,7 +582,7 @@ impl<'a> Parser<'a> {
                     // x := e2 — reparse: e must be Ident
                     if let ExprKind::Ident(name) = e.kind {
                         let init = self.expr(0, false)?;
-                        return Some(Stmt::Let { name, ty: None, init, span: sp });
+                        return Some(Stmt::Let { name, ty: None, init: Some(init), span: sp });
                     }
                     self.diags.push(Diag::err(e.span, "parse", "left of `:=` must be a name"));
                     return None;

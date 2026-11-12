@@ -225,8 +225,17 @@ done
 out=$("$OXL" test tests/net_test.oxl)
 printf '%s
 ' "$out" >&2
-for t in test_echo test_closer test_refused test_lookup test_badip; do
+for t in test_badport test_lookup; do
     grep -q "$t ... ok" <<<"$out" || { echo "FAIL net: $out"; exit 1; }
+done
+# socket-dependent half — the js lane's socket natives are trap21
+# stubs, so this file stays native-only (the w4 lane runs net_test's
+# socket-free tests)
+out=$("$OXL" test tests/net_sock_test.oxl)
+printf '%s
+' "$out" >&2
+for t in test_echo test_closer test_refused test_resolve test_badip; do
+    grep -q "$t ... ok" <<<"$out" || { echo "FAIL net-sock: $out"; exit 1; }
 done
 out=$("$OXL" test tests/net_url.oxl)
 printf '%s
@@ -1233,10 +1242,15 @@ echo "== toolchain driver in .oxl (t2) =="
 # the driver was built (gen1+gen2) and fixpoint-verified in the
 # t6 section above — SELFOXL is the product binary
 # command surface: bare usage, unknown command, and list's usage error
-# are byte-identical stderr + exit codes (2/2/2)
+# are byte-identical stderr + exit codes (2/2/2) — modulo the
+# sanctioned W-extension: the self driver documents `[--target js]`
+# and `[--html]` on build/run/test, flags the frozen seed can never
+# grow (its emit lane is C-only). Scrub exactly those markers off
+# the self side before comparing; any other drift still fails.
 for inv in "" "bogus" "list"; do
     seed_out=$("$SEEDOXL" $inv 2>&1) && seed_rc=0 || seed_rc=$?
     self_out=$("$SELFOXL" $inv 2>&1) && self_rc=0 || self_rc=$?
+    self_out=$(printf '%s\n' "$self_out" | sed 's/ \[--target js\]//g; s/ \[--html\]//g')
     if [ "$seed_out" != "$self_out" ] || [ "$seed_rc" != "$self_rc" ]; then
         echo "FAIL driver parity: \`oxl $inv\`"
         echo "-- seed ($seed_rc) --"; printf '%s\n' "$seed_out"
@@ -1600,6 +1614,20 @@ echo "== g1 typed chans + named scopes =="
 out=$("$OXL" run tests/chan_own.oxl)
 [ "$(tail -1 <<<"$out")" = "chan_own done" ] || { echo "FAIL chan_own: $out"; exit 1; }
 
+echo "== susp closures + zero values =="
+# closures in susp fns keep their own defer mark + snapshot captures;
+# bare `let` zero-inits its slot on both emitters
+out=$("$OXL" run tests/susp_closure.oxl)
+[ "$(tail -1 <<<"$out")" = "susp closure ok" ] || { echo "FAIL susp_closure: $out"; exit 1; }
+out=$("$OXL" run tests/closure_mcall.oxl)
+[ "$(tail -1 <<<"$out")" = "closure mcall ok" ] || { echo "FAIL closure_mcall: $out"; exit 1; }
+out=$("$OXL" run tests/closure_fnfield.oxl)
+[ "$(tail -1 <<<"$out")" = "closure fnfield ok" ] || { echo "FAIL closure_fnfield: $out"; exit 1; }
+out=$("$OXL" run tests/closure_shadow.oxl)
+[ "$(tail -1 <<<"$out")" = "closure shadow ok" ] || { echo "FAIL closure_shadow: $out"; exit 1; }
+out=$("$OXL" run tests/zero_str.oxl)
+[ "$(tail -1 <<<"$out")" = "zero str ok" ] || { echo "FAIL zero_str: $out"; exit 1; }
+
 echo "== g1 gui: mock backend + cancel gate =="
 out=$("$OXL" run tests/gui_mock.oxl)
 [ "$(tail -1 <<<"$out")" = "done" ] || { echo "FAIL gui_mock: $out"; exit 1; }
@@ -1646,6 +1674,14 @@ rc=0
 out=$(with_timeout 30 "$scratch/gui_lifecycle$EXE") || rc=$?
 [ "$rc" -eq 0 ] && [ "$(tail -1 <<<"$out")" = "lifecycle ok" ] || {
     echo "FAIL gui_lifecycle: rc=$rc: $out"; exit 1; }
+# delayed-reply drain (G1): stop fired mid-delay must let the reply
+# land or reconcile before pump_fin's sweep — never a dead reply.
+"$OXL" build tests/gui_delay_stop.oxl -o "$scratch/gui_delay_stop$EXE" || {
+    echo "FAIL gui_delay_stop: compile failed"; exit 1; }
+rc=0
+out=$(with_timeout 30 "$scratch/gui_delay_stop$EXE") || rc=$?
+[ "$rc" -eq 0 ] && [ "$(tail -1 <<<"$out")" = "delay stop ok" ] || {
+    echo "FAIL gui_delay_stop: rc=$rc: $out"; exit 1; }
 # parked select must unwedge on sibling trap — exits nonzero, not a hang.
 # 124 = with_timeout expiry = the hang this test exists to catch. Build
 # first so a compile error fails the check instead of passing as a
@@ -1787,6 +1823,99 @@ if command -v pkg-config >/dev/null 2>&1 && pkg-config --exists gtk4 2>/dev/null
     fi
 else
     echo "  (skipped: gtk4 not installed)"
+fi
+
+echo "== w1 js runtime smoke =="
+# node-gated: the hand-written driver exercises the rt.mjs poll
+# contract (spawn/scope/trap/defer/chan/err) — W1's suite gate;
+# skips cleanly where node is absent
+if command -v node >/dev/null 2>&1; then
+    node tests/js/rt-core-smoke.mjs || { echo "FAIL rt-core-smoke"; exit 1; }
+    node tests/js/rt-browser-stub.mjs || { echo "FAIL rt-browser-stub"; exit 1; }
+else
+    echo "  (skipped: node not installed)"
+fi
+
+echo "== w4 js driver lane =="
+# node-gated: the whitelisted corpus (W3 concurrency suite + W2
+# pure-stdlib corpus) through the self-built product driver's
+# `--target js` lane — the W4 conformance gate. Lane skips cleanly
+# where node is absent.
+if command -v node >/dev/null 2>&1; then
+    # gui_* joined the lane in W5 — the susp-pump contract lets the
+    # mock's cooperative pump drive the same gates single-threaded
+    # each file's last-line success marker is grepped — an err-path
+    # regression that prints + exits 0 (gui_dom's `run err:` shape)
+    # can't pass silently
+    for f in conc_ping conc_scale select select_fair chan_own chanbuf chanbuf_close scope_exit orphan_join defer_order pairfwd match methods fnval d5_qual stdmods_test susp_closure closure_mcall closure_fnfield closure_shadow zero_str gui_mock gui_lifecycle gui_overflow gui_select gui_stress gui_cancel gui_dom gui_delay_stop js_ident; do
+        case "$f" in
+            conc_ping)      marker='bounces=' ;;
+            conc_scale)     marker='done' ;;
+            select)         marker='select done' ;;
+            select_fair)    marker='select fair ok' ;;
+            chan_own)       marker='chan_own done' ;;
+            chanbuf)        marker='chanbuf done' ;;
+            chanbuf_close)  marker='chanbuf close ok' ;;
+            scope_exit)     marker='scope-exit ok' ;;
+            orphan_join)    marker='orphan-join ok' ;;
+            defer_order)    marker='defer order ok' ;;
+            pairfwd)        marker='pairfwd ok' ;;
+            match)          marker='match ok' ;;
+            methods)        marker='methods ok' ;;
+            fnval)          marker='fnval ok' ;;
+            d5_qual)        marker='d5 qual ok' ;;
+            stdmods_test)   marker='done' ;;
+            susp_closure)   marker='susp closure ok' ;;
+            closure_mcall)  marker='closure mcall ok' ;;
+            closure_fnfield) marker='closure fnfield ok' ;;
+            closure_shadow) marker='closure shadow ok' ;;
+            zero_str)       marker='zero str ok' ;;
+            gui_mock)       marker='done' ;;
+            gui_lifecycle)  marker='lifecycle ok' ;;
+            gui_overflow)   marker='overflow ok' ;;
+            gui_select)     marker='select ok' ;;
+            gui_stress)     marker='stress ok' ;;
+            gui_cancel)     marker='cancel ok' ;;
+            gui_dom)        marker='activated' ;;
+            gui_delay_stop) marker='delay stop ok' ;;
+            js_ident)       marker='js ident ok' ;;
+        esac
+        out=$(with_timeout 60 "$SELFOXL" run --target js "tests/$f.oxl" 2>&1) || { echo "FAIL js lane $f: $out"; exit 1; }
+        grep -q "$marker" <<<"$out" || { echo "FAIL js lane $f marker '$marker': $out"; exit 1; }
+    done
+    for f in enc_test hash_test regexp_test float_test util_test stdlib_test collections_test enum_test defer_test os_test exec_test net_test flaglog_test extra_testutil; do
+        out=$(with_timeout 60 "$SELFOXL" test --target js "tests/$f.oxl" 2>&1) || { echo "FAIL js lane test $f: $out"; exit 1; }
+        grep -q 'FAIL' <<<"$out" && { echo "FAIL js lane test $f: $out"; exit 1; }
+    done
+    for f in select_cancel cancel_join; do
+        "$SELFOXL" build --target js "tests/$f.oxl" -o "$scratch/$f.mjs" || { echo "FAIL js lane $f: emit"; exit 1; }
+        rc=0
+        out=$(with_timeout 30 node "$scratch/$f.mjs" 2>&1) || rc=$?
+        [ "$rc" -ne 0 ] || { echo "FAIL js lane $f: expected trap exit"; exit 1; }
+        grep -q 'escaped top scope' <<<"$out" || { echo "FAIL js lane $f: trap line: $out"; exit 1; }
+    done
+else
+    echo "  (skipped: node not installed)"
+fi
+
+echo "== w6 dom backend + web bundle =="
+# node-gated: the reference app's emitted bundle structure plus its
+# headless-DOM selftest — the same rows=2 churn=200 gate the gtk
+# pilot asserts, driven through the dom backend's listener path.
+if command -v node >/dev/null 2>&1; then
+    "$SELFOXL" build --target js --html examples/web-todo -o "$scratch/web-todo.mjs" || {
+        echo "FAIL web-todo emit"; exit 1; }
+    for r in rt.mjs rt-node.mjs rt-browser.mjs rt-dom.mjs web-todo.mjs web-todo.mjs.html; do
+        [ -f "$scratch/$r" ] || { echo "FAIL web-todo bundle missing $r"; exit 1; }
+    done
+    grep -q 'type="module"' "$scratch/web-todo.mjs.html" || {
+        echo "FAIL web-todo html scaffold"; exit 1; }
+    out=$(cd "$scratch" && with_timeout 60 node -e "process.argv[1]='web-todo.mjs'; process.argv[2]='--selftest'; import('./web-todo.mjs')" 2>&1) || {
+        echo "FAIL web-todo selftest: $out"; exit 1; }
+    grep -q 'selftest rows=2 churn=200 ok' <<<"$out" || {
+        echo "FAIL web-todo selftest line: $out"; exit 1; }
+else
+    echo "  (skipped: node not installed)"
 fi
 
 echo "== toolchain shim + version manager (i60) =="

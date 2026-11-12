@@ -1,0 +1,498 @@
+package dom
+
+// extra/gui/dom — DOM backend for the js target (W6). Elements live
+// behind monotonic int handles in rt-dom.mjs's table: real document
+// nodes in a browser, headless object nodes under node — the backend
+// is identical either way; tests drive the headless tree through
+// oxl_dom_fire.
+//
+// Cooperative-scheduler backend: susp_pump() == 1 — run drives
+// pump_iter passes on its own frame and parks on wakech between
+// them. stop/wake and the headless fire path both post an edge.
+import "std/errors"
+
+import "github.com/oxidean/oxl/extra/gui"
+
+// ---- externs: rt-dom.mjs fills __oxl_ffi.oxl_dom_* ----
+extern fn oxl_dom_root() -> int
+
+extern fn oxl_dom_create(tag: str) -> int
+
+extern fn oxl_dom_destroy(h: int)
+
+extern fn oxl_dom_alive(h: int) -> int
+
+extern fn oxl_dom_attach(parent: int, child: int)
+
+extern fn oxl_dom_detach(parent: int, child: int)
+
+extern fn oxl_dom_set_text(h: int, id: int, s: str)
+
+extern fn oxl_dom_read_str(h: int, id: int) -> cstr
+
+extern fn oxl_dom_read_has(h: int, id: int) -> int
+
+extern fn oxl_dom_read_num(h: int, id: int) -> int
+
+extern fn oxl_dom_listen(h: int, kind: int)
+
+extern fn oxl_dom_ev_next() -> int
+
+extern fn oxl_dom_ev_pop()
+
+extern fn oxl_dom_ev_kind() -> int
+
+extern fn oxl_dom_ev_aux() -> int
+
+extern fn oxl_dom_ev_txt() -> cstr
+
+extern fn oxl_dom_fire(h: int, kind: int)
+
+extern fn oxl_dom_unlisten(h: int, kind: int)
+
+extern fn oxl_dom_set_edge(c: chan)
+
+extern fn oxl_dom_tag(h: int) -> cstr
+
+extern fn oxl_dom_kids(h: int) -> int
+
+extern fn oxl_dom_kid(h: int, i: int) -> int
+
+extern fn oxl_dom_style(h: int, name: str, v: str)
+
+extern fn rt_str_free(s: str)
+
+// dom event codes — mirror runtime/rt-dom.mjs's table
+let D_CLICK = 1
+
+let D_INPUT = 2
+
+let D_ENTER = 3
+
+let D_ROWCLICK = 4
+
+let D_CLOSE = 5
+
+struct Dom { stopf: shared, wakech: chan }
+
+let g_viol: shared = nil // dead-target protocol violations recorded
+
+// ---- live-handle set (sweep on teardown; mirrors gtk) ----
+struct AH { h: int, next: own AH }
+
+let g_alive: own AH = nil
+
+fn al_add(h: int) {
+    a := new(AH)
+    a.h = h
+    a.next = g_alive
+    g_alive = a
+}
+
+fn al_has(h: int) -> int {
+    l := g_alive
+    for l != nil {
+        if l.h == h {
+            return 1
+        }
+        l = l.next
+    }
+    return 0
+}
+
+fn al_del(h: int) {
+    let out: own AH = nil
+    l := g_alive
+    for l != nil {
+        n := l.next
+        if l.h != h {
+            l.next = out
+            out = l
+        } else {
+            l.next = nil
+        }
+        l = n
+    }
+    g_alive = out
+}
+
+// ---- the backend ----
+
+// backend — the DOM flavor the emitted page uses: #app when present,
+// <body> otherwise; under node the provider is headless already.
+fn backend() -> Dom {
+    g_viol = mkshared(0)
+    d := Dom{stopf: mkshared(0), wakech: mkchan()}
+    // hand the provider our wake chan — a real DOM event posts an
+    // edge there so the pump's park wakes on input, not on the
+    // defensive 50ms timeout (headless fire() does the same below)
+    oxl_dom_set_edge(d.wakech)
+    return d
+}
+
+// headless — explicit test-entry name; the provider tree is the same
+// object model under node either way, so this is backend() with the
+// intent spelled out. fire() drives the listener path.
+fn headless() -> Dom {
+    return backend()
+}
+
+// fire — headless-only test hook: synthesize a DOM event of the given
+// D_* kind on handle h; lands in the event queue for pump_iter to
+// deliver through the real listener path.
+fn (d Dom) fire(h: int, kind: int) {
+    oxl_dom_fire(h, kind)
+    try_send(d.wakech, 1)
+}
+
+// tag — headless inspection for tests; "" when the handle is dead.
+fn (d Dom) tag(h: int) -> str {
+    return str(oxl_dom_tag(h))
+}
+
+// widget kind -> tag name (per items/dom-backend.md's mapping)
+fn tag_of(kind: gui.WidgetKind) -> str {
+    match kind {
+        gui.WidgetKind.window => {
+            return "div"
+        }
+        gui.WidgetKind.vbox => {
+            return "div"
+        }
+        gui.WidgetKind.hbox => {
+            return "div"
+        }
+        gui.WidgetKind.label => {
+            return "span"
+        }
+        gui.WidgetKind.button => {
+            return "button"
+        }
+        gui.WidgetKind.entry => {
+            return "input"
+        }
+        gui.WidgetKind.list => {
+            return "ul"
+        }
+        gui.WidgetKind.scrolled => {
+            return "div"
+        }
+        _ => {
+            return "div"
+        }
+    }
+    return "div"
+}
+
+// ---- iface methods ----
+
+// props apply in order post-create; element creation cannot fail for
+// a known kind. A window attaches under the provider's root — the
+// owned-child rule keeps destroy from ever removing the host.
+fn (d Dom) new(kind: gui.WidgetKind, props: own []gui.Prop) -> [int, err] {
+    h := oxl_dom_create(tag_of(kind))
+    if h == 0 {
+        return 0, errors.new("gui/dom: element create failed")
+    }
+    al_add(h)
+    if props != nil {
+        i := 0
+        for i < len(props) {
+            d.set_prop(h, props[i])
+            i = i + 1
+        }
+    }
+    // listeners per the kind contract — delivery still goes through
+    // the event queue, so an unfired listener is inert
+    match kind {
+        gui.WidgetKind.window => {
+            oxl_dom_attach(oxl_dom_root(), h)
+            oxl_dom_listen(h, D_CLOSE)
+        }
+        gui.WidgetKind.button => {
+            oxl_dom_listen(h, D_CLICK)
+        }
+        gui.WidgetKind.entry => {
+            oxl_dom_listen(h, D_INPUT)
+            oxl_dom_listen(h, D_ENTER)
+        }
+        gui.WidgetKind.scrolled => {
+            oxl_dom_style(h, "overflow", "auto")
+        }
+        _ => {
+        }
+    }
+    return h, nil
+}
+
+fn (d Dom) set_prop(h: int, p: gui.Prop) {
+    match p.val {
+        gui.PropVal.Text(s) => {
+            if p.id == gui.P_ROWS || al_has(h) == 0 {
+                sadd(g_viol, 1)
+                return
+            }
+            oxl_dom_set_text(h, p.id, s)
+        }
+        _ => {
+            println("gui/dom: non-text prop write unsupported")
+        }
+    }
+}
+
+fn (d Dom) attach(parent: int, child: int) {
+    if al_has(parent) == 0 || al_has(child) == 0 {
+        sadd(g_viol, 1)
+        return
+    }
+    oxl_dom_attach(parent, child)
+    // a child under a <ul> is a row — row_activated click target per
+    // the event mapping; the row index rides the dom layer's aux
+    if d.tag(parent) == "ul" {
+        oxl_dom_listen(child, D_ROWCLICK)
+    }
+}
+
+fn (d Dom) detach(parent: int, child: int) {
+    if al_has(parent) == 0 || al_has(child) == 0 {
+        sadd(g_viol, 1)
+        return
+    }
+    if d.tag(parent) == "ul" {
+        oxl_dom_unlisten(child, D_ROWCLICK)
+    }
+    oxl_dom_detach(parent, child)
+}
+
+fn (d Dom) destroy(h: int) {
+    if al_has(h) == 0 {
+        sadd(g_viol, 1)
+        return
+    }
+    d.destroy_tree(h)
+}
+
+// kid 0's index slides as each subtree detaches — one fresh lookup per
+// level keeps the walk simple under DOM-mutating destroys
+fn (d Dom) destroy_tree(h: int) {
+    for oxl_dom_kids(h) > 0 {
+        k := oxl_dom_kid(h, 0)
+        if k == 0 {
+            break
+        }
+        d.destroy_tree(k)
+    }
+    al_del(h)
+    oxl_dom_destroy(h)
+}
+
+// exec one Cmd on the pump task — same reconcile rules as the mock
+// and gtk: a dead parent resolves err_gone before create, a lost
+// reply destroys the just-created handle on the spot, a lost read
+// reply releases the owned str copy ourselves.
+fn (d Dom) exec(c: own gui.Cmd) {
+    if c.kind == gui.CmdKind.new_kind {
+        if c.target != 0 && al_has(c.target) == 0 {
+            r := new(gui.CmdResult)
+            r.e = gui.err_gone()
+            r.handle = 0
+            r.val = gui.PropVal.Num(0)
+            try_send(c.reply, r)
+            return
+        }
+        [h, e] = d.new(c.widget, c.props)
+        if e != nil {
+            r := new(gui.CmdResult)
+            r.e = e
+            r.handle = 0
+            r.val = gui.PropVal.Num(0)
+            try_send(c.reply, r)
+            return
+        }
+        if c.target != 0 {
+            d.attach(c.target, h)
+        }
+        r2 := new(gui.CmdResult)
+        r2.e = nil
+        r2.handle = h
+        r2.val = gui.PropVal.Num(0)
+        if !try_send(c.reply, r2) {
+            d.destroy(h)
+        }
+        return
+    }
+    if c.kind == gui.CmdKind.set_prop {
+        d.set_prop(c.target, c.prop)
+        return
+    }
+    if c.kind == gui.CmdKind.attach {
+        d.attach(c.target, c.arg)
+        return
+    }
+    if c.kind == gui.CmdKind.detach {
+        d.detach(c.target, c.arg)
+        return
+    }
+    if c.kind == gui.CmdKind.destroy {
+        d.destroy(c.target)
+        return
+    }
+    if c.kind == gui.CmdKind.dismiss_close {
+        if al_has(c.target) == 0 {
+            sadd(g_viol, 1)
+        }
+        return
+    }
+    if c.kind == gui.CmdKind.read {
+        if al_has(c.target) == 0 {
+            r := new(gui.CmdResult)
+            r.e = gui.err_gone()
+            r.handle = 0
+            r.val = gui.PropVal.Num(0)
+            try_send(c.reply, r)
+            return
+        }
+        if c.prop.id == gui.P_ROWS {
+            n := oxl_dom_read_num(c.target, c.prop.id)
+            r := new(gui.CmdResult)
+            r.handle = 0
+            if n < 0 {
+                r.e = errors.new("gui/dom: P_ROWS on non-list")
+                r.val = gui.PropVal.Num(0)
+            } else {
+                r.e = nil
+                r.val = gui.PropVal.Num(n)
+            }
+            try_send(c.reply, r)
+            return
+        }
+        r2 := new(gui.CmdResult)
+        r2.handle = 0
+        if oxl_dom_read_has(c.target, c.prop.id) == 0 {
+            r2.e = errors.new("gui/dom: unsupported prop")
+            r2.val = gui.PropVal.Num(0)
+            try_send(c.reply, r2)
+            return
+        }
+        // own copy crosses the reply boundary — a lost reply drops the
+        // envelope through the chan thunk but the str backing is ours
+        s := gui.str_own(str(oxl_dom_read_str(c.target, c.prop.id)))
+        r2.e = nil
+        r2.val = gui.PropVal.Text(s)
+        if !try_send(c.reply, r2) {
+            rt_str_free(s)
+        }
+        return
+    }
+}
+
+// marshal one queued dom event into a core Event and post — never
+// blocks; the aux slot carries the row index for row_activated.
+fn (d Dom) deliver(events: mut gui.EventBuf, h: int, k: int, aux: int, txt: cstr) {
+    e := new(gui.Event)
+    e.target = h
+    e.data = gui.EventData.None
+    if k == D_CLICK {
+        e.kind = gui.EventKind.clicked
+    }
+    if k == D_ENTER {
+        e.kind = gui.EventKind.activated
+    }
+    if k == D_CLOSE {
+        e.kind = gui.EventKind.close_requested
+    }
+    if k == D_ROWCLICK {
+        e.kind = gui.EventKind.row_activated
+        e.data = gui.EventData.Index(aux)
+    }
+    if k == D_INPUT {
+        e.kind = gui.EventKind.text_changed
+        if oxl_dom_read_has(h, gui.P_TEXT) == 1 {
+            e.data = gui.EventData.Text(str(txt))
+        }
+    }
+    // unknown provider kinds carry no meaningful event — dropping
+    // beats posting a phantom `clicked` (the enum zero variant)
+    if e.kind == gui.EventKind.clicked && k != D_CLICK {
+        return
+    }
+    events.post(e)
+}
+
+// blocking pump is unreachable — susp_pump() == 1 means run drives
+// pump_iter on its own frame.
+fn (d Dom) pump(events: mut gui.EventBuf, cmds: mut gui.CmdBuf) {
+    assert(1 == 0)
+}
+
+fn (d Dom) susp_pump() -> int {
+    return 1
+}
+
+// one bounded pass: drain the dom event queue into the buf, then
+// drain + exec every queued cmd.
+fn (d Dom) pump_iter(events: mut gui.EventBuf, cmds: mut gui.CmdBuf) -> int {
+    for 1 == 1 {
+        h := oxl_dom_ev_next()
+        if h == 0 {
+            break
+        }
+        k := oxl_dom_ev_kind()
+        a := oxl_dom_ev_aux()
+        // the queue head is popped before deliver runs, so the
+        // fire-time text must be read here — after pop it would be
+        // the NEXT event's payload (or "" on a drained queue)
+        t := oxl_dom_ev_txt()
+        oxl_dom_ev_pop()
+        d.deliver(events, h, k, a, t)
+    }
+    q := cmds.drain()
+    worked := 0
+    for q != nil {
+        c := q.v
+        r := q.next
+        q.next = nil
+        d.exec(c)
+        q = r
+        worked = 1
+    }
+    return worked
+}
+
+fn (d Dom) pump_edge() -> chan {
+    return d.wakech
+}
+
+fn (d Dom) stopped() -> int {
+    return sget(d.stopf)
+}
+
+// dead-target protocol calls recorded so far.
+fn (d Dom) violations() -> int {
+    return sget(g_viol)
+}
+
+// teardown — the contract forbids returning with live handles; the
+// provider's destroy is idempotent so a sweep double is a no-op.
+fn (d Dom) pump_fin() {
+    for 1 == 1 {
+        l := g_alive
+        if l == nil {
+            return
+        }
+        h := l.h
+        al_del(h)
+        oxl_dom_destroy(h)
+    }
+}
+
+// stop — idempotent, safe from any task: flag + edge nudge.
+fn (d Dom) stop() {
+    sset(d.stopf, 1)
+    try_send(d.wakech, 1)
+}
+
+// wake — nudge a parked pump so a posted Cmd is seen promptly.
+fn (d Dom) wake() {
+    try_send(d.wakech, 1)
+}

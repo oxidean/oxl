@@ -1,0 +1,52 @@
+package main
+
+// gui_delay_stop — the delayed-reply drain gate: `gui.stop()` fired
+// while a create reply is still sleeping must not let pump_fin's
+// live-handle sweep run ahead of the reply. `stopped()` holds until
+// g_pending drains, so the reply either lands on a live handle or is
+// reconciled through the lost-reply destroy — never a reply naming a
+// swept handle, never a `destroy-dead` violation.
+import "github.com/oxidean/oxl/extra/gui"
+
+import "github.com/oxidean/oxl/extra/gui/mock"
+
+import "std/time"
+
+let g_m: mock.Mock = mock.backend()
+
+let g_got: shared = nil
+
+fn creator() {
+    [h, e] = gui.window("x")
+    if e != nil {
+        println("create err")
+        return
+    }
+    // the reply was published — send-time ordering is the contract;
+    // consumer-time liveness is not (the sweep may legally run before
+    // this resumes). `reply-dead` in the mock log catches a swept handle.
+    sset(g_got, 1)
+    println("reply landed")
+}
+
+fn orchestrator() {
+    g_m.delay(60)
+    spawn creator()
+    time.sleep_ms(20) // inside the reply window
+    gui.stop()
+}
+
+fn app(events: chan own gui.Event) {
+    spawn orchestrator()
+}
+
+fn main() {
+    g_got = mkshared(0)
+    e := gui.run(g_m, app)
+    assert(e == nil)
+    assert(sget(g_got) == 1)
+    assert(g_m.count("reply-dead") == 0)
+    assert(g_m.count("destroy-dead") == 0)
+    assert(g_m.violations() == 0)
+    println("delay stop ok")
+}

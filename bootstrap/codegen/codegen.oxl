@@ -57,6 +57,16 @@ fn gbnd(n: str, ce: str, t: int, next: own GBnd) -> own GBnd {
     return c
 }
 
+fn gbnd_has(l: ref GBnd, n: str) -> bool {
+    for l != nil {
+        if l.n == n {
+            return true
+        }
+        l = l.next
+    }
+    return false
+}
+
 // match arm decode: has=0 → unconditional (else), has=1 → `if (cond)`
 struct GArm { has: int, cond: str, binds: own GBnd }
 
@@ -378,7 +388,7 @@ fn gsplice(s: str, mark: str, ins: str) -> str {
 
 // collect call args as evaluated C fragments (linked list — []str returns
 // can't be written in the `->` position)
-struct GAv { v: str, next: own GAv }
+struct GAv { v: str, pre: str, post: str, next: own GAv }
 
 fn gav(g: mut G, args: ref parser.NList) -> own GAv {
     let head: own GAv = nil
@@ -1625,23 +1635,27 @@ fn gcall_plan(g: mut G, f: ref parser.Node, args: ref parser.NList) -> own GCP {
         parser.Node.Field{obj, name} => {
             ot := gsub(g, xty(g, obj))
             if ot >= 0 {
-                mt := check.method_target(g.ck, ot, name)
-                if mt.k == 1 {
-                    cp.k = 1
-                    cp.dotted = 1
-                    cp.q = mt.q
-                    return cp
-                }
-                if mt.k == 2 {
-                    cp.k = 2
-                    cp.dotted = 1
-                    cp.w = g.ck.tyv[ot].name
-                    cp.mname = name
-                    cp.midx = gimidx(g, cp.w, name)
-                    cp.ps = check.il_clone(mt.ps)
-                    cp.rk = mt.rk
-                    cp.r1 = mt.r1
-                    return cp
+                // `call` gives fields precedence — a field value call is
+                // not a method call, so never plan the method path
+                if check.field_ty(g.ck, ot, name) < 0 {
+                    mt := check.method_target(g.ck, ot, name)
+                    if mt.k == 1 {
+                        cp.k = 1
+                        cp.dotted = 1
+                        cp.q = mt.q
+                        return cp
+                    }
+                    if mt.k == 2 {
+                        cp.k = 2
+                        cp.dotted = 1
+                        cp.w = g.ck.tyv[ot].name
+                        cp.mname = name
+                        cp.midx = gimidx(g, cp.w, name)
+                        cp.ps = check.il_clone(mt.ps)
+                        cp.rk = mt.rk
+                        cp.r1 = mt.r1
+                        return cp
+                    }
                 }
             }
         }
@@ -1822,6 +1836,7 @@ fn gdefer(g: mut G, call: own parser.Node) {
     }
     sc := new(GS)
     sc.l = nil
+    sc.binds = nil
     gscan_e(g, sc, rewritten)
     let caps: own GBnd = nil
     u := sc.l
@@ -2026,6 +2041,8 @@ fn garm(g: mut G, pat: ref parser.Node, acc: str, st: int) -> GArm {
     if k == 46 { // bare ident binds whole
         match pat {
             parser.Node.PatBind{name} => {
+                // `_ms` not `acc` — acc is `(*_ms)` under own/ref/mut,
+                // and an own-typed bind needs the pointer, not the pointee
                 r.binds = gbnd(name, "_ms", st, nil)
             }
             _ => {
@@ -2144,6 +2161,8 @@ fn gmatch(g: mut G, scrut: ref parser.Node, arms: ref parser.NList) -> str {
                     if !first {
                         o = o + "else if (" + ga.cond + ") { "
                     }
+                } else if first {
+                    o = o + "if (true) { "
                 } else {
                     o = o + "else { "
                 }
@@ -3468,7 +3487,7 @@ fn gspawn_args(g: mut G, qn: str, dst: str, argvs: ref GAv) {
 }
 
 // ---------- closures (seed closure_expr + BodyScan) ----------
-struct GS { l: own check.SList }
+struct GS { l: own check.SList, binds: own check.SList }
 
 fn gsc_add(s: mut GS, n: str) {
     if len(n) == 0 {
@@ -3552,7 +3571,20 @@ fn gscan_e(g: mut G, s: mut GS, e: ref parser.Node) {
             gscan_e(g, s, lo)
             gscan_e(g, s, hi)
         }
-        parser.Node.Closure{body} => {
+        parser.Node.Closure{params, body} => {
+            pl := params
+            for pl != nil {
+                match pl.v {
+                    parser.Node.Param{name} => {
+                        if !check.sl_has(s.binds, name) {
+                            s.binds = check.scons(name, s.binds)
+                        }
+                    }
+                    _ => {
+                    }
+                }
+                pl = pl.next
+            }
             gscan_b(g, s, body)
         }
         _ => {
@@ -3568,6 +3600,27 @@ fn gscan_pat(g: mut G, s: mut GS, pat: ref parser.Node) {
         parser.Node.PatLit{v} => {
             gscan_e(g, s, v)
         }
+        parser.Node.Pat{binds} => {
+            // pattern binds are closure-locals for capture purposes
+            bl := binds
+            for bl != nil {
+                match bl.v {
+                    parser.Node.Name{n} => {
+                        if n != "_" && !check.sl_has(s.binds, n) {
+                            s.binds = check.scons(n, s.binds)
+                        }
+                    }
+                    _ => {
+                    }
+                }
+                bl = bl.next
+            }
+        }
+        parser.Node.PatBind{name} => {
+            if !check.sl_has(s.binds, name) {
+                s.binds = check.scons(name, s.binds)
+            }
+        }
         _ => {
         }
     }
@@ -3578,13 +3631,30 @@ fn gscan_s(g: mut G, s: mut GS, st: ref parser.Node) {
         return
     }
     match st {
-        parser.Node.Let{init} => {
+        parser.Node.Let{name, init} => {
+            if !check.sl_has(s.binds, name) {
+                s.binds = check.scons(name, s.binds)
+            }
             gscan_e(g, s, init)
         }
-        parser.Node.Bind{init} => {
+        parser.Node.Bind{name, init} => {
+            if !check.sl_has(s.binds, name) {
+                s.binds = check.scons(name, s.binds)
+            }
             gscan_e(g, s, init)
         }
-        parser.Node.Let2{call} => {
+        parser.Node.Let2{names, call} => {
+            // names arrive comma-joined — each binds locally
+            nm := names
+            for len(nm) > 0 {
+                ci := find(nm, ",")
+                if ci < 0 {
+                    s.binds = check.scons(nm, s.binds)
+                    break
+                }
+                s.binds = check.scons(substr(nm, 0, ci), s.binds)
+                nm = substr(nm, ci + 1, len(nm))
+            }
             gscan_e(g, s, call)
         }
         parser.Node.Assign{target, val} => {
@@ -3641,7 +3711,10 @@ fn gscan_s(g: mut G, s: mut GS, st: ref parser.Node) {
             al := arms
             for al != nil {
                 match al.v {
-                    parser.Node.SArm{ch, ms, body} => {
+                    parser.Node.SArm{ch, bind, ms, body} => {
+                        if len(bind) > 0 && !check.sl_has(s.binds, bind) {
+                            s.binds = check.scons(bind, s.binds)
+                        }
                         gscan_e(g, s, ch)
                         gscan_e(g, s, ms)
                         gscan_b(g, s, body)
@@ -3705,15 +3778,36 @@ fn gclosure(g: mut G, params: ref parser.NList, body: ref parser.Node) -> str {
     sid := itoa(id)
     sc := new(GS)
     sc.l = nil
+    sc.binds = nil
     gscan_b(g, sc, body)
     let caps: own GBnd = nil
     u := sc.l
     for u != nil {
-        if !gscan_param(params, u.v) {
-            t := gx_lookup(g, u.v)
-            if t >= 0 {
-                caps = gbnd(u.v, "", t, caps)
+        // a flattened `recv.m` ref arrives whole — the capturable
+        // binding is its longest bound prefix (`recv`); params shadow
+        // at every prefix length, and globals emit directly
+        n := u.v
+        for len(n) > 0 {
+            // bound inside the closure body => resolves to the local
+            // bind lexically — never a capture
+            if check.sl_has(sc.binds, n) {
+                break
             }
+            if gscan_param(params, n) {
+                break
+            }
+            t := gx_lookup(g, n)
+            if t >= 0 {
+                if (n == u.v || g_local(g, n)) && !gbnd_has(caps, n) {
+                    caps = gbnd(n, "", t, caps)
+                }
+                break
+            }
+            ld := check.last_dot(n)
+            if ld < 0 {
+                break
+            }
+            n = substr(n, 0, ld)
         }
         u = u.next
     }
@@ -3862,8 +3956,13 @@ fn gs(g: mut G, s: ref parser.Node) {
             if ty == nil {
                 t = xty(g, init)
             }
-            v := gx(g, init)
-            v = gconv_v(g, init, v, t)
+            // bare `let` zero-inits: the compound literal is the typed
+            // zero for scalars and structs alike (str, slice, pair)
+            v := "(" + gcty(g, t) + "){0}"
+            if init != nil {
+                v = gx(g, init)
+                v = gconv_v(g, init, v, t)
+            }
             wln(g, "    " + gcty(g, t) + " " + name + " = " + v + ";")
             check.env_bind(g.env, name, t)
         }
@@ -4201,6 +4300,8 @@ fn gfmatch(g: mut G, scrut: ref parser.Node, arms: ref parser.NList) {
                     if !first {
                         wln(g, "    else if (" + ga.cond + ") {")
                     }
+                } else if first {
+                    wln(g, "    if (true) {")
                 } else {
                     wln(g, "    else {")
                 }
@@ -4403,7 +4504,10 @@ fn gfstmt(g: mut G, s: ref parser.Node) {
             ct := gcty(g, t)
             fd := gfslot(g, name, ct)
             check.env_bind(g.env, name, t)
-            if len(g_call_susp(g, init)) > 0 {
+            if init == nil {
+                // bare `let` in a susp fn: typed zero for the slot
+                wln(g, "    fr->" + fd + " = (" + ct + "){0};")
+            } else if len(g_call_susp(g, init)) > 0 {
                 gfsusp_go(g, init, 1, fd, "")
             } else {
                 v := gx(g, init)
@@ -5854,12 +5958,15 @@ fn emit(r: own check.CkRes, testm: int) -> str {
 // thin main is a one-line call.
 fn run() {
     testm := 0
+    jsm := 0
     file := ""
     ai := 1
     for ai < argc() {
         a := argv(ai)
         if a == "--test" {
             testm = 1
+        } else if a == "--js" {
+            jsm = 1
         } else {
             file = a
         }
@@ -5879,5 +5986,9 @@ fn run() {
         }
         exit(1)
     }
-    print(emit(r, testm))
+    if jsm == 1 {
+        print(emit_js(r, testm))
+    } else {
+        print(emit(r, testm))
+    }
 }

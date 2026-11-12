@@ -41,7 +41,13 @@ check_attribution() {
     _VENDOR='claude|cursor|copilot|chatgpt|codex|gemini|devin|openai|anthropic|codeium|windsurf|github[[:space:]]+copilot|claude[[:space:]]+code|(claude|gemini)[[:space:]]+(opus|sonnet|pro|ultra)|swe-[0-9a-z.-]*' 
     # AI co-author / bot trailers. A human Co-authored-by is fine; the
     # ban is on AI vendors, bots, and *-ai-* / [bot] addresses.
-    _co=$(printf '%s\n' "$_msg" | grep -iE '^[[:space:]]*co-?authored-by:' || :)
+    # One machine-injected exception: GitHub appends
+    # "Co-authored-by: github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>"
+    # to a squash merge whose merger differs from the commit author —
+    # platform boilerplate, not an authored trailer. Match the exact
+    # login+address pair only; every other [bot] trailer still fails.
+    _co=$(printf '%s\n' "$_msg" | grep -iE '^[[:space:]]*co-?authored-by:' \
+        | grep -ivE '^[[:space:]]*co-?authored-by:[[:space:]]*github-actions\[bot\][[:space:]]*<[[:space:]]*41898282\+github-actions\[bot\]@users\.noreply\.github\.com[[:space:]]*>[[:space:]]*$' || :)
     # Unambiguous machine signals anywhere in the trailer: [bot] tags,
     # bot@ addresses, *-ai-integration logins, AI-vendor domains (literal
     # list of vendor-owned domains — never github.com, or humans on the

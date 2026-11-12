@@ -211,19 +211,37 @@ jobs:
             sleep 2
           done
           [ "$m" = "MERGEABLE" ] || { echo "::error::bump PR #$pr never became mergeable"; exit 1; }
-          # The default squash body folds in "Co-authored-by: github-actions[bot]"
-          # (merger != author) and trips the bot-trailer ban in commit-lint —
-          # pin an explicit message instead.
-          gh pr merge "$pr" --squash --delete-branch \
+          # The bump PR must pass main's required checks (build-test on
+          # three OSes + commit-lint) before it can merge — firing
+          # `gh pr merge` immediately always loses that race and dies
+          # with "base branch policy prohibits the merge". Arm auto-merge
+          # instead and wait for the checks: the merge fires the moment
+          # the ruleset is satisfied. The pinned subject/body still
+          # applies — the default squash body would fold in
+          # "Co-authored-by: github-actions[bot]" (merger != author) and
+          # trip the bot-trailer ban in commit-lint.
+          if ! gh pr merge "$pr" --auto --squash --delete-branch \
             --subject "chore(release): bump docs manifest to $ver" \
-            --body "Automated docs-manifest sync for $ver — the docs bundle packs from the tagged tree and gates on manifest.version == tag."
+            --body "Automated docs-manifest sync for $ver — the docs bundle packs from the tagged tree and gates on manifest.version == tag."; then
+            # auto-merge unavailable or already satisfied — try the
+            # immediate merge once before giving up.
+            gh pr merge "$pr" --squash --delete-branch \
+              --subject "chore(release): bump docs manifest to $ver" \
+              --body "Automated docs-manifest sync for $ver — the docs bundle packs from the tagged tree and gates on manifest.version == tag."
+          fi
           mc=""
-          for i in $(seq 1 15); do
-            mc="$(gh pr view "$pr" --json mergeCommit,state --jq 'select(.state=="MERGED") | .mergeCommit.oid')"
-            [ -n "$mc" ] && break
-            sleep 2
+          state=""
+          # the bump PR runs the full 3-OS matrix — allow ~50 min for
+          # checks plus queue time before declaring the wait lost.
+          for i in $(seq 1 100); do
+            read -r state mc < <(gh pr view "$pr" --json state,mergeCommit \
+              --jq '[.state, (.mergeCommit.oid // "")] | @tsv')
+            [ "$state" = "MERGED" ] && [ -n "$mc" ] && break
+            [ "$state" = "CLOSED" ] && { echo "::error::bump PR #$pr closed without merging"; exit 1; }
+            sleep 30
           done
-          [ -n "$mc" ] || { echo "::error::bump PR #$pr did not report merged"; exit 1; }
+          [ "$state" = "MERGED" ] && [ -n "$mc" ] \
+            || { echo "::error::bump PR #$pr did not merge within the wait window"; exit 1; }
           emit "$mc"
 
   release:

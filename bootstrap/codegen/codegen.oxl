@@ -453,6 +453,43 @@ fn cname(s: str) -> str {
     return out
 }
 
+// user binding names that would collide with emitted C identifiers
+// get a u_ prefix — same rule as the JS emitter's jname: _-leading
+// temps (_ms/_r<n>/__rc/…), o_*-prefixed top-levels (o_f_/o_g_/…),
+// u_*-prefixed escapes themselves, rt_*-prefixed runtime calls,
+// Rt*-prefixed runtime types, and C keywords. Applied at every site
+// a user local/param/binding name is emitted as a C identifier;
+// env/struct-field names stay raw (member namespace can't collide).
+fn vname(n: str) -> str {
+    if n == "_" || len(n) == 0 {
+        return n
+    }
+    b0 := byteat(n, 0)
+    if b0 == 95 {
+        return "u_" + n
+    }
+    if len(n) > 1 && b0 == 117 && byteat(n, 1) == 95 {
+        return "u_" + n
+    }
+    if len(n) > 1 && b0 == 111 && byteat(n, 1) == 95 {
+        return "u_" + n
+    }
+    if len(n) > 2 && b0 == 114 && byteat(n, 1) == 116 && byteat(n, 2) == 95 {
+        return "u_" + n
+    }
+    if len(n) > 2 && b0 == 82 && byteat(n, 1) == 116 && byteat(n, 2) >= 65 && byteat(n, 2) <= 90 {
+        return "u_" + n
+    }
+    if n == "ObjHdr" || n == "OxlWinStart" {
+        return "u_" + n
+    }
+    kw := "|auto|break|case|char|const|continue|default|do|double|else|enum|extern|float|for|goto|if|inline|int|long|register|restrict|return|short|signed|sizeof|static|struct|switch|typedef|union|unsigned|void|volatile|while|alignas|alignof|bool|typeof|asm|constexpr|nullptr|static_assert|thread_local|char8_t|typeof_unqual|true|false|dec32|dec64|dec128|"
+    if find(kw, "|" + n + "|") >= 0 {
+        return "u_" + n
+    }
+    return n
+}
+
 fn hex2(c: int) -> str {
     d := "0123456789abcdef"
     return substr(d, c / 16, c / 16 + 1) + substr(d, c % 16, c % 16 + 1)
@@ -1766,7 +1803,7 @@ fn gref(g: mut G, n: str) -> str {
             return "fr->" + fslot_str(n, s)
         }
     }
-    return n
+    return vname(n)
 }
 
 // register a frame field for an oxl local (seed fslot)
@@ -1819,7 +1856,7 @@ fn gdefer(g: mut G, call: own parser.Node) {
                     t := xty(g, al.v)
                     an := "_da" + itoa(di) + "_" + itoa(i)
                     v := gx(g, al.v)
-                    wln(g, "    " + gcty(g, t) + " " + an + " = " + v + ";")
+                    wln(g, "    " + gcty(g, t) + " " + vname(an) + " = " + v + ";")
                     check.env_bind(g.env, an, t)
                     nargs = parser.ncons(new(parser.Node.Name{n: an, lo: 0, hi: 0}), nargs)
                     i = i + 1
@@ -1867,7 +1904,7 @@ fn gdefer(g: mut G, call: own parser.Node) {
         envf = ""
         cp := caps
         for cp != nil {
-            envf = envf + " " + gcty(g, cp.t) + " " + cname(cp.n) + ";"
+            envf = envf + " " + gcty(g, cp.t) + " " + vname(cp.n) + ";"
             cp = cp.next
         }
     }
@@ -1881,7 +1918,7 @@ fn gdefer(g: mut G, call: own parser.Node) {
     check.env_push(g.env)
     cp2 := caps
     for cp2 != nil {
-        wln(g, "    " + gcty(g, cp2.t) + " " + cname(cp2.n) + " = _e->" + cname(cp2.n) + ";")
+        wln(g, "    " + gcty(g, cp2.t) + " " + vname(cp2.n) + " = _e->" + vname(cp2.n) + ";")
         check.env_bind(g.env, cp2.n, cp2.t)
         cp2 = cp2.next
     }
@@ -1895,7 +1932,7 @@ fn gdefer(g: mut G, call: own parser.Node) {
     inits := ""
     cp3 := caps
     for cp3 != nil {
-        inits = inits + " _de->" + cname(cp3.n) + " = " + gxname(g, cp3.n) + ";"
+        inits = inits + " _de->" + vname(cp3.n) + " = " + gxname(g, cp3.n) + ";"
         cp3 = cp3.next
     }
     wln(g, "    { struct " + denv + " *_de = malloc(sizeof *_de);" + inits + " rt_defer_push(" + thunk + ", _de); }")
@@ -2170,7 +2207,7 @@ fn gmatch(g: mut G, scrut: ref parser.Node, arms: ref parser.NList) -> str {
                 check.env_push(g.env)
                 pb := ga.binds
                 for pb != nil {
-                    o = o + gcty(g, pb.t) + " " + pb.n + " = " + pb.ce + "; "
+                    o = o + gcty(g, pb.t) + " " + vname(pb.n) + " = " + pb.ce + "; "
                     check.env_bind(g.env, pb.n, pb.t)
                     pb = pb.next
                 }
@@ -2639,7 +2676,7 @@ fn gxname(g: mut G, n: str) -> str {
         }
     }
     if g_local(g, n) {
-        return n
+        return vname(n)
     }
     gn3 := check.qname(g.ck.cur_mod, n)
     if gn3 != n && collections.map_has(g.ck.globals, gn3) {
@@ -2652,7 +2689,7 @@ fn gxname(g: mut G, n: str) -> str {
     if len(v) > 0 {
         return v
     }
-    return n
+    return vname(n)
 }
 
 fn gxun(g: mut G, op: str, inner: ref parser.Node) -> str {
@@ -3816,7 +3853,7 @@ fn gclosure(g: mut G, params: ref parser.NList, body: ref parser.Node) -> str {
     for pl != nil {
         match pl.v {
             parser.Node.Param{name, ty} => {
-                psig = psig + ", " + gcty(g, gty(g, ty)) + " " + cname(name)
+                psig = psig + ", " + gcty(g, gty(g, ty)) + " " + vname(name)
             }
             _ => {
             }
@@ -3827,7 +3864,7 @@ fn gclosure(g: mut G, params: ref parser.NList, body: ref parser.Node) -> str {
     envf := ""
     cp := caps
     for cp != nil {
-        envf = envf + " " + gcty(g, cp.t) + " " + cname(cp.n) + ";"
+        envf = envf + " " + gcty(g, cp.t) + " " + vname(cp.n) + ";"
         cp = cp.next
     }
     g.clpro = push(g.clpro, "struct o_env_" + sid + " {" + envf + " };")
@@ -3849,7 +3886,7 @@ fn gclosure(g: mut G, params: ref parser.NList, body: ref parser.Node) -> str {
     check.env_push(g.env)
     cp = caps
     for cp != nil {
-        wln(g, "    " + gcty(g, cp.t) + " " + cname(cp.n) + " = _e->" + cname(cp.n) + ";")
+        wln(g, "    " + gcty(g, cp.t) + " " + vname(cp.n) + " = _e->" + vname(cp.n) + ";")
         check.env_bind(g.env, cp.n, cp.t)
         cp = cp.next
     }
@@ -3879,7 +3916,7 @@ fn gclosure(g: mut G, params: ref parser.NList, body: ref parser.Node) -> str {
     inits := ""
     cp = caps
     for cp != nil {
-        inits = inits + " _e->" + cname(cp.n) + " = " + gxname(g, cp.n) + ";"
+        inits = inits + " _e->" + vname(cp.n) + " = " + gxname(g, cp.n) + ";"
         cp = cp.next
     }
     return "({ struct o_env_" + sid + " *_e = rt_alloc_own(sizeof(struct o_env_" + sid + "));" + inits + " (RtFnv){ _e, (void*)o_cl_" + sid + " }; })"
@@ -3934,11 +3971,11 @@ fn glet2(g: mut G, names: str, call: ref parser.Node) {
     c := gx(g, call)
     wln(g, "    struct " + tag + " _r" + itoa(n) + " = " + c + ";")
     if len(na) > 0 && na != "_" {
-        wln(g, "    " + gcty(g, vt) + " " + na + " = _r" + itoa(n) + ".val;")
+        wln(g, "    " + gcty(g, vt) + " " + vname(na) + " = _r" + itoa(n) + ".val;")
         check.env_bind(g.env, na, vt)
     }
     if len(nb) > 0 && nb != "_" {
-        wln(g, "    int64_t " + nb + " = _r" + itoa(n) + ".err;")
+        wln(g, "    int64_t " + vname(nb) + " = _r" + itoa(n) + ".err;")
         check.env_bind(g.env, nb, check.t_err(g.ck))
     }
 }
@@ -3963,14 +4000,14 @@ fn gs(g: mut G, s: ref parser.Node) {
                 v = gx(g, init)
                 v = gconv_v(g, init, v, t)
             }
-            wln(g, "    " + gcty(g, t) + " " + name + " = " + v + ";")
+            wln(g, "    " + gcty(g, t) + " " + vname(name) + " = " + v + ";")
             check.env_bind(g.env, name, t)
         }
         parser.Node.Bind{name, init} => {
             t := xty(g, init)
             v := gx(g, init)
             v = gconv_v(g, init, v, t)
-            wln(g, "    " + gcty(g, t) + " " + name + " = " + v + ";")
+            wln(g, "    " + gcty(g, t) + " " + vname(name) + " = " + v + ";")
             check.env_bind(g.env, name, t)
         }
         parser.Node.Let2{names, call} => {
@@ -4879,7 +4916,7 @@ fn gparams(g: mut G, params: ref parser.NList) -> str {
                 if len(s) > 0 {
                     s = s + ", "
                 }
-                s = s + gcty(g, gty(g, ty)) + " " + name
+                s = s + gcty(g, gty(g, ty)) + " " + vname(name)
             }
             _ => {
             }
@@ -4899,7 +4936,7 @@ fn gparams2(g: mut G, recv: ref parser.Node, params: ref parser.NList) -> str {
     if recv != nil {
         match recv {
             parser.Node.Param{name, ty} => {
-                rp = gcty(g, gty(g, ty)) + " " + name
+                rp = gcty(g, gty(g, ty)) + " " + vname(name)
             }
             _ => {
             }
@@ -4912,7 +4949,7 @@ fn gparams2(g: mut G, recv: ref parser.Node, params: ref parser.NList) -> str {
                 if len(rp) > 0 {
                     rp = rp + ", "
                 }
-                rp = rp + gcty(g, gty(g, ty)) + " " + name
+                rp = rp + gcty(g, gty(g, ty)) + " " + vname(name)
             }
             _ => {
             }

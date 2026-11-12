@@ -24,6 +24,36 @@ fn cname(n: &str) -> String {
     n.replace('.', "_")
 }
 
+/// user binding names that would collide with emitted C identifiers
+/// get a u_ prefix — same rule as the JS emitter's jname and the
+/// self-hosted emitter's vname: _-leading temps (_ms/_r<n>/__rc/…),
+/// o_*-prefixed top-levels (o_f_/o_g_/…), u_*-prefixed escapes
+/// themselves, rt_*-prefixed runtime calls, Rt*-prefixed runtime
+/// types, and C keywords. Applied at every site a user
+/// local/param/binding name is emitted as a C identifier; env and
+/// struct-field names stay raw (member namespace can't collide).
+fn vname(n: &str) -> String {
+    if n == "_" || n.is_empty() {
+        return n.to_string();
+    }
+    let b = n.as_bytes();
+    if b[0] == b'_'
+        || (n.len() > 1 && b[0] == b'u' && b[1] == b'_')
+        || (n.len() > 1 && b[0] == b'o' && b[1] == b'_')
+        || (n.len() > 2 && b[0] == b'r' && b[1] == b't' && b[2] == b'_')
+        || (n.len() > 2 && b[0] == b'R' && b[1] == b't' && b[2].is_ascii_uppercase())
+        || n == "ObjHdr"
+        || n == "OxlWinStart"
+    {
+        return format!("u_{n}");
+    }
+    const KW: &str = "|auto|break|case|char|const|continue|default|do|double|else|enum|extern|float|for|goto|if|inline|int|long|register|restrict|return|short|signed|sizeof|static|struct|switch|typedef|union|unsigned|void|volatile|while|alignas|alignof|bool|typeof|asm|constexpr|nullptr|static_assert|thread_local|char8_t|typeof_unqual|true|false|dec32|dec64|dec128|";
+    if KW.contains(&format!("|{n}|")) {
+        return format!("u_{n}");
+    }
+    n.to_string()
+}
+
 /// vtab symbol fragment for an impl key — `iface:W2` rewraps sanitize
 /// to `iface_W2` since ':' is not a C identifier char (.oxl gvtkey)
 fn vtkey(implkey: &str) -> String {
@@ -1041,7 +1071,7 @@ impl<'a> Gen<'a> {
         };
         let params: Vec<String> = all_params(f)
             .iter()
-            .map(|p| format!("{} {}", self.pty(&self.ty_of_ref(&p.ty)), p.name))
+            .map(|p| format!("{} {}", self.pty(&self.ty_of_ref(&p.ty)), vname(&p.name)))
             .collect();
         let params = if params.is_empty() { "void".into() } else { params.join(", ") };
         let _ = writeln!(out, "{ret_c} {name}({params});");
@@ -1069,7 +1099,7 @@ impl<'a> Gen<'a> {
         let ret_c = self.ret_decl(f, true);
         let params: Vec<String> = all_params(f)
             .iter()
-            .map(|p| format!("{} {}", self.pty(&self.ty_of_ref(&p.ty)), p.name))
+            .map(|p| format!("{} {}", self.pty(&self.ty_of_ref(&p.ty)), vname(&p.name)))
             .collect();
         let params = if params.is_empty() { "void".into() } else { params.join(", ") };
         let _ = writeln!(self.out, "{ret_c} o_f_{}({params}) {{", cname(&f.name));
@@ -1136,7 +1166,7 @@ impl<'a> Gen<'a> {
         let ret_c = self.ret_decl_named(f, mangled);
         let params: Vec<String> = all_params(f)
             .iter()
-            .map(|p| format!("{} {}", self.pty(&self.ty_of_ref(&p.ty)), p.name))
+            .map(|p| format!("{} {}", self.pty(&self.ty_of_ref(&p.ty)), vname(&p.name)))
             .collect();
         let params = if params.is_empty() { "void".into() } else { params.join(", ") };
         let _ = writeln!(self.out, "{ret_c} o_f_{}({params}) {{", cname(&mangled));
@@ -1169,7 +1199,7 @@ impl<'a> Gen<'a> {
         let ret_c = self.ret_decl_named(f, name);
         let params: Vec<String> = all_params(f)
             .iter()
-            .map(|p| format!("{} {}", self.pty(&self.ty_of_ref(&p.ty)), p.name))
+            .map(|p| format!("{} {}", self.pty(&self.ty_of_ref(&p.ty)), vname(&p.name)))
             .collect();
         let params = if params.is_empty() { "void".into() } else { params.join(", ") };
         let _ = writeln!(out, "{ret_c} o_f_{}({params});", cname(&name));
@@ -1525,7 +1555,7 @@ impl<'a> Gen<'a> {
                     // raw value: call-site conversion (cstr wrap, borrow
                     // regions) stays part of the deferred call at drain
                     let v = self.expr(a);
-                    let _ = writeln!(self.out, "    {} {} = {};", self.cty(&t), an, v);
+                    let _ = writeln!(self.out, "    {} {} = {};", self.cty(&t), vname(&an), v);
                     self.env.last_mut().unwrap().insert(an.clone(), t);
                     temps.push(Expr { kind: ExprKind::Ident(an), span: a.span });
                 }
@@ -1543,7 +1573,7 @@ impl<'a> Gen<'a> {
             proto += " char _none;";
         }
         for (n, t) in &caps {
-            proto += &format!(" {} {};", self.cty(t), cname(n));
+            proto += &format!(" {} {};", self.cty(t), vname(n));
         }
         proto += &format!(" }}; static void {thunk}(void *);\n");
         self.closure_protos.push_str(&proto);
@@ -1554,7 +1584,7 @@ impl<'a> Gen<'a> {
         self.in_frame = false;
         let mut body = format!("static void {thunk}(void *_env) {{\n    struct {denv} *_e = _env;\n");
         for (n, t) in &caps {
-            body += &format!("    {} {} = _e->{};\n", self.cty(t), cname(n), cname(n));
+            body += &format!("    {} {} = _e->{};\n", self.cty(t), vname(n), vname(n));
         }
         let v = self.expr(&rewritten);
         body += &format!("    (void)({v});\n}}\n");
@@ -1565,7 +1595,7 @@ impl<'a> Gen<'a> {
         let mut reg = format!("    {{ struct {denv} *_de = malloc(sizeof *_de);");
         for (n, _) in &caps {
             let val = self.expr(&Expr { kind: ExprKind::Ident(n.clone()), span: call.span });
-            reg += &format!(" _de->{} = {val};", cname(n));
+            reg += &format!(" _de->{} = {val};", vname(n));
         }
         reg += &format!(" rt_defer_push({thunk}, _de); }}");
         let _ = writeln!(self.out, "{reg}");
@@ -1584,7 +1614,7 @@ impl<'a> Gen<'a> {
                 // typed zero for scalars and structs alike
                 let v = init.as_ref().map(|i| self.conv(i, &t))
                     .unwrap_or_else(|| format!("({ct}){{0}}"));
-                let _ = writeln!(self.out, "    {ct} {name} = {v};");
+                let _ = writeln!(self.out, "    {ct} {} = {v};", vname(name));
                 self.env.last_mut().unwrap().insert(name.clone(), t);
             }
             Stmt::Let2 { a, b, call, .. } => {
@@ -1635,11 +1665,11 @@ impl<'a> Gen<'a> {
                         let _ = writeln!(self.out, "    struct {ret_name} _r{n} = {c};");
                         if let Bind::Name(na) = a {
                             let ct = self.cty(&vt);
-                            let _ = writeln!(self.out, "    {ct} {na} = _r{n}.val;");
+                            let _ = writeln!(self.out, "    {ct} {} = _r{n}.val;", vname(na));
                             self.env.last_mut().unwrap().insert(na.clone(), vt);
                         }
                         if let Bind::Name(nb) = b {
-                            let _ = writeln!(self.out, "    int64_t {nb} = _r{n}.err;");
+                            let _ = writeln!(self.out, "    int64_t {} = _r{n}.err;", vname(nb));
                             self.env.last_mut().unwrap().insert(nb.clone(), Ty::Err);
                         }
                     }
@@ -1935,7 +1965,7 @@ impl<'a> Gen<'a> {
                     self.fnv_wraps.insert(n.clone());
                     format!("(RtFnv){{ 0, (void*)o_fnv_wrap_{} }}", cname(&n))
                 } else {
-                    n.clone()
+                    vname(n)
                 }
             }
             ExprKind::Call { f, args } => self.call(f, args),
@@ -2239,11 +2269,11 @@ impl<'a> Gen<'a> {
         let ret_c = self.cty(&ret);
         let mut psig = String::new();
         for (p, t) in params.iter().zip(ptys.iter()) {
-            psig += &format!(", {} {}", self.cty(t), cname(&p.name));
+            psig += &format!(", {} {}", self.cty(t), vname(&p.name));
         }
         let mut env_fields = String::new();
         for (n, t) in &captures {
-            env_fields += &format!(" {} {};", self.cty(t), cname(n));
+            env_fields += &format!(" {} {};", self.cty(t), vname(n));
         }
         let _ = writeln!(self.closure_protos, "struct o_env_{id} {{{env_fields} }};");
         let _ = writeln!(self.closure_protos,
@@ -2262,7 +2292,7 @@ impl<'a> Gen<'a> {
         let _ = writeln!(self.out, "    RtDefer *_dmark = rt_defer_mark();");
         let mut scope = HashMap::new();
         for (n, t) in &captures {
-            let _ = writeln!(self.out, "    {} {} = _e->{};", self.cty(t), cname(n), cname(n));
+            let _ = writeln!(self.out, "    {} {} = _e->{};", self.cty(t), vname(n), vname(n));
             scope.insert(n.clone(), t.clone());
         }
         for (p, t) in params.iter().zip(ptys.iter()) {
@@ -2295,9 +2325,9 @@ impl<'a> Gen<'a> {
             // closes. Copy the bytes into own storage so the env really
             // does outlive its creating scope.
             if matches!(t, Ty::Str) {
-                inits += &format!(" _e->{} = rt_str_own({v});", cname(n));
+                inits += &format!(" _e->{} = rt_str_own({v});", vname(n));
             } else {
-                inits += &format!(" _e->{} = {v};", cname(n));
+                inits += &format!(" _e->{} = {v};", vname(n));
             }
         }
         format!(
@@ -2356,7 +2386,7 @@ impl<'a> Gen<'a> {
             first = false;
             self.env.push(HashMap::new());
             for (bn, bv, bt) in &binds {
-                o.push_str(&format!("{} {bn} = {bv}; ", self.cty(bt)));
+                o.push_str(&format!("{} {} = {bv}; ", self.cty(bt), vname(bn)));
                 self.env.last_mut().unwrap().insert(bn.clone(), bt.clone());
             }
             match &arm.body {

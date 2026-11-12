@@ -1627,6 +1627,8 @@ out=$("$OXL" run tests/closure_shadow.oxl)
 [ "$(tail -1 <<<"$out")" = "closure shadow ok" ] || { echo "FAIL closure_shadow: $out"; exit 1; }
 out=$("$OXL" run tests/zero_str.oxl)
 [ "$(tail -1 <<<"$out")" = "zero str ok" ] || { echo "FAIL zero_str: $out"; exit 1; }
+out=$("$OXL" run tests/js_ident.oxl)
+[ "$(tail -1 <<<"$out")" = "js ident ok" ] || { echo "FAIL js_ident: $out"; exit 1; }
 
 echo "== g1 gui: mock backend + cancel gate =="
 out=$("$OXL" run tests/gui_mock.oxl)

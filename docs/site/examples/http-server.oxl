@@ -1,0 +1,21 @@
+package main
+
+// A tiny HTTP service: one route, plain-text responses.
+//   oxl run docs/site/examples/http-server.oxl
+//   curl localhost:8080/hello/oxl
+import "std/net/http"
+import "std/strings"
+
+struct App {}
+
+fn (a App) route(method: str, path: str, body: str) -> http.Resp {
+    if method == "GET" && strings.startswith(path, "/hello/") {
+        who := substr(path, len("/hello/"), len(path))
+        return http.Resp{status: 200, body: "hello, " + who + "\n", ctype: "text/plain"}
+    }
+    return http.Resp{status: 404, body: "not found\n", ctype: "text/plain"}
+}
+
+fn main() {
+    http.serve(8080, App{})
+}

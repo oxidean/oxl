@@ -208,11 +208,12 @@ jobs:
           resolve_pr() {
             local out
             for _ in 1 2 3; do
+              # Test gh's status directly — a piped head -1 would mask a
+              # lookup failure as "no PR" wherever pipefail isn't set.
               if out="$(gh pr list --head "$branch" --base main --state open \
                   --json number,baseRefName,headRefOid \
-                  --jq ".[] | select(.baseRefName==\"main\" and .headRefOid==\"$expected_sha\") | .number" \
-                  | head -1)"; then
-                printf '%s\n' "$out"
+                  --jq ".[] | select(.baseRefName==\"main\" and .headRefOid==\"$expected_sha\") | .number")"; then
+                printf '%s\n' "$out" | head -1
                 return 0
               fi
               sleep 10

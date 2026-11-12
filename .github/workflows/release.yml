@@ -20,6 +20,14 @@ concurrency:
 jobs:
   version:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
+    # Job-level grants replace the workflow-level block — all three are
+    # restated: contents (tag/branch pushes), pull-requests (bump PR),
+    # actions (approve held runs on the bot-authored bump PR).
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write
     outputs:
       tag: ${{ steps.v.outputs.tag }}
       sha: ${{ steps.sha.outputs.sha }}
@@ -200,26 +208,91 @@ jobs:
             # gh pr create prints only the URL — re-read the number via list.
             pr="$(gh pr list --head "$branch" --state open --json number --jq '.[0].number')"
           fi
-          m=""
-          for i in $(seq 1 30); do
-            m="$(gh pr view "$pr" --json mergeable --jq '.mergeable')"
-            [ "$m" = "MERGEABLE" ] && break
-            if [ "$m" = "CONFLICTING" ]; then
-              echo "::error::bump PR #$pr conflicts with main — rerun the release"
+          if [ -z "$pr" ]; then
+            echo "::error::could not resolve bump PR number for $branch"
+            exit 1
+          fi
+          # The bump PR is bot-authored: its pull_request runs arrive held at
+          # action_required (GITHUB_TOKEN can't self-trigger), so required
+          # checks never report and branch policy blocks the merge. Approve
+          # held runs every poll — late-spawning runs get caught too — and
+          # wait on mergeStateStatus rather than mergeable, which reports
+          # conflicts only and stays MERGEABLE while required checks pend.
+          state=""
+          merged_gate=0
+          for i in $(seq 1 100); do
+            held="$(gh api "repos/${{ github.repository }}/actions/runs" -X GET \
+              -f "branch=$branch" -f event=pull_request -f per_page=50 \
+              --jq '.workflow_runs[] | select(.status=="waiting" or .conclusion=="action_required") | .id' 2>/dev/null || true)"
+            for rid in $held; do
+              if err="$(gh api -X POST "repos/${{ github.repository }}/actions/runs/$rid/approve" 2>&1)"; then
+                echo "approved held run $rid"
+              else
+                echo "::warning::approve call failed for held run $rid — $err"
+              fi
+            done
+            state="$(gh pr view "$pr" --json mergeStateStatus --jq '.mergeStateStatus' 2>/dev/null)" || {
+              echo "::warning::could not read merge state for bump PR #$pr — retrying"
+              sleep 20
+              continue
+            }
+            case "$state" in
+              CONFLICTING|DIRTY)
+                echo "::error::bump PR #$pr conflicts with main — rerun the release"
+                exit 1 ;;
+            esac
+            # Gate on every check, not just required ones: a failed check on
+            # the release cut stops the tag, and a still-pending check keeps
+            # the loop waiting. A failed query is not a pass — retry it.
+            # gh pr checks exits non-zero when any check pends/fails even with
+            # --json — the read guard tests stdout, so JSON still lands first.
+            if ! read -r fails pending < <(gh pr checks "$pr" --json bucket \
+                --jq '"\([.[]|select(.bucket=="fail")]|length) \([.[]|select(.bucket=="pending")]|length)"' 2>/dev/null); then
+              echo "::warning::could not read checks for bump PR #$pr — retrying"
+              sleep 20
+              continue
+            fi
+            if [ "$fails" != "0" ]; then
+              echo "::error::bump PR #$pr has a failing check — rerun the release"
+              gh pr checks "$pr" || true
               exit 1
             fi
-            sleep 2
+            case "$state" in
+              CLEAN) merged_gate=1; break ;;
+              # BEHIND is mergeable unless the ruleset demands up-to-date
+              # branches — let the merge call arbitrate once checks settle.
+              UNSTABLE|BEHIND) if [ "$pending" = "0" ]; then merged_gate=1; break; fi ;;
+            esac
+            sleep 20
           done
-          [ "$m" = "MERGEABLE" ] || { echo "::error::bump PR #$pr never became mergeable"; exit 1; }
+          if [ "$merged_gate" != "1" ]; then
+            echo "::error::bump PR #$pr never reached a clean state (mergeStateStatus=$state)"
+            gh pr checks "$pr" || true
+            exit 1
+          fi
           # The default squash body folds in "Co-authored-by: github-actions[bot]"
           # (merger != author) and trips the bot-trailer ban in commit-lint —
           # pin an explicit message instead.
-          gh pr merge "$pr" --squash --delete-branch \
-            --subject "chore(release): bump docs manifest to $ver" \
-            --body "Automated docs-manifest sync for $ver — the docs bundle packs from the tagged tree and gates on manifest.version == tag."
+          merged_now=0
+          for i in 1 2 3; do
+            if gh pr merge "$pr" --squash --delete-branch \
+              --subject "chore(release): bump docs manifest to $ver" \
+              --body "Automated docs-manifest sync for $ver — the docs bundle packs from the tagged tree and gates on manifest.version == tag."; then
+              merged_now=1
+              break
+            fi
+            # gh pr merge fails non-zero even when the merge landed but a
+            # trailing op (e.g. --delete-branch) errored — probe state first.
+            if [ "$(gh pr view "$pr" --json state --jq '.state' 2>/dev/null || true)" = "MERGED" ]; then
+              merged_now=1
+              break
+            fi
+            [ "$i" = "3" ] || sleep 5
+          done
+          [ "$merged_now" = "1" ] || { echo "::error::bump PR #$pr merge refused after clean state"; exit 1; }
           mc=""
           for i in $(seq 1 15); do
-            mc="$(gh pr view "$pr" --json mergeCommit,state --jq 'select(.state=="MERGED") | .mergeCommit.oid')"
+            mc="$(gh pr view "$pr" --json mergeCommit,state --jq 'select(.state=="MERGED") | .mergeCommit.oid' || true)"
             [ -n "$mc" ] && break
             sleep 2
           done

@@ -221,7 +221,8 @@ jobs:
           state=""
           merged_gate=0
           for i in $(seq 1 100); do
-            held="$(gh api "repos/${{ github.repository }}/actions/runs?branch=$branch&event=pull_request&per_page=50" \
+            held="$(gh api "repos/${{ github.repository }}/actions/runs" \
+              -f "branch=$branch" -f event=pull_request -f per_page=50 \
               --jq '.workflow_runs[] | select(.status=="waiting" or .conclusion=="action_required") | .id' 2>/dev/null || true)"
             for rid in $held; do
               if err="$(gh api -X POST "repos/${{ github.repository }}/actions/runs/$rid/approve" 2>&1)"; then
@@ -243,6 +244,8 @@ jobs:
             # Gate on every check, not just required ones: a failed check on
             # the release cut stops the tag, and a still-pending check keeps
             # the loop waiting. A failed query is not a pass — retry it.
+            # gh pr checks exits non-zero when any check pends/fails even with
+            # --json — the read guard tests stdout, so JSON still lands first.
             if ! read -r fails pending < <(gh pr checks "$pr" --json bucket \
                 --jq '"\([.[]|select(.bucket=="fail")]|length) \([.[]|select(.bucket=="pending")]|length)"' 2>/dev/null); then
               echo "::warning::could not read checks for bump PR #$pr — retrying"
@@ -256,7 +259,9 @@ jobs:
             fi
             case "$state" in
               CLEAN) merged_gate=1; break ;;
-              UNSTABLE) if [ "$pending" = "0" ]; then merged_gate=1; break; fi ;;
+              # BEHIND is mergeable unless the ruleset demands up-to-date
+              # branches — let the merge call arbitrate once checks settle.
+              UNSTABLE|BEHIND) if [ "$pending" = "0" ]; then merged_gate=1; break; fi ;;
             esac
             sleep 20
           done
@@ -268,13 +273,23 @@ jobs:
           # The default squash body folds in "Co-authored-by: github-actions[bot]"
           # (merger != author) and trips the bot-trailer ban in commit-lint —
           # pin an explicit message instead.
+          merged_now=0
           for i in 1 2 3; do
-            gh pr merge "$pr" --squash --delete-branch \
+            if gh pr merge "$pr" --squash --delete-branch \
               --subject "chore(release): bump docs manifest to $ver" \
-              --body "Automated docs-manifest sync for $ver — the docs bundle packs from the tagged tree and gates on manifest.version == tag." && break
-            [ "$i" = "3" ] && { echo "::error::bump PR #$pr merge refused after clean state"; exit 1; }
-            sleep 5
+              --body "Automated docs-manifest sync for $ver — the docs bundle packs from the tagged tree and gates on manifest.version == tag."; then
+              merged_now=1
+              break
+            fi
+            # gh pr merge fails non-zero even when the merge landed but a
+            # trailing op (e.g. --delete-branch) errored — probe state first.
+            if [ "$(gh pr view "$pr" --json state --jq '.state' 2>/dev/null || true)" = "MERGED" ]; then
+              merged_now=1
+              break
+            fi
+            [ "$i" = "3" ] || sleep 5
           done
+          [ "$merged_now" = "1" ] || { echo "::error::bump PR #$pr merge refused after clean state"; exit 1; }
           mc=""
           for i in $(seq 1 15); do
             mc="$(gh pr view "$pr" --json mergeCommit,state --jq 'select(.state=="MERGED") | .mergeCommit.oid' || true)"

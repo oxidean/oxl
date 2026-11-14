@@ -1634,6 +1634,8 @@ out=$("$OXL" run tests/zero_str.oxl)
 [ "$(tail -1 <<<"$out")" = "zero str ok" ] || { echo "FAIL zero_str: $out"; exit 1; }
 out=$("$OXL" run tests/js_ident.oxl)
 [ "$(tail -1 <<<"$out")" = "js ident ok" ] || { echo "FAIL js_ident: $out"; exit 1; }
+out=$("$OXL" run tests/susp_ownarg.oxl)
+[ "$(tail -1 <<<"$out")" = "susp ownarg ok" ] || { echo "FAIL susp_ownarg: $out"; exit 1; }
 
 echo "== g1 gui: mock backend + cancel gate =="
 out=$("$OXL" run tests/gui_mock.oxl)
@@ -1748,12 +1750,135 @@ if ! "$OXL" fmt --check $(find std bootstrap tests examples -name '*.oxl' | sort
 fi
 
 
-echo "== lsp hover/definition =="
-# a Windows python can't exec an msys path — hand it the native spelling
-OXL_WIN=$(cygpath -w "$OXL" 2>/dev/null || printf '%s' "$OXL")
-$PY - "$OXL_WIN" <<'PYEOF'
+echo "== stage0 findings (#102) =="
+# snapshot-review compiler bugs: 4-byte UTF-8 decode in fmt, test
+# runner exit status, single-eval borrowed call args, whitespace-
+# split require upserts, symlink dir walks, and checker index records
+# for := decls / assign targets
+
+# fmt canonicalizes char literals to their scalar — 'U+1F600' must
+# decode to 128512 (the *64 second payload byte yielded 3520)
+printf 'package main\nfn main() {\n    c := '\''\xf0\x9f\x98\x80'\''\n    println(itoa(c))\n}\n' > "$scratch/u8.oxl"
+out=$("$OXL" fmt "$scratch/u8.oxl")
+grep -q 'c := 128512' <<<"$out" || { echo "FAIL fmt utf8-4byte: $out"; exit 1; }
+
+# `oxl test` must exit nonzero when any test_ fn traps — the runner
+# printed FAIL but returned 0 before the exit-status fix
+cat > "$scratch/tfail.oxl" <<'EOF'
+package main
+
+import "std/testing"
+
+fn test_ok() { testing.expect_eq(1, 1, "fine") }
+fn test_bad() { testing.expect_eq(1, 2, "boom") }
+EOF
+cat > "$scratch/tpass.oxl" <<'EOF'
+package main
+
+import "std/testing"
+
+fn test_ok() { testing.expect_eq(1, 1, "fine") }
+EOF
+rc=0
+out=$("$OXL" test "$scratch/tfail.oxl" 2>&1) || rc=$?
+[ "$rc" -ne 0 ] || { echo "FAIL test exit status: failing suite exited 0"; exit 1; }
+grep -q 'FAIL' <<<"$out" || { echo "FAIL test exit marker: $out"; exit 1; }
+"$OXL" test "$scratch/tpass.oxl" > /dev/null 2>&1 || { echo "FAIL test pass rc"; exit 1; }
+
+# own -> mut/ref call args evaluate exactly once: the borrow ledger
+# temps the expr instead of embedding it in borrow/call/unborrow
+cat > "$scratch/borrow.oxl" <<'EOF'
+package main
+
+import "std/testing"
+
+struct Counter { n: int }
+
+let g_n: int = 0
+
+fn mk() -> own Counter {
+    g_n = g_n + 1
+    return new(Counter{n: 0})
+}
+
+fn bump(c: mut Counter) { c.n = c.n + 1 }
+
+fn test_borrow_once() {
+    bump(mk())
+    testing.expect_eq(g_n, 1, "borrowed arg evaluated once")
+}
+EOF
+"$OXL" test "$scratch/borrow.oxl" > /dev/null 2>&1 || { echo "FAIL borrow single-eval"; exit 1; }
+if command -v node >/dev/null 2>&1; then
+    rc=0
+    "$OXL" test --target js "$scratch/tfail.oxl" > /dev/null 2>&1 || rc=$?
+    [ "$rc" -ne 0 ] || { echo "FAIL js test exit status"; exit 1; }
+    "$OXL" test --target js "$scratch/borrow.oxl" > /dev/null 2>&1 || { echo "FAIL js borrow single-eval"; exit 1; }
+fi
+
+# get: tab-separated require lines upsert in place (split on general
+# whitespace like the manifest parser) — pre-fix the version token
+# glued to the path appended a duplicate require instead — and a
+# symlink inside a sealed cache slot must not hang dir_h1's walk
+case "$(uname -s)" in
+MINGW*|MSYS*|CYGWIN*) ;;
+*)
+    w102="$scratch/w102"
+    mkdir -p "$w102/dep/util" "$w102/app/app" "$w102/cache"
+    ( cd "$w102/dep" && git init -q . && git config user.email t@t && git config user.name t
+      printf 'module file://%s/dep\noxl 0.3\n' "$w102" > oxl.mod
+      printf 'package util\nfn answer() -> int { return 42 }\n' > util/u.oxl
+      git add -A && git commit -qm v1 && git tag v1.0.0
+      printf 'package util\nfn answer() -> int { return 43 }\n' > util/u.oxl
+      git add -A && git commit -qm v2 && git tag v1.1.0 )
+    printf 'module local/app\noxl 0.3\n\nrequire file://%s/dep\tv1.0.0\n' "$w102" > "$w102/app/oxl.mod"
+    printf 'package main\nimport "file://%s/dep/util"\n\nfn main() { println("answer=" + itoa(util.answer())) }\n' "$w102" > "$w102/app/app/main.oxl"
+    ( cd "$w102/app" && OXLMODCACHE="$w102/cache" "$OXL" get "file://$w102/dep@v1.1.0" ) > "$w102/get" 2>&1 || { echo "FAIL w102 get rc"; cat "$w102/get"; exit 1; }
+    # the tab require's version was swapped in place — one require
+    # line for dep, now at v1.1.0, no appended duplicate
+    [ "$(grep -c "require file://$w102/dep" "$w102/app/oxl.mod")" = 1 ] || { echo "FAIL w102 dup require"; cat "$w102/app/oxl.mod"; exit 1; }
+    grep -q "v1.1.0" "$w102/app/oxl.mod" || { echo "FAIL w102 require ver"; cat "$w102/app/oxl.mod"; exit 1; }
+    ! grep -q 'v1.0.0' "$w102/app/oxl.mod" || { echo "FAIL w102 stale ver"; cat "$w102/app/oxl.mod"; exit 1; }
+    # a symlink inside the sealed slot is skipped by dir_walk — the
+    # verify must complete (pre-fix the walk re-read it forever)
+    slot102=$(find "$w102/cache" -name '*@v1.1.0' -type d)
+    [ -n "$slot102" ] || { echo "FAIL w102 slot missing"; exit 1; }
+    chmod -R u+w "$w102/cache" 2>/dev/null
+    ln -s /etc/hostname "$slot102/link" 2>/dev/null || ln -s /etc/passwd "$slot102/link"
+    ( cd "$w102/app" && export OXLMODCACHE="$w102/cache" && with_timeout 60 "$OXL" mod verify ) > "$w102/vfy" 2>&1 || { echo "FAIL w102 verify (symlink hang?)"; cat "$w102/vfy"; exit 1; }
+    grep -q 'all modules verified' "$w102/vfy" || { echo "FAIL w102 verify text"; cat "$w102/vfy"; exit 1; }
+    ;;
+esac
+
+# lsp index records: := decl names and assign targets resolve as
+# locals (hover shows the binding, not the enclosing fn), and rename
+# covers the decl + write + read sites. Edit ranges are deduped
+# client-side here — the server-side dedupe rides with the lsp
+# worker's rename changes.
+OXL_WIN102=$(cygpath -w "$OXL" 2>/dev/null || printf '%s' "$OXL")
+$PY - "$OXL_WIN102" "$scratch" <<'PYEOF'
 import json, pathlib, subprocess, sys
 oxl = sys.argv[1]
+work = pathlib.Path(sys.argv[2]) / "lsp102"
+work.mkdir(parents=True, exist_ok=True)
+f = work / "main.oxl"
+f.write_text("""package main
+
+fn id[T any](x: T) -> T { return x }
+
+fn helper(p_seed: int) -> int {
+    total := p_seed + 1
+    total = total * 2
+    return total
+}
+
+fn main() {
+    w := 41
+    v := id(w)
+    println("v=" + itoa(v))
+    println("h=" + itoa(helper(v)))
+}
+""")
 p = subprocess.Popen([oxl, "lsp"], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
 def send(m):
     b = json.dumps(m).encode()
@@ -1765,6 +1890,159 @@ def recv():
         if not l: break
         k, v = l.split(":", 1); h[k.strip()] = v.strip()
     return json.loads(p.stdout.read(int(h["Content-Length"])).decode())
+uri = f.as_uri(); src = f.read_text()
+send({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}); recv()
+send({"jsonrpc":"2.0","method":"initialized","params":{}})
+send({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":uri,"languageId":"oxl","version":1,"text":src}}}); recv()
+lines = src.split("\n")
+def pos_of(sub):
+    for i, l in enumerate(lines):
+        j = l.find(sub)
+        if j >= 0:
+            return {"textDocument":{"uri":uri},"position":{"line":i,"character":j}}
+    raise AssertionError("missing " + sub)
+def recv_id(i):
+    while True:
+        m = recv()
+        if m.get("id") == i: return m
+# hover on the `total :=` decl name — the binding, not fn helper
+send({"jsonrpc":"2.0","id":2,"method":"textDocument/hover","params":pos_of("total :=")})
+h = recv_id(2)
+assert "total: int" in json.dumps(h), h
+# hover on the `total =` assign target — a write is still an occurrence
+send({"jsonrpc":"2.0","id":3,"method":"textDocument/hover","params":pos_of("total =")})
+h = recv_id(3)
+assert "total: int" in json.dumps(h), h
+# hover on the p_seed param decl
+send({"jsonrpc":"2.0","id":4,"method":"textDocument/hover","params":pos_of("p_seed:")})
+h = recv_id(4)
+assert "p_seed: int" in json.dumps(h), h
+# rename total -> tt: decl + assign target + two reads, deduped
+send({"jsonrpc":"2.0","id":5,"method":"textDocument/rename","params":{**pos_of("total :="),"newName":"tt"}})
+r = recv_id(5)
+assert "result" in r and "changes" in r["result"], r
+edits = [e for u, es in r["result"]["changes"].items() for e in es]
+# the server itself must not emit overlapping replacements — the
+# client-side uniq below would hide a duplicate
+raw_keys = [(e["range"]["start"]["line"], e["range"]["start"]["character"], e["range"]["end"]["line"], e["range"]["end"]["character"]) for e in edits]
+assert len(raw_keys) == len(set(raw_keys)), raw_keys
+seen = set()
+uniq = []
+for e in edits:
+    key = (e["range"]["start"]["line"], e["range"]["start"]["character"], e["range"]["end"]["line"], e["range"]["end"]["character"])
+    if key not in seen:
+        seen.add(key); uniq.append(e)
+starts = sorted((e["range"]["start"]["line"], e["range"]["start"]["character"]) for e in uniq)
+# decl 5:4, write 6:4, reads 6:12 + 7:11
+assert starts == [(5,4),(6,4),(6,12),(7,11)], starts
+# rename w -> ww: the generic-call arg `id(w)` must appear exactly
+# once — the ty-param inference pass used to record it a second time
+send({"jsonrpc":"2.0","id":6,"method":"textDocument/rename","params":{**pos_of("w :="),"newName":"ww"}})
+r = recv_id(6)
+assert "result" in r and "changes" in r["result"], r
+raw = [e for u, es in r["result"]["changes"].items() for e in es]
+arg_hits = [e for e in raw if e["range"]["start"]["line"] == 12 and e["range"]["start"]["character"] == 12]
+assert len(arg_hits) == 1, raw
+send({"jsonrpc":"2.0","method":"exit","params":{}})
+print("lsp102 ok")
+PYEOF
+
+echo "== lsp didClose invalidation (#102) =="
+OXL_WIN102=$(cygpath -w "$OXL" 2>/dev/null || printf '%s' "$OXL")
+$PY - "$OXL_WIN102" "$scratch" <<'PYEOF'
+import json, pathlib, subprocess, sys
+oxl = sys.argv[1]
+work = pathlib.Path(sys.argv[2]) / "lsp102close"
+work.mkdir(parents=True, exist_ok=True)
+fa = work / "a.oxl"
+fb = work / "b.oxl"
+fa.write_text("""package main
+
+fn helper() -> int {
+    return 42
+}
+""")
+fb.write_text("""package main
+
+fn main() {
+    x := helper()
+    println(x)
+}
+""")
+p = subprocess.Popen([oxl, "lsp"], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+srv_methods = []
+def send(m):
+    b = json.dumps(m).encode()
+    p.stdin.write(b"Content-Length: %d\r\n\r\n" % len(b) + b); p.stdin.flush()
+def recv():
+    while True:
+        h = {}
+        while True:
+            l = p.stdout.readline().decode().strip()
+            if not l: break
+            k, v = l.split(":", 1); h[k.strip()] = v.strip()
+        m = json.loads(p.stdout.read(int(h["Content-Length"])).decode())
+        if "method" in m and "id" in m:
+            srv_methods.append(m["method"])
+            b = json.dumps({"jsonrpc":"2.0","id":m["id"],"result":{}}).encode()
+            p.stdin.write(b"Content-Length: %d\r\n\r\n" % len(b) + b); p.stdin.flush()
+            continue
+        return m
+def recv_id(i):
+    while True:
+        m = recv()
+        if m.get("id") == i: return m
+ua = fa.as_uri(); ub = fb.as_uri()
+sa = fa.read_text(); sb = fb.read_text()
+send({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}); recv()
+send({"jsonrpc":"2.0","method":"initialized","params":{}})
+send({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":ua,"languageId":"oxl","version":1,"text":sa}}})
+send({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":ub,"languageId":"oxl","version":1,"text":sb}}})
+def hover_helper():
+    send({"jsonrpc":"2.0","id":90,"method":"textDocument/hover","params":{"textDocument":{"uri":ub},"position":{"line":3,"character":10}}})
+    return recv_id(90)
+h = hover_helper()
+assert "fn helper" in json.dumps(h), h
+# break the callee in an unsaved overlay — the sibling's hover degrades
+send({"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":ua,"version":2},"contentChanges":[{"text":sa.replace("helper", "helperX")}]}})
+h = hover_helper()
+assert "fn helper" not in json.dumps(h), h
+# closing the broken doc must invalidate the stale overlay and rebuild
+# the package analysis from disk — hover resolves again
+send({"jsonrpc":"2.0","method":"textDocument/didClose","params":{"textDocument":{"uri":ua}}})
+h = hover_helper()
+assert "fn helper" in json.dumps(h), h
+send({"jsonrpc":"2.0","method":"exit","params":{}})
+print("lsp102close ok")
+PYEOF
+
+echo "== lsp hover/definition =="
+# a Windows python can't exec an msys path — hand it the native spelling
+OXL_WIN=$(cygpath -w "$OXL" 2>/dev/null || printf '%s' "$OXL")
+$PY - "$OXL_WIN" <<'PYEOF'
+import json, pathlib, subprocess, sys
+oxl = sys.argv[1]
+p = subprocess.Popen([oxl, "lsp"], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+srv_methods = []
+def send(m):
+    b = json.dumps(m).encode()
+    p.stdin.write(b"Content-Length: %d\r\n\r\n" % len(b) + b); p.stdin.flush()
+def recv():
+    while True:
+        h = {}
+        while True:
+            l = p.stdout.readline().decode().strip()
+            if not l: break
+            k, v = l.split(":", 1); h[k.strip()] = v.strip()
+        m = json.loads(p.stdout.read(int(h["Content-Length"])).decode())
+        # server->client requests (e.g. client/registerCapability)
+        # carry method+id — answer them so the handshake completes
+        if "method" in m and "id" in m:
+            srv_methods.append(m["method"])
+            b = json.dumps({"jsonrpc":"2.0","id":m["id"],"result":{}}).encode()
+            p.stdin.write(b"Content-Length: %d\r\n\r\n" % len(b) + b); p.stdin.flush()
+            continue
+        return m
 uri = pathlib.Path("bootstrap/cmd/parse/main.oxl").resolve().as_uri()
 src = open("bootstrap/cmd/parse/main.oxl").read()
 send({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}); recv()
@@ -1873,6 +2151,28 @@ send({"jsonrpc":"2.0","method":"workspace/didChangeWatchedFiles","params":{"chan
 send({"jsonrpc":"2.0","id":20,"method":"textDocument/hover","params":pos2})
 h3 = recv_id(20); assert "fn lexlib.lex" in json.dumps(h3), h3
 
+# hover on a local's binding site shows the local, not the fn sig —
+# `ast :=` on the emoji-bearing line; the position is UTF-16 units
+ast_col = u16(lines2[i2][:lines2[i2].index("ast :=")])
+send({"jsonrpc":"2.0","id":22,"method":"textDocument/hover","params":{"textDocument":{"uri":uri},"position":{"line":i2,"character":ast_col}}})
+hb = recv_id(22)["result"]
+assert hb["contents"]["value"].startswith("ast:"), hb
+
+# semanticTokens/range returns delta-encoded data for the range only —
+# first token is `fn` at the start of the fn main line
+fn_line = next(i for i,l in enumerate(lines) if l.startswith("fn main"))
+send({"jsonrpc":"2.0","id":23,"method":"textDocument/semanticTokens/range","params":{"textDocument":{"uri":uri},"range":{"start":{"line":fn_line,"character":0},"end":{"line":fn_line+1,"character":0}}}})
+tr = recv_id(23)["result"]["data"]
+assert len(tr) > 0 and len(tr) % 5 == 0 and tr[0] == fn_line and tr[1] == 0, tr[:10]
+# the non-spec bare semanticTokens alias is gone
+send({"jsonrpc":"2.0","id":24,"method":"textDocument/semanticTokens","params":{"textDocument":{"uri":uri}}})
+eb = recv_id(24); assert eb["error"]["code"] == -32601, eb
+# semanticTokensProvider advertises range support
+assert caps["semanticTokensProvider"]["range"] == True
+
+# client/registerCapability was sent once after `initialized`
+assert srv_methods.count("client/registerCapability") == 1, srv_methods
+
 # unknown method -> -32601, malformed body -> -32700
 send({"jsonrpc":"2.0","id":21,"method":"bogus/method","params":{}})
 e1 = recv_id(21); assert e1["error"]["code"] == -32601, e1
@@ -1943,7 +2243,7 @@ if command -v node >/dev/null 2>&1; then
     # each file's last-line success marker is grepped — an err-path
     # regression that prints + exits 0 (gui_dom's `run err:` shape)
     # can't pass silently
-    for f in conc_ping conc_scale select select_fair chan_own chanbuf chanbuf_close scope_exit orphan_join defer_order pairfwd match methods fnval d5_qual stdmods_test susp_closure closure_mcall closure_fnfield closure_shadow zero_str gui_mock gui_lifecycle gui_overflow gui_select gui_stress gui_cancel gui_dom gui_delay_stop js_ident; do
+    for f in conc_ping conc_scale select select_fair chan_own chanbuf chanbuf_close scope_exit orphan_join defer_order pairfwd match methods fnval d5_qual stdmods_test susp_closure closure_mcall closure_fnfield closure_shadow zero_str susp_ownarg gui_mock gui_lifecycle gui_overflow gui_select gui_stress gui_cancel gui_dom gui_delay_stop js_ident; do
         case "$f" in
             conc_ping)      marker='bounces=' ;;
             conc_scale)     marker='done' ;;
@@ -1975,6 +2275,7 @@ if command -v node >/dev/null 2>&1; then
             gui_dom)        marker='activated' ;;
             gui_delay_stop) marker='delay stop ok' ;;
             js_ident)       marker='js ident ok' ;;
+            susp_ownarg)    marker='susp ownarg ok' ;;
         esac
         out=$(with_timeout 60 "$SELFOXL" run --target js "tests/$f.oxl" 2>&1) || { echo "FAIL js lane $f: $out"; exit 1; }
         grep -q "$marker" <<<"$out" || { echo "FAIL js lane $f marker '$marker': $out"; exit 1; }

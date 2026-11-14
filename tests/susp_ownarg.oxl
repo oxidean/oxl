@@ -1,0 +1,46 @@
+package main
+
+// own->mut/ref args to an inline susp call must evaluate exactly once:
+// the borrow ledger mark, the child frame's p_ slot, and rt_unborrow
+// all share one temp. A raw arg expr would run 3x (and mark a
+// different object than the callee receives); the C lane must hold
+// the same marks across the poll.
+struct Ev { x: int }
+
+let made: int = 0
+
+fn mk() -> own Ev {
+    made = made + 1
+    e := new(Ev)
+    e.x = made
+    return e
+}
+
+fn take_mut(e: mut Ev) {
+    msleep(1)
+    if e.x < 1 {
+        println("FAIL mut arg unreadable")
+        exit(1)
+    }
+}
+
+fn take_ref(e: ref Ev) -> int {
+    msleep(1)
+    return e.x
+}
+
+fn main() {
+    made = 0
+    take_mut(mk())
+    if made != 1 {
+        println("FAIL mut arg evals=" + itoa(made))
+        exit(1)
+    }
+    made = 0
+    v := take_ref(mk())
+    if made != 1 || v != 1 {
+        println("FAIL ref arg evals=" + itoa(made) + " v=" + itoa(v))
+        exit(1)
+    }
+    println("susp ownarg ok")
+}

@@ -1246,15 +1246,12 @@ echo "== toolchain driver in .oxl (t2) =="
 # the driver was built (gen1+gen2) and fixpoint-verified in the
 # t6 section above — SELFOXL is the product binary
 # command surface: bare usage, unknown command, and list's usage error
-# are byte-identical stderr + exit codes (2/2/2) — modulo the
-# sanctioned W-extension: the self driver documents `[--target js]`
-# and `[--html]` on build/run/test, flags the frozen seed can never
-# grow (its emit lane is C-only). Scrub exactly those markers off
-# the self side before comparing; any other drift still fails.
+# are byte-identical stderr + exit codes (2/2/2). The stage-0 snapshot
+# compiles the same driver sources as gen1, so no output scrubbing is
+# needed — seed and self are the same program at different generations.
 for inv in "" "bogus" "list"; do
     seed_out=$("$SEEDOXL" $inv 2>&1) && seed_rc=0 || seed_rc=$?
     self_out=$("$SELFOXL" $inv 2>&1) && self_rc=0 || self_rc=$?
-    self_out=$(printf '%s\n' "$self_out" | sed 's/ \[--target js\]//g; s/ \[--html\]//g')
     if [ "$seed_out" != "$self_out" ] || [ "$seed_rc" != "$self_rc" ]; then
         echo "FAIL driver parity: \`oxl $inv\`"
         echo "-- seed ($seed_rc) --"; printf '%s\n' "$seed_out"

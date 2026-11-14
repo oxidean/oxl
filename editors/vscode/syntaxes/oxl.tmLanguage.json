@@ -2,20 +2,43 @@
   "name": "OXL",
   "scopeName": "source.oxl",
   "patterns": [
-    { "include": "#comment" },
-    { "include": "#string" },
-    { "include": "#char" },
-    { "include": "#number" },
-    { "include": "#keyword" },
-    { "include": "#type" },
-    { "include": "#function" },
-    { "include": "#constant" }
+    {
+      "include": "#comment"
+    },
+    {
+      "include": "#string"
+    },
+    {
+      "include": "#char"
+    },
+    {
+      "include": "#number"
+    },
+    {
+      "include": "#function"
+    },
+    {
+      "include": "#keyword"
+    },
+    {
+      "include": "#type"
+    },
+    {
+      "include": "#constant"
+    }
   ],
   "repository": {
     "comment": {
       "patterns": [
-        { "name": "comment.line.double-slash.oxl", "match": "//.*$" },
-        { "name": "comment.block.oxl", "begin": "/\\*", "end": "\\*/" }
+        {
+          "name": "comment.line.double-slash.oxl",
+          "match": "//.*$"
+        },
+        {
+          "name": "comment.block.oxl",
+          "begin": "/\\*",
+          "end": "\\*/"
+        }
       ]
     },
     "string": {
@@ -23,7 +46,10 @@
       "begin": "\"",
       "end": "\"",
       "patterns": [
-        { "name": "constant.character.escape.oxl", "match": "\\\\(u[0-9a-fA-F]{4}|x[0-9a-fA-F]{2}|.)" }
+        {
+          "name": "constant.character.escape.oxl",
+          "match": "\\\\(u[0-9a-fA-F]{4}|x[0-9a-fA-F]{2}|.)"
+        }
       ]
     },
     "char": {
@@ -31,13 +57,22 @@
       "begin": "'",
       "end": "'",
       "patterns": [
-        { "name": "constant.character.escape.oxl", "match": "\\\\(u[0-9a-fA-F]{4}|x[0-9a-fA-F]{2}|.)" }
+        {
+          "name": "constant.character.escape.oxl",
+          "match": "\\\\(u[0-9a-fA-F]{4}|x[0-9a-fA-F]{2}|.)"
+        }
       ]
     },
     "number": {
       "patterns": [
-        { "name": "constant.numeric.float.oxl", "match": "\\b\\d+\\.\\d+([eE][+-]?\\d+)?\\b" },
-        { "name": "constant.numeric.integer.oxl", "match": "\\b\\d[\\d_]*\\b" }
+        {
+          "name": "constant.numeric.float.oxl",
+          "match": "\\b\\d+\\.\\d+([eE][+-]?\\d+)?\\b"
+        },
+        {
+          "name": "constant.numeric.integer.oxl",
+          "match": "\\b\\d[\\d_]*\\b"
+        }
       ]
     },
     "keyword": {
@@ -45,12 +80,22 @@
       "match": "\\b(fn|struct|enum|interface|extern|return|if|else|for|let|scope|spawn|go|goin|spawnBlocking|chan|select|defer|match|as|import|package|break|continue)\\b"
     },
     "type": {
-      "name": "keyword.type.oxl",
+      "name": "storage.type.oxl",
       "match": "\\b(int|float|bool|str|byte|void|err|cstr|own|ref|mut|unsafe|nil|true|false|any|ordered|eq|add)\\b"
     },
     "function": {
       "patterns": [
-        { "name": "entity.name.function.oxl", "match": "\\b(fn)\\s+([A-Za-z_][A-Za-z0-9_]*)" }
+        {
+          "match": "\\b(fn)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": {
+              "name": "keyword.declaration.oxl"
+            },
+            "2": {
+              "name": "entity.name.function.oxl"
+            }
+          }
+        }
       ]
     },
     "constant": {

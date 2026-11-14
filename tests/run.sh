@@ -104,6 +104,10 @@ SELFOXL2="$PWD/target/oxl-self2$EXE"
 "$SELFOXL2" run bootstrap/cmd/codegen -- cmd/oxl > "$scratch/drv2.c" || { echo "FAIL gen2 emit"; exit 1; }
 diff "$scratch/drv0.c" "$scratch/drv1.c" >/dev/null || { echo "FAIL driver C fixpoint (seed vs gen1)"; diff "$scratch/drv0.c" "$scratch/drv1.c" | head -20; exit 1; }
 diff "$scratch/drv1.c" "$scratch/drv2.c" >/dev/null || { echo "FAIL driver C fixpoint (gen1 vs gen2)"; diff "$scratch/drv1.c" "$scratch/drv2.c" | head -20; exit 1; }
+# the checked-in snapshot must be the emit of the current driver
+# sources — drv0 is that emit via the seed, so a stale snapshot fails
+# here with a pointer back to scripts/stage0.sh emit
+diff "$scratch/drv0.c" bootstrap/stage0/oxl.c >/dev/null || { echo "FAIL stage-0 snapshot stale: regenerate with scripts/stage0.sh emit"; diff "$scratch/drv0.c" bootstrap/stage0/oxl.c | head -20; exit 1; }
 OXL="$SELFOXL"
 
 echo "== hello =="
@@ -1822,7 +1826,7 @@ assert any(c["label"] == "main" for c in comp), comp[:5]
 assert any(c["label"] == "fn" for c in comp)
 
 # semanticTokens: full-doc data, 5 ints per token, non-empty
-send({"jsonrpc":"2.0","id":13,"method":"textDocument/semanticTokens","params":{"textDocument":{"uri":uri}}})
+send({"jsonrpc":"2.0","id":13,"method":"textDocument/semanticTokens/full","params":{"textDocument":{"uri":uri}}})
 tok = recv_id(13)["result"]["data"]
 assert len(tok) > 0 and len(tok) % 5 == 0, tok[:20]
 

@@ -10,6 +10,8 @@ import "oxl/bootstrap/check"
 
 import "oxl/bootstrap/lexlib"
 
+import "std/collections"
+
 import "std/encoding/json"
 
 import "std/os"
@@ -34,6 +36,10 @@ struct PubU { key: str, uri: str }
 struct Lsp { docs: []LDoc, ans: []Anl, pubs: []PubU, root: str }
 
 struct LC { l: int, c: int }
+
+// a (byte-pos, line, utf16-col) cursor — lsp_advance walks it forward
+// so offset-sorted consumers don't rescan the source per position
+struct LCur { p: int, l: int, c: int }
 
 // ---------- utf8/utf-16 units ----------
 // byte-length of the utf8 sequence starting with lead byte b
@@ -105,6 +111,28 @@ fn lsp_line_col(src: str, off: int) -> LC {
     return LC{l: l, c: c}
 }
 
+// advance cur forward to byte offset `off` (off >= cur.p); same
+// UTF-16 column accounting as lsp_line_col
+fn lsp_advance(src: str, off: int, cur: LCur) -> LCur {
+    i := cur.p
+    l := cur.l
+    c := cur.c
+    for i < len(src) && i < off {
+        ch := byteat(src, i)
+        if ch == 10 {
+            l = l + 1
+            c = 0
+        } else {
+            c = c + 1
+            if u8len(ch) == 4 {
+                c = c + 1
+            }
+        }
+        i = i + u8len(ch)
+    }
+    return LCur{p: i, l: l, c: c}
+}
+
 // ---------- naive json (seed-parity extractors) ----------
 fn is_alpha(c: int) -> bool {
     return c >= 65 && c <= 90 || c >= 97 && c <= 122
@@ -112,6 +140,10 @@ fn is_alpha(c: int) -> bool {
 
 fn is_alnum(c: int) -> bool {
     return is_alpha(c) || c >= 48 && c <= 57
+}
+
+fn is_ident_char(c: int) -> bool {
+    return is_alnum(c) || c == 95
 }
 
 fn hexval(c: int) -> int {
@@ -735,10 +767,10 @@ fn word_eq(src: str, i: int, w: str) -> bool {
     if substr(src, i, i + len(w)) != w {
         return false
     }
-    if i > 0 && is_alnum(byteat(src, i - 1)) {
+    if i > 0 && is_ident_char(byteat(src, i - 1)) {
         return false
     }
-    if i + len(w) < len(src) && is_alnum(byteat(src, i + len(w))) {
+    if i + len(w) < len(src) && is_ident_char(byteat(src, i + len(w))) {
         return false
     }
     return true
@@ -996,6 +1028,23 @@ fn lsp_semantic_tokens(ck: ref check.Ck, file: str, src: str) -> own json.Json {
     hd := lexlib.lex(src)
     toks := st_walk(hd, src, mkslice(STok, 0))
     all := st_merge(toks, st_comments(src, toks))
+    // per-request lookup tables — the token loop must not rescan the
+    // package-wide use/decl tables once per identifier
+    um := collections.map_new()
+    ui := 0
+    for ui < len(ck.usev) {
+        x := ck.usev[ui]
+        collections.map_set(um, x.file + "|" + itoa(x.lo) + "|" + itoa(x.hi), ui)
+        ui = ui + 1
+    }
+    dm := collections.map_new()
+    di := 0
+    for di < len(ck.declsv) {
+        d := ck.declsv[di]
+        collections.map_set(dm, d.file + "|" + itoa(d.lo) + "|" + itoa(d.hi), d.kind)
+        di = di + 1
+    }
+    cur := LCur{p: 0, l: 0, c: 0}
     pl := 0
     pc := 0
     i := 0
@@ -1004,14 +1053,34 @@ fn lsp_semantic_tokens(ck: ref check.Ck, file: str, src: str) -> own json.Json {
         ty := tk.ty
         if ty == 8 {
             // ident: upgrade variable -> decl kind via the use index
-            mid := tk.lo + 1
-            if mid >= tk.hi {
-                mid = tk.lo
+            u := -1
+            uk := file + "|" + itoa(tk.lo) + "|" + itoa(tk.hi)
+            if collections.map_has(um, uk) {
+                [uv, ue] = collections.map_get(um, uk)
+                if ue == nil {
+                    u = uv
+                }
             }
-            u := index_at(ck.usev, file, mid)
+            if u < 0 {
+                mid := tk.lo + 1
+                if mid >= tk.hi {
+                    mid = tk.lo
+                }
+                u = index_at(ck.usev, file, mid)
+            }
             if u >= 0 {
                 x := ck.usev[u]
-                dk := decl_kind_of(ck.declsv, x.def_file, x.def_lo, x.def_hi)
+                dk := -1
+                dkkey := x.def_file + "|" + itoa(x.def_lo) + "|" + itoa(x.def_hi)
+                if collections.map_has(dm, dkkey) {
+                    [dv, de] = collections.map_get(dm, dkkey)
+                    if de == nil {
+                        dk = dv
+                    }
+                }
+                if dk < 0 {
+                    dk = decl_kind_of(ck.declsv, x.def_file, x.def_lo, x.def_hi)
+                }
                 if dk >= 0 {
                     ty = st_kind(dk)
                 }
@@ -1025,8 +1094,11 @@ fn lsp_semantic_tokens(ck: ref check.Ck, file: str, src: str) -> own json.Json {
                 eol = eol + 1
             }
             if eol > seg {
-                pa := lsp_line_col(src, seg)
-                pb := lsp_line_col(src, eol)
+                if seg < cur.p {
+                    cur = LCur{p: 0, l: 0, c: 0}
+                }
+                pa := lsp_advance(src, seg, cur)
+                pb := lsp_advance(src, eol, pa)
                 dl := pa.l - pl
                 dc := pa.c
                 if dl == 0 {
@@ -1040,6 +1112,7 @@ fn lsp_semantic_tokens(ck: ref check.Ck, file: str, src: str) -> own json.Json {
                 json.jarrb_add(db, json.jint(0))
                 pl = pa.l
                 pc = pa.c
+                cur = pa
             }
             if eol >= tk.hi {
                 break
@@ -1200,7 +1273,7 @@ fn decl_qname_of(sig: str) -> str {
 fn lsp_completion(ck: ref check.Ck, file: str, src: str, off: int) -> own json.Json {
     // identifier prefix immediately before the cursor
     ps := off
-    for ps > 0 && is_alnum(byteat(src, ps - 1)) {
+    for ps > 0 && is_ident_char(byteat(src, ps - 1)) {
         ps = ps - 1
     }
     prefix := substr(src, ps, off)
@@ -1215,7 +1288,7 @@ fn lsp_completion(ck: ref check.Ck, file: str, src: str, off: int) -> own json.J
         // receiver: last ident before the '.'
         rend := dotpos
         rstart := rend
-        for rstart > 0 && is_alnum(byteat(src, rstart - 1)) {
+        for rstart > 0 && is_ident_char(byteat(src, rstart - 1)) {
             rstart = rstart - 1
         }
         if rstart < rend {
@@ -1453,7 +1526,7 @@ fn lsp_signature_help(ck: ref check.Ck, file: str, src: str, off: int) -> own js
         ce = ce - 1
     }
     cs := ce
-    for cs > 0 && is_alnum(byteat(src, cs - 1)) {
+    for cs > 0 && is_ident_char(byteat(src, cs - 1)) {
         cs = cs - 1
     }
     if cs == ce {
@@ -1618,7 +1691,7 @@ fn local_name_span(dsrc: str, r: check.UseRec) -> LC {
     }
     k := 1
     for k < len(nm) {
-        if !is_alnum(byteat(nm, k)) {
+        if !is_ident_char(byteat(nm, k)) {
             return res
         }
         k = k + 1
@@ -1746,10 +1819,9 @@ fn lsp_document_highlight(ck: ref check.Ck, docs: []LDoc, file: str, src: str, o
         i := 0
         for i < len(ck.usev) {
             x := ck.usev[i]
-            if def_key(x.def_file, x.def_lo, x.def_hi) == dk && is_decl_self(ck, x) == 0 {
-                xsrc := file_src(docs, x.file)
+            if x.file == file && def_key(x.def_file, x.def_lo, x.def_hi) == dk && is_decl_self(ck, x) == 0 {
                 h := json.jobj()
-                json.jadd(h, "range", jrange_at(xsrc, x.lo, x.hi))
+                json.jadd(h, "range", jrange_at(src, x.lo, x.hi))
                 json.jadd(h, "kind", json.jint(1))
                 json.jarrb_add(arr, h)
             }
@@ -1826,6 +1898,18 @@ fn lsp_rename(ck: ref check.Ck, docs: []LDoc, file: str, src: str, off: int, new
     }
     r := ck.usev[u]
     tdk := def_key(r.def_file, r.def_lo, r.def_hi)
+    // type and field references are not fully indexed (type
+    // annotations and literal keys never reach usev), so renaming
+    // those decls would leave stale references behind
+    tkind := decl_kind_of(ck.declsv, r.def_file, r.def_lo, r.def_hi)
+    if tkind == 1 || tkind == 2 || tkind == 3 || tkind == 4 {
+        p := json.jobj()
+        json.jadd(p, "type", json.jint(2))
+        json.jadd(p, "message", json.jstr("rename rejected: type and field renames are not supported yet"))
+        lsp_frame(lsp_notify("window/showMessage", p))
+        json.jadd(res, "changes", ch)
+        return res
+    }
     warn := rename_conflict(ck, docs, newname, tdk, r)
     if len(warn) > 0 {
         p := json.jobj()
@@ -1840,6 +1924,7 @@ fn lsp_rename(ck: ref check.Ck, docs: []LDoc, file: str, src: str, off: int, new
     dlo := -1
     dhi := -1
     dfile := ""
+    oldname := ""
     di := 0
     for di < len(ck.declsv) {
         d := ck.declsv[di]
@@ -1850,6 +1935,7 @@ fn lsp_rename(ck: ref check.Ck, docs: []LDoc, file: str, src: str, off: int, new
                 dlo = ns.l
                 dhi = ns.c
                 dfile = d.file
+                oldname = d.name
             }
             di = len(ck.declsv)
         }
@@ -1862,6 +1948,10 @@ fn lsp_rename(ck: ref check.Ck, docs: []LDoc, file: str, src: str, off: int, new
             dlo = ns.l
             dhi = ns.c
             dfile = r.def_file
+            nc := find(r.sig, ": ")
+            if nc > 0 {
+                oldname = substr(r.sig, 0, nc)
+            }
         }
     }
     if dlo < 0 {
@@ -1873,6 +1963,25 @@ fn lsp_rename(ck: ref check.Ck, docs: []LDoc, file: str, src: str, off: int, new
         lsp_frame(lsp_notify("window/showMessage", p))
         json.jadd(res, "changes", ch)
         return res
+    }
+    // every recorded use must cover exactly the old name — composite
+    // spans (E.V, pkg.T{..}) would be corrupted by a whole-span
+    // rewrite, so refuse the rename rather than produce a partial one
+    vi := 0
+    for vi < len(ck.usev) {
+        x := ck.usev[vi]
+        if def_key(x.def_file, x.def_lo, x.def_hi) == tdk && is_decl_self(ck, x) == 0 {
+            xsrc := file_src(docs, x.file)
+            if substr(xsrc, x.lo, x.hi) != oldname {
+                p := json.jobj()
+                json.jadd(p, "type", json.jint(2))
+                json.jadd(p, "message", json.jstr("rename rejected: a reference does not resolve to a plain identifier"))
+                lsp_frame(lsp_notify("window/showMessage", p))
+                json.jadd(res, "changes", ch)
+                return res
+            }
+        }
+        vi = vi + 1
     }
     // unique URIs in first-seen order: decl site first, then uses
     ulist := mkslice(str, 0)
@@ -2194,11 +2303,13 @@ fn cmd_lsp() {
             }
             res := json.jobj()
             json.jadd(res, "capabilities", lsp_capabilities())
-            json.jadd(res, "serverInfo", json.jstr("oxl"))
+            sinfo := json.jobj()
+            json.jadd(sinfo, "name", json.jstr("oxl"))
+            json.jadd(res, "serverInfo", sinfo)
             resp = lsp_result(idn, res)
         } else if method == "shutdown" {
             resp = lsp_result(idn, json.jnull())
-        } else if method == "textDocument/hover" || method == "textDocument/definition" || method == "textDocument/completion" || method == "textDocument/signatureHelp" || method == "textDocument/documentSymbol" || method == "textDocument/documentHighlight" || method == "textDocument/references" || method == "textDocument/rename" || method == "textDocument/formatting" || method == "textDocument/semanticTokens" {
+        } else if method == "textDocument/hover" || method == "textDocument/definition" || method == "textDocument/completion" || method == "textDocument/signatureHelp" || method == "textDocument/documentSymbol" || method == "textDocument/documentHighlight" || method == "textDocument/references" || method == "textDocument/rename" || method == "textDocument/formatting" || method == "textDocument/semanticTokens/full" || method == "textDocument/semanticTokens" {
             td := jsub(params, "textDocument")
             uri := jfield_str(td, "uri")
             file := uri_to_path(uri)
@@ -2214,7 +2325,7 @@ fn cmd_lsp() {
                     res = lsp_document_symbol(ls.ans[ai].res.ck, file, src)
                 } else if method == "textDocument/formatting" {
                     res = lsp_formatting(file, src)
-                } else if method == "textDocument/semanticTokens" {
+                } else if method == "textDocument/semanticTokens/full" || method == "textDocument/semanticTokens" {
                     res = lsp_semantic_tokens(ls.ans[ai].res.ck, file, src)
                 } else {
                     pos := jsub(params, "position")
@@ -2262,7 +2373,7 @@ fn cmd_lsp() {
                         } else {
                             ni := 1
                             for ni < len(nn) {
-                                if !is_alnum(byteat(nn, ni)) {
+                                if !is_ident_char(byteat(nn, ni)) {
                                     bad = 1
                                 }
                                 ni = ni + 1

@@ -10,7 +10,7 @@ and a Qt/GTK FFI bridge. Web target (JS/HTML/CSS) parked.
 
 Stage-0 bootstrap: `bootstrap/stage0/oxl.c`, a checked-in C snapshot
 of the driver emitted by `bootstrap/cmd/codegen`, compiled through
-the system `cc` (`LANG_CC`/`LANG_LDFLAGS`/`LANG_SQLITE_SRC` knobs).
+the system `cc` (`LANG_CC`/`LANG_SQLITE_SRC` knobs).
 The product toolchain is `cmd/oxl`, itself `.oxl` end to end; the
 `bootstrap/` components self-compile and run correctly
 — lexer/parser/check/codegen all four emit identical output under

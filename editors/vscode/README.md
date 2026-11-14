@@ -1,7 +1,7 @@
 # oxl-language
 
 Syntax highlighting and language configuration for
-[oxl](https://github.com/oxidean-org/language-selfhost-editor) (`.oxl`
+[oxl](https://github.com/oxidean/oxl) (`.oxl`
 files).
 
 ## Install

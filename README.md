@@ -67,9 +67,10 @@ source below.
 
 Requires: a C compiler (`cc`) and pthreads. The stage-0 snapshot
 (`bootstrap/stage0/oxl.c`) bootstraps the self-hosted driver — no Rust
-toolchain needed. Programs that use the sqlite3 shims also need
-sqlite3 dev headers (`-lsqlite3` is linked only when the emitted C calls
-it). Supported platforms: Linux (x86_64), macOS (aarch64), and Windows
+toolchain needed. The driver links SQLite, so the build needs the
+sqlite3 library (`-lsqlite3`) or `LANG_SQLITE_SRC` pointing at the
+SQLite sources — even for programs that never touch the sqlite3 shims
+(user programs that do use them need it as well). Supported platforms: Linux (x86_64), macOS (aarch64), and Windows
 (x86_64, via MinGW gcc or LLVM clang — the runtime's `oxl_*` veneer in
 `runtime/rt.h` maps threads/sync to SRWLOCK+CONDITION_VARIABLE and
 sockets to WinSock2).

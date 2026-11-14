@@ -27,7 +27,7 @@ before codegen if any `Error` exists.
 
 ```rust
 enum Tok { Ident(String), Int(i64), Float(f64), Str(String), Kw(Kw), P(P), Eof }
-struct Token { tok: Tok, span: Span }   // Span { lo, hi } — byte offsets (diag.rs)
+struct Token { tok: Tok, span: Span }   // Span { lo, hi } — byte offsets
 ```
 
 Keywords: `fn struct extern return if else for let scope spawn go own
@@ -37,10 +37,10 @@ keywords.
 
 ## AST (parser output)
 
-`Crate { items: Vec<Item> }` where `Item = Fn | Struct | Enum | Extern |
-Interface | Import | Global`. Expressions/statements per
-`oxl/src/ast.rs` — the AST is deliberately syntactic (no desugaring in
-parser; `x := e` parses to `Stmt::Let { ty: None, .. }`).
+The self-hosted parser (`bootstrap/parser/parser.oxl`) produces a
+typed `Node` enum covering fns, structs, enums, globals, imports, and
+bodies — deliberately syntactic, with no desugaring in the parser
+(`x := e` stays a let-binding node, ty annotation optional).
 
 ## TAST (typechecker output — target contract)
 

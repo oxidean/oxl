@@ -16,23 +16,15 @@ with UTF-16 columns; documents sync as full text.
 ## VS Code
 
 Install the extension in `editors/vscode/` (see its README) for syntax
-highlighting and language configuration, then attach the language
-server. With a generic LSP client extension, or the built-in
-`vscode-languageclient` if you wire one up, the server command is:
-
-```json
-{
-  "command": "oxl",
-  "args": ["lsp"]
-}
-```
-
-Set `oxl.lsp.path` if your `oxl` binary is not on `PATH`.
+highlighting and language configuration. The extension does not bundle
+a language client — attach `oxl lsp` with whatever LSP client you use;
+the server command is `oxl` with args `["lsp"]`.
 
 ## Neovim (nvim-lspconfig)
 
 ```lua
-require('lspconfig').oxl = {
+vim.filetype.add({ extension = { oxl = 'oxl' } })
+require('lspconfig.configs').oxl = {
   default_config = {
     cmd = { 'oxl', 'lsp' },
     filetypes = { 'oxl' },

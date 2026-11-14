@@ -34,8 +34,15 @@ emit() {
         exit 1
     fi
     # codegen prints the driver's C (all imported modules inlined) on
-    # stdout; diagnostics stay on stderr
-    "$oxl" run bootstrap/cmd/codegen -- cmd/oxl > "$SNAP"
+    # stdout; diagnostics stay on stderr. Emit to a sibling temp and
+    # rename only on success so a failed regen never truncates the
+    # checked-in snapshot
+    tmp="$SNAP.tmp.$$"
+    if ! "$oxl" run bootstrap/cmd/codegen -- cmd/oxl > "$tmp"; then
+        rm -f "$tmp"
+        exit 1
+    fi
+    mv "$tmp" "$SNAP"
     echo "stage0: wrote $SNAP ($(wc -c < "$SNAP") bytes) via $oxl"
 }
 

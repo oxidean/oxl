@@ -17,7 +17,7 @@ The fixpoint needs *a* seed binary that can compile `bootstrap/` +
 
 | option | shape | tradeoff |
 |---|---|---|
-| **A. Checked-in C snapshot** | `bootstrap/stage0/oxl.c` (~1.6 MB, verified: compiles with `cc` + `runtime/rt.c` alone) committed; CI does `cc stage0.c rt.c -o oxl-seed`; run.sh uses it as SEEDOXL | deterministic, offline, one artifact for all 3 CI OSes; freshness is *enforced by the existing fixpoint* — a stale snapshot's emit diverges from gen1 and the gate fails, telling you to regenerate; regeneration needs a working oxl (installed release toolchain), documented as `scripts/stage0.sh` |
+| **A. Checked-in C snapshot** | `bootstrap/stage0/oxl.c` (~1.6 MB, verified: compiles with `cc` + `runtime/rt.c` alone) committed; CI does `cc stage0.c rt.c -o oxl-seed`; run.sh uses it as SEEDOXL | deterministic, offline, one artifact for all 3 CI OSes; freshness is *enforced twice* — run.sh diffs the seed emit against the checked-in snapshot byte-for-byte (stale → regenerate) and the gen1/gen2 fixpoint still gates emit drift; regeneration needs a working oxl (installed release toolchain), documented as `scripts/stage0.sh` |
 | B. Fetch previous release | CI downloads the pinned prior tag's toolchain asset as seed | no generated file in repo; but adds a network dep + version pin to every CI/release run, per-OS asset selection, and a bootstrap deadlock window if release assets change shape |
 | C. Frozen minimal Rust seed | strip `oxl/` to just enough emit | keeps Rust in the tree — the thing being removed; two compiler surfaces forever |
 

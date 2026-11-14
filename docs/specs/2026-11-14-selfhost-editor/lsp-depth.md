@@ -21,13 +21,13 @@ capabilities: {
   textDocumentSync: 1,
   hoverProvider: true,
   definitionProvider: true,
-  completionProvider: { triggerCharacters: [".", "("] },
+  completionProvider: { triggerCharacters: ["."] },
   signatureHelpProvider: { triggerCharacters: ["(", ","] },
   documentSymbolProvider: true,
   documentFormattingProvider: true,
   semanticTokensProvider: {
     legend: { tokenTypes, tokenModifiers },   // fixed order
-    full: { delta: null }                      // full-document only
+    full: { delta: false }                     // full-document only
   },
   referencesProvider: true,
   renameProvider: { prepareProvider: false },
@@ -54,8 +54,8 @@ capabilities: {
   by span containment; `kind` from decl class; `range`/`selectionRange`
   from lo/hi.
 - **formatting** — whole-document `fmt_text(src)`; returns
-  `TextEdit[]` with one full-range edit (or null when already
-  canonical — client no-ops either way).
+  `TextEdit[]` with one full-range edit, `[]` when the text is
+  already canonical, and `null` when formatting fails.
 - **semanticTokens** — full-document token stream. Legend:
   namespace, type, class, enum, interface, struct, typeParameter,
   parameter, variable, property, enumMember, event, function,
@@ -89,16 +89,17 @@ capabilities: {
 
 Unchanged contract: scoped `publishDiagnostics` per
 (file → package-dir) so one package's analysis never clears
-another's. Versioned per didChange; stale publishes for
-superseded versions are dropped.
+another's. Publishes are unversioned — each publish replaces the
+prior diagnostic set for that URI.
 
 ## Errors
 
 - Unknown method → `-32601`.
-- Malformed JSON / missing Content-Length → `-32700`, connection
-  stays up.
-- Request on unopened/unanalyzed doc → analyze on demand (current
-  behavior), then answer.
+- Malformed JSON → `-32700`, connection stays up. A header block
+  with a missing/unusable Content-Length is dropped silently —
+  no response, connection stays up.
+- Request on unopened/unanalyzed doc → `null` result (analysis
+  runs on didOpen/didChange, not on demand).
 - Rename rejection → successful response with empty `changes`
   plus the showMessage notification (not a JSON-RPC error — the
   request itself was valid).

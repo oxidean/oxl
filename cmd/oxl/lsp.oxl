@@ -449,16 +449,17 @@ fn doc_put(ls: mut Lsp, uri: str, p: str, text: str) {
     ls.docs = push(ls.docs, LDoc{uri: uri, path: p, text: text})
 }
 
-fn doc_drop(ls: mut Lsp, uri: str) {
+fn doc_drop(ls: mut Lsp, uri: str) -> int {
     i := 0
     for i < len(ls.docs) {
         if ls.docs[i].uri == uri {
             ls.docs[i] = ls.docs[len(ls.docs) - 1]
             ls.docs = ls.docs[0:len(ls.docs) - 1]
-            return
+            return 1
         }
         i = i + 1
     }
+    return 0
 }
 
 // the open doc's buffer text by URI (hover/def positions map against it)
@@ -537,16 +538,19 @@ fn pub_rebuild(ls: mut Lsp, key: str, current: []str) {
 
 // a closed doc's URIs leave every scope's published set — the client
 // won't show its diagnostics anymore
-fn pub_drop_uri(ls: mut Lsp, uri: str) {
+fn pub_drop_uri(ls: mut Lsp, uri: str) -> int {
+    dropped := 0
     i := 0
     for i < len(ls.pubs) {
         if ls.pubs[i].uri == uri {
             ls.pubs[i] = ls.pubs[len(ls.pubs) - 1]
             ls.pubs = ls.pubs[0:len(ls.pubs) - 1]
+            dropped = 1
         } else {
             i = i + 1
         }
     }
+    return dropped
 }
 
 // a closed doc's text was an overlay input to EVERY cached analysis
@@ -1194,7 +1198,10 @@ fn lsp_semantic_tokens(ck: ref check.Ck, file: str, src: str, rlo: int, rhi: int
             for eol < tk.hi && byteat(src, eol) != 10 {
                 eol = eol + 1
             }
-            if eol > seg {
+            // multi-line tokens (block comments, strings) yield one
+            // segment per line — keep only segments intersecting the
+            // requested range or /range leaks tokens outside it
+            if eol > seg && seg < rhi && eol > rlo {
                 if seg < cur.p {
                     cur = LCur{p: 0, l: 0, c: 0}
                 }
@@ -1840,9 +1847,14 @@ fn def_key(df: str, dl: int, dh: int) -> str {
 // decl-file -> client URI, resolving relative decl paths against the
 // requesting doc's dir (same rule the definition response used)
 fn lsp_uri_for(df: str, file: str) -> str {
-    // absolute = `/`-rooted (POSIX) or drive-rooted (`D:/...`, the
-    // spelling uri_to_path produces for Windows file URIs)
-    if len(df) > 0 && (byteat(df, 0) == 47 || len(df) > 1 && is_alpha(byteat(df, 0)) && byteat(df, 1) == 58) {
+    // absolute = `/`-rooted (POSIX) or drive-rooted (`D:/...`/`D:\...`,
+    // the spellings uri_to_path produces for Windows file URIs) — a
+    // bare `X:` prefix is NOT enough: `a:b/f` is a legal POSIX relative
+    // path and `D:foo` is drive-relative, not absolute
+    if len(df) > 0 && byteat(df, 0) == 47 {
+        return path_to_uri(df)
+    }
+    if len(df) > 2 && is_alpha(byteat(df, 0)) && byteat(df, 1) == 58 && (byteat(df, 2) == 47 || byteat(df, 2) == 92) {
         return path_to_uri(df)
     }
     base := check.dir_of(file)
@@ -2364,7 +2376,7 @@ fn lsp_register_watched(ls: mut Lsp) {
     json.jadd(p, "registrations", json.jarrb_arr(regs))
     r := json.jobj()
     json.jadd(r, "jsonrpc", json.jstr("2.0"))
-    json.jadd(r, "id", json.jint(ls.rid))
+    json.jadd(r, "id", json.jstr("oxl-req-" + itoa(ls.rid)))
     ls.rid = ls.rid + 1
     json.jadd(r, "method", json.jstr("client/registerCapability"))
     json.jadd(r, "params", p)
@@ -2458,9 +2470,16 @@ fn cmd_lsp() {
             td := jsub(params, "textDocument")
             uri := jfield_str(td, "uri")
             if len(uri) > 0 {
-                doc_drop(ls, uri)
-                pub_drop_uri(ls, uri)
-                doc_close_invalidate(ls)
+                dropped := doc_drop(ls, uri)
+                pdrop := pub_drop_uri(ls, uri)
+                // diagnostics are server-owned — clear the closed
+                // doc's set explicitly; clients may retain them
+                if dropped == 1 || pdrop == 1 {
+                    publish_diags(uri, mkslice(LDiag, 0))
+                }
+                if dropped == 1 {
+                    doc_close_invalidate(ls)
+                }
             }
             continue
         }

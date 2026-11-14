@@ -3919,6 +3919,9 @@ fn call(ck: mut Ck, f: ref parser.Node, args: ref parser.NList, env: mut Env) ->
             // index records here or every arg use lands twice
             oi := ck.in_infer
             ck.in_infer = 1
+            // the inference expr() re-runs are speculative — move marks
+            // they leave behind would false-positive in the real pass
+            msv := moved_save(env)
             wl0 := sig.params
             if recv != nil && wl0 != nil {
                 bind_vars(ck, wl0.v, expr(ck, recv, env), bind)
@@ -3943,6 +3946,7 @@ fn call(ck: mut Ck, f: ref parser.Node, args: ref parser.NList, env: mut Env) ->
                 }
                 tl = tl.next
             }
+            moved_restore(env, msv)
             ck.in_infer = oi
         }
         wl := sig.params
@@ -4618,7 +4622,8 @@ fn closure_expr(ck: mut Ck, params: ref parser.NList, body: ref parser.Node, env
     for pl != nil && wl != nil {
         match pl.v {
             parser.Node.Param{name, ty, lo, hi} => {
-                env_set(env, name, wl.v, lo, hi)
+                env_set(env, name, wl.v, lo, lo + len(name))
+                rec_local(ck, lo, lo + len(name), name, wl.v, env)
             }
             _ => {
             }

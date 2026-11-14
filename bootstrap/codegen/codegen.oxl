@@ -5756,8 +5756,11 @@ fn genall(g: mut G) -> str {
         for i < len(g.its) {
             if check.nk(g.its[i].node) == 24 {
                 match g.its[i].node {
-                    parser.Node.Fn{name} => {
-                        if len(name) > 5 && substr(name, 0, 5) == "test_" {
+                    parser.Node.Fn{ex, name, recv, typarams} => {
+                        // only plain fns have a callable o_f_ entry —
+                        // methods need a receiver, externs have no body,
+                        // generics exist only as instantiations
+                        if !ex && recv == nil && typarams == nil && len(name) > 5 && substr(name, 0, 5) == "test_" {
                             qn := check.qname(g.its[i].mod, name)
                             cn := cname(qn)
                             sid := itoa(id)

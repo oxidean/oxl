@@ -926,14 +926,14 @@ void o_f_lsp_frame(OxlStr s);
 void o_f_publish_diags(OxlStr uri, RtSlice list);
 int o_f_has_str(RtSlice ss, OxlStr s);
 void o_f_doc_put(struct o_s_Lsp* ls, OxlStr uri, OxlStr p, OxlStr text);
-void o_f_doc_drop(struct o_s_Lsp* ls, OxlStr uri);
+int64_t o_f_doc_drop(struct o_s_Lsp* ls, OxlStr uri);
 OxlStr o_f_doc_text_by_uri(RtSlice docs, OxlStr uri);
 OxlStr o_f_doc_text_by_path(RtSlice docs, OxlStr p);
 OxlStr o_f_dir_key(OxlStr p);
 int64_t o_f_anl_at(RtSlice ans, OxlStr key);
 void o_f_anl_put(struct o_s_Lsp* ls, struct o_s_Anl* a);
 void o_f_pub_rebuild(struct o_s_Lsp* ls, OxlStr key, RtSlice current);
-void o_f_pub_drop_uri(struct o_s_Lsp* ls, OxlStr uri);
+int64_t o_f_pub_drop_uri(struct o_s_Lsp* ls, OxlStr uri);
 void o_f_doc_close_invalidate(struct o_s_Lsp* ls);
 struct o_s_check_OverEnt* o_f_build_over(RtSlice docs, OxlStr p, OxlStr text);
 struct o_s_Anl* o_f_analyze_lsp(OxlStr path, struct o_s_check_OverEnt* over, RtSlice docs);
@@ -12138,6 +12138,7 @@ int64_t o_f_check_call(struct o_s_check_Ck* ck, struct o_en_parser_Node* f, stru
     if ((sig.f_typarams != 0)) {
     int64_t oi = ck->f_in_infer;
     ck->f_in_infer = 1LL;
+    struct o_s_check_LL* msv = o_f_check_moved_save(env);
     struct o_s_check_IList* wl0 = sig.f_params;
     if (((recv != 0) && (wl0 != 0))) {
     ({ struct o_s_collections_Map* _ba263 = bind; rt_borrow_mut(_ba263); o_f_check_bind_vars(ck, wl0->f_v, o_f_check_expr(ck, recv, env), _ba263); rt_unborrow(_ba263); });
@@ -12164,6 +12165,7 @@ int64_t o_f_check_call(struct o_s_check_Ck* ck, struct o_en_parser_Node* f, stru
     }
     tl = tl->f_next;
     }
+    o_f_check_moved_restore(env, msv);
     ck->f_in_infer = oi;
     }
     struct o_s_check_IList* wl = sig.f_params;
@@ -12770,7 +12772,8 @@ int64_t o_f_check_closure_expr(struct o_s_check_Ck* ck, struct o_s_parser_NList*
     pl = params;
     struct o_s_check_IList* wl = ps;
     while (((pl != 0) && (wl != 0))) {
-    ({ struct o_en_parser_Node* _ms = pl->f_v; if ((*_ms).tag == 6) { int64_t hi = (*_ms).u.v6.f_hi; int64_t lo = (*_ms).u.v6.f_lo; struct o_en_parser_Node* ty = (*_ms).u.v6.f_ty; OxlStr name = (*_ms).u.v6.f_name;     o_f_check_env_set(env, name, wl->f_v, lo, hi);
+    ({ struct o_en_parser_Node* _ms = pl->f_v; if ((*_ms).tag == 6) { int64_t hi = (*_ms).u.v6.f_hi; int64_t lo = (*_ms).u.v6.f_lo; struct o_en_parser_Node* ty = (*_ms).u.v6.f_ty; OxlStr name = (*_ms).u.v6.f_name;     o_f_check_env_set(env, name, wl->f_v, lo, (lo + rt_len(name)));
+    o_f_check_rec_local(ck, lo, (lo + rt_len(name)), name, wl->f_v, env);
 } else { } });
     wl = wl->f_next;
     pl = pl->f_next;
@@ -19860,7 +19863,7 @@ void o_f_doc_put(struct o_s_Lsp* ls, OxlStr uri, OxlStr p, OxlStr text) {
     rt_defer_drain_to(_dmark);
 }
 
-void o_f_doc_drop(struct o_s_Lsp* ls, OxlStr uri) {
+int64_t o_f_doc_drop(struct o_s_Lsp* ls, OxlStr uri) {
     RtDefer *_dmark = rt_defer_mark();
     int64_t i = 0LL;
     while ((i < (ls->f_docs).len)) {
@@ -19868,10 +19871,12 @@ void o_f_doc_drop(struct o_s_Lsp* ls, OxlStr uri) {
     (*({ RtSlice _ms = ls->f_docs; int64_t _mi = i; if (_mi < 0 || _mi >= _ms.len) rt_trap(10); (struct o_s_LDoc*)_ms.ptr + _mi; })) = (*({ RtSlice _ms = ls->f_docs; int64_t _mi = ((ls->f_docs).len - 1LL); if (_mi < 0 || _mi >= _ms.len) rt_trap(10); (struct o_s_LDoc*)_ms.ptr + _mi; }));
     ls->f_docs = ({ RtSlice _ms = ls->f_docs; int64_t _ma = 0LL; int64_t _mb = ((ls->f_docs).len - 1LL); if (_ma < 0 || _mb < _ma || _mb > _ms.len) rt_trap(10); (RtSlice){ (struct o_s_LDoc*)_ms.ptr + _ma, _mb - _ma, _ms.cap - _ma, _ms.heap }; });
     rt_defer_drain_to(_dmark);
-    return;
+    return 1LL;
     }
     i = (i + 1LL);
     }
+    rt_defer_drain_to(_dmark);
+    return 0LL;
     rt_defer_drain_to(_dmark);
 }
 
@@ -19967,17 +19972,21 @@ void o_f_pub_rebuild(struct o_s_Lsp* ls, OxlStr key, RtSlice current) {
     rt_defer_drain_to(_dmark);
 }
 
-void o_f_pub_drop_uri(struct o_s_Lsp* ls, OxlStr uri) {
+int64_t o_f_pub_drop_uri(struct o_s_Lsp* ls, OxlStr uri) {
     RtDefer *_dmark = rt_defer_mark();
+    int64_t dropped = 0LL;
     int64_t i = 0LL;
     while ((i < (ls->f_pubs).len)) {
     if ((rt_streq((*({ RtSlice _ms = ls->f_pubs; int64_t _mi = i; if (_mi < 0 || _mi >= _ms.len) rt_trap(10); (struct o_s_PubU*)_ms.ptr + _mi; })).f_uri, uri))) {
     (*({ RtSlice _ms = ls->f_pubs; int64_t _mi = i; if (_mi < 0 || _mi >= _ms.len) rt_trap(10); (struct o_s_PubU*)_ms.ptr + _mi; })) = (*({ RtSlice _ms = ls->f_pubs; int64_t _mi = ((ls->f_pubs).len - 1LL); if (_mi < 0 || _mi >= _ms.len) rt_trap(10); (struct o_s_PubU*)_ms.ptr + _mi; }));
     ls->f_pubs = ({ RtSlice _ms = ls->f_pubs; int64_t _ma = 0LL; int64_t _mb = ((ls->f_pubs).len - 1LL); if (_ma < 0 || _mb < _ma || _mb > _ms.len) rt_trap(10); (RtSlice){ (struct o_s_PubU*)_ms.ptr + _ma, _mb - _ma, _ms.cap - _ma, _ms.heap }; });
+    dropped = 1LL;
     } else {
     i = (i + 1LL);
     }
     }
+    rt_defer_drain_to(_dmark);
+    return dropped;
     rt_defer_drain_to(_dmark);
 }
 
@@ -20686,7 +20695,7 @@ struct o_s_json_Json* o_f_lsp_semantic_tokens(struct o_s_check_Ck* ck, OxlStr fi
     while (((eol < tk.f_hi) && (rt_byteat(src, eol) != 10LL))) {
     eol = (eol + 1LL);
     }
-    if ((eol > seg)) {
+    if ((((eol > seg) && (seg < rhi)) && (eol > rlo))) {
     if ((seg < cur.f_p)) {
     cur = (struct o_s_LCur){ .f_p = 0LL, .f_l = 0LL, .f_c = 0LL };
     }
@@ -21360,7 +21369,11 @@ OxlStr o_f_def_key(OxlStr df, int64_t dl, int64_t dh) {
 
 OxlStr o_f_lsp_uri_for(OxlStr df, OxlStr file) {
     RtDefer *_dmark = rt_defer_mark();
-    if (((rt_len(df) > 0LL) && ((rt_byteat(df, 0LL) == 47LL) || (((rt_len(df) > 1LL) && o_f_is_alpha(rt_byteat(df, 0LL))) && (rt_byteat(df, 1LL) == 58LL))))) {
+    if (((rt_len(df) > 0LL) && (rt_byteat(df, 0LL) == 47LL))) {
+    rt_defer_drain_to(_dmark);
+    return o_f_path_to_uri(df);
+    }
+    if (((((rt_len(df) > 2LL) && o_f_is_alpha(rt_byteat(df, 0LL))) && (rt_byteat(df, 1LL) == 58LL)) && ((rt_byteat(df, 2LL) == 47LL) || (rt_byteat(df, 2LL) == 92LL)))) {
     rt_defer_drain_to(_dmark);
     return o_f_path_to_uri(df);
     }
@@ -21886,7 +21899,7 @@ void o_f_lsp_register_watched(struct o_s_Lsp* ls) {
     ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_json_jadd }; ((void (*)(void*, struct o_s_json_Json*, OxlStr, struct o_s_json_Json*))_fv.fp)(_fv.env, p, rt_str_lit("registrations"), ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_json_jarrb_arr }; ((struct o_s_json_Json* (*)(void*, struct o_s_json_JArrB*))_fv.fp)(_fv.env, regs); })); });
     struct o_s_json_Json* r = ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_json_jobj }; ((struct o_s_json_Json* (*)(void*))_fv.fp)(_fv.env); });
     ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_json_jadd }; ((void (*)(void*, struct o_s_json_Json*, OxlStr, struct o_s_json_Json*))_fv.fp)(_fv.env, r, rt_str_lit("jsonrpc"), ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_json_jstr }; ((struct o_s_json_Json* (*)(void*, OxlStr))_fv.fp)(_fv.env, rt_str_lit("2.0")); })); });
-    ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_json_jadd }; ((void (*)(void*, struct o_s_json_Json*, OxlStr, struct o_s_json_Json*))_fv.fp)(_fv.env, r, rt_str_lit("id"), ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_json_jint }; ((struct o_s_json_Json* (*)(void*, int64_t))_fv.fp)(_fv.env, ls->f_rid); })); });
+    ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_json_jadd }; ((void (*)(void*, struct o_s_json_Json*, OxlStr, struct o_s_json_Json*))_fv.fp)(_fv.env, r, rt_str_lit("id"), ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_json_jstr }; ((struct o_s_json_Json* (*)(void*, OxlStr))_fv.fp)(_fv.env, rt_strcat(rt_str_lit("oxl-req-"), rt_itoa(ls->f_rid))); })); });
     ls->f_rid = (ls->f_rid + 1LL);
     ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_json_jadd }; ((void (*)(void*, struct o_s_json_Json*, OxlStr, struct o_s_json_Json*))_fv.fp)(_fv.env, r, rt_str_lit("method"), ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_json_jstr }; ((struct o_s_json_Json* (*)(void*, OxlStr))_fv.fp)(_fv.env, rt_str_lit("client/registerCapability")); })); });
     ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_json_jadd }; ((void (*)(void*, struct o_s_json_Json*, OxlStr, struct o_s_json_Json*))_fv.fp)(_fv.env, r, rt_str_lit("params"), p); });
@@ -21979,9 +21992,14 @@ void o_f_cmd_lsp(void) {
     struct o_s_json_Json* td = ({ struct o_s_json_Json* __rc; struct o_s_json_Json* _ba756 = params; rt_borrow_read(_ba756); __rc = o_f_jsub(_ba756, rt_str_lit("textDocument")); rt_unborrow(_ba756); __rc; });
     OxlStr uri = ({ OxlStr __rc; struct o_s_json_Json* _ba757 = td; rt_borrow_read(_ba757); __rc = o_f_jfield_str(_ba757, rt_str_lit("uri")); rt_unborrow(_ba757); __rc; });
     if ((rt_len(uri) > 0LL)) {
-    ({ struct o_s_Lsp* _ba758 = ls; rt_borrow_mut(_ba758); o_f_doc_drop(_ba758, uri); rt_unborrow(_ba758); });
-    ({ struct o_s_Lsp* _ba759 = ls; rt_borrow_mut(_ba759); o_f_pub_drop_uri(_ba759, uri); rt_unborrow(_ba759); });
+    int64_t dropped = ({ int64_t __rc; struct o_s_Lsp* _ba758 = ls; rt_borrow_mut(_ba758); __rc = o_f_doc_drop(_ba758, uri); rt_unborrow(_ba758); __rc; });
+    int64_t pdrop = ({ int64_t __rc; struct o_s_Lsp* _ba759 = ls; rt_borrow_mut(_ba759); __rc = o_f_pub_drop_uri(_ba759, uri); rt_unborrow(_ba759); __rc; });
+    if (((dropped == 1LL) || (pdrop == 1LL))) {
+    o_f_publish_diags(uri, rt_mkslice(0LL, sizeof(struct o_s_LDiag)));
+    }
+    if ((dropped == 1LL)) {
     ({ struct o_s_Lsp* _ba760 = ls; rt_borrow_mut(_ba760); o_f_doc_close_invalidate(_ba760); rt_unborrow(_ba760); });
+    }
     }
     continue;
     }
@@ -27349,7 +27367,7 @@ OxlStr o_f_codegen_genall(struct o_s_codegen_G* g) {
     int64_t id = 0LL;
     while ((i < (g->f_its).len)) {
     if ((({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_check_nk }; ((int64_t (*)(void*, struct o_en_parser_Node*))_fv.fp)(_fv.env, (*({ RtSlice _ms = g->f_its; int64_t _mi = i; if (_mi < 0 || _mi >= _ms.len) rt_trap(10); (struct o_s_check_It*)_ms.ptr + _mi; })).f_node); }) == 24LL)) {
-    ({ struct o_en_parser_Node* _ms = (*({ RtSlice _ms = g->f_its; int64_t _mi = i; if (_mi < 0 || _mi >= _ms.len) rt_trap(10); (struct o_s_check_It*)_ms.ptr + _mi; })).f_node; if ((*_ms).tag == 28) { OxlStr name = (*_ms).u.v28.f_name;     if (((rt_len(name) > 5LL) && (rt_streq(rt_substr(name, 0LL, 5LL), rt_str_lit("test_"))))) {
+    ({ struct o_en_parser_Node* _ms = (*({ RtSlice _ms = g->f_its; int64_t _mi = i; if (_mi < 0 || _mi >= _ms.len) rt_trap(10); (struct o_s_check_It*)_ms.ptr + _mi; })).f_node; if ((*_ms).tag == 28) { struct o_s_parser_NList* typarams = (*_ms).u.v28.f_typarams; struct o_en_parser_Node* recv = (*_ms).u.v28.f_recv; OxlStr name = (*_ms).u.v28.f_name; int ex = (*_ms).u.v28.f_ex;     if ((((((!ex) && (recv == 0)) && (typarams == 0)) && (rt_len(name) > 5LL)) && (rt_streq(rt_substr(name, 0LL, 5LL), rt_str_lit("test_"))))) {
     OxlStr qn = ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_check_qname }; ((OxlStr (*)(void*, OxlStr, OxlStr))_fv.fp)(_fv.env, (*({ RtSlice _ms = g->f_its; int64_t _mi = i; if (_mi < 0 || _mi >= _ms.len) rt_trap(10); (struct o_s_check_It*)_ms.ptr + _mi; })).f_mod, name); });
     OxlStr cn = o_f_codegen_cname(qn);
     OxlStr sid = rt_itoa(id);
@@ -30817,7 +30835,7 @@ OxlStr o_f_codegen_jgenall(struct o_s_codegen_G* g) {
     int64_t id = 0LL;
     while ((i < (g->f_its).len)) {
     if ((({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_check_nk }; ((int64_t (*)(void*, struct o_en_parser_Node*))_fv.fp)(_fv.env, (*({ RtSlice _ms = g->f_its; int64_t _mi = i; if (_mi < 0 || _mi >= _ms.len) rt_trap(10); (struct o_s_check_It*)_ms.ptr + _mi; })).f_node); }) == 24LL)) {
-    ({ struct o_en_parser_Node* _ms = (*({ RtSlice _ms = g->f_its; int64_t _mi = i; if (_mi < 0 || _mi >= _ms.len) rt_trap(10); (struct o_s_check_It*)_ms.ptr + _mi; })).f_node; if ((*_ms).tag == 28) { OxlStr name = (*_ms).u.v28.f_name;     if (((rt_len(name) > 5LL) && (rt_streq(rt_substr(name, 0LL, 5LL), rt_str_lit("test_"))))) {
+    ({ struct o_en_parser_Node* _ms = (*({ RtSlice _ms = g->f_its; int64_t _mi = i; if (_mi < 0 || _mi >= _ms.len) rt_trap(10); (struct o_s_check_It*)_ms.ptr + _mi; })).f_node; if ((*_ms).tag == 28) { struct o_s_parser_NList* typarams = (*_ms).u.v28.f_typarams; struct o_en_parser_Node* recv = (*_ms).u.v28.f_recv; OxlStr name = (*_ms).u.v28.f_name; int ex = (*_ms).u.v28.f_ex;     if ((((((!ex) && (recv == 0)) && (typarams == 0)) && (rt_len(name) > 5LL)) && (rt_streq(rt_substr(name, 0LL, 5LL), rt_str_lit("test_"))))) {
     OxlStr qn = ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_check_qname }; ((OxlStr (*)(void*, OxlStr, OxlStr))_fv.fp)(_fv.env, (*({ RtSlice _ms = g->f_its; int64_t _mi = i; if (_mi < 0 || _mi >= _ms.len) rt_trap(10); (struct o_s_check_It*)_ms.ptr + _mi; })).f_mod, name); });
     OxlStr cn = o_f_codegen_cname(qn);
     OxlStr sid = rt_itoa(id);

@@ -35,7 +35,14 @@ struct PubU { key: str, uri: str }
 
 // server state — the tables grow inside an own object so arena slices
 // can live in it (same shape as Ck's slice fields)
-struct Lsp { docs: []LDoc, ans: []Anl, pubs: []PubU, root: str }
+struct Lsp {
+    docs: []LDoc,
+    ans: []Anl,
+    pubs: []PubU,
+    root: str,
+    rid: int,
+    wreg: int,
+}
 
 struct LC { l: int, c: int }
 
@@ -77,6 +84,12 @@ fn lsp_offset(src: str, line: int, col: int) -> int {
                 }
                 k = k + 1
                 if n == 4 {
+                    if k == col {
+                        // col inside a surrogate pair — no valid
+                        // boundary splits the code point; clamp to
+                        // just after it rather than running to EOL
+                        return off + n
+                    }
                     k = k + 1
                 }
                 off = off + n
@@ -869,19 +882,21 @@ fn span_has(spans: []int, off: int) -> int {
 
 // comment spans outside string literals — lexlib drops comments, so
 // scan for them directly while skipping string-token spans (a "//"
-// inside a string is not a comment)
-fn st_comments(src: str, toks: []STok) -> []STok {
+// inside a string is not a comment). k_err spans skip too: an
+// unterminated string/char still swallows "//" to EOF.
+fn st_comments(src: str, hd: ref lexlib.Tok) -> []STok {
     spans := mkslice(int, 0)
-    i := 0
-    for i < len(toks) {
-        if toks[i].ty == 18 {
-            spans = push(spans, toks[i].lo)
-            spans = push(spans, toks[i].hi)
+    k_str := lexlib.k_str()
+    k_err := lexlib.k_err()
+    for hd != nil {
+        if hd.kind == k_str || hd.kind == k_err {
+            spans = push(spans, hd.off)
+            spans = push(spans, hd.eoff)
         }
-        i = i + 1
+        hd = hd.next
     }
     out := mkslice(STok, 0)
-    i = 0
+    i := 0
     n := len(src)
     for i < n {
         if span_has(spans, i) == 1 {
@@ -1035,12 +1050,14 @@ fn st_legend() -> own json.Json {
     return leg
 }
 
-fn lsp_semantic_tokens(ck: ref check.Ck, file: str, src: str) -> own json.Json {
+// emit delta-encoded tokens intersecting [rlo, rhi) — full passes
+// 0/len(src), range passes the request's byte bounds
+fn lsp_semantic_tokens(ck: ref check.Ck, file: str, src: str, rlo: int, rhi: int) -> own json.Json {
     res := json.jobj()
     db := json.jarrb()
     hd := lexlib.lex(src)
     toks := st_walk(hd, src, mkslice(STok, 0))
-    all := st_merge(toks, st_comments(src, toks))
+    all := st_merge(toks, st_comments(src, hd))
     // per-request lookup tables — the token loop must not rescan the
     // package-wide use/decl tables once per identifier
     um := collections.map_new()
@@ -1077,6 +1094,13 @@ fn lsp_semantic_tokens(ck: ref check.Ck, file: str, src: str) -> own json.Json {
     i := 0
     for i < len(all) {
         tk := all[i]
+        if tk.lo >= rhi {
+            break
+        }
+        if tk.hi <= rlo {
+            i = i + 1
+            continue
+        }
         ty := tk.ty
         if ty == 8 {
             // ident: upgrade variable -> decl kind via the use index
@@ -1752,6 +1776,38 @@ fn local_name_span(dsrc: str, r: check.UseRec) -> LC {
     return decl_name_span(dsrc, r.def_lo, r.def_hi, nm, 5)
 }
 
+// hover text for a local binding's NAME at byte offset `off` — the
+// binding site itself has no usev entry (rec_local records uses
+// only), so a decl-self fallback would show the enclosing decl's
+// signature. Scans local use records for a binding whose name span
+// covers `off`; "" on miss. A local never used after binding leaves
+// no record at all — that case keeps the decl-self hover.
+fn local_bind_hover(ck: ref check.Ck, file: str, src: str, off: int) -> str {
+    best := ""
+    bestsz := 0
+    i := 0
+    for i < len(ck.usev) {
+        x := ck.usev[i]
+        if x.def_file == file && is_decl_self(ck, x) == 0 {
+            // locals only: sig is "name: ty" and the def span isn't a
+            // package decl (fn/struct sigs also contain ": ")
+            c := find(x.sig, ": ")
+            if c > 0 && decl_kind_of(ck.declsv, x.def_file, x.def_lo, x.def_hi) < 0 {
+                ns := local_name_span(src, x)
+                if ns.l >= 0 && ns.l <= off && off < ns.c {
+                    sz := x.def_hi - x.def_lo
+                    if len(best) == 0 || sz < bestsz {
+                        best = x.sig
+                        bestsz = sz
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return best
+}
+
 // ---------- references / highlight / rename ----------
 fn def_key(df: str, dl: int, dh: int) -> str {
     return df + "|" + itoa(dl) + "|" + itoa(dh)
@@ -2129,6 +2185,7 @@ fn lsp_capabilities() -> own json.Json {
     full := json.jobj()
     json.jadd(full, "delta", json.jbool(false))
     json.jadd(st, "full", full)
+    json.jadd(st, "range", json.jbool(true))
     json.jadd(c, "semanticTokensProvider", st)
     ws := json.jobj()
     wf := json.jobj()
@@ -2247,6 +2304,39 @@ fn lsp_watched(ls: mut Lsp, changes: ref json.Json) {
     }
 }
 
+// client/registerCapability — dynamic registration for
+// workspace/didChangeWatchedFiles, sent once after `initialized`.
+// The glob is workspace-folder-relative per the LSP spec; a client
+// that rejects registration answers with an error response, which
+// the main loop drops like any other server->client response.
+fn lsp_register_watched(ls: mut Lsp) {
+    if ls.wreg == 1 {
+        return
+    }
+    ls.wreg = 1
+    w := json.jobj()
+    json.jadd(w, "globPattern", json.jstr("**/*.oxl"))
+    wa := json.jarrb()
+    json.jarrb_add(wa, w)
+    ro := json.jobj()
+    json.jadd(ro, "watchers", json.jarrb_arr(wa))
+    reg := json.jobj()
+    json.jadd(reg, "id", json.jstr("oxl-watched-files"))
+    json.jadd(reg, "method", json.jstr("workspace/didChangeWatchedFiles"))
+    json.jadd(reg, "registerOptions", ro)
+    regs := json.jarrb()
+    json.jarrb_add(regs, reg)
+    p := json.jobj()
+    json.jadd(p, "registrations", json.jarrb_arr(regs))
+    r := json.jobj()
+    json.jadd(r, "jsonrpc", json.jstr("2.0"))
+    json.jadd(r, "id", json.jint(ls.rid))
+    ls.rid = ls.rid + 1
+    json.jadd(r, "method", json.jstr("client/registerCapability"))
+    json.jadd(r, "params", p)
+    lsp_frame(json.tojson(r))
+}
+
 // ---------- the stdio loop ----------
 fn cmd_lsp() {
     in := os.stdin()
@@ -2257,6 +2347,8 @@ fn cmd_lsp() {
     ls.ans = mkslice(Anl, 0)
     ls.pubs = mkslice(PubU, 0)
     ls.root = ""
+    ls.rid = 1
+    ls.wreg = 0
     for true {
         // read headers + one full body
         body := ""
@@ -2287,6 +2379,12 @@ fn cmd_lsp() {
             continue
         }
         method := jfield_str(msg, "method")
+        // a response to a server->client request (e.g. the
+        // registerCapability answer, or its rejection) carries id +
+        // result/error but no method — nothing to dispatch
+        if len(method) == 0 {
+            continue
+        }
         if method == "exit" {
             return
         }
@@ -2335,7 +2433,11 @@ fn cmd_lsp() {
             lsp_watched(ls, jsub(params, "changes"))
             continue
         }
-        if method == "initialized" || method == "$/cancelRequest" {
+        if method == "initialized" {
+            lsp_register_watched(ls)
+            continue
+        }
+        if method == "$/cancelRequest" {
             continue
         }
         // ---------- requests ----------
@@ -2362,7 +2464,7 @@ fn cmd_lsp() {
             resp = lsp_result(idn, res)
         } else if method == "shutdown" {
             resp = lsp_result(idn, json.jnull())
-        } else if method == "textDocument/hover" || method == "textDocument/definition" || method == "textDocument/completion" || method == "textDocument/signatureHelp" || method == "textDocument/documentSymbol" || method == "textDocument/documentHighlight" || method == "textDocument/references" || method == "textDocument/rename" || method == "textDocument/formatting" || method == "textDocument/semanticTokens/full" || method == "textDocument/semanticTokens" {
+        } else if method == "textDocument/hover" || method == "textDocument/definition" || method == "textDocument/completion" || method == "textDocument/signatureHelp" || method == "textDocument/documentSymbol" || method == "textDocument/documentHighlight" || method == "textDocument/references" || method == "textDocument/rename" || method == "textDocument/formatting" || method == "textDocument/semanticTokens/full" || method == "textDocument/semanticTokens/range" {
             td := jsub(params, "textDocument")
             uri := jfield_str(td, "uri")
             file := uri_to_path(uri)
@@ -2378,8 +2480,15 @@ fn cmd_lsp() {
                     res = lsp_document_symbol(ls.ans[ai].res.ck, file, src)
                 } else if method == "textDocument/formatting" {
                     res = lsp_formatting(file, src)
-                } else if method == "textDocument/semanticTokens/full" || method == "textDocument/semanticTokens" {
-                    res = lsp_semantic_tokens(ls.ans[ai].res.ck, file, src)
+                } else if method == "textDocument/semanticTokens/full" {
+                    res = lsp_semantic_tokens(ls.ans[ai].res.ck, file, src, 0, len(src))
+                } else if method == "textDocument/semanticTokens/range" {
+                    rg := jsub(params, "range")
+                    sp := jsub(rg, "start")
+                    ep := jsub(rg, "end")
+                    rlo := lsp_offset(src, jfield_num(sp, "line"), jfield_num(sp, "character"))
+                    rhi := lsp_offset(src, jfield_num(ep, "line"), jfield_num(ep, "character"))
+                    res = lsp_semantic_tokens(ls.ans[ai].res.ck, file, src, rlo, rhi)
                 } else {
                     pos := jsub(params, "position")
                     line := jfield_num(pos, "line")
@@ -2388,9 +2497,21 @@ fn cmd_lsp() {
                     if method == "textDocument/hover" {
                         u := index_at(ls.ans[ai].res.ck.usev, file, off)
                         if u >= 0 {
+                            x := ls.ans[ai].res.ck.usev[u]
+                            sig := x.sig
+                            // a decl-self hit means no use record
+                            // covers the position — if it's a local's
+                            // binding name, show the local, not the
+                            // enclosing decl's signature
+                            if is_decl_self(ls.ans[ai].res.ck, x) == 1 {
+                                lsig := local_bind_hover(ls.ans[ai].res.ck, file, src, off)
+                                if len(lsig) > 0 {
+                                    sig = lsig
+                                }
+                            }
                             h := json.jobj()
                             json.jadd(h, "kind", json.jstr("plaintext"))
-                            json.jadd(h, "value", json.jstr(ls.ans[ai].res.ck.usev[u].sig))
+                            json.jadd(h, "value", json.jstr(sig))
                             ho := json.jobj()
                             json.jadd(ho, "contents", h)
                             res = ho

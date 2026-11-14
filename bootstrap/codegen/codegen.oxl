@@ -1776,8 +1776,10 @@ fn gborrow_c(g: mut G, v: str, ct: int, pk: int) -> GArgOut {
 // one call arg coerced to its declared param (subst'd via the callee
 // bind when generic, then through the current inst): iface conv,
 // str->cstr, own->mut/ref borrow marks. hoist=1 temps borrowed args
-// for single-eval; hoist=0 (spawn fills, whose pre/post are dropped)
-// keeps the inline expr.
+// for single-eval; hoist=2 (susp fills) routes through a frame slot
+// for the same reason; hoist=0 (spawn fills, whose pre/post are
+// dropped) keeps the inline expr unmarked — a spawned task outlives
+// the call, so no borrow can be held for it.
 fn garg_c(g: mut G, e: ref parser.Node, v: str, pt: int, bind: ref collections.Map, hoist: int) -> GArgOut {
     o := GArgOut{v: "", pre: "", post: ""}
     o.v = v
@@ -1794,10 +1796,14 @@ fn garg_c(g: mut G, e: ref parser.Node, v: str, pt: int, bind: ref collections.M
     if tyk(g, pt2) == check.k_cstr() && tyk(g, raw) == check.k_str() {
         o.v = "rt_cstr(" + o.v + ")"
     }
-    if hoist == 1 && tyk(g, raw) == check.k_own() {
+    if tyk(g, raw) == check.k_own() {
         pk := tyk(g, pt2)
         if pk == check.k_mut() || pk == check.k_ref() {
-            o = gborrow_c(g, o.v, raw, pk)
+            if hoist == 1 {
+                o = gborrow_c(g, o.v, raw, pk)
+            } else if hoist == 2 {
+                o = gsusp_borrow(g, o.v, raw, pk)
+            }
         }
     }
     return o
@@ -1828,6 +1834,24 @@ fn gfslot(g: mut G, name: str, ct: str) -> str {
     g.fdecls = push(g.fdecls, ct + " v" + itoa(i) + ";")
     check.env_bind(g.fsl, name, i)
     return "v" + itoa(i)
+}
+
+// susp-fill borrow: own->mut/ref args to an inline susp call hold
+// their ledger mark across the poll — the temp lives in a frame
+// field (fr->v<i>) because a C local can't survive the resume goto
+fn gsusp_borrow(g: mut G, v: str, raw: int, pk: int) -> GArgOut {
+    o := GArgOut{v: "", pre: "", post: ""}
+    sl := gfslot(g, "_bs" + itoa(g.hoistn), gcty(g, raw))
+    g.hoistn = g.hoistn + 1
+    fv := "fr->" + sl
+    bf := "rt_borrow_mut"
+    if pk == check.k_ref() {
+        bf = "rt_borrow_read"
+    }
+    o.pre = fv + " = " + v + "; " + bf + "(" + fv + "); "
+    o.post = "rt_unborrow(" + fv + "); "
+    o.v = fv
+    return o
 }
 
 // drain the fn's runtime defer stack down to its entry mark — emitted
@@ -3078,7 +3102,7 @@ fn gcall(g: mut G, f: ref parser.Node, args: ref parser.NList) -> str {
 // ---------- spawn (seed spawn) ----------
 // arg vector coerced to declared sig params (subst'd when generic) —
 // `recv` prepends as an adapted first arg for dotted method calls
-fn gav_decl(g: mut G, args: ref parser.NList, fi: int, bind: ref collections.Map, recv: ref parser.Node) -> own GAv {
+fn gav_decl(g: mut G, args: ref parser.NList, fi: int, bind: ref collections.Map, recv: ref parser.Node, susp: int) -> own GAv {
     let head: own GAv = nil
     let tail: own GAv = nil
     let il: own check.IList = nil
@@ -3087,6 +3111,8 @@ fn gav_decl(g: mut G, args: ref parser.NList, fi: int, bind: ref collections.Map
     }
     if recv != nil {
         v := gx(g, recv)
+        cpre := ""
+        cpost := ""
         if il != nil {
             pt := il.v
             if bind != nil {
@@ -3094,23 +3120,47 @@ fn gav_decl(g: mut G, args: ref parser.NList, fi: int, bind: ref collections.Map
             }
             pt = gsub(g, pt)
             v = gadapt_v(g, recv, v, pt)
+            if susp == 1 {
+                raw := gsub(g, xty(g, recv))
+                if tyk(g, raw) == check.k_own() {
+                    pk := tyk(g, pt)
+                    if pk == check.k_mut() || pk == check.k_ref() {
+                        bo := gsusp_borrow(g, v, raw, pk)
+                        v = bo.v
+                        cpre = bo.pre
+                        cpost = bo.post
+                    }
+                }
+            }
             il = il.next
         }
         c := new(GAv)
         c.v = v
+        c.pre = cpre
+        c.post = cpost
         head = c
         tail = c
     }
     al := args
     for al != nil {
         v := gx(g, al.v)
+        apre := ""
+        apost := ""
         if il != nil {
-            o := garg_c(g, al.v, v, il.v, bind, 0)
+            jh := 0
+            if susp == 1 {
+                jh = 2
+            }
+            o := garg_c(g, al.v, v, il.v, bind, jh)
             v = o.v
+            apre = o.pre
+            apost = o.post
             il = il.next
         }
         c := new(GAv)
         c.v = v
+        c.pre = apre
+        c.post = apost
         if head == nil {
             head = c
             tail = c
@@ -3371,7 +3421,7 @@ fn gspawn(g: mut G, sc: ref parser.Node, e: ref parser.Node, blocking: bool) {
             // suspendable callee — heap frame + poll driver task
             if cp.k == 1 && check.sl_has(g.ck.susp, base) {
                 cn := cname(ename)
-                argvs := gav_decl(g, args, fi2, bind, rnode)
+                argvs := gav_decl(g, args, fi2, bind, rnode, 0)
                 if bind != nil {
                     ginst_queue(g, base, g.ck.fnsv[fi2].typarams, bind)
                 }
@@ -3475,7 +3525,7 @@ fn gspawn(g: mut G, sc: ref parser.Node, e: ref parser.Node, blocking: bool) {
             tr = tr + "static void* l_tr_" + sid + "(void* _p) { struct o_args_" + sid + "* a = _p; " + body + " return 0; }\n"
             g.tramp = push(g.tramp, tr)
             wln(g, "    { struct o_args_" + sid + "* a = rt_alloc(sizeof(struct o_args_" + sid + "));")
-            fills := gav_decl(g, args, fi2, bind, rnode)
+            fills := gav_decl(g, args, fi2, bind, rnode, 0)
             if bind != nil {
                 ginst_queue(g, base, g.ck.fnsv[fi2].typarams, bind)
             }
@@ -4180,13 +4230,17 @@ fn gfsusp_call(g: mut G, call: ref parser.Node, name: str, dk: int, da: str, db:
                     }
                 }
             }
-            argvs = gav_decl(g, args, fi, bind, rnode)
+            argvs = gav_decl(g, args, fi, bind, rnode, 1)
         }
         _ => {
         }
     }
     if len(bname) == 0 {
         bname = name
+    }
+    bo := gav_borrows(argvs)
+    if len(bo.pre) > 0 {
+        wln(g, "    " + bo.pre)
     }
     wln(g, "    { struct " + frty + " *_c = (struct " + frty + " *)malloc(sizeof(struct " + frty + "));")
     wln(g, "      ((RtFrame *)_c)->cur_scope = tls_scope; ((RtFrame *)_c)->state = 0;")
@@ -4198,6 +4252,9 @@ fn gfsusp_call(g: mut G, call: ref parser.Node, name: str, dk: int, da: str, db:
     wln(g, "    s" + itoa(k) + ": ;")
     wln(g, "      _p = o_poll_" + cn + "(fr->child, task);")
     wln(g, "      if (_p != RT_READY) { fr->cur_scope = tls_scope; tls_scope = saved; return _p; }")
+    if len(bo.post) > 0 {
+        wln(g, "      " + bo.post)
+    }
     if dk == 1 {
         wln(g, "      fr->" + da + " = ((struct " + frty + " *)fr->child)->result;")
     }

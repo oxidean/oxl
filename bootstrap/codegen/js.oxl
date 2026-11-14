@@ -254,9 +254,29 @@ fn jborrow_c(g: mut G, v: str, pk: int) -> GArgOut {
     return o
 }
 
-// hoist=1 temps borrowed args for single-eval; hoist=0 (spawn/fsusp
-// fills, whose pre/post are emitted as statements around a suspend
-// point a `const` can't survive) keeps the inline expr
+// susp-fill borrow: the temp must live in a frame slot — a `const`
+// can't survive the case boundary a suspend point creates, so the
+// arg expr evaluates once into fr.v<i> shared by rt_borrow_*, the
+// child p_ slot, and rt_unborrow
+fn jsusp_borrow(g: mut G, v: str, raw: int, pk: int) -> GArgOut {
+    o := GArgOut{v: "", pre: "", post: ""}
+    sl := jfslot(g, "_bs" + itoa(g.hoistn), jzero(g, raw))
+    g.hoistn = g.hoistn + 1
+    fv := "fr." + sl
+    bf := "rt.rt_borrow_mut"
+    if pk == check.k_ref() {
+        bf = "rt.rt_borrow_read"
+    }
+    o.pre = fv + " = " + v + "; " + bf + "(" + fv + "); "
+    o.post = "rt.rt_unborrow(" + fv + "); "
+    o.v = fv
+    return o
+}
+
+// hoist=1 temps borrowed args for single-eval; hoist=2 (susp fills)
+// routes through a frame slot for the same reason; hoist=0 (spawn
+// fills, whose pre/post are dropped) keeps the inline expr unmarked —
+// a spawned task outlives the call, so no borrow can be held for it
 fn jarg_c(g: mut G, e: ref parser.Node, v: str, pt: int, bind: ref collections.Map, hoist: int) -> GArgOut {
     o := GArgOut{v: "", pre: "", post: ""}
     o.v = v
@@ -278,12 +298,8 @@ fn jarg_c(g: mut G, e: ref parser.Node, v: str, pt: int, bind: ref collections.M
         if pk == check.k_mut() || pk == check.k_ref() {
             if hoist == 1 {
                 o = jborrow_c(g, o.v, pk)
-            } else if pk == check.k_mut() {
-                o.pre = "rt.rt_borrow_mut(" + o.v + "); "
-                o.post = "rt.rt_unborrow(" + o.v + "); "
-            } else {
-                o.pre = "rt.rt_borrow_read(" + o.v + "); "
-                o.post = "rt.rt_unborrow(" + o.v + "); "
+            } else if hoist == 2 {
+                o = jsusp_borrow(g, o.v, raw, pk)
             }
         }
     }
@@ -311,8 +327,11 @@ fn jav(g: mut G, args: ref parser.NList) -> own GAv {
 }
 
 // jav_decl — declared-ty arg list for spawn/fsusp fills: the receiver
-// leads when dotted, each arg adapts to its (subst'd) param ty
-fn jav_decl(g: mut G, args: ref parser.NList, fi: int, bind: ref collections.Map, recv: ref parser.Node) -> own GAv {
+// leads when dotted, each arg adapts to its (subst'd) param ty.
+// susp=1 (inline susp fills) routes own->mut/ref args + receiver
+// through frame-slot borrows; susp=0 (spawn fills) drops the marks —
+// a spawned task outlives the call
+fn jav_decl(g: mut G, args: ref parser.NList, fi: int, bind: ref collections.Map, recv: ref parser.Node, susp: int) -> own GAv {
     let head: own GAv = nil
     let tail: own GAv = nil
     cpre := ""
@@ -331,15 +350,13 @@ fn jav_decl(g: mut G, args: ref parser.NList, fi: int, bind: ref collections.Map
             pt = gsub(g, pt)
             v = jadapt_v(g, recv, v, pt)
             raw := gsub(g, xty(g, recv))
-            if tyk(g, raw) == check.k_own() {
+            if susp == 1 && tyk(g, raw) == check.k_own() {
                 pk := tyk(g, pt)
-                if pk == check.k_mut() {
-                    cpre = "rt.rt_borrow_mut(" + v + "); "
-                    cpost = "rt.rt_unborrow(" + v + "); "
-                }
-                if pk == check.k_ref() {
-                    cpre = "rt.rt_borrow_read(" + v + "); "
-                    cpost = "rt.rt_unborrow(" + v + "); "
+                if pk == check.k_mut() || pk == check.k_ref() {
+                    bo := jsusp_borrow(g, v, raw, pk)
+                    v = bo.v
+                    cpre = bo.pre
+                    cpost = bo.post
                 }
             }
             il = il.next
@@ -357,7 +374,11 @@ fn jav_decl(g: mut G, args: ref parser.NList, fi: int, bind: ref collections.Map
         apre := ""
         apost := ""
         if il != nil {
-            o := jarg_c(g, al.v, v, il.v, bind, 0)
+            jh := 0
+            if susp == 1 {
+                jh = 2
+            }
+            o := jarg_c(g, al.v, v, il.v, bind, jh)
             v = o.v
             apre = o.pre
             apost = o.post
@@ -2250,7 +2271,7 @@ fn jfsusp_call(g: mut G, call: ref parser.Node, name: str, dk: int, da: str, db:
                     }
                 }
             }
-            argvs = jav_decl(g, args, fi, bind, rnode)
+            argvs = jav_decl(g, args, fi, bind, rnode, 1)
         }
         _ => {
         }
@@ -3091,7 +3112,7 @@ fn jspawn(g: mut G, sc: ref parser.Node, e: ref parser.Node, blocking: bool) {
             // suspendable callee — frame task + poll driver
             if cp.k == 1 && check.sl_has(g.ck.susp, base) {
                 cn := cname(ename)
-                argvs := jav_decl(g, args, fi2, bind, rnode)
+                argvs := jav_decl(g, args, fi2, bind, rnode, 0)
                 if bind != nil {
                     ginst_queue(g, base, g.ck.fnsv[fi2].typarams, bind)
                 }
@@ -3116,7 +3137,7 @@ fn jspawn(g: mut G, sc: ref parser.Node, e: ref parser.Node, blocking: bool) {
             }
             id := g.tmpn
             g.tmpn = g.tmpn + 1
-            argvs := jav_decl(g, args, fi2, bind, rnode)
+            argvs := jav_decl(g, args, fi2, bind, rnode, 0)
             if bind != nil {
                 ginst_queue(g, base, g.ck.fnsv[fi2].typarams, bind)
             }

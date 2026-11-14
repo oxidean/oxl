@@ -99,7 +99,7 @@ fn futf8_val(src: str, i: int) -> int {
     if b0 < 240 {
         return (b0 - 224) * 4096 + (byteat(src, i + 1) - 128) * 64 + (byteat(src, i + 2) - 128)
     }
-    return (b0 - 240) * 262144 + (byteat(src, i + 1) - 128) * 64 + (byteat(src, i + 2) - 128) * 64 + (byteat(src, i + 3) - 128)
+    return (b0 - 240) * 262144 + (byteat(src, i + 1) - 128) * 4096 + (byteat(src, i + 2) - 128) * 64 + (byteat(src, i + 3) - 128)
 }
 
 // the seed's keyword set — wider than lexlib's (defer/select/enum/match

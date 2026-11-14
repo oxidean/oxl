@@ -1029,10 +1029,9 @@ fn upsert_require(mtext: str, path: str, ver: str) -> [own UpsRes, err] {
             if strings.startswith(t, ")") {
                 in_block = 0
             } else if len(found) == 0 {
-                toks := strings.split(t, " ")
-                ft := first_tok(toks)
-                if ft == path {
-                    old := second_tok(toks)
+                toks := split_ws_g(t)
+                if tok_at(toks, 0) == path {
+                    old := tok_at(toks, 1)
                     if len(old) > 0 {
                         found = old
                         line = replace_first(line, old, ver)
@@ -1044,10 +1043,9 @@ fn upsert_require(mtext: str, path: str, ver: str) -> [own UpsRes, err] {
             if strings.startswith(rest, "(") {
                 in_block = 1
             } else {
-                toks := strings.split(rest, " ")
-                ft := first_tok(toks)
-                if ft == path {
-                    old := second_tok(toks)
+                toks := split_ws_g(rest)
+                if tok_at(toks, 0) == path {
+                    old := tok_at(toks, 1)
                     if len(old) > 0 {
                         found = old
                         line = replace_first(line, old, ver)
@@ -1061,32 +1059,6 @@ fn upsert_require(mtext: str, path: str, ver: str) -> [own UpsRes, err] {
         out = out + "require " + path + " " + ver + "\n"
     }
     return new(UpsRes{text: out, old: found}), nil
-}
-
-fn first_tok(toks: ref strings.StrList) -> str {
-    for toks != nil {
-        t := strings.trim(toks.v)
-        if len(t) > 0 {
-            return t
-        }
-        toks = toks.next
-    }
-    return ""
-}
-
-fn second_tok(toks: ref strings.StrList) -> str {
-    seen := 0
-    for toks != nil {
-        t := strings.trim(toks.v)
-        if len(t) > 0 {
-            if seen == 1 {
-                return t
-            }
-            seen = 1
-        }
-        toks = toks.next
-    }
-    return ""
 }
 
 // s.replacen(old, ver, 1) — first occurrence only
@@ -2970,23 +2942,34 @@ fn ll_at(l: ref strings.StrList, i: int) -> str {
 struct Toks { n: int, l: own strings.StrList }
 
 fn split_ws_g(t: str) -> Toks {
-    parts := strings.split(t, " ")
-    let keep: own strings.StrList = nil
-    n := 0
-    for parts != nil {
-        s := strings.trim(parts.v)
-        parts = parts.next
-        if len(s) == 0 {
-            continue
+    // split_whitespace equivalent — space/tab runs collapse with no
+    // empty tokens. strings.split(" ") leaves tabs glued inside a
+    // token, which broke tab-separated `require` lines.
+    let rev: own strings.StrList = nil
+    cur := ""
+    i := 0
+    for i < len(t) {
+        c := byteat(t, i)
+        if c == 32 || c == 9 {
+            if len(cur) > 0 {
+                rev = new(strings.StrList{v: cur, next: rev})
+                cur = ""
+            }
+        } else {
+            cur = cur + substr(t, i, i + 1)
         }
-        keep = new(strings.StrList{v: s, next: keep})
-        n = n + 1
+        i = i + 1
+    }
+    if len(cur) > 0 {
+        rev = new(strings.StrList{v: cur, next: rev})
     }
     // reverse to original order
     let out: own strings.StrList = nil
-    for keep != nil {
-        out = new(strings.StrList{v: keep.v, next: out})
-        keep = keep.next
+    n := 0
+    for rev != nil {
+        out = new(strings.StrList{v: rev.v, next: out})
+        rev = rev.next
+        n = n + 1
     }
     return Toks{n: n, l: out}
 }

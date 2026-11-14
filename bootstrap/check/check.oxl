@@ -451,6 +451,7 @@ struct Ck {
     ret1: int,
     in_let2: int,
     in_spawn: int, // inside `spawn`/`goin` callee — no calls edge (seed in_spawn)
+    in_infer: int, // generic ty-param inference pass — expr() re-runs for real checking, so index records stay off
     in_cl: int, // inside `{ |..| }` — ret feeds cl_ret
     cl_ret: int, // inferred closure return ty (-1 none)
     clcks: own ClChk, // deferred closure susp checks
@@ -545,6 +546,9 @@ fn rec_decl(ck: mut Ck, key: str, lo: int, hi: int, sig: str, name: str, kind: i
 // record a use-site -> its decl (no-op for builtins/locals — those
 // aren't `decls` keys)
 fn rec_use(ck: mut Ck, lo: int, hi: int, key: str) {
+    if ck.in_infer == 1 {
+        return
+    }
     if collections.map_has(ck.decls, key) {
         [di, err] = collections.map_get(ck.decls, key)
         if err == nil {
@@ -557,6 +561,9 @@ fn rec_use(ck: mut Ck, lo: int, hi: int, key: str) {
 // record a local-binding use — sig is `name: ty`, def is the visible
 // binding's span
 fn rec_local(ck: mut Ck, lo: int, hi: int, n: str, t: int, env: ref Env) {
+    if ck.in_infer == 1 {
+        return
+    }
     dl := lo
     dh := hi
     ds := decl_span(env, n)
@@ -3908,6 +3915,10 @@ fn call(ck: mut Ck, f: ref parser.Node, args: ref parser.NList, env: mut Env) ->
         // generic: bind ty params from argument tys, check constraints
         bind := collections.map_new()
         if sig.typarams != nil {
+            // args are re-checked below once types bind — suppress
+            // index records here or every arg use lands twice
+            oi := ck.in_infer
+            ck.in_infer = 1
             wl0 := sig.params
             if recv != nil && wl0 != nil {
                 bind_vars(ck, wl0.v, expr(ck, recv, env), bind)
@@ -3932,6 +3943,7 @@ fn call(ck: mut Ck, f: ref parser.Node, args: ref parser.NList, env: mut Env) ->
                 }
                 tl = tl.next
             }
+            ck.in_infer = oi
         }
         wl := sig.params
         al := args
@@ -4111,11 +4123,18 @@ fn stmt(ck: mut Ck, s: ref parser.Node, env: mut Env) {
             idn := ""
             tt := t_unk(ck)
             match target {
-                parser.Node.Name{n} => {
+                parser.Node.Name{n, lo, hi} => {
                     idn = n
                     tt = env_get(ck, env, n)
                     if tt < 0 {
                         tt = expr(ck, target, env)
+                    } else if scope_of(env, n) >= 0 {
+                        // a write is still an occurrence — record it
+                        // without the moved-value read ident() would
+                        // flag (reassignment re-initializes)
+                        rec_local(ck, lo, hi, n, tt, env)
+                    } else {
+                        rec_use(ck, lo, hi, resolve_named(ck, n))
                     }
                 }
                 _ => {
@@ -4257,7 +4276,11 @@ fn stmt(ck: mut Ck, s: ref parser.Node, env: mut Env) {
         }
         parser.Node.Bind{name, init, lo, hi} => {
             t := expr(ck, init, env)
-            env_set(env, name, t, lo, hi)
+            // decl span is the name token itself — `lo` is its offset
+            env_set(env, name, t, lo, lo + len(name))
+            // decl-name occurrence: queries on `name` would otherwise
+            // fall through to the enclosing fn's decl record
+            rec_local(ck, lo, lo + len(name), name, t, env)
         }
         parser.Node.Unsafe{body} => {
             block_node(ck, body, env)
@@ -5565,7 +5588,10 @@ fn check_fn(ck: mut Ck, mod: str, name: str, recv: ref parser.Node, params: ref 
             if recv != nil && wl != nil {
                 match recv {
                     parser.Node.Param{name, lo, hi} => {
-                        env_set(env, name, wl.v, lo, hi)
+                        // decl span is the name token — `lo` is its offset
+                        env_set(env, name, wl.v, lo, lo + len(name))
+                        // param decl names index like := bindings
+                        rec_local(ck, lo, lo + len(name), name, wl.v, env)
                     }
                     _ => {
                     }
@@ -5576,7 +5602,8 @@ fn check_fn(ck: mut Ck, mod: str, name: str, recv: ref parser.Node, params: ref 
             for pl != nil && wl != nil {
                 match pl.v {
                     parser.Node.Param{name, ty, lo, hi} => {
-                        env_set(env, name, wl.v, lo, hi)
+                        env_set(env, name, wl.v, lo, lo + len(name))
+                        rec_local(ck, lo, lo + len(name), name, wl.v, env)
                     }
                     _ => {
                     }
@@ -7209,6 +7236,9 @@ fn dir_walk(base: str, dir: str, acc: mut SAcc) {
         nm := ents[i]
         p := dir + "/" + nm
         if rt_islnk(p) == 1 {
+            // skip the entry — but still advance i or the loop
+            // re-reads this symlink forever
+            i = i + 1
             continue
         }
         if rt_isdir(p) == 1 {

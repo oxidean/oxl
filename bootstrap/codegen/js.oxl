@@ -236,7 +236,28 @@ fn jadapt_v(g: mut G, e: ref parser.Node, ev: str, want: int) -> str {
     return ev
 }
 
-fn jarg_c(g: mut G, e: ref parser.Node, v: str, pt: int, bind: ref collections.Map) -> GArgOut {
+// own->mut/ref borrow ledger entry: the arg expr evaluates exactly
+// once into a temp shared by rt_borrow_*, the call arg, and
+// rt_unborrow — embedding the expr raw would run it three times
+fn jborrow_c(g: mut G, v: str, pk: int) -> GArgOut {
+    o := GArgOut{v: "", pre: "", post: ""}
+    n := g.tmpn
+    g.tmpn = g.tmpn + 1
+    tn := "__ba" + itoa(n)
+    bf := "rt.rt_borrow_mut"
+    if pk == check.k_ref() {
+        bf = "rt.rt_borrow_read"
+    }
+    o.pre = "const " + tn + " = " + v + "; " + bf + "(" + tn + "); "
+    o.post = "rt.rt_unborrow(" + tn + "); "
+    o.v = tn
+    return o
+}
+
+// hoist=1 temps borrowed args for single-eval; hoist=0 (spawn/fsusp
+// fills, whose pre/post are emitted as statements around a suspend
+// point a `const` can't survive) keeps the inline expr
+fn jarg_c(g: mut G, e: ref parser.Node, v: str, pt: int, bind: ref collections.Map, hoist: int) -> GArgOut {
     o := GArgOut{v: "", pre: "", post: ""}
     o.v = v
     if pt < 0 {
@@ -254,13 +275,16 @@ fn jarg_c(g: mut G, e: ref parser.Node, v: str, pt: int, bind: ref collections.M
     }
     if tyk(g, raw) == check.k_own() {
         pk := tyk(g, pt2)
-        if pk == check.k_mut() {
-            o.pre = "rt.rt_borrow_mut(" + o.v + "); "
-            o.post = "rt.rt_unborrow(" + o.v + "); "
-        }
-        if pk == check.k_ref() {
-            o.pre = "rt.rt_borrow_read(" + o.v + "); "
-            o.post = "rt.rt_unborrow(" + o.v + "); "
+        if pk == check.k_mut() || pk == check.k_ref() {
+            if hoist == 1 {
+                o = jborrow_c(g, o.v, pk)
+            } else if pk == check.k_mut() {
+                o.pre = "rt.rt_borrow_mut(" + o.v + "); "
+                o.post = "rt.rt_unborrow(" + o.v + "); "
+            } else {
+                o.pre = "rt.rt_borrow_read(" + o.v + "); "
+                o.post = "rt.rt_unborrow(" + o.v + "); "
+            }
         }
     }
     return o
@@ -333,7 +357,7 @@ fn jav_decl(g: mut G, args: ref parser.NList, fi: int, bind: ref collections.Map
         apre := ""
         apost := ""
         if il != nil {
-            o := jarg_c(g, al.v, v, il.v, bind)
+            o := jarg_c(g, al.v, v, il.v, bind, 0)
             v = o.v
             apre = o.pre
             apost = o.post
@@ -1464,7 +1488,7 @@ fn jcall(g: mut G, f: ref parser.Node, args: ref parser.NList) -> str {
                     if il != nil {
                         // same arg adaptation as direct calls —
                         // jarg_c adds the own->mut/ref borrow ledger
-                        o := jarg_c(g, al.v, v, il.v, nil)
+                        o := jarg_c(g, al.v, v, il.v, nil, 1)
                         v = o.v
                         pre = pre + o.pre
                         post = post + o.post
@@ -1537,13 +1561,11 @@ fn jcall(g: mut G, f: ref parser.Node, args: ref parser.NList) -> str {
                 raw := gsub(g, xty(g, obj))
                 if tyk(g, raw) == check.k_own() {
                     pk := tyk(g, pt)
-                    if pk == check.k_mut() {
-                        pre = pre + "rt.rt_borrow_mut(" + c.v + "); "
-                        post = "rt.rt_unborrow(" + c.v + "); " + post
-                    }
-                    if pk == check.k_ref() {
-                        pre = pre + "rt.rt_borrow_read(" + c.v + "); "
-                        post = "rt.rt_unborrow(" + c.v + "); " + post
+                    if pk == check.k_mut() || pk == check.k_ref() {
+                        bo := jborrow_c(g, c.v, pk)
+                        c.v = bo.v
+                        pre = pre + bo.pre
+                        post = bo.post + post
                     }
                 }
                 coerced = c
@@ -1559,7 +1581,7 @@ fn jcall(g: mut G, f: ref parser.Node, args: ref parser.NList) -> str {
     for al != nil {
         v := av.v
         if il != nil {
-            o := jarg_c(g, al.v, v, il.v, bind)
+            o := jarg_c(g, al.v, v, il.v, bind, 1)
             v = o.v
             pre = pre + o.pre
             post = post + o.post
@@ -3375,7 +3397,10 @@ fn jgenall(g: mut G) -> str {
     ru := gubegin(g)
     g.units[ru].root = 1
     if g.testm == 1 {
-        tb := "async function oxl_main() {\n@@GLOBALS@@"
+        // test mode: any FAIL exits the process nonzero once the
+        // whole suite has run (rt_exit is a node process.exit, a
+        // browser no-op)
+        tb := "async function oxl_main() {\n@@GLOBALS@@    let _fails = 0;\n"
         i = 0
         id := 0
         for i < len(g.its) {
@@ -3393,7 +3418,7 @@ fn jgenall(g: mut G) -> str {
                                 tb = tb + "o_f_" + cn + "(); "
                             }
                             tb = tb + "_e" + sid + " = await rt.rt_scope_drain(_t" + sid + "); } catch (_x) { _e" + sid + " = (_x && _x.code !== undefined) ? _x.code : 1n; try { await rt.rt_scope_drain(_t" + sid + "); } catch (_y) {} } "
-                            tb = tb + "rt.rt_print_str(rt.rt_str_lit(\"" + base64.encode(("  " + name + " ... ") as []byte) + "\")); if (_e" + sid + ") rt.rt_println_str(rt.rt_str_lit(\"" + base64.encode("FAIL" as []byte) + "\")); else rt.rt_println_str(rt.rt_str_lit(\"" + base64.encode("ok" as []byte) + "\")); }\n"
+                            tb = tb + "rt.rt_print_str(rt.rt_str_lit(\"" + base64.encode(("  " + name + " ... ") as []byte) + "\")); if (_e" + sid + ") { rt.rt_println_str(rt.rt_str_lit(\"" + base64.encode("FAIL" as []byte) + "\")); _fails = _fails + 1; } else { rt.rt_println_str(rt.rt_str_lit(\"" + base64.encode("ok" as []byte) + "\")); } }\n"
                             id = id + 1
                         }
                     }
@@ -3405,7 +3430,7 @@ fn jgenall(g: mut G) -> str {
         }
         // scope_try yields the code: 0/ok when nothing trapped — the
         // C prints FAIL on nonzero; mirror with a small conditional
-        g.units[ru].ob = push(g.units[ru].ob, tb + "}\n")
+        g.units[ru].ob = push(g.units[ru].ob, tb + "    if (_fails) { globalThis.__oxl_ffi.rt_exit(1n); }\n}\n")
     }
     if g.testm == 0 && g.maink == 1 {
         g.units[ru].ob = push(g.units[ru].ob, "async function oxl_main() {\n@@GLOBALS@@    await rt.rt_run_root(o_frm_main());\n}\n")

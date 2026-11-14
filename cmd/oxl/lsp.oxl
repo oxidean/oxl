@@ -16,6 +16,8 @@ import "std/encoding/json"
 
 import "std/os"
 
+import "std/sort"
+
 import "std/strings"
 
 // an open buffer — its wire text is the analyze-time authority over disk
@@ -582,6 +584,17 @@ fn analyze_lsp(path: str, over: own check.OverEnt, docs: []LDoc) -> own Anl {
     return a
 }
 
+// span-start order for the per-file containment sweep — ties break on
+// the shorter span so nested records sort inner-first
+struct UIdx { lo: int, hi: int, ui: int }
+
+fn uidx_lt(a: UIdx, b: UIdx) -> bool {
+    if a.lo != b.lo {
+        return a.lo < b.lo
+    }
+    return a.hi < b.hi
+}
+
 // the index entry with the smallest span containing `off`
 fn index_at(us: []check.UseRec, file: str, off: int) -> int {
     best := -1
@@ -1044,6 +1057,20 @@ fn lsp_semantic_tokens(ck: ref check.Ck, file: str, src: str) -> own json.Json {
         collections.map_set(dm, d.file + "|" + itoa(d.lo) + "|" + itoa(d.hi), d.kind)
         di = di + 1
     }
+    // per-file usev sorted by span start — exact-map misses sweep this
+    // for the smallest containing record instead of scanning every
+    // package-wide entry per token
+    fu := mkslice(UIdx, 0)
+    fi := 0
+    for fi < len(ck.usev) {
+        if ck.usev[fi].file == file {
+            fu = push(fu, UIdx{lo: ck.usev[fi].lo, hi: ck.usev[fi].hi, ui: fi})
+        }
+        fi = fi + 1
+    }
+    sort.sortfn(fu, uidx_lt)
+    ap := 0
+    act := mkslice(UIdx, 0)
     cur := LCur{p: 0, l: 0, c: 0}
     pl := 0
     pc := 0
@@ -1053,23 +1080,52 @@ fn lsp_semantic_tokens(ck: ref check.Ck, file: str, src: str) -> own json.Json {
         ty := tk.ty
         if ty == 8 {
             // ident: upgrade variable -> decl kind via the use index
-            u := -1
+            x := check.UseRec{file: "", lo: 0, hi: 0, sig: "", def_file: "", def_lo: 0, def_hi: 0}
+            xok := 0
             uk := file + "|" + itoa(tk.lo) + "|" + itoa(tk.hi)
             if collections.map_has(um, uk) {
                 [uv, ue] = collections.map_get(um, uk)
                 if ue == nil {
-                    u = uv
+                    x = ck.usev[uv]
+                    xok = 1
                 }
             }
-            if u < 0 {
+            if xok == 0 {
                 mid := tk.lo + 1
                 if mid >= tk.hi {
                     mid = tk.lo
                 }
-                u = index_at(ck.usev, file, mid)
+                // sweep: token offsets ascend, so entries join the
+                // active set once and expire by hi — the miss lookup
+                // scans only spans covering this position
+                for ap < len(fu) && fu[ap].lo <= mid {
+                    act = push(act, fu[ap])
+                    ap = ap + 1
+                }
+                w := 0
+                best := -1
+                bestsz := 0
+                ai := 0
+                for ai < len(act) {
+                    y := act[ai]
+                    if y.hi > mid {
+                        act[w] = y
+                        w = w + 1
+                        sz := y.hi - y.lo
+                        if best < 0 || sz < bestsz {
+                            best = w - 1
+                            bestsz = sz
+                        }
+                    }
+                    ai = ai + 1
+                }
+                act = act[0:w]
+                if best >= 0 {
+                    x = ck.usev[act[best].ui]
+                    xok = 1
+                }
             }
-            if u >= 0 {
-                x := ck.usev[u]
+            if xok == 1 {
                 dk := -1
                 dkkey := x.def_file + "|" + itoa(x.def_lo) + "|" + itoa(x.def_hi)
                 if collections.map_has(dm, dkkey) {
@@ -1077,9 +1133,6 @@ fn lsp_semantic_tokens(ck: ref check.Ck, file: str, src: str) -> own json.Json {
                     if de == nil {
                         dk = dv
                     }
-                }
-                if dk < 0 {
-                    dk = decl_kind_of(ck.declsv, x.def_file, x.def_lo, x.def_hi)
                 }
                 if dk >= 0 {
                     ty = st_kind(dk)

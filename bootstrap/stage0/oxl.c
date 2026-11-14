@@ -220,6 +220,7 @@ struct o_s_PubU {    OxlStr f_key;    OxlStr f_uri;};
 struct o_s_Lsp {    RtSlice f_docs;    RtSlice f_ans;    RtSlice f_pubs;    OxlStr f_root;};
 struct o_s_LC {    int64_t f_l;    int64_t f_c;};
 struct o_s_LCur {    int64_t f_p;    int64_t f_l;    int64_t f_c;};
+struct o_s_UIdx {    int64_t f_lo;    int64_t f_hi;    int64_t f_ui;};
 struct o_s_STok {    int64_t f_lo;    int64_t f_hi;    int64_t f_ty;};
 struct o_s_codegen_GBnd {    OxlStr f_n;    OxlStr f_ce;    int64_t f_t;    struct o_s_codegen_GBnd* f_next;};
 struct o_s_codegen_GArm {    int64_t f_has;    OxlStr f_cond;    struct o_s_codegen_GBnd* f_binds;};
@@ -937,6 +938,7 @@ void o_f_pub_rebuild(struct o_s_Lsp* ls, OxlStr key, RtSlice current);
 void o_f_pub_drop_uri(struct o_s_Lsp* ls, OxlStr uri);
 struct o_s_check_OverEnt* o_f_build_over(RtSlice docs, OxlStr p, OxlStr text);
 struct o_s_Anl* o_f_analyze_lsp(OxlStr path, struct o_s_check_OverEnt* over, RtSlice docs);
+int o_f_uidx_lt(struct o_s_UIdx a, struct o_s_UIdx b);
 int64_t o_f_index_at(RtSlice us, OxlStr file, int64_t off);
 int64_t o_f_lsp_len(OxlStr buf, int64_t h);
 int64_t o_f_ck_item_kind(int64_t k);
@@ -1226,6 +1228,8 @@ void o_f_cmd_run(void);
 void o_f_cmd_test(void);
 void o_f_cmd_list(void);
 void o_f_main(void);
+void o_f_sort_sortfn__UIdx(RtSlice, RtFnv);
+void o_f_sort_sift__UIdx(RtSlice, RtFnv, int64_t, int64_t);
 void o_f_sort_sort__str(RtSlice);
 void o_f_sort_sifto__str(RtSlice, int64_t, int64_t);
 static struct o_s_check_SList* o_fnv_wrap_check_split_ws(void* _e, OxlStr a0) { return o_f_check_split_ws(a0); }
@@ -1302,6 +1306,7 @@ static struct o_s_json_Json* o_fnv_wrap_json_jparse(void* _e, OxlStr a0) { retur
 static struct o_s_os_File o_fnv_wrap_os_stdin(void* _e) { return o_f_os_stdin(); }
 static OxlStr o_fnv_wrap_check_canon_or(void* _e, OxlStr a0) { return o_f_check_canon_or(a0); }
 static OxlStr o_fnv_wrap_check_ty_name(void* _e, struct o_s_check_Ck* a0, int64_t a1) { return o_f_check_ty_name(a0, a1); }
+static int o_fnv_wrap_uidx_lt(void* _e, struct o_s_UIdx a0, struct o_s_UIdx a1) { return o_f_uidx_lt(a0, a1); }
 static int64_t o_fnv_wrap_lexlib_k_eof(void* _e) { return o_f_lexlib_k_eof(); }
 static int64_t o_fnv_wrap_lexlib_k_float(void* _e) { return o_f_lexlib_k_float(); }
 static int64_t o_fnv_wrap_lexlib_k_punct(void* _e) { return o_f_lexlib_k_punct(); }
@@ -20025,6 +20030,17 @@ struct o_s_Anl* o_f_analyze_lsp(OxlStr path, struct o_s_check_OverEnt* over, RtS
     rt_defer_drain_to(_dmark);
 }
 
+int o_f_uidx_lt(struct o_s_UIdx a, struct o_s_UIdx b) {
+    RtDefer *_dmark = rt_defer_mark();
+    if ((a.f_lo != b.f_lo)) {
+    rt_defer_drain_to(_dmark);
+    return (a.f_lo < b.f_lo);
+    }
+    rt_defer_drain_to(_dmark);
+    return (a.f_hi < b.f_hi);
+    rt_defer_drain_to(_dmark);
+}
+
 int64_t o_f_index_at(RtSlice us, OxlStr file, int64_t off) {
     RtDefer *_dmark = rt_defer_mark();
     int64_t best = (-1LL);
@@ -20555,6 +20571,17 @@ struct o_s_json_Json* o_f_lsp_semantic_tokens(struct o_s_check_Ck* ck, OxlStr fi
     ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_collections_map_set }; ((void (*)(void*, struct o_s_collections_Map*, OxlStr, int64_t))_fv.fp)(_fv.env, dm, rt_strcat(rt_strcat(rt_strcat(rt_strcat(d.f_file, rt_str_lit("|")), rt_itoa(d.f_lo)), rt_str_lit("|")), rt_itoa(d.f_hi)), d.f_kind); });
     di = (di + 1LL);
     }
+    RtSlice fu = rt_mkslice(0LL, sizeof(struct o_s_UIdx));
+    int64_t fi = 0LL;
+    while ((fi < (ck->f_usev).len)) {
+    if ((rt_streq((*({ RtSlice _ms = ck->f_usev; int64_t _mi = fi; if (_mi < 0 || _mi >= _ms.len) rt_trap(10); (struct o_s_check_UseRec*)_ms.ptr + _mi; })).f_file, file))) {
+    fu = ({ struct o_s_UIdx _pv = (struct o_s_UIdx){ .f_lo = (*({ RtSlice _ms = ck->f_usev; int64_t _mi = fi; if (_mi < 0 || _mi >= _ms.len) rt_trap(10); (struct o_s_check_UseRec*)_ms.ptr + _mi; })).f_lo, .f_hi = (*({ RtSlice _ms = ck->f_usev; int64_t _mi = fi; if (_mi < 0 || _mi >= _ms.len) rt_trap(10); (struct o_s_check_UseRec*)_ms.ptr + _mi; })).f_hi, .f_ui = fi }; rt_slice_push(fu, sizeof(struct o_s_UIdx), &_pv); });
+    }
+    fi = (fi + 1LL);
+    }
+    o_f_sort_sortfn__UIdx(fu, (RtFnv){ 0, (void*)o_fnv_wrap_uidx_lt });
+    int64_t ap = 0LL;
+    RtSlice act = rt_mkslice(0LL, sizeof(struct o_s_UIdx));
     struct o_s_LCur cur = (struct o_s_LCur){ .f_p = 0LL, .f_l = 0LL, .f_c = 0LL };
     int64_t pl = 0LL;
     int64_t pc = 0LL;
@@ -20563,25 +20590,51 @@ struct o_s_json_Json* o_f_lsp_semantic_tokens(struct o_s_check_Ck* ck, OxlStr fi
     struct o_s_STok tk = (*({ RtSlice _ms = all; int64_t _mi = i; if (_mi < 0 || _mi >= _ms.len) rt_trap(10); (struct o_s_STok*)_ms.ptr + _mi; }));
     int64_t ty = tk.f_ty;
     if ((ty == 8LL)) {
-    int64_t u = (-1LL);
+    struct o_s_check_UseRec x = (struct o_s_check_UseRec){ .f_file = rt_str_lit(""), .f_lo = 0LL, .f_hi = 0LL, .f_sig = rt_str_lit(""), .f_def_file = rt_str_lit(""), .f_def_lo = 0LL, .f_def_hi = 0LL };
+    int64_t xok = 0LL;
     OxlStr uk = rt_strcat(rt_strcat(rt_strcat(rt_strcat(file, rt_str_lit("|")), rt_itoa(tk.f_lo)), rt_str_lit("|")), rt_itoa(tk.f_hi));
     if (({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_collections_map_has }; ((int (*)(void*, struct o_s_collections_Map*, OxlStr))_fv.fp)(_fv.env, um, uk); })) {
     struct o_ret_collections_map_get _r107 = ({ struct o_ret_collections_map_get __rc; rt_borrow_read(um); __rc = o_f_collections_map_get(um, uk); rt_unborrow(um); __rc; });
     int64_t uv = _r107.val;
     int64_t ue = _r107.err;
     if ((ue == 0)) {
-    u = uv;
+    x = (*({ RtSlice _ms = ck->f_usev; int64_t _mi = uv; if (_mi < 0 || _mi >= _ms.len) rt_trap(10); (struct o_s_check_UseRec*)_ms.ptr + _mi; }));
+    xok = 1LL;
     }
     }
-    if ((u < 0LL)) {
+    if ((xok == 0LL)) {
     int64_t mid = (tk.f_lo + 1LL);
     if ((mid >= tk.f_hi)) {
     mid = tk.f_lo;
     }
-    u = o_f_index_at(ck->f_usev, file, mid);
+    while (((ap < (fu).len) && ((*({ RtSlice _ms = fu; int64_t _mi = ap; if (_mi < 0 || _mi >= _ms.len) rt_trap(10); (struct o_s_UIdx*)_ms.ptr + _mi; })).f_lo <= mid))) {
+    act = ({ struct o_s_UIdx _pv = (*({ RtSlice _ms = fu; int64_t _mi = ap; if (_mi < 0 || _mi >= _ms.len) rt_trap(10); (struct o_s_UIdx*)_ms.ptr + _mi; })); rt_slice_push(act, sizeof(struct o_s_UIdx), &_pv); });
+    ap = (ap + 1LL);
     }
-    if ((u >= 0LL)) {
-    struct o_s_check_UseRec x = (*({ RtSlice _ms = ck->f_usev; int64_t _mi = u; if (_mi < 0 || _mi >= _ms.len) rt_trap(10); (struct o_s_check_UseRec*)_ms.ptr + _mi; }));
+    int64_t w = 0LL;
+    int64_t best = (-1LL);
+    int64_t bestsz = 0LL;
+    int64_t ai = 0LL;
+    while ((ai < (act).len)) {
+    struct o_s_UIdx y = (*({ RtSlice _ms = act; int64_t _mi = ai; if (_mi < 0 || _mi >= _ms.len) rt_trap(10); (struct o_s_UIdx*)_ms.ptr + _mi; }));
+    if ((y.f_hi > mid)) {
+    (*({ RtSlice _ms = act; int64_t _mi = w; if (_mi < 0 || _mi >= _ms.len) rt_trap(10); (struct o_s_UIdx*)_ms.ptr + _mi; })) = y;
+    w = (w + 1LL);
+    int64_t sz = (y.f_hi - y.f_lo);
+    if (((best < 0LL) || (sz < bestsz))) {
+    best = (w - 1LL);
+    bestsz = sz;
+    }
+    }
+    ai = (ai + 1LL);
+    }
+    act = ({ RtSlice _ms = act; int64_t _ma = 0LL; int64_t _mb = w; if (_ma < 0 || _mb < _ma || _mb > _ms.len) rt_trap(10); (RtSlice){ (struct o_s_UIdx*)_ms.ptr + _ma, _mb - _ma, _ms.cap - _ma, _ms.heap }; });
+    if ((best >= 0LL)) {
+    x = (*({ RtSlice _ms = ck->f_usev; int64_t _mi = (*({ RtSlice _ms = act; int64_t _mi = best; if (_mi < 0 || _mi >= _ms.len) rt_trap(10); (struct o_s_UIdx*)_ms.ptr + _mi; })).f_ui; if (_mi < 0 || _mi >= _ms.len) rt_trap(10); (struct o_s_check_UseRec*)_ms.ptr + _mi; }));
+    xok = 1LL;
+    }
+    }
+    if ((xok == 1LL)) {
     int64_t dk = (-1LL);
     OxlStr dkkey = rt_strcat(rt_strcat(rt_strcat(rt_strcat(x.f_def_file, rt_str_lit("|")), rt_itoa(x.f_def_lo)), rt_str_lit("|")), rt_itoa(x.f_def_hi));
     if (({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_collections_map_has }; ((int (*)(void*, struct o_s_collections_Map*, OxlStr))_fv.fp)(_fv.env, dm, dkkey); })) {
@@ -20591,9 +20644,6 @@ struct o_s_json_Json* o_f_lsp_semantic_tokens(struct o_s_check_Ck* ck, OxlStr fi
     if ((de == 0)) {
     dk = dv;
     }
-    }
-    if ((dk < 0LL)) {
-    dk = o_f_decl_kind_of(ck->f_declsv, x.f_def_file, x.f_def_lo, x.f_def_hi);
     }
     if ((dk >= 0LL)) {
     ty = o_f_st_kind(dk);
@@ -31799,6 +31849,47 @@ void o_f_main(void) {
     } else {
     o_f_eprintln(rt_strcat(rt_strcat(rt_str_lit("unknown command `"), c), rt_str_lit("`")));
     rt_exit(2LL);
+    }
+    rt_defer_drain_to(_dmark);
+}
+
+void o_f_sort_sortfn__UIdx(RtSlice v, RtFnv lt) {
+    RtDefer *_dmark = rt_defer_mark();
+    int64_t n = (v).len;
+    int64_t i = ((n / 2LL) - 1LL);
+    while ((i >= 0LL)) {
+    o_f_sort_sift__UIdx(v, lt, i, n);
+    i = (i - 1LL);
+    }
+    int64_t e = (n - 1LL);
+    while ((e > 0LL)) {
+    struct o_s_UIdx t = (*({ RtSlice _ms = v; int64_t _mi = 0LL; if (_mi < 0 || _mi >= _ms.len) rt_trap(10); (struct o_s_UIdx*)_ms.ptr + _mi; }));
+    (*({ RtSlice _ms = v; int64_t _mi = 0LL; if (_mi < 0 || _mi >= _ms.len) rt_trap(10); (struct o_s_UIdx*)_ms.ptr + _mi; })) = (*({ RtSlice _ms = v; int64_t _mi = e; if (_mi < 0 || _mi >= _ms.len) rt_trap(10); (struct o_s_UIdx*)_ms.ptr + _mi; }));
+    (*({ RtSlice _ms = v; int64_t _mi = e; if (_mi < 0 || _mi >= _ms.len) rt_trap(10); (struct o_s_UIdx*)_ms.ptr + _mi; })) = t;
+    o_f_sort_sift__UIdx(v, lt, 0LL, e);
+    e = (e - 1LL);
+    }
+    rt_defer_drain_to(_dmark);
+}
+
+void o_f_sort_sift__UIdx(RtSlice v, RtFnv lt, int64_t r, int64_t n) {
+    RtDefer *_dmark = rt_defer_mark();
+    int64_t i = r;
+    while (1) {
+    int64_t c = (((int64_t)((uint64_t)(2LL) * (uint64_t)(i))) + 1LL);
+    if ((c >= n)) {
+    break;
+    }
+    if ((((c + 1LL) < n) && ({ RtFnv _fv = lt; ((int (*)(void*, struct o_s_UIdx, struct o_s_UIdx))_fv.fp)(_fv.env, (*({ RtSlice _ms = v; int64_t _mi = c; if (_mi < 0 || _mi >= _ms.len) rt_trap(10); (struct o_s_UIdx*)_ms.ptr + _mi; })), (*({ RtSlice _ms = v; int64_t _mi = (c + 1LL); if (_mi < 0 || _mi >= _ms.len) rt_trap(10); (struct o_s_UIdx*)_ms.ptr + _mi; }))); }))) {
+    c = (c + 1LL);
+    }
+    if ((!({ RtFnv _fv = lt; ((int (*)(void*, struct o_s_UIdx, struct o_s_UIdx))_fv.fp)(_fv.env, (*({ RtSlice _ms = v; int64_t _mi = i; if (_mi < 0 || _mi >= _ms.len) rt_trap(10); (struct o_s_UIdx*)_ms.ptr + _mi; })), (*({ RtSlice _ms = v; int64_t _mi = c; if (_mi < 0 || _mi >= _ms.len) rt_trap(10); (struct o_s_UIdx*)_ms.ptr + _mi; }))); }))) {
+    break;
+    }
+    struct o_s_UIdx t = (*({ RtSlice _ms = v; int64_t _mi = i; if (_mi < 0 || _mi >= _ms.len) rt_trap(10); (struct o_s_UIdx*)_ms.ptr + _mi; }));
+    (*({ RtSlice _ms = v; int64_t _mi = i; if (_mi < 0 || _mi >= _ms.len) rt_trap(10); (struct o_s_UIdx*)_ms.ptr + _mi; })) = (*({ RtSlice _ms = v; int64_t _mi = c; if (_mi < 0 || _mi >= _ms.len) rt_trap(10); (struct o_s_UIdx*)_ms.ptr + _mi; }));
+    (*({ RtSlice _ms = v; int64_t _mi = c; if (_mi < 0 || _mi >= _ms.len) rt_trap(10); (struct o_s_UIdx*)_ms.ptr + _mi; })) = t;
+    i = c;
     }
     rt_defer_drain_to(_dmark);
 }

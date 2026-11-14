@@ -549,6 +549,30 @@ fn pub_drop_uri(ls: mut Lsp, uri: str) {
     }
 }
 
+// a closed doc's text was an overlay input to EVERY cached analysis
+// (build_over feeds all open buffers to each package check), so its
+// Anl rows are all suspect — drop them, clear published diags, then
+// revalidate one open doc per package dir to rebuild
+fn doc_close_invalidate(ls: mut Lsp) {
+    i := 0
+    for i < len(ls.pubs) {
+        publish_diags(ls.pubs[i].uri, mkslice(LDiag, 0))
+        i = i + 1
+    }
+    ls.pubs = mkslice(PubU, 0)
+    ls.ans = mkslice(Anl, 0)
+    seen := mkslice(str, 0)
+    d := 0
+    for d < len(ls.docs) {
+        key := dir_key(ls.docs[d].path)
+        if !has_str(seen, key) {
+            seen = push(seen, key)
+            lsp_revalidate(ls, ls.docs[d].uri, ls.docs[d].path, ls.docs[d].text)
+        }
+        d = d + 1
+    }
+}
+
 // every open buffer is authoritative over its path — an unsaved
 // sibling's decls must resolve too, not just the analyzed doc's
 fn build_over(docs: []LDoc, p: str, text: str) -> own check.OverEnt {
@@ -1816,7 +1840,9 @@ fn def_key(df: str, dl: int, dh: int) -> str {
 // decl-file -> client URI, resolving relative decl paths against the
 // requesting doc's dir (same rule the definition response used)
 fn lsp_uri_for(df: str, file: str) -> str {
-    if len(df) > 0 && byteat(df, 0) == 47 {
+    // absolute = `/`-rooted (POSIX) or drive-rooted (`D:/...`, the
+    // spelling uri_to_path produces for Windows file URIs)
+    if len(df) > 0 && (byteat(df, 0) == 47 || len(df) > 1 && is_alpha(byteat(df, 0)) && byteat(df, 1) == 58) {
         return path_to_uri(df)
     }
     base := check.dir_of(file)
@@ -2111,22 +2137,30 @@ fn lsp_rename(ck: ref check.Ck, docs: []LDoc, file: str, src: str, off: int, new
     for k < len(ulist) {
         target := ulist[k]
         ab := json.jarrb()
+        // decl-site edit + any use record covering the same span would
+        // emit overlapping replacements — dedupe by byte range
+        seen := mkslice(str, 0)
         if du == target {
             dsrc := file_src(docs, dfile)
             te := json.jobj()
             json.jadd(te, "range", jrange_at(dsrc, dlo, dhi))
             json.jadd(te, "newText", json.jstr(newname))
             json.jarrb_add(ab, te)
+            seen = push(seen, itoa(dlo) + ":" + itoa(dhi))
         }
         i = 0
         for i < len(ck.usev) {
             x := ck.usev[i]
             if def_key(x.def_file, x.def_lo, x.def_hi) == tdk && is_decl_self(ck, x) == 0 && lsp_uri_for(x.file, file) == target {
-                xsrc := file_src(docs, x.file)
-                te := json.jobj()
-                json.jadd(te, "range", jrange_at(xsrc, x.lo, x.hi))
-                json.jadd(te, "newText", json.jstr(newname))
-                json.jarrb_add(ab, te)
+                xk := itoa(x.lo) + ":" + itoa(x.hi)
+                if !has_str(seen, xk) {
+                    seen = push(seen, xk)
+                    xsrc := file_src(docs, x.file)
+                    te := json.jobj()
+                    json.jadd(te, "range", jrange_at(xsrc, x.lo, x.hi))
+                    json.jadd(te, "newText", json.jstr(newname))
+                    json.jarrb_add(ab, te)
+                }
             }
             i = i + 1
         }
@@ -2426,6 +2460,7 @@ fn cmd_lsp() {
             if len(uri) > 0 {
                 doc_drop(ls, uri)
                 pub_drop_uri(ls, uri)
+                doc_close_invalidate(ls)
             }
             continue
         }

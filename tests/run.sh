@@ -1920,6 +1920,10 @@ send({"jsonrpc":"2.0","id":5,"method":"textDocument/rename","params":{**pos_of("
 r = recv_id(5)
 assert "result" in r and "changes" in r["result"], r
 edits = [e for u, es in r["result"]["changes"].items() for e in es]
+# the server itself must not emit overlapping replacements — the
+# client-side uniq below would hide a duplicate
+raw_keys = [(e["range"]["start"]["line"], e["range"]["start"]["character"], e["range"]["end"]["line"], e["range"]["end"]["character"]) for e in edits]
+assert len(raw_keys) == len(set(raw_keys)), raw_keys
 seen = set()
 uniq = []
 for e in edits:
@@ -1939,6 +1943,75 @@ arg_hits = [e for e in raw if e["range"]["start"]["line"] == 12 and e["range"]["
 assert len(arg_hits) == 1, raw
 send({"jsonrpc":"2.0","method":"exit","params":{}})
 print("lsp102 ok")
+PYEOF
+
+echo "== lsp didClose invalidation (#102) =="
+OXL_WIN102=$(cygpath -w "$OXL" 2>/dev/null || printf '%s' "$OXL")
+$PY - "$OXL_WIN102" "$scratch" <<'PYEOF'
+import json, pathlib, subprocess, sys
+oxl = sys.argv[1]
+work = pathlib.Path(sys.argv[2]) / "lsp102close"
+work.mkdir(parents=True, exist_ok=True)
+fa = work / "a.oxl"
+fb = work / "b.oxl"
+fa.write_text("""package main
+
+fn helper() -> int {
+    return 42
+}
+""")
+fb.write_text("""package main
+
+fn main() {
+    x := helper()
+    println(x)
+}
+""")
+p = subprocess.Popen([oxl, "lsp"], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+srv_methods = []
+def send(m):
+    b = json.dumps(m).encode()
+    p.stdin.write(b"Content-Length: %d\r\n\r\n" % len(b) + b); p.stdin.flush()
+def recv():
+    while True:
+        h = {}
+        while True:
+            l = p.stdout.readline().decode().strip()
+            if not l: break
+            k, v = l.split(":", 1); h[k.strip()] = v.strip()
+        m = json.loads(p.stdout.read(int(h["Content-Length"])).decode())
+        if "method" in m and "id" in m:
+            srv_methods.append(m["method"])
+            b = json.dumps({"jsonrpc":"2.0","id":m["id"],"result":{}}).encode()
+            p.stdin.write(b"Content-Length: %d\r\n\r\n" % len(b) + b); p.stdin.flush()
+            continue
+        return m
+def recv_id(i):
+    while True:
+        m = recv()
+        if m.get("id") == i: return m
+ua = fa.as_uri(); ub = fb.as_uri()
+sa = fa.read_text(); sb = fb.read_text()
+send({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}); recv()
+send({"jsonrpc":"2.0","method":"initialized","params":{}})
+send({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":ua,"languageId":"oxl","version":1,"text":sa}}})
+send({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":ub,"languageId":"oxl","version":1,"text":sb}}})
+def hover_helper():
+    send({"jsonrpc":"2.0","id":90,"method":"textDocument/hover","params":{"textDocument":{"uri":ub},"position":{"line":3,"character":10}}})
+    return recv_id(90)
+h = hover_helper()
+assert "fn helper" in json.dumps(h), h
+# break the callee in an unsaved overlay — the sibling's hover degrades
+send({"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":ua,"version":2},"contentChanges":[{"text":sa.replace("helper", "helperX")}]}})
+h = hover_helper()
+assert "fn helper" not in json.dumps(h), h
+# closing the broken doc must invalidate the stale overlay and rebuild
+# the package analysis from disk — hover resolves again
+send({"jsonrpc":"2.0","method":"textDocument/didClose","params":{"textDocument":{"uri":ua}}})
+h = hover_helper()
+assert "fn helper" in json.dumps(h), h
+send({"jsonrpc":"2.0","method":"exit","params":{}})
+print("lsp102close ok")
 PYEOF
 
 echo "== lsp hover/definition =="

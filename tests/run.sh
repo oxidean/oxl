@@ -1755,16 +1755,26 @@ $PY - "$OXL_WIN" <<'PYEOF'
 import json, pathlib, subprocess, sys
 oxl = sys.argv[1]
 p = subprocess.Popen([oxl, "lsp"], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+srv_methods = []
 def send(m):
     b = json.dumps(m).encode()
     p.stdin.write(b"Content-Length: %d\r\n\r\n" % len(b) + b); p.stdin.flush()
 def recv():
-    h = {}
     while True:
-        l = p.stdout.readline().decode().strip()
-        if not l: break
-        k, v = l.split(":", 1); h[k.strip()] = v.strip()
-    return json.loads(p.stdout.read(int(h["Content-Length"])).decode())
+        h = {}
+        while True:
+            l = p.stdout.readline().decode().strip()
+            if not l: break
+            k, v = l.split(":", 1); h[k.strip()] = v.strip()
+        m = json.loads(p.stdout.read(int(h["Content-Length"])).decode())
+        # server->client requests (e.g. client/registerCapability)
+        # carry method+id — answer them so the handshake completes
+        if "method" in m and "id" in m:
+            srv_methods.append(m["method"])
+            b = json.dumps({"jsonrpc":"2.0","id":m["id"],"result":{}}).encode()
+            p.stdin.write(b"Content-Length: %d\r\n\r\n" % len(b) + b); p.stdin.flush()
+            continue
+        return m
 uri = pathlib.Path("bootstrap/cmd/parse/main.oxl").resolve().as_uri()
 src = open("bootstrap/cmd/parse/main.oxl").read()
 send({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}); recv()
@@ -1872,6 +1882,28 @@ send({"jsonrpc":"2.0","method":"workspace/didChangeWatchedFiles","params":{"chan
 # hover still resolves after invalidation
 send({"jsonrpc":"2.0","id":20,"method":"textDocument/hover","params":pos2})
 h3 = recv_id(20); assert "fn lexlib.lex" in json.dumps(h3), h3
+
+# hover on a local's binding site shows the local, not the fn sig —
+# `ast :=` on the emoji-bearing line; the position is UTF-16 units
+ast_col = u16(lines2[i2][:lines2[i2].index("ast :=")])
+send({"jsonrpc":"2.0","id":22,"method":"textDocument/hover","params":{"textDocument":{"uri":uri},"position":{"line":i2,"character":ast_col}}})
+hb = recv_id(22)["result"]
+assert hb["contents"]["value"].startswith("ast:"), hb
+
+# semanticTokens/range returns delta-encoded data for the range only —
+# first token is `fn` at the start of the fn main line
+fn_line = next(i for i,l in enumerate(lines) if l.startswith("fn main"))
+send({"jsonrpc":"2.0","id":23,"method":"textDocument/semanticTokens/range","params":{"textDocument":{"uri":uri},"range":{"start":{"line":fn_line,"character":0},"end":{"line":fn_line+1,"character":0}}}})
+tr = recv_id(23)["result"]["data"]
+assert len(tr) > 0 and len(tr) % 5 == 0 and tr[0] == fn_line and tr[1] == 0, tr[:10]
+# the non-spec bare semanticTokens alias is gone
+send({"jsonrpc":"2.0","id":24,"method":"textDocument/semanticTokens","params":{"textDocument":{"uri":uri}}})
+eb = recv_id(24); assert eb["error"]["code"] == -32601, eb
+# semanticTokensProvider advertises range support
+assert caps["semanticTokensProvider"]["range"] == True
+
+# client/registerCapability was sent once after `initialized`
+assert srv_methods.count("client/registerCapability") == 1, srv_methods
 
 # unknown method -> -32601, malformed body -> -32700
 send({"jsonrpc":"2.0","id":21,"method":"bogus/method","params":{}})

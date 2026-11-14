@@ -38,6 +38,11 @@ Milestone map: [docs/specs/2026-11-07-phase-2-plan/](../specs/2026-11-07-phase-2
 
 - **T — toolchain-in-oxl**: shipped — `cmd/oxl` is `.oxl` end to
   end; cargo is out of the build path
+- **U — self-host-only + editor support**: shipped — the Rust seed
+  is retired for a checked-in stage-0 C snapshot (`scripts/stage0.sh`),
+  `oxl lsp` covers the full capability surface, and the repo carries a
+  TextMate grammar plus a VS Code extension skeleton; spec:
+  `docs/specs/2026-11-14-selfhost-editor/`
 - **E — monorepo / oxl-extra**: shipped — `extra/` module for
   packages outside `std`, `oxl.work` workspaces, git-backed index +
   `oxl publish` (absorbs registry), polish issues
@@ -75,5 +80,6 @@ Milestone map: [docs/specs/2026-11-07-phase-2-plan/](../specs/2026-11-07-phase-2
     demands it; `compress`/`archive`/`net`/`container` landed,
     files one work item each.
 
-(The compiler already compiles itself — see `docs/self-hosting.md`;
-"T" retires the Rust seed driver, not the compiler.)
+(The compiler compiles itself end to end — see
+`docs/self-hosting.md`; milestone U retired the last Rust seed
+artifact, not the compiler.)

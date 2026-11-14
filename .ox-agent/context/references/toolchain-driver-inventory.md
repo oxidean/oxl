@@ -31,13 +31,14 @@ Not ported (seed only): `check.rs`/`codegen.rs`/`parser.rs`/`lexer.rs`/`ast.rs`.
 ## Bootstrap-of-the-bootstrap
 
 New `oxl` = `package main` (e.g. `bootstrap/cmd/oxl/`) importing the
-compiler packages + std. First build uses the Rust seed; exit criterion
-(milestone map): self-built `oxl` passes `tests/run.sh` as the driver
-with cargo out of the *product* build path (seed stays for bootstrap).
+compiler packages + std. First build uses the stage-0 C snapshot
+(`bootstrap/stage0/oxl.c` via `scripts/stage0.sh`); exit criterion
+(milestone map): self-built `oxl` passes `tests/run.sh` as the driver —
+met, and the Rust seed was retired in milestone U (ADR-0014).
 
 ## Verification surface
 
-`config.yaml` test_command: `cargo build --release --manifest-path
-oxl/Cargo.toml && tests/run.sh oxl/target/release/oxl`. Dogfood gate:
+`config.yaml` test_command: `bash scripts/stage0.sh && tests/run.sh
+./target/oxl`. Dogfood gate:
 run the same suite with the self-built driver (`tests/run.sh <new-oxl>`)
 — byte-identical `oxl doc`/`fmt`/`check` output, plus mod/get coverage.

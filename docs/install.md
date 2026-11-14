@@ -101,18 +101,26 @@ prebuilt tarball):
 
 ```sh
 git clone https://github.com/oxidean/oxl && cd oxl
-cd oxl && cargo build --release && cd ..
-export PATH="$PWD/oxl/target/release:$PATH"
+bash scripts/stage0.sh   # stage-0 snapshot -> target/oxl
+export PATH="$PWD/target:$PATH"
 ```
 
-The seed binary builds the product driver (`cmd/oxl`) the same way the
-release does:
+The stage-0 binary builds the product driver (`cmd/oxl`) the same way
+the release does — `tests/run.sh` runs that gen1/gen2 fixpoint plus
+the full suite:
 
 ```sh
-oxl build cmd/oxl -o target/oxl-self
+bash tests/run.sh ./target/oxl
 ```
 
 A source-built binary reports `oxl dev (language 0.3)` — no `RELEASE`
 file sits beside it. The version manager only manages release installs;
 a dev build lives outside `~/.oxl/versions/` and can shadow the shim
 by sitting earlier on `PATH`.
+
+## Editor support
+
+`oxl lsp` starts the stdio language server used by the editor
+integrations — VS Code extension skeleton under `editors/vscode/`,
+TextMate grammar under `editors/grammars/`, setup notes in
+[docs/editors.md](editors.md).

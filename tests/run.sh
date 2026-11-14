@@ -84,13 +84,14 @@ cleanup() {
 trap cleanup EXIT
 
 echo "== self-built product driver (t6) =="
-# ADR-0006: the Rust seed is the bootstrap input only — it builds the
-# product driver once (gen 1), the product driver rebuilds itself
-# (gen 2), and the C each generation emits for the driver sources must
-# be byte-identical (the fixpoint — not a binary hash: build-ids and
-# embedded paths legitimately differ) — seed emit included, so the
-# seed-vs-self spec criterion is checked directly, not just via
-# output parity. Every section below then runs
+# ADR-0006/ADR-0014: the stage-0 snapshot (bootstrap/stage0/oxl.c,
+# compiled by scripts/stage0.sh) is the bootstrap input only — it
+# builds the product driver once (gen 1), the product driver rebuilds
+# itself (gen 2), and the C each generation emits for the driver
+# sources must be byte-identical (the fixpoint — not a binary hash:
+# build-ids and embedded paths legitimately differ) — seed emit
+# included, so the seed-vs-self spec criterion is checked directly,
+# not just via output parity. Every section below then runs
 # under the product driver; SEEDOXL stays only where a seed-vs-self
 # output comparison needs it.
 SEEDOXL="$OXL"
@@ -103,6 +104,10 @@ SELFOXL2="$PWD/target/oxl-self2$EXE"
 "$SELFOXL2" run bootstrap/cmd/codegen -- cmd/oxl > "$scratch/drv2.c" || { echo "FAIL gen2 emit"; exit 1; }
 diff "$scratch/drv0.c" "$scratch/drv1.c" >/dev/null || { echo "FAIL driver C fixpoint (seed vs gen1)"; diff "$scratch/drv0.c" "$scratch/drv1.c" | head -20; exit 1; }
 diff "$scratch/drv1.c" "$scratch/drv2.c" >/dev/null || { echo "FAIL driver C fixpoint (gen1 vs gen2)"; diff "$scratch/drv1.c" "$scratch/drv2.c" | head -20; exit 1; }
+# the checked-in snapshot must be the emit of the current driver
+# sources — drv0 is that emit via the seed, so a stale snapshot fails
+# here with a pointer back to scripts/stage0.sh emit
+diff "$scratch/drv0.c" bootstrap/stage0/oxl.c >/dev/null || { echo "FAIL stage-0 snapshot stale: regenerate with scripts/stage0.sh emit"; diff "$scratch/drv0.c" bootstrap/stage0/oxl.c | head -20; exit 1; }
 OXL="$SELFOXL"
 
 echo "== hello =="
@@ -607,10 +612,13 @@ for f in bootstrap/check bootstrap/codegen examples/features.oxl tests/match.oxl
 done
 
 echo "== differential diagnostics (c1) =="
-# tests/diag/ holds files that parse cleanly in both pipelines but fail
-# checking — the seed checker's diagnostics must equal the self-hosted
-# one's, line for line and in order. The seed driver prefixes each diag
-# `file:line:col:` (stripped here); check.oxl reports {kind,msg} only.
+# tests/diag/ holds files that parse cleanly but fail checking. Since
+# ADR-0014 both sides run the same self-hosted checker — the "seed"
+# side through the driver build path, the "self" side through the
+# standalone check binary — so this now guards the driver's diag
+# plumbing (prefix strip, ordering, acceptance) rather than a second
+# implementation. The driver prefixes each diag `file:line:col:`
+# (stripped here); check.oxl reports {kind,msg} only.
 # Out of corpus scope by design: parse/lex failures (the [parse]/[lex]
 # kinds don't surface through check.oxl's diag list) and cases neither
 # checker diagnoses (cc or the runtime catches those downstream — that
@@ -644,9 +652,9 @@ done
 echo "== module resolution (m2) =="
 # tests/mod/ holds self-contained module trees; each carries its own
 # oxl.mod so root discovery never escapes into the repo's module.
-# `expected` marks the outcome — `ok` fixtures must build in the seed toolchain and
-# print `ok` in the self-hosted checker; error fixtures must be
-# rejected by both checkers with byte-identical diagnostics. The
+# `expected` marks the outcome — `ok` fixtures must build under the
+# driver and print `ok` in the standalone checker; error fixtures must
+# be rejected by both paths with identical diagnostics. The
 # module cache is pointed at an empty dir so `missing module` is
 # deterministic; `tests/mod/widget` and `tests/mod/intmod` are shared
 # replace-targets, not cases.
@@ -729,11 +737,11 @@ if [ "$seed_rc" != 0 ] || [ "$self_rc" != 0 ] || [ "$self_out" != ok ]; then
 fi
 ;;
 esac
-# invalid UTF-8 inside a comment: the seed's read_to_string rejects the
-# file outright; the self-hosted driver must degrade to the documented
+# invalid UTF-8 inside a comment: strict readers reject the file
+# outright; the driver must degrade to the documented
 # missing-directive diagnostic — validating before comment stripping,
 # not during line parsing. Diagnostics differ by contract, so only the
-# self side's text is asserted.
+# driver side's text is asserted.
 mkdir -p "$scratch/workbadutf8/app"
 printf 'module local/badutf8\noxl 0.3\n' > "$scratch/workbadutf8/oxl.mod"
 printf 'package main\nfn main() {}\n' > "$scratch/workbadutf8/app/main.oxl"
@@ -1242,15 +1250,12 @@ echo "== toolchain driver in .oxl (t2) =="
 # the driver was built (gen1+gen2) and fixpoint-verified in the
 # t6 section above — SELFOXL is the product binary
 # command surface: bare usage, unknown command, and list's usage error
-# are byte-identical stderr + exit codes (2/2/2) — modulo the
-# sanctioned W-extension: the self driver documents `[--target js]`
-# and `[--html]` on build/run/test, flags the frozen seed can never
-# grow (its emit lane is C-only). Scrub exactly those markers off
-# the self side before comparing; any other drift still fails.
+# are byte-identical stderr + exit codes (2/2/2). The stage-0 snapshot
+# compiles the same driver sources as gen1, so no output scrubbing is
+# needed — seed and self are the same program at different generations.
 for inv in "" "bogus" "list"; do
     seed_out=$("$SEEDOXL" $inv 2>&1) && seed_rc=0 || seed_rc=$?
     self_out=$("$SELFOXL" $inv 2>&1) && self_rc=0 || self_rc=$?
-    self_out=$(printf '%s\n' "$self_out" | sed 's/ \[--target js\]//g; s/ \[--html\]//g')
     if [ "$seed_out" != "$self_out" ] || [ "$seed_rc" != "$self_rc" ]; then
         echo "FAIL driver parity: \`oxl $inv\`"
         echo "-- seed ($seed_rc) --"; printf '%s\n' "$seed_out"
@@ -1785,6 +1790,95 @@ cidx = lines2[i2].index("lexlib.lex") + 7
 pos2 = {"textDocument":{"uri":uri},"position":{"line":i2,"character":len(lines2[i2][:cidx].encode("utf-16-le"))//2}}
 send({"jsonrpc":"2.0","id":4,"method":"textDocument/hover","params":pos2})
 h2 = recv(); assert "fn lexlib.lex(src: str)" in json.dumps(h2), h2
+
+def recv_id(i):
+    while True:
+        m = recv()
+        if m.get("id") == i:
+            return m
+
+def u16(t):
+    return len(t.encode("utf-16-le")) // 2
+
+# positions on the emoji-bearing line must be UTF-16 units, not code points
+sh_col = u16(lines2[i2][:lines2[i2].index("lexlib.lex") + 12])
+src_col = u16(lines2[i2][:lines2[i2].index("src)") + 1])
+
+# ---- milestone U: extended capabilities ----
+# initialize advertised the full block
+send({"jsonrpc":"2.0","id":10,"method":"initialize","params":{"rootUri":"file://" + str(pathlib.Path("bootstrap/cmd/parse").resolve()),"workspaceFolders":[{"uri":"file://" + str(pathlib.Path("bootstrap/cmd/parse").resolve()),"name":"parse"}]}})
+init = recv_id(10)
+caps = init["result"]["capabilities"]
+for k in ["completionProvider","signatureHelpProvider","documentSymbolProvider","documentHighlightProvider","referencesProvider","renameProvider","documentFormattingProvider","semanticTokensProvider","workspace"]:
+    assert k in caps, (k, caps)
+assert caps["semanticTokensProvider"]["legend"]["tokenTypes"] == ["namespace","type","class","enum","interface","struct","typeParameter","parameter","variable","property","enumMember","event","function","method","macro","keyword","modifier","comment","string","number","regexp","operator","decorator"]
+assert caps["textDocumentSync"] == 1
+
+# documentSymbol: fn main is a top-level symbol
+send({"jsonrpc":"2.0","id":11,"method":"textDocument/documentSymbol","params":{"textDocument":{"uri":uri}}})
+syms = recv_id(11)["result"]
+assert any(s["name"] == "main" and s["kind"] == 12 for s in syms), syms
+
+# completion at top level returns package decls + keywords
+send({"jsonrpc":"2.0","id":12,"method":"textDocument/completion","params":{"textDocument":{"uri":uri},"position":{"line":0,"character":0}}})
+comp = recv_id(12)["result"]["items"]
+assert any(c["label"] == "main" for c in comp), comp[:5]
+assert any(c["label"] == "fn" for c in comp)
+
+# semanticTokens: full-doc data, 5 ints per token, non-empty
+send({"jsonrpc":"2.0","id":13,"method":"textDocument/semanticTokens/full","params":{"textDocument":{"uri":uri}}})
+tok = recv_id(13)["result"]["data"]
+assert len(tok) > 0 and len(tok) % 5 == 0, tok[:20]
+
+# signatureHelp inside lexlib.lex(src)
+send({"jsonrpc":"2.0","id":14,"method":"textDocument/signatureHelp","params":{"textDocument":{"uri":uri},"position":{"line":i2,"character":sh_col}}})
+sh = recv_id(14)["result"]
+assert len(sh["signatures"]) == 1, sh
+assert "lex" in sh["signatures"][0]["label"]
+
+# references + documentHighlight on the `src` local's use site
+send({"jsonrpc":"2.0","id":15,"method":"textDocument/references","params":{"textDocument":{"uri":uri},"position":{"line":i2,"character":src_col},"context":{"includeDeclaration":True}}})
+refs = recv_id(15)["result"]
+assert len(refs) >= 2, refs
+send({"jsonrpc":"2.0","id":16,"method":"textDocument/documentHighlight","params":{"textDocument":{"uri":uri},"position":{"line":i2,"character":src_col}}})
+hl = recv_id(16)["result"]
+assert len(hl) >= 2, hl
+
+# rename src -> source: WorkspaceEdit over decl + uses
+send({"jsonrpc":"2.0","id":17,"method":"textDocument/rename","params":{"textDocument":{"uri":uri},"position":{"line":i2,"character":src_col},"newName":"source"}})
+rn = recv_id(17)["result"]
+assert "changes" in rn, rn
+edits = [e for u, es in rn["changes"].items() for e in es]
+assert len(edits) >= 2 and all(e["newText"] == "source" for e in edits), edits
+
+# rename src -> ast captures the sibling local: empty edit set + warning
+send({"jsonrpc":"2.0","id":18,"method":"textDocument/rename","params":{"textDocument":{"uri":uri},"position":{"line":i2,"character":src_col},"newName":"ast"}})
+rn2 = recv_id(18)["result"]
+assert all(len(es) == 0 for es in rn2["changes"].values()), rn2
+
+# rename to a keyword or builtin is rejected before any edit is built
+send({"jsonrpc":"2.0","id":181,"method":"textDocument/rename","params":{"textDocument":{"uri":uri},"position":{"line":i2,"character":src_col},"newName":"fn"}})
+ekw = recv_id(181); assert ekw["error"]["code"] == -32602, ekw
+send({"jsonrpc":"2.0","id":182,"method":"textDocument/rename","params":{"textDocument":{"uri":uri},"position":{"line":i2,"character":src_col},"newName":"print"}})
+ebi = recv_id(182); assert ebi["error"]["code"] == -32602, ebi
+
+# formatting returns an edit list (canonical file -> empty)
+send({"jsonrpc":"2.0","id":19,"method":"textDocument/formatting","params":{"textDocument":{"uri":uri}}})
+fmt = recv_id(19)["result"]
+assert isinstance(fmt, list), fmt
+
+# didChangeWatchedFiles invalidates the touched package dir
+send({"jsonrpc":"2.0","method":"workspace/didChangeWatchedFiles","params":{"changes":[{"uri":"file://" + str(pathlib.Path("bootstrap/lexlib/lexlib.oxl").resolve()),"type":2}]}})
+# hover still resolves after invalidation
+send({"jsonrpc":"2.0","id":20,"method":"textDocument/hover","params":pos2})
+h3 = recv_id(20); assert "fn lexlib.lex" in json.dumps(h3), h3
+
+# unknown method -> -32601, malformed body -> -32700
+send({"jsonrpc":"2.0","id":21,"method":"bogus/method","params":{}})
+e1 = recv_id(21); assert e1["error"]["code"] == -32601, e1
+raw = b"{not json"
+p.stdin.write(b"Content-Length: %d" % len(raw) + b"\r\n\r\n" + raw); p.stdin.flush()
+e2 = recv(); assert e2["error"]["code"] == -32700, e2
 send({"jsonrpc":"2.0","method":"exit","params":{}})
 PYEOF
 

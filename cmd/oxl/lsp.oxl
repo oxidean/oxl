@@ -8,7 +8,15 @@ package main
 // package's analysis never clears another's diagnostics.
 import "oxl/bootstrap/check"
 
+import "oxl/bootstrap/lexlib"
+
+import "std/collections"
+
+import "std/encoding/json"
+
 import "std/os"
+
+import "std/sort"
 
 import "std/strings"
 
@@ -27,9 +35,13 @@ struct PubU { key: str, uri: str }
 
 // server state — the tables grow inside an own object so arena slices
 // can live in it (same shape as Ck's slice fields)
-struct Lsp { docs: []LDoc, ans: []Anl, pubs: []PubU }
+struct Lsp { docs: []LDoc, ans: []Anl, pubs: []PubU, root: str }
 
 struct LC { l: int, c: int }
+
+// a (byte-pos, line, utf16-col) cursor — lsp_advance walks it forward
+// so offset-sorted consumers don't rescan the source per position
+struct LCur { p: int, l: int, c: int }
 
 // ---------- utf8/utf-16 units ----------
 // byte-length of the utf8 sequence starting with lead byte b
@@ -101,6 +113,28 @@ fn lsp_line_col(src: str, off: int) -> LC {
     return LC{l: l, c: c}
 }
 
+// advance cur forward to byte offset `off` (off >= cur.p); same
+// UTF-16 column accounting as lsp_line_col
+fn lsp_advance(src: str, off: int, cur: LCur) -> LCur {
+    i := cur.p
+    l := cur.l
+    c := cur.c
+    for i < len(src) && i < off {
+        ch := byteat(src, i)
+        if ch == 10 {
+            l = l + 1
+            c = 0
+        } else {
+            c = c + 1
+            if u8len(ch) == 4 {
+                c = c + 1
+            }
+        }
+        i = i + u8len(ch)
+    }
+    return LCur{p: i, l: l, c: c}
+}
+
 // ---------- naive json (seed-parity extractors) ----------
 fn is_alpha(c: int) -> bool {
     return c >= 65 && c <= 90 || c >= 97 && c <= 122
@@ -108,6 +142,10 @@ fn is_alpha(c: int) -> bool {
 
 fn is_alnum(c: int) -> bool {
     return is_alpha(c) || c >= 48 && c <= 57
+}
+
+fn is_ident_char(c: int) -> bool {
+    return is_alnum(c) || c == 95
 }
 
 fn hexval(c: int) -> int {
@@ -130,174 +168,138 @@ fn bstr(b: int) -> str {
     return bufstr(p, 1)
 }
 
-// codepoint -> utf8 str
-fn utf8enc(cp: int) -> str {
-    if cp < 128 {
-        return bstr(cp)
+// ---------- std/encoding/json access ----------
+// jget deep-clones its hit (strings shared, node spine copied); every
+// hop re-reads through ref so the clones stay cheap
+fn jsub(o: ref json.Json, key: str) -> own json.Json {
+    if o == nil {
+        return nil
     }
-    if cp < 2048 {
-        return bstr(192 + cp / 64) + bstr(128 + cp % 64)
-    }
-    if cp < 65536 {
-        return bstr(224 + cp / 4096) + bstr(128 + cp / 64 % 64) + bstr(128 + cp % 64)
-    }
-    return bstr(240 + cp / 262144) + bstr(128 + cp / 4096 % 64) + bstr(128 + cp / 64 % 64) + bstr(128 + cp % 64)
+    return json.jget(o, key)
 }
 
-fn hex4of(s: str, i: int) -> int {
-    if i + 4 > len(s) {
-        return -1
-    }
-    v := 0
-    k := 0
-    for k < 4 {
-        h := hexval(byteat(s, i + k))
-        if h < 0 {
-            return -1
-        }
-        v = v * 16 + h
-        k = k + 1
-    }
-    return v
-}
-
-// naive JSON string-field extraction (seed json_str: first hit, tolerates
-// `"k": "v"` and `"k":"v"` spacing). "" doubles as absent — presence
-// checks use find() like the seed's Option does
-fn json_str(body: str, key: str) -> str {
-    pat := "\"" + key + "\":"
-    at := find(body, pat)
-    if at < 0 {
-        return ""
-    }
-    at = at + len(pat)
-    q := find(substr(body, at, len(body)), "\"")
-    if q < 0 {
-        return ""
-    }
-    i := at + q + 1
-    out := ""
-    for i < len(body) {
-        c := byteat(body, i)
-        if c == 34 {
-            return out
-        }
-        if c == 92 {
-            if i + 1 >= len(body) {
-                return out
-            }
-            e := byteat(body, i + 1)
-            if e == 110 {
-                out = out + "\n"
-                i = i + 2
-            } else if e == 116 {
-                out = out + "\t"
-                i = i + 2
-            } else if e == 114 {
-                out = out + "\r"
-                i = i + 2
-            } else if e == 98 {
-                out = out + bstr(8)
-                i = i + 2
-            } else if e == 102 {
-                out = out + bstr(12)
-                i = i + 2
-            } else if e == 117 {
-                cp := hex4of(body, i + 2)
-                if cp < 0 {
-                    return out
-                }
-                i = i + 6
-                if cp >= 55296 && cp < 56320 {
-                    // high surrogate — pair with a following \uDC00..\uDFFF
-                    if i + 6 <= len(body) && byteat(body, i) == 92 && byteat(body, i + 1) == 117 {
-                        lo := hex4of(body, i + 2)
-                        if lo >= 56320 && lo < 57344 {
-                            cp = 65536 + (cp - 55296) * 1024 + (lo - 56320)
-                            i = i + 6
-                        }
-                    }
-                }
-                out = out + utf8enc(cp)
-            } else {
-                out = out + bstr(e)
-                i = i + 2
-            }
-        } else {
-            out = out + substr(body, i, i + 1)
-            i = i + 1
-        }
-    }
-    return out
-}
-
-// naive JSON number-field extraction (first hit; seed json_num)
-fn json_num(body: str, key: str) -> int {
-    pat := "\"" + key + "\":"
-    at := find(body, pat)
-    if at < 0 {
+fn jnum(j: ref json.Json) -> int {
+    if j == nil {
         return 0
     }
-    rest := substr(body, at + len(pat), len(body))
-    end := len(rest)
-    i := 0
-    for i < len(rest) {
-        c := byteat(rest, i)
-        if c == 44 || c == 125 || c == 93 {
-            end = i
-            i = len(rest)
-        }
-        i = i + 1
+    if j.kind == 2 {
+        return j.i
     }
-    return atoi(strings.trim(substr(rest, 0, end)))
+    return 0
 }
 
-fn extract_id(body: str) -> str {
-    at := find(body, "\"id\":")
-    if at < 0 {
-        return "0"
+fn jboolf(j: ref json.Json) -> bool {
+    if j == nil {
+        return false
     }
-    rest := substr(body, at + 5, len(body))
-    end := len(rest)
-    i := 0
-    for i < len(rest) {
-        c := byteat(rest, i)
-        if c == 44 || c == 125 {
-            end = i
-            i = len(rest)
-        }
-        i = i + 1
+    if j.kind == 1 {
+        return j.b
     }
-    return strings.trim(substr(rest, 0, end))
+    return false
 }
 
-// escape for embedding in a JSON string literal — every control char,
-// not just backslash and quote (diagnostics and hover text containing
-// newlines/tabs must not break the wire)
-fn json_escape(s: str) -> str {
-    out := ""
-    i := 0
-    for i < len(s) {
-        c := byteat(s, i)
-        if c == 92 {
-            out = out + "\\\\"
-        } else if c == 34 {
-            out = out + "\\\""
-        } else if c == 10 {
-            out = out + "\\n"
-        } else if c == 13 {
-            out = out + "\\r"
-        } else if c == 9 {
-            out = out + "\\t"
-        } else if c < 32 {
-            h := "0123456789abcdef"
-            out = out + "\\u00" + substr(h, c / 16, c / 16 + 1) + substr(h, c % 16, c % 16 + 1)
-        } else {
-            out = out + substr(s, i, i + 1)
-        }
-        i = i + 1
+fn jstrf(j: ref json.Json) -> str {
+    if j == nil {
+        return ""
     }
-    return out
+    if j.kind == 3 {
+        return j.s
+    }
+    return ""
+}
+
+fn jfield_str(o: ref json.Json, key: str) -> str {
+    return jstrf(jsub(o, key))
+}
+
+fn jfield_num(o: ref json.Json, key: str) -> int {
+    return jnum(jsub(o, key))
+}
+
+// clone of an array's first element (workspaceFolders[0])
+fn jarr_first(a: ref json.Json) -> own json.Json {
+    if a == nil || a.kind != 5 {
+        return nil
+    }
+    m := a.child
+    if m == nil {
+        return nil
+    }
+    return json.jclone(m)
+}
+
+// clone of an array's last element (didChange contentChanges)
+fn jarr_last(a: ref json.Json) -> own json.Json {
+    if a == nil || a.kind != 5 {
+        return nil
+    }
+    m := a.child
+    last := m
+    for m != nil {
+        last = m
+        m = m.next
+    }
+    if last == nil {
+        return nil
+    }
+    return json.jclone(last)
+}
+
+// ---------- response builders ----------
+fn jpos(l: int, c: int) -> own json.Json {
+    o := json.jobj()
+    json.jadd(o, "line", json.jint(l))
+    json.jadd(o, "character", json.jint(c))
+    return o
+}
+
+// byte-offset range -> LSP Range against the file's own text
+fn jrange_at(src: str, lo: int, hi: int) -> own json.Json {
+    a := lsp_line_col(src, lo)
+    b := lsp_line_col(src, hi)
+    r := json.jobj()
+    json.jadd(r, "start", jpos(a.l, a.c))
+    json.jadd(r, "end", jpos(b.l, b.c))
+    return r
+}
+
+fn lsp_result(idn: own json.Json, res: own json.Json) -> str {
+    r := json.jobj()
+    json.jadd(r, "jsonrpc", json.jstr("2.0"))
+    if idn == nil {
+        idn = json.jnull()
+    }
+    json.jadd(r, "id", idn)
+    if res == nil {
+        res = json.jnull()
+    }
+    json.jadd(r, "result", res)
+    return json.tojson(r)
+}
+
+fn lsp_error(idn: own json.Json, code: int, msg: str) -> str {
+    r := json.jobj()
+    json.jadd(r, "jsonrpc", json.jstr("2.0"))
+    if idn == nil {
+        idn = json.jnull()
+    }
+    json.jadd(r, "id", idn)
+    e := json.jobj()
+    json.jadd(e, "code", json.jint(code))
+    json.jadd(e, "message", json.jstr(msg))
+    json.jadd(r, "error", e)
+    return json.tojson(r)
+}
+
+fn lsp_notify(method: str, params: own json.Json) -> str {
+    r := json.jobj()
+    json.jadd(r, "jsonrpc", json.jstr("2.0"))
+    json.jadd(r, "method", json.jstr(method))
+    if params == nil {
+        params = json.jobj()
+    }
+    json.jadd(r, "params", params)
+    return json.tojson(r)
 }
 
 // ---------- uri <-> path ----------
@@ -381,12 +383,9 @@ fn lsp_frame(s: str) {
 // publish the file's diagnostics — the seed keeps the client-supplied
 // URI verbatim for the open doc and re-encodes siblings from paths
 fn publish_diags(uri: str, list: []LDiag) {
-    ds := ""
+    arr := json.jarrb()
     i := 0
     for i < len(list) {
-        if i > 0 {
-            ds = ds + ","
-        }
         d := list[i]
         l0 := d.l - 1
         if l0 < 0 {
@@ -396,11 +395,20 @@ fn publish_diags(uri: str, list: []LDiag) {
         if c0 < 0 {
             c0 = 0
         }
-        ds = ds + "{\"range\":{\"start\":{\"line\":" + itoa(l0) + ",\"character\":" + itoa(c0) + "},\"end\":{\"line\":" + itoa(l0) + ",\"character\":" + itoa(c0 + 1) + "}},\"severity\":1,\"message\":\"" + json_escape(d.m) + "\"}"
+        rg := json.jobj()
+        json.jadd(rg, "start", jpos(l0, c0))
+        json.jadd(rg, "end", jpos(l0, c0 + 1))
+        dd := json.jobj()
+        json.jadd(dd, "range", rg)
+        json.jadd(dd, "severity", json.jint(1))
+        json.jadd(dd, "message", json.jstr(d.m))
+        json.jarrb_add(arr, dd)
         i = i + 1
     }
-    notif := "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":\"" + uri + "\",\"diagnostics\":[" + ds + "]}}"
-    lsp_frame(notif)
+    p := json.jobj()
+    json.jadd(p, "uri", json.jstr(uri))
+    json.jadd(p, "diagnostics", json.jarrb_arr(arr))
+    lsp_frame(lsp_notify("textDocument/publishDiagnostics", p))
 }
 
 // ---------- doc/analysis/publish tables ----------
@@ -576,6 +584,17 @@ fn analyze_lsp(path: str, over: own check.OverEnt, docs: []LDoc) -> own Anl {
     return a
 }
 
+// span-start order for the per-file containment sweep — ties break on
+// the shorter span so nested records sort inner-first
+struct UIdx { lo: int, hi: int, ui: int }
+
+fn uidx_lt(a: UIdx, b: UIdx) -> bool {
+    if a.lo != b.lo {
+        return a.lo < b.lo
+    }
+    return a.hi < b.hi
+}
+
 // the index entry with the smallest span containing `off`
 fn index_at(us: []check.UseRec, file: str, off: int) -> int {
     best := -1
@@ -603,6 +622,1631 @@ fn lsp_len(buf: str, h: int) -> int {
     return atoi(strings.trim(substr(buf, at + 15, h)))
 }
 
+// ---------- decl kinds -> LSP enums ----------
+// DeclEnt.kind: 0 fn · 1 struct · 2 enum · 3 interface · 4 field ·
+// 5 global · 6 variant · 7 method
+fn ck_item_kind(k: int) -> int {
+    if k == 0 {
+        return 3
+    }
+    if k == 1 {
+        return 22
+    }
+    if k == 2 {
+        return 13
+    }
+    if k == 3 {
+        return 8
+    }
+    if k == 4 {
+        return 5
+    }
+    if k == 5 {
+        return 6
+    }
+    if k == 6 {
+        return 20
+    }
+    if k == 7 {
+        return 2
+    }
+    return 1
+}
+
+fn ck_sym_kind(k: int) -> int {
+    if k == 0 {
+        return 12
+    }
+    if k == 1 {
+        return 15
+    }
+    if k == 2 {
+        return 10
+    }
+    if k == 3 {
+        return 11
+    }
+    if k == 4 {
+        return 8
+    }
+    if k == 5 {
+        return 13
+    }
+    if k == 6 {
+        return 8
+    }
+    if k == 7 {
+        return 6
+    }
+    return 13
+}
+
+// decl kind -> semantic tokenType index (legend order is fixed in
+// st_legend and advertised at initialize)
+fn st_kind(k: int) -> int {
+    if k == 0 {
+        return 12
+    }
+    if k == 1 {
+        return 5
+    }
+    if k == 2 {
+        return 3
+    }
+    if k == 3 {
+        return 4
+    }
+    if k == 4 {
+        return 9
+    }
+    if k == 5 {
+        return 8
+    }
+    if k == 6 {
+        return 10
+    }
+    if k == 7 {
+        return 13
+    }
+    return 8
+}
+
+fn decl_kind_of(decls: []check.DeclEnt, df: str, dl: int, dh: int) -> int {
+    i := 0
+    for i < len(decls) {
+        d := decls[i]
+        if d.file == df && d.lo == dl && d.hi == dh {
+            return d.kind
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// a usev entry that is a decl's own registration span — rec_decl
+// pushes a self-use covering the WHOLE decl; it is never an editable
+// occurrence (rename/references/highlight skip it and use the name
+// span instead)
+fn is_decl_self(ck: ref check.Ck, x: check.UseRec) -> int {
+    if x.file != x.def_file || x.lo != x.def_lo || x.hi != x.def_hi {
+        return 0
+    }
+    if decl_kind_of(ck.declsv, x.def_file, x.def_lo, x.def_hi) >= 0 {
+        return 1
+    }
+    return 0
+}
+
+// ---------- small text helpers ----------
+fn is_ident_start(c: int) -> bool {
+    return is_alpha(c) || c == 95
+}
+
+fn last_dot(s: str) -> int {
+    k := len(s) - 1
+    for k >= 0 {
+        if byteat(s, k) == 46 {
+            return k
+        }
+        k = k - 1
+    }
+    return -1
+}
+
+// does n end with "." + short?
+fn suffix_dot(n: str, short: str) -> bool {
+    if len(n) <= len(short) {
+        return false
+    }
+    if substr(n, len(n) - len(short), len(n)) != short {
+        return false
+    }
+    return byteat(n, len(n) - len(short) - 1) == 46
+}
+
+fn last_comp(s: str) -> str {
+    d := last_dot(s)
+    if d < 0 {
+        return s
+    }
+    return substr(s, d + 1, len(s))
+}
+
+// whole-word match of w at src[i]
+fn word_eq(src: str, i: int, w: str) -> bool {
+    if i + len(w) > len(src) {
+        return false
+    }
+    if substr(src, i, i + len(w)) != w {
+        return false
+    }
+    if i > 0 && is_ident_char(byteat(src, i - 1)) {
+        return false
+    }
+    if i + len(w) < len(src) && is_ident_char(byteat(src, i + len(w))) {
+        return false
+    }
+    return true
+}
+
+// skip ws then one optional balanced [...] group (typarams)
+fn skip_typarams(src: str, i: int) -> int {
+    for i < len(src) && (byteat(src, i) == 32 || byteat(src, i) == 9 || byteat(src, i) == 10) {
+        i = i + 1
+    }
+    if i < len(src) && byteat(src, i) == 91 {
+        depth := 0
+        for i < len(src) {
+            c := byteat(src, i)
+            if c == 91 {
+                depth = depth + 1
+            }
+            if c == 93 {
+                depth = depth - 1
+                if depth == 0 {
+                    i = i + 1
+                    break
+                }
+            }
+            i = i + 1
+        }
+        for i < len(src) && (byteat(src, i) == 32 || byteat(src, i) == 9 || byteat(src, i) == 10) {
+            i = i + 1
+        }
+    }
+    return i
+}
+
+// the decl's NAME span inside its [lo,hi) source window — LC.l/.c
+// carry byte offsets, (-1,-1) when unresolvable. fns/methods take the
+// ident whose next token (after optional typarams) is '('; other decl
+// kinds take the first whole-ident occurrence
+fn decl_name_span(src: str, lo: int, hi: int, name: str, kind: int) -> LC {
+    r := LC{l: -1, c: -1}
+    if len(name) == 0 {
+        return r
+    }
+    if kind == 0 || kind == 7 {
+        i := lo
+        for i + len(name) <= hi {
+            if word_eq(src, i, name) {
+                j := skip_typarams(src, i + len(name))
+                if j < hi && byteat(src, j) == 40 {
+                    r.l = i
+                    r.c = i + len(name)
+                    return r
+                }
+            }
+            i = i + 1
+        }
+        return r
+    }
+    i2 := lo
+    for i2 + len(name) <= hi {
+        if word_eq(src, i2, name) {
+            r.l = i2
+            r.c = i2 + len(name)
+            return r
+        }
+        i2 = i2 + 1
+    }
+    return r
+}
+
+// ---------- semantic tokens ----------
+struct STok { lo: int, hi: int, ty: int }
+
+fn span_has(spans: []int, off: int) -> int {
+    j := 0
+    for j + 1 < len(spans) {
+        if off >= spans[j] && off < spans[j + 1] {
+            return 1
+        }
+        j = j + 2
+    }
+    return 0
+}
+
+// comment spans outside string literals — lexlib drops comments, so
+// scan for them directly while skipping string-token spans (a "//"
+// inside a string is not a comment)
+fn st_comments(src: str, toks: []STok) -> []STok {
+    spans := mkslice(int, 0)
+    i := 0
+    for i < len(toks) {
+        if toks[i].ty == 18 {
+            spans = push(spans, toks[i].lo)
+            spans = push(spans, toks[i].hi)
+        }
+        i = i + 1
+    }
+    out := mkslice(STok, 0)
+    i = 0
+    n := len(src)
+    for i < n {
+        if span_has(spans, i) == 1 {
+            i = i + 1
+            continue
+        }
+        c := byteat(src, i)
+        if c == 47 && i + 1 < n && byteat(src, i + 1) == 47 {
+            j := i + 2
+            for j < n && byteat(src, j) != 10 {
+                j = j + 1
+            }
+            out = push(out, STok{lo: i, hi: j, ty: 17})
+            i = j
+            continue
+        }
+        if c == 47 && i + 1 < n && byteat(src, i + 1) == 42 {
+            j := i + 2
+            for j + 1 < n && !(byteat(src, j) == 42 && byteat(src, j + 1) == 47) {
+                j = j + 1
+            }
+            if j + 1 < n {
+                j = j + 2
+            } else {
+                j = n
+            }
+            out = push(out, STok{lo: i, hi: j, ty: 17})
+            i = j
+            continue
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// merge two offset-sorted token lists
+fn st_merge(a: []STok, b: []STok) -> []STok {
+    out := mkslice(STok, 0)
+    i := 0
+    j := 0
+    for i < len(a) || j < len(b) {
+        take_a := 0
+        if j >= len(b) {
+            take_a = 1
+        } else if i < len(a) && a[i].lo <= b[j].lo {
+            take_a = 1
+        }
+        if take_a == 1 {
+            out = push(out, a[i])
+            i = i + 1
+        } else {
+            out = push(out, b[j])
+            j = j + 1
+        }
+    }
+    return out
+}
+
+// lexlib walk — t is a ref so .next borrows rather than moves
+fn st_walk(t: ref lexlib.Tok, src: str, acc: []STok) -> []STok {
+    k_ident := lexlib.k_ident()
+    k_kw := lexlib.k_kw()
+    k_int := lexlib.k_int()
+    k_str := lexlib.k_str()
+    k_punct := lexlib.k_punct()
+    k_float := lexlib.k_float()
+    k_eof := lexlib.k_eof()
+    k_err := lexlib.k_err()
+    for t != nil {
+        k := t.kind
+        if k != k_eof && k != k_err {
+            ty := -1
+            if k == k_kw {
+                w := substr(src, t.off, t.eoff)
+                if w == "own" || w == "ref" || w == "mut" || w == "unsafe" {
+                    ty = 16
+                } else {
+                    ty = 15
+                }
+            } else if k == k_ident {
+                ty = 8
+            } else if k == k_int || k == k_float {
+                ty = 19
+            } else if k == k_str {
+                ty = 18
+            } else if k == k_punct {
+                ty = 21
+            }
+            if ty >= 0 {
+                acc = push(acc, STok{lo: t.off, hi: t.eoff, ty: ty})
+            }
+        }
+        t = t.next
+    }
+    return acc
+}
+
+// the fixed legend advertised at initialize — indices are the token
+// types above; modifiers stay empty (all tokens carry mods=0)
+fn st_legend() -> own json.Json {
+    leg := json.jobj()
+    tt := json.jarrb()
+    names := mkslice(str, 0)
+    names = push(names, "namespace")
+    names = push(names, "type")
+    names = push(names, "class")
+    names = push(names, "enum")
+    names = push(names, "interface")
+    names = push(names, "struct")
+    names = push(names, "typeParameter")
+    names = push(names, "parameter")
+    names = push(names, "variable")
+    names = push(names, "property")
+    names = push(names, "enumMember")
+    names = push(names, "event")
+    names = push(names, "function")
+    names = push(names, "method")
+    names = push(names, "macro")
+    names = push(names, "keyword")
+    names = push(names, "modifier")
+    names = push(names, "comment")
+    names = push(names, "string")
+    names = push(names, "number")
+    names = push(names, "regexp")
+    names = push(names, "operator")
+    names = push(names, "decorator")
+    i := 0
+    for i < len(names) {
+        json.jarrb_add(tt, json.jstr(names[i]))
+        i = i + 1
+    }
+    json.jadd(leg, "tokenTypes", json.jarrb_arr(tt))
+    tm := json.jarrb()
+    mods := mkslice(str, 0)
+    mods = push(mods, "none")
+    mods = push(mods, "default")
+    mods = push(mods, "definition")
+    mods = push(mods, "declaration")
+    mods = push(mods, "static")
+    mods = push(mods, "readonly")
+    mods = push(mods, "abstract")
+    mods = push(mods, "async")
+    mods = push(mods, "modification")
+    mods = push(mods, "deprecated")
+    i = 0
+    for i < len(mods) {
+        json.jarrb_add(tm, json.jstr(mods[i]))
+        i = i + 1
+    }
+    json.jadd(leg, "tokenModifiers", json.jarrb_arr(tm))
+    return leg
+}
+
+fn lsp_semantic_tokens(ck: ref check.Ck, file: str, src: str) -> own json.Json {
+    res := json.jobj()
+    db := json.jarrb()
+    hd := lexlib.lex(src)
+    toks := st_walk(hd, src, mkslice(STok, 0))
+    all := st_merge(toks, st_comments(src, toks))
+    // per-request lookup tables — the token loop must not rescan the
+    // package-wide use/decl tables once per identifier
+    um := collections.map_new()
+    ui := 0
+    for ui < len(ck.usev) {
+        x := ck.usev[ui]
+        collections.map_set(um, x.file + "|" + itoa(x.lo) + "|" + itoa(x.hi), ui)
+        ui = ui + 1
+    }
+    dm := collections.map_new()
+    di := 0
+    for di < len(ck.declsv) {
+        d := ck.declsv[di]
+        collections.map_set(dm, d.file + "|" + itoa(d.lo) + "|" + itoa(d.hi), d.kind)
+        di = di + 1
+    }
+    // per-file usev sorted by span start — exact-map misses sweep this
+    // for the smallest containing record instead of scanning every
+    // package-wide entry per token
+    fu := mkslice(UIdx, 0)
+    fi := 0
+    for fi < len(ck.usev) {
+        if ck.usev[fi].file == file {
+            fu = push(fu, UIdx{lo: ck.usev[fi].lo, hi: ck.usev[fi].hi, ui: fi})
+        }
+        fi = fi + 1
+    }
+    sort.sortfn(fu, uidx_lt)
+    ap := 0
+    act := mkslice(UIdx, 0)
+    cur := LCur{p: 0, l: 0, c: 0}
+    pl := 0
+    pc := 0
+    i := 0
+    for i < len(all) {
+        tk := all[i]
+        ty := tk.ty
+        if ty == 8 {
+            // ident: upgrade variable -> decl kind via the use index
+            x := check.UseRec{file: "", lo: 0, hi: 0, sig: "", def_file: "", def_lo: 0, def_hi: 0}
+            xok := 0
+            uk := file + "|" + itoa(tk.lo) + "|" + itoa(tk.hi)
+            if collections.map_has(um, uk) {
+                [uv, ue] = collections.map_get(um, uk)
+                if ue == nil {
+                    x = ck.usev[uv]
+                    xok = 1
+                }
+            }
+            if xok == 0 {
+                mid := tk.lo + 1
+                if mid >= tk.hi {
+                    mid = tk.lo
+                }
+                // sweep: token offsets ascend, so entries join the
+                // active set once and expire by hi — the miss lookup
+                // scans only spans covering this position
+                for ap < len(fu) && fu[ap].lo <= mid {
+                    act = push(act, fu[ap])
+                    ap = ap + 1
+                }
+                w := 0
+                best := -1
+                bestsz := 0
+                ai := 0
+                for ai < len(act) {
+                    y := act[ai]
+                    if y.hi > mid {
+                        act[w] = y
+                        w = w + 1
+                        sz := y.hi - y.lo
+                        if best < 0 || sz < bestsz {
+                            best = w - 1
+                            bestsz = sz
+                        }
+                    }
+                    ai = ai + 1
+                }
+                act = act[0:w]
+                if best >= 0 {
+                    x = ck.usev[act[best].ui]
+                    xok = 1
+                }
+            }
+            if xok == 1 {
+                dk := -1
+                dkkey := x.def_file + "|" + itoa(x.def_lo) + "|" + itoa(x.def_hi)
+                if collections.map_has(dm, dkkey) {
+                    [dv, de] = collections.map_get(dm, dkkey)
+                    if de == nil {
+                        dk = dv
+                    }
+                }
+                if dk >= 0 {
+                    ty = st_kind(dk)
+                }
+            }
+        }
+        // semantic tokens are single-line — split spans at newlines
+        seg := tk.lo
+        for seg < tk.hi {
+            eol := seg
+            for eol < tk.hi && byteat(src, eol) != 10 {
+                eol = eol + 1
+            }
+            if eol > seg {
+                if seg < cur.p {
+                    cur = LCur{p: 0, l: 0, c: 0}
+                }
+                pa := lsp_advance(src, seg, cur)
+                pb := lsp_advance(src, eol, pa)
+                dl := pa.l - pl
+                dc := pa.c
+                if dl == 0 {
+                    dc = pa.c - pc
+                }
+                tl := pb.c - pa.c
+                json.jarrb_add(db, json.jint(dl))
+                json.jarrb_add(db, json.jint(dc))
+                json.jarrb_add(db, json.jint(tl))
+                json.jarrb_add(db, json.jint(ty))
+                json.jarrb_add(db, json.jint(0))
+                pl = pa.l
+                pc = pa.c
+                cur = pa
+            }
+            if eol >= tk.hi {
+                break
+            }
+            seg = eol + 1
+        }
+        i = i + 1
+    }
+    json.jadd(res, "data", json.jarrb_arr(db))
+    return res
+}
+
+// ---------- completion ----------
+fn push_completion(ab: mut json.JArrB, name: str, kind: int, detail: str, filter: str, rank: int) {
+    if len(filter) > 0 && !strings.startswith(name, filter) {
+        return
+    }
+    it := json.jobj()
+    json.jadd(it, "label", json.jstr(name))
+    json.jadd(it, "kind", json.jint(kind))
+    if len(detail) > 0 {
+        json.jadd(it, "detail", json.jstr(detail))
+    }
+    json.jadd(it, "insertText", json.jstr(name))
+    json.jadd(it, "sortText", json.jstr("0" + itoa(rank) + name))
+    json.jarrb_add(ab, it)
+}
+
+// strip own/ref/mut/[] wrappers off a sig type tail -> bare type name
+fn bare_ty(t: str) -> str {
+    s := strings.trim(t)
+    for true {
+        if strings.startswith(s, "own ") {
+            s = strings.trim(substr(s, 4, len(s)))
+        } else if strings.startswith(s, "ref ") {
+            s = strings.trim(substr(s, 4, len(s)))
+        } else if strings.startswith(s, "mut ") {
+            s = strings.trim(substr(s, 4, len(s)))
+        } else if strings.startswith(s, "[]") {
+            s = strings.trim(substr(s, 2, len(s)))
+        } else {
+            return s
+        }
+    }
+    return s
+}
+
+// type name from a UseRec sig: locals carry "name: ty", decls "fn ..."
+fn sig_local_ty(sig: str) -> str {
+    if strings.startswith(sig, "fn ") {
+        return ""
+    }
+    c := find(sig, ": ")
+    if c <= 0 {
+        return ""
+    }
+    return bare_ty(substr(sig, c + 2, len(sig)))
+}
+
+// struct/enum lookup by (possibly qualified) name — returns the
+// structsv index, or -(enumsv index)-2 for enums, -1 when absent
+fn find_type(ck: ref check.Ck, tn: str) -> int {
+    i := 0
+    for i < len(ck.structsv) {
+        if ck.structsv[i].n == tn {
+            return i
+        }
+        i = i + 1
+    }
+    j := 0
+    for j < len(ck.enumsv) {
+        if ck.enumsv[j].n == tn {
+            return -j - 2
+        }
+        j = j + 1
+    }
+    // last-component fallback for qualification mismatches
+    sc := last_comp(tn)
+    if sc != tn {
+        i = 0
+        for i < len(ck.structsv) {
+            n := ck.structsv[i].n
+            if n == sc || suffix_dot(n, sc) {
+                return i
+            }
+            i = i + 1
+        }
+        j = 0
+        for j < len(ck.enumsv) {
+            n := ck.enumsv[j].n
+            if n == sc || suffix_dot(n, sc) {
+                return -j - 2
+            }
+            j = j + 1
+        }
+    }
+    return -1
+}
+
+// does method qname "pkg.Type.name" belong to receiver type tn?
+fn type_qname_match(qn: str, tn: str) -> bool {
+    d := last_dot(qn)
+    if d < 0 {
+        return false
+    }
+    recv := substr(qn, 0, d)
+    if recv == tn {
+        return true
+    }
+    rc := last_comp(recv)
+    tc := last_comp(tn)
+    if rc != tc {
+        return false
+    }
+    return suffix_dot(recv, tc) || suffix_dot(tn, rc) || recv == tn
+}
+
+// qname portion of a "fn [(recv) ]qname[tp](params) -> ret" sig
+fn decl_qname_of(sig: str) -> str {
+    s := sig
+    if !strings.startswith(s, "fn ") {
+        return ""
+    }
+    s = substr(s, 3, len(s))
+    if len(s) > 0 && byteat(s, 0) == 40 {
+        depth := 0
+        i := 0
+        for i < len(s) {
+            c := byteat(s, i)
+            if c == 40 {
+                depth = depth + 1
+            }
+            if c == 41 {
+                depth = depth - 1
+                if depth == 0 {
+                    i = i + 1
+                    break
+                }
+            }
+            i = i + 1
+        }
+        for i < len(s) && (byteat(s, i) == 32 || byteat(s, i) == 9) {
+            i = i + 1
+        }
+        s = substr(s, i, len(s))
+    }
+    i := 0
+    for i < len(s) {
+        c := byteat(s, i)
+        if c == 91 || c == 40 || c == 32 {
+            return substr(s, 0, i)
+        }
+        i = i + 1
+    }
+    return s
+}
+
+fn lsp_completion(ck: ref check.Ck, file: str, src: str, off: int) -> own json.Json {
+    // identifier prefix immediately before the cursor
+    ps := off
+    for ps > 0 && is_ident_char(byteat(src, ps - 1)) {
+        ps = ps - 1
+    }
+    prefix := substr(src, ps, off)
+    member := 0
+    dotpos := -1
+    if ps > 0 && byteat(src, ps - 1) == 46 {
+        member = 1
+        dotpos = ps - 1
+    }
+    ab := json.jarrb()
+    if member == 1 {
+        // receiver: last ident before the '.'
+        rend := dotpos
+        rstart := rend
+        for rstart > 0 && is_ident_char(byteat(src, rstart - 1)) {
+            rstart = rstart - 1
+        }
+        if rstart < rend {
+            u := index_at(ck.usev, file, rstart)
+            if u >= 0 {
+                x := ck.usev[u]
+                tn := sig_local_ty(x.sig)
+                if len(tn) > 0 {
+                    ti := find_type(ck, tn)
+                    if ti >= 0 {
+                        fl := ck.structsv[ti].fields
+                        for fl != nil {
+                            push_completion(ab, fl.v.n, 5, fl.v.n + ": " + check.ty_name(ck, fl.v.t), prefix, 1)
+                            fl = fl.next
+                        }
+                        di := 0
+                        for di < len(ck.declsv) {
+                            dd := ck.declsv[di]
+                            if dd.kind == 7 && type_qname_match(decl_qname_of(dd.sig), tn) {
+                                push_completion(ab, dd.name, 2, dd.sig, prefix, 0)
+                            }
+                            di = di + 1
+                        }
+                    } else if ti <= -2 {
+                        ei := -ti - 2
+                        el := ck.enumsv[ei].vars
+                        for el != nil {
+                            push_completion(ab, el.v.n, 20, ck.enumsv[ei].n + "." + el.v.n, prefix, 1)
+                            el = el.next
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        // package decls (same dir only — imported decls need a
+        // qualifier we don't resolve yet), then locals, keywords, types
+        pdir := dir_key(file)
+        di := 0
+        for di < len(ck.declsv) {
+            dd := ck.declsv[di]
+            if dir_key(dd.file) == pdir && dd.kind != 4 && dd.kind != 6 && dd.kind != 7 {
+                push_completion(ab, dd.name, ck_item_kind(dd.kind), dd.sig, prefix, 2)
+            }
+            di = di + 1
+        }
+        // local bindings — approximation: every local in the file,
+        // scope filtering is a later refinement
+        seen := mkslice(str, 0)
+        ui := 0
+        for ui < len(ck.usev) {
+            x := ck.usev[ui]
+            if x.file == file {
+                c := find(x.sig, ": ")
+                if c > 0 {
+                    nm := substr(x.sig, 0, c)
+                    if is_ident_start(byteat(nm, 0)) && decl_kind_of(ck.declsv, x.def_file, x.def_lo, x.def_hi) < 0 && !has_str(seen, nm) {
+                        seen = push(seen, nm)
+                        push_completion(ab, nm, 6, x.sig, prefix, 2)
+                    }
+                }
+            }
+            ui = ui + 1
+        }
+        tys := mkslice(str, 0)
+        tys = push(tys, "int")
+        tys = push(tys, "float")
+        tys = push(tys, "bool")
+        tys = push(tys, "str")
+        tys = push(tys, "byte")
+        tys = push(tys, "void")
+        tys = push(tys, "err")
+        tys = push(tys, "cstr")
+        tys = push(tys, "any")
+        tys = push(tys, "ordered")
+        tys = push(tys, "eq")
+        tys = push(tys, "add")
+        ti2 := 0
+        for ti2 < len(tys) {
+            if len(prefix) == 0 || strings.startswith(tys[ti2], prefix) {
+                it := json.jobj()
+                json.jadd(it, "label", json.jstr(tys[ti2]))
+                json.jadd(it, "kind", json.jint(25))
+                json.jadd(it, "insertText", json.jstr(tys[ti2]))
+                json.jadd(it, "sortText", json.jstr("03" + tys[ti2]))
+                json.jarrb_add(ab, it)
+            }
+            ti2 = ti2 + 1
+        }
+        kws := mkslice(str, 0)
+        kws = push(kws, "fn")
+        kws = push(kws, "struct")
+        kws = push(kws, "enum")
+        kws = push(kws, "interface")
+        kws = push(kws, "let")
+        kws = push(kws, "if")
+        kws = push(kws, "else")
+        kws = push(kws, "for")
+        kws = push(kws, "return")
+        kws = push(kws, "import")
+        kws = push(kws, "package")
+        kws = push(kws, "extern")
+        kws = push(kws, "own")
+        kws = push(kws, "ref")
+        kws = push(kws, "mut")
+        kws = push(kws, "scope")
+        kws = push(kws, "spawn")
+        kws = push(kws, "goin")
+        kws = push(kws, "spawnBlocking")
+        kws = push(kws, "chan")
+        kws = push(kws, "break")
+        kws = push(kws, "continue")
+        kws = push(kws, "match")
+        kws = push(kws, "as")
+        kws = push(kws, "unsafe")
+        kws = push(kws, "nil")
+        kws = push(kws, "true")
+        kws = push(kws, "false")
+        ki := 0
+        for ki < len(kws) {
+            if len(prefix) == 0 || strings.startswith(kws[ki], prefix) {
+                it := json.jobj()
+                json.jadd(it, "label", json.jstr(kws[ki]))
+                json.jadd(it, "kind", json.jint(14))
+                json.jadd(it, "insertText", json.jstr(kws[ki]))
+                json.jadd(it, "sortText", json.jstr("04" + kws[ki]))
+                json.jarrb_add(ab, it)
+            }
+            ki = ki + 1
+        }
+    }
+    res := json.jobj()
+    json.jadd(res, "isIncomplete", json.jbool(false))
+    json.jadd(res, "items", json.jarrb_arr(ab))
+    return res
+}
+
+// ---------- signature help ----------
+// params text of a "fn ..." sig: the first '(' whose match is followed
+// by " -> " or end-of-string is the param list (receiver groups and
+// fn-typed params inside it can't qualify — the param open wins)
+fn sig_params(sig: str) -> str {
+    s := sig
+    if !strings.startswith(s, "fn ") {
+        return ""
+    }
+    i := 0
+    n := len(s)
+    for i < n {
+        if byteat(s, i) == 40 {
+            d := 1
+            j := i + 1
+            for j < n && d > 0 {
+                cj := byteat(s, j)
+                if cj == 40 {
+                    d = d + 1
+                }
+                if cj == 41 {
+                    d = d - 1
+                }
+                j = j + 1
+            }
+            if d == 0 {
+                k := j
+                for k < n && (byteat(s, k) == 32 || byteat(s, k) == 9) {
+                    k = k + 1
+                }
+                if k >= n || k + 1 < n && byteat(s, k) == 45 && byteat(s, k + 1) == 62 {
+                    return substr(s, i + 1, j - 1)
+                }
+            }
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// split "a: t, b: t" on top-level commas (types may nest parens)
+fn split_params(s: str) -> []str {
+    out := mkslice(str, 0)
+    depth := 0
+    start := 0
+    i := 0
+    for i < len(s) {
+        c := byteat(s, i)
+        if c == 40 || c == 91 || c == 123 {
+            depth = depth + 1
+        }
+        if c == 41 || c == 93 || c == 125 {
+            depth = depth - 1
+        }
+        if c == 44 && depth == 0 {
+            out = push(out, strings.trim(substr(s, start, i)))
+            start = i + 1
+        }
+        i = i + 1
+    }
+    last := strings.trim(substr(s, start, len(s)))
+    if len(last) > 0 {
+        out = push(out, last)
+    }
+    return out
+}
+
+fn lsp_signature_help(ck: ref check.Ck, file: str, src: str, off: int) -> own json.Json {
+    res := json.jobj()
+    json.jadd(res, "signatures", json.jarr())
+    json.jadd(res, "activeSignature", json.jint(0))
+    json.jadd(res, "activeParameter", json.jint(0))
+    // scan back for the unmatched '(' enclosing the cursor — naive:
+    // parens inside string/char literals can confuse it (v1 limit)
+    depth := 0
+    open := -1
+    i := off - 1
+    for i >= 0 {
+        c := byteat(src, i)
+        if c == 41 {
+            depth = depth + 1
+        }
+        if c == 40 {
+            if depth == 0 {
+                open = i
+                break
+            }
+            depth = depth - 1
+        }
+        i = i - 1
+    }
+    if open < 0 {
+        return res
+    }
+    // callee ident ending right before '('
+    ce := open
+    for ce > 0 && (byteat(src, ce - 1) == 32 || byteat(src, ce - 1) == 9) {
+        ce = ce - 1
+    }
+    cs := ce
+    for cs > 0 && is_ident_char(byteat(src, cs - 1)) {
+        cs = cs - 1
+    }
+    if cs == ce {
+        return res
+    }
+    u := index_at(ck.usev, file, cs)
+    if u < 0 {
+        return res
+    }
+    sig := ck.usev[u].sig
+    if !strings.startswith(sig, "fn ") {
+        return res
+    }
+    plist := split_params(sig_params(sig))
+    // activeParameter: top-level commas between '(' and cursor
+    ap := 0
+    pd := 0
+    j := open + 1
+    for j < off && j < len(src) {
+        c := byteat(src, j)
+        if c == 40 || c == 91 || c == 123 {
+            pd = pd + 1
+        }
+        if c == 41 || c == 93 || c == 125 {
+            pd = pd - 1
+        }
+        if c == 44 && pd == 0 {
+            ap = ap + 1
+        }
+        j = j + 1
+    }
+    params_json := json.jarrb()
+    k := 0
+    for k < len(plist) {
+        pj := json.jobj()
+        json.jadd(pj, "label", json.jstr(plist[k]))
+        json.jarrb_add(params_json, pj)
+        k = k + 1
+    }
+    sg := json.jobj()
+    json.jadd(sg, "label", json.jstr(sig))
+    json.jadd(sg, "parameters", json.jarrb_arr(params_json))
+    sigs := json.jarrb()
+    json.jarrb_add(sigs, sg)
+    json.jadd(res, "signatures", json.jarrb_arr(sigs))
+    if ap >= len(plist) && len(plist) > 0 {
+        ap = len(plist) - 1
+    }
+    json.jadd(res, "activeParameter", json.jint(ap))
+    return res
+}
+
+// ---------- document symbol ----------
+fn lsp_emit_sym(ck: ref check.Ck, ord: []int, par: []int, pos: int, src: str) -> own json.Json {
+    d := ck.declsv[ord[pos]]
+    so := json.jobj()
+    json.jadd(so, "name", json.jstr(d.name))
+    json.jadd(so, "detail", json.jstr(d.sig))
+    json.jadd(so, "kind", json.jint(ck_sym_kind(d.kind)))
+    json.jadd(so, "range", jrange_at(src, d.lo, d.hi))
+    ns := decl_name_span(src, d.lo, d.hi, d.name, d.kind)
+    if ns.l >= 0 {
+        json.jadd(so, "selectionRange", jrange_at(src, ns.l, ns.c))
+    } else {
+        json.jadd(so, "selectionRange", jrange_at(src, d.lo, d.hi))
+    }
+    ch := json.jarrb()
+    k := 0
+    for k < len(ord) {
+        if par[k] == pos {
+            json.jarrb_add(ch, lsp_emit_sym(ck, ord, par, k, src))
+        }
+        k = k + 1
+    }
+    json.jadd(so, "children", json.jarrb_arr(ch))
+    return so
+}
+
+fn lsp_document_symbol(ck: ref check.Ck, file: str, src: str) -> own json.Json {
+    // declsv indices for this file, sorted lo asc / hi desc
+    ord := mkslice(int, 0)
+    i := 0
+    for i < len(ck.declsv) {
+        if ck.declsv[i].file == file {
+            ord = push(ord, i)
+        }
+        i = i + 1
+    }
+    si := 1
+    for si < len(ord) {
+        sj := si
+        for sj > 0 {
+            x := ck.declsv[ord[sj - 1]]
+            y := ck.declsv[ord[sj]]
+            sw := 0
+            if y.lo < x.lo {
+                sw = 1
+            }
+            if y.lo == x.lo && y.hi > x.hi {
+                sw = 1
+            }
+            if sw == 1 {
+                t := ord[sj - 1]
+                ord[sj - 1] = ord[sj]
+                ord[sj] = t
+                sj = sj - 1
+            } else {
+                sj = 0
+            }
+        }
+        si = si + 1
+    }
+    // parent = smallest strictly-containing earlier decl
+    par := mkslice(int, len(ord))
+    i = 0
+    for i < len(ord) {
+        par[i] = -1
+        best := -1
+        bestsz := 0
+        j := 0
+        for j < i {
+            x := ck.declsv[ord[j]]
+            y := ck.declsv[ord[i]]
+            if x.lo <= y.lo && y.hi <= x.hi && x.hi - x.lo > y.hi - y.lo {
+                sz := x.hi - x.lo
+                if best < 0 || sz < bestsz {
+                    best = j
+                    bestsz = sz
+                }
+            }
+            j = j + 1
+        }
+        if best >= 0 {
+            par[i] = best
+        }
+        i = i + 1
+    }
+    arr := json.jarrb()
+    i = 0
+    for i < len(ord) {
+        if par[i] == -1 {
+            json.jarrb_add(arr, lsp_emit_sym(ck, ord, par, i, src))
+        }
+        i = i + 1
+    }
+    return json.jarrb_arr(arr)
+}
+
+// a local binding's NAME span — rec_local's def span covers the whole
+// binding form (`x := e`, `a, b := f()`, param lists), so the name is
+// the sig's "name: ty" prefix located as the first whole-ident inside
+// the def span. (-1,-1) when unresolvable.
+fn local_name_span(dsrc: str, r: check.UseRec) -> LC {
+    res := LC{l: -1, c: -1}
+    c := find(r.sig, ": ")
+    if c <= 0 {
+        return res
+    }
+    nm := substr(r.sig, 0, c)
+    if len(nm) == 0 || !is_ident_start(byteat(nm, 0)) {
+        return res
+    }
+    k := 1
+    for k < len(nm) {
+        if !is_ident_char(byteat(nm, k)) {
+            return res
+        }
+        k = k + 1
+    }
+    return decl_name_span(dsrc, r.def_lo, r.def_hi, nm, 5)
+}
+
+// ---------- references / highlight / rename ----------
+fn def_key(df: str, dl: int, dh: int) -> str {
+    return df + "|" + itoa(dl) + "|" + itoa(dh)
+}
+
+// decl-file -> client URI, resolving relative decl paths against the
+// requesting doc's dir (same rule the definition response used)
+fn lsp_uri_for(df: str, file: str) -> str {
+    if len(df) > 0 && byteat(df, 0) == 47 {
+        return path_to_uri(df)
+    }
+    base := check.dir_of(file)
+    if len(base) == 0 {
+        base = "."
+    }
+    return path_to_uri(check.canon_or(base + "/" + df))
+}
+
+fn file_src(docs: []LDoc, p: str) -> str {
+    s := doc_text_by_path(docs, p)
+    if len(s) == 0 {
+        s = readfile(p)
+    }
+    return s
+}
+
+fn lsp_references(ck: ref check.Ck, docs: []LDoc, file: str, src: str, off: int, want_decl: int) -> own json.Json {
+    arr := json.jarrb()
+    u := index_at(ck.usev, file, off)
+    if u >= 0 {
+        r := ck.usev[u]
+        dk := def_key(r.def_file, r.def_lo, r.def_hi)
+        if want_decl == 1 {
+            found := 0
+            i := 0
+            for i < len(ck.declsv) {
+                d := ck.declsv[i]
+                if def_key(d.file, d.lo, d.hi) == dk {
+                    found = 1
+                    dsrc := file_src(docs, d.file)
+                    ns := decl_name_span(dsrc, d.lo, d.hi, d.name, d.kind)
+                    if ns.l >= 0 {
+                        lo := json.jobj()
+                        json.jadd(lo, "uri", json.jstr(lsp_uri_for(d.file, file)))
+                        json.jadd(lo, "range", jrange_at(dsrc, ns.l, ns.c))
+                        json.jarrb_add(arr, lo)
+                    }
+                    i = len(ck.declsv)
+                }
+                i = i + 1
+            }
+            if found == 0 {
+                // local binding: name span inside the def span
+                dsrc := file_src(docs, r.def_file)
+                ns := local_name_span(dsrc, r)
+                if ns.l >= 0 {
+                    lo := json.jobj()
+                    json.jadd(lo, "uri", json.jstr(lsp_uri_for(r.def_file, file)))
+                    json.jadd(lo, "range", jrange_at(dsrc, ns.l, ns.c))
+                    json.jarrb_add(arr, lo)
+                }
+            }
+        }
+        i2 := 0
+        for i2 < len(ck.usev) {
+            x := ck.usev[i2]
+            if def_key(x.def_file, x.def_lo, x.def_hi) == dk && is_decl_self(ck, x) == 0 {
+                xsrc := file_src(docs, x.file)
+                lo := json.jobj()
+                json.jadd(lo, "uri", json.jstr(lsp_uri_for(x.file, file)))
+                json.jadd(lo, "range", jrange_at(xsrc, x.lo, x.hi))
+                json.jarrb_add(arr, lo)
+            }
+            i2 = i2 + 1
+        }
+    }
+    return json.jarrb_arr(arr)
+}
+
+fn lsp_document_highlight(ck: ref check.Ck, docs: []LDoc, file: str, src: str, off: int) -> own json.Json {
+    arr := json.jarrb()
+    u := index_at(ck.usev, file, off)
+    if u >= 0 {
+        r := ck.usev[u]
+        dk := def_key(r.def_file, r.def_lo, r.def_hi)
+        // the decl site itself when it lives in this document —
+        // DeclEnt name span for package decls, def span for locals
+        if r.def_file == file {
+            dlo := -1
+            dhi := -1
+            di := 0
+            for di < len(ck.declsv) {
+                d := ck.declsv[di]
+                if def_key(d.file, d.lo, d.hi) == dk {
+                    ns := decl_name_span(src, d.lo, d.hi, d.name, d.kind)
+                    if ns.l >= 0 {
+                        dlo = ns.l
+                        dhi = ns.c
+                    }
+                    di = len(ck.declsv)
+                }
+                di = di + 1
+            }
+            if dlo < 0 {
+                ns := local_name_span(src, r)
+                if ns.l >= 0 {
+                    dlo = ns.l
+                    dhi = ns.c
+                }
+            }
+            if dlo >= 0 {
+                h := json.jobj()
+                json.jadd(h, "range", jrange_at(src, dlo, dhi))
+                json.jadd(h, "kind", json.jint(1))
+                json.jarrb_add(arr, h)
+            }
+        }
+        i := 0
+        for i < len(ck.usev) {
+            x := ck.usev[i]
+            if x.file == file && def_key(x.def_file, x.def_lo, x.def_hi) == dk && is_decl_self(ck, x) == 0 {
+                h := json.jobj()
+                json.jadd(h, "range", jrange_at(src, x.lo, x.hi))
+                json.jadd(h, "kind", json.jint(1))
+                json.jarrb_add(arr, h)
+            }
+            i = i + 1
+        }
+    }
+    return json.jarrb_arr(arr)
+}
+
+// would `newname` capture a different binding? Conservative v1:
+// reject on a same-package decl collision, or a same-file binding of
+// the name inside the same top-level decl span as an edit site
+// (locals never enter declsv, so their def spans index the binding
+// ident itself)
+fn rename_conflict(ck: ref check.Ck, docs: []LDoc, newname: str, tdk: str, r: check.UseRec) -> str {
+    i := 0
+    for i < len(ck.declsv) {
+        d := ck.declsv[i]
+        if d.name == newname && def_key(d.file, d.lo, d.hi) != tdk && dir_key(d.file) == dir_key(r.def_file) {
+            return "`" + newname + "` is already declared in this package"
+        }
+        i = i + 1
+    }
+    j := 0
+    for j < len(ck.usev) {
+        x := ck.usev[j]
+        if def_key(x.def_file, x.def_lo, x.def_hi) == tdk && is_decl_self(ck, x) == 0 {
+            // smallest declsv span containing this use = its top-level
+            // decl; a binding of newname inside it would capture
+            elo := -1
+            ehi := -1
+            di := 0
+            for di < len(ck.declsv) {
+                d := ck.declsv[di]
+                if d.file == x.file && d.lo <= x.lo && x.hi <= d.hi {
+                    if elo < 0 || d.hi - d.lo < ehi - elo {
+                        elo = d.lo
+                        ehi = d.hi
+                    }
+                }
+                di = di + 1
+            }
+            if elo >= 0 {
+                ui := 0
+                for ui < len(ck.usev) {
+                    y := ck.usev[ui]
+                    if y.file == x.file && y.def_file == x.file && y.def_lo >= elo && y.def_hi <= ehi && def_key(y.def_file, y.def_lo, y.def_hi) != tdk {
+                        // binding name = sig's "name: ty" prefix — locals
+                        // only (decl sigs start with a keyword)
+                        yc := find(y.sig, ": ")
+                        if yc > 0 {
+                            bn := substr(y.sig, 0, yc)
+                            if bn == newname && is_ident_start(byteat(bn, 0)) {
+                                return "`" + newname + "` would capture a different binding"
+                            }
+                        }
+                    }
+                    ui = ui + 1
+                }
+            }
+        }
+        j = j + 1
+    }
+    return ""
+}
+
+fn lsp_rename(ck: ref check.Ck, docs: []LDoc, file: str, src: str, off: int, newname: str) -> own json.Json {
+    ch := json.jobj()
+    u := index_at(ck.usev, file, off)
+    res := json.jobj()
+    if u < 0 {
+        json.jadd(res, "changes", ch)
+        return res
+    }
+    r := ck.usev[u]
+    tdk := def_key(r.def_file, r.def_lo, r.def_hi)
+    // type and field references are not fully indexed (type
+    // annotations and literal keys never reach usev), so renaming
+    // those decls would leave stale references behind
+    tkind := decl_kind_of(ck.declsv, r.def_file, r.def_lo, r.def_hi)
+    if tkind == 1 || tkind == 2 || tkind == 3 || tkind == 4 {
+        p := json.jobj()
+        json.jadd(p, "type", json.jint(2))
+        json.jadd(p, "message", json.jstr("rename rejected: type and field renames are not supported yet"))
+        lsp_frame(lsp_notify("window/showMessage", p))
+        json.jadd(res, "changes", ch)
+        return res
+    }
+    warn := rename_conflict(ck, docs, newname, tdk, r)
+    if len(warn) > 0 {
+        p := json.jobj()
+        json.jadd(p, "type", json.jint(2))
+        json.jadd(p, "message", json.jstr("rename rejected: " + warn))
+        lsp_frame(lsp_notify("window/showMessage", p))
+        json.jadd(res, "changes", ch)
+        return res
+    }
+    // decl-site edit: DeclEnt name span for package decls, the def
+    // span itself for local bindings
+    dlo := -1
+    dhi := -1
+    dfile := ""
+    oldname := ""
+    di := 0
+    for di < len(ck.declsv) {
+        d := ck.declsv[di]
+        if def_key(d.file, d.lo, d.hi) == tdk {
+            dsrc := file_src(docs, d.file)
+            ns := decl_name_span(dsrc, d.lo, d.hi, d.name, d.kind)
+            if ns.l >= 0 {
+                dlo = ns.l
+                dhi = ns.c
+                dfile = d.file
+                oldname = d.name
+            }
+            di = len(ck.declsv)
+        }
+        di = di + 1
+    }
+    if dlo < 0 {
+        dsrc := file_src(docs, r.def_file)
+        ns := local_name_span(dsrc, r)
+        if ns.l >= 0 {
+            dlo = ns.l
+            dhi = ns.c
+            dfile = r.def_file
+            nc := find(r.sig, ": ")
+            if nc > 0 {
+                oldname = substr(r.sig, 0, nc)
+            }
+        }
+    }
+    if dlo < 0 {
+        // binding site unresolvable — refuse rather than risk a
+        // whole-statement rewrite
+        p := json.jobj()
+        json.jadd(p, "type", json.jint(2))
+        json.jadd(p, "message", json.jstr("rename rejected: could not resolve the binding site"))
+        lsp_frame(lsp_notify("window/showMessage", p))
+        json.jadd(res, "changes", ch)
+        return res
+    }
+    // every recorded use must cover exactly the old name — composite
+    // spans (E.V, pkg.T{..}) would be corrupted by a whole-span
+    // rewrite, so refuse the rename rather than produce a partial one
+    vi := 0
+    for vi < len(ck.usev) {
+        x := ck.usev[vi]
+        if def_key(x.def_file, x.def_lo, x.def_hi) == tdk && is_decl_self(ck, x) == 0 {
+            xsrc := file_src(docs, x.file)
+            if substr(xsrc, x.lo, x.hi) != oldname {
+                p := json.jobj()
+                json.jadd(p, "type", json.jint(2))
+                json.jadd(p, "message", json.jstr("rename rejected: a reference does not resolve to a plain identifier"))
+                lsp_frame(lsp_notify("window/showMessage", p))
+                json.jadd(res, "changes", ch)
+                return res
+            }
+        }
+        vi = vi + 1
+    }
+    // unique URIs in first-seen order: decl site first, then uses
+    ulist := mkslice(str, 0)
+    du := lsp_uri_for(dfile, file)
+    ulist = push(ulist, du)
+    i := 0
+    for i < len(ck.usev) {
+        x := ck.usev[i]
+        if def_key(x.def_file, x.def_lo, x.def_hi) == tdk && is_decl_self(ck, x) == 0 {
+            uu := lsp_uri_for(x.file, file)
+            if !has_str(ulist, uu) {
+                ulist = push(ulist, uu)
+            }
+        }
+        i = i + 1
+    }
+    k := 0
+    for k < len(ulist) {
+        target := ulist[k]
+        ab := json.jarrb()
+        if du == target {
+            dsrc := file_src(docs, dfile)
+            te := json.jobj()
+            json.jadd(te, "range", jrange_at(dsrc, dlo, dhi))
+            json.jadd(te, "newText", json.jstr(newname))
+            json.jarrb_add(ab, te)
+        }
+        i = 0
+        for i < len(ck.usev) {
+            x := ck.usev[i]
+            if def_key(x.def_file, x.def_lo, x.def_hi) == tdk && is_decl_self(ck, x) == 0 && lsp_uri_for(x.file, file) == target {
+                xsrc := file_src(docs, x.file)
+                te := json.jobj()
+                json.jadd(te, "range", jrange_at(xsrc, x.lo, x.hi))
+                json.jadd(te, "newText", json.jstr(newname))
+                json.jarrb_add(ab, te)
+            }
+            i = i + 1
+        }
+        json.jadd(ch, target, json.jarrb_arr(ab))
+        k = k + 1
+    }
+    json.jadd(res, "changes", ch)
+    return res
+}
+
+// ---------- formatting ----------
+fn lsp_formatting(path: str, src: str) -> own json.Json {
+    fr := format_file(path, src)
+    if fr.ok == 0 {
+        return json.jnull()
+    }
+    if fr.out == src {
+        return json.jarr()
+    }
+    e := json.jobj()
+    rg := json.jobj()
+    json.jadd(rg, "start", jpos(0, 0))
+    lc := lsp_line_col(src, len(src))
+    json.jadd(rg, "end", jpos(lc.l, lc.c))
+    json.jadd(e, "range", rg)
+    json.jadd(e, "newText", json.jstr(fr.out))
+    arr := json.jarrb()
+    json.jarrb_add(arr, e)
+    return json.jarrb_arr(arr)
+}
+
+// ---------- initialize capabilities ----------
+fn lsp_capabilities() -> own json.Json {
+    c := json.jobj()
+    json.jadd(c, "textDocumentSync", json.jint(1))
+    json.jadd(c, "hoverProvider", json.jbool(true))
+    json.jadd(c, "definitionProvider", json.jbool(true))
+    comp := json.jobj()
+    tg := json.jarrb()
+    json.jarrb_add(tg, json.jstr("."))
+    json.jadd(comp, "triggerCharacters", json.jarrb_arr(tg))
+    json.jadd(c, "completionProvider", comp)
+    sh := json.jobj()
+    ts := json.jarrb()
+    json.jarrb_add(ts, json.jstr("("))
+    json.jarrb_add(ts, json.jstr(","))
+    json.jadd(sh, "triggerCharacters", json.jarrb_arr(ts))
+    json.jadd(c, "signatureHelpProvider", sh)
+    json.jadd(c, "documentSymbolProvider", json.jbool(true))
+    json.jadd(c, "documentHighlightProvider", json.jbool(true))
+    json.jadd(c, "referencesProvider", json.jbool(true))
+    json.jadd(c, "renameProvider", json.jbool(true))
+    json.jadd(c, "documentFormattingProvider", json.jbool(true))
+    st := json.jobj()
+    json.jadd(st, "legend", st_legend())
+    full := json.jobj()
+    json.jadd(full, "delta", json.jbool(false))
+    json.jadd(st, "full", full)
+    json.jadd(c, "semanticTokensProvider", st)
+    ws := json.jobj()
+    wf := json.jobj()
+    json.jadd(wf, "supported", json.jbool(true))
+    json.jadd(wf, "changeNotifications", json.jbool(false))
+    json.jadd(ws, "workspaceFolders", wf)
+    json.jadd(c, "workspace", ws)
+    return c
+}
+
+// ---------- revalidation / invalidation ----------
+fn anl_drop_key(ls: mut Lsp, key: str) {
+    i := 0
+    for i < len(ls.ans) {
+        if ls.ans[i].key == key {
+            ls.ans[i] = ls.ans[len(ls.ans) - 1]
+            ls.ans = ls.ans[0:len(ls.ans) - 1]
+        } else {
+            i = i + 1
+        }
+    }
+}
+
+// re-analyze one open doc and republish its package's diagnostics —
+// shared by didOpen/didChange and didChangeWatchedFiles invalidation
+fn lsp_revalidate(ls: mut Lsp, uri: str, p: str, text: str) {
+    over := build_over(ls.docs, p, text)
+    a := analyze_lsp(p, over, ls.docs)
+    key := dir_key(p)
+    order := mkslice(str, 0)
+    i := 0
+    for i < len(a.diags) {
+        if !has_str(order, a.diags[i].f) {
+            order = push(order, a.diags[i].f)
+        }
+        i = i + 1
+    }
+    ordered := mkslice(str, 0)
+    ordered = push(ordered, p)
+    i = 0
+    for i < len(order) {
+        if order[i] != p {
+            ordered = push(ordered, order[i])
+        }
+        i = i + 1
+    }
+    sent := mkslice(str, 0)
+    current := mkslice(str, 0)
+    i = 0
+    for i < len(ordered) {
+        f := ordered[i]
+        u := uri
+        if f != p {
+            u = path_to_uri(f)
+        }
+        ds := mkslice(LDiag, 0)
+        j := 0
+        for j < len(a.diags) {
+            if a.diags[j].f == f {
+                ds = push(ds, a.diags[j])
+            }
+            j = j + 1
+        }
+        publish_diags(u, ds)
+        sent = push(sent, u)
+        if len(ds) > 0 {
+            current = push(current, u)
+        }
+        i = i + 1
+    }
+    i = 0
+    for i < len(ls.pubs) {
+        if ls.pubs[i].key == key && !has_str(current, ls.pubs[i].uri) && !has_str(sent, ls.pubs[i].uri) {
+            publish_diags(ls.pubs[i].uri, mkslice(LDiag, 0))
+        }
+        i = i + 1
+    }
+    pub_rebuild(ls, key, current)
+    doc_put(ls, uri, p, text)
+    anl_put(ls, a)
+}
+
+// workspace/didChangeWatchedFiles — drop matching Anl entries (and
+// their pubs rows, with an empty publish so clients clear), then
+// re-analyze open docs in the affected package dirs
+fn lsp_watched(ls: mut Lsp, changes: ref json.Json) {
+    if changes == nil || changes.kind != 5 {
+        return
+    }
+    m := changes.child
+    for m != nil {
+        uri := jfield_str(m, "uri")
+        if len(uri) > 0 {
+            p := uri_to_path(uri)
+            key := dir_key(p)
+            i := 0
+            for i < len(ls.pubs) {
+                if ls.pubs[i].key == key {
+                    publish_diags(ls.pubs[i].uri, mkslice(LDiag, 0))
+                    ls.pubs[i] = ls.pubs[len(ls.pubs) - 1]
+                    ls.pubs = ls.pubs[0:len(ls.pubs) - 1]
+                } else {
+                    i = i + 1
+                }
+            }
+            anl_drop_key(ls, key)
+            d := 0
+            for d < len(ls.docs) {
+                if dir_key(ls.docs[d].path) == key {
+                    lsp_revalidate(ls, ls.docs[d].uri, ls.docs[d].path, ls.docs[d].text)
+                }
+                d = d + 1
+            }
+        }
+        m = m.next
+    }
+}
+
 // ---------- the stdio loop ----------
 fn cmd_lsp() {
     in := os.stdin()
@@ -612,6 +2256,7 @@ fn cmd_lsp() {
     ls.docs = mkslice(LDoc, 0)
     ls.ans = mkslice(Anl, 0)
     ls.pubs = mkslice(PubU, 0)
+    ls.root = ""
     for true {
         // read headers + one full body
         body := ""
@@ -623,8 +2268,7 @@ fn cmd_lsp() {
                     body = substr(buf, h + 4, h + 4 + ml)
                     buf = substr(buf, h + 4 + ml, len(buf))
                 } else if ml <= 0 {
-                    // header block with no usable length — drop it like
-                    // the seed's `if len == 0 { continue }`
+                    // header block with no usable length — drop it
                     buf = substr(buf, h + 4, len(buf))
                 }
             }
@@ -637,147 +2281,172 @@ fn cmd_lsp() {
             }
             buf = buf + chunk[0:n] as str
         }
-        method := json_str(body, "method")
+        msg := json.jparse(body)
+        if msg == nil || msg.kind != 4 {
+            lsp_frame(lsp_error(json.jnull(), -32700, "Parse error"))
+            continue
+        }
+        method := jfield_str(msg, "method")
         if method == "exit" {
             return
         }
-        if method == "textDocument/didOpen" || method == "textDocument/didChange" {
-            if find(body, "\"uri\":") >= 0 && find(body, "\"text\":") >= 0 {
-                uri := json_str(body, "uri")
-                text := json_str(body, "text")
-                p := uri_to_path(uri)
-                over := build_over(ls.docs, p, text)
-                a := analyze_lsp(p, over, ls.docs)
-                key := dir_key(p)
-                // group diags by file in first-seen order; the open doc
-                // always publishes first — even an empty list clears
-                // stale diagnostics and a client reads one response per
-                // didOpen
-                order := mkslice(str, 0)
-                i := 0
-                for i < len(a.diags) {
-                    if !has_str(order, a.diags[i].f) {
-                        order = push(order, a.diags[i].f)
-                    }
-                    i = i + 1
-                }
-                ordered := mkslice(str, 0)
-                ordered = push(ordered, p)
-                i = 0
-                for i < len(order) {
-                    if order[i] != p {
-                        ordered = push(ordered, order[i])
-                    }
-                    i = i + 1
-                }
-                sent := mkslice(str, 0)
-                current := mkslice(str, 0)
-                i = 0
-                for i < len(ordered) {
-                    f := ordered[i]
-                    u := uri
-                    if f != p {
-                        u = path_to_uri(f)
-                    }
-                    ds := mkslice(LDiag, 0)
-                    j := 0
-                    for j < len(a.diags) {
-                        if a.diags[j].f == f {
-                            ds = push(ds, a.diags[j])
-                        }
-                        j = j + 1
-                    }
-                    publish_diags(u, ds)
-                    sent = push(sent, u)
-                    if len(ds) > 0 {
-                        current = push(current, u)
-                    }
-                    i = i + 1
-                }
-                // a file whose last diagnostic cleared still needs an
-                // explicit empty publish — only URIs this scope already
-                // published get cleared (other packages' survive)
-                i = 0
-                for i < len(ls.pubs) {
-                    if ls.pubs[i].key == key && !has_str(current, ls.pubs[i].uri) && !has_str(sent, ls.pubs[i].uri) {
-                        publish_diags(ls.pubs[i].uri, mkslice(LDiag, 0))
-                    }
-                    i = i + 1
-                }
-                pub_rebuild(ls, key, current)
-                doc_put(ls, uri, p, text)
-                anl_put(ls, a)
+        idn := json.jget(msg, "id")
+        has_id := 0
+        if idn != nil {
+            has_id = 1
+        }
+        params := jsub(msg, "params")
+        if params == nil {
+            params = json.jobj()
+        }
+        // ---------- notifications (never answered) ----------
+        if method == "textDocument/didOpen" {
+            td := jsub(params, "textDocument")
+            uri := jfield_str(td, "uri")
+            text := jfield_str(td, "text")
+            if len(uri) > 0 {
+                lsp_revalidate(ls, uri, uri_to_path(uri), text)
+            }
+            continue
+        }
+        if method == "textDocument/didChange" {
+            td := jsub(params, "textDocument")
+            uri := jfield_str(td, "uri")
+            le := jarr_last(jsub(params, "contentChanges"))
+            text := ""
+            if le != nil {
+                text = jfield_str(le, "text")
+            }
+            if len(uri) > 0 {
+                lsp_revalidate(ls, uri, uri_to_path(uri), text)
             }
             continue
         }
         if method == "textDocument/didClose" {
-            if find(body, "\"uri\":") >= 0 {
-                uri := json_str(body, "uri")
+            td := jsub(params, "textDocument")
+            uri := jfield_str(td, "uri")
+            if len(uri) > 0 {
                 doc_drop(ls, uri)
-                // a closed doc's URIs leave every scope's published set —
-                // the client won't show its diagnostics anymore
                 pub_drop_uri(ls, uri)
             }
             continue
         }
+        if method == "workspace/didChangeWatchedFiles" {
+            lsp_watched(ls, jsub(params, "changes"))
+            continue
+        }
+        if method == "initialized" || method == "$/cancelRequest" {
+            continue
+        }
+        // ---------- requests ----------
+        if has_id == 0 {
+            continue
+        }
         resp := ""
-        handled := 1
         if method == "initialize" {
-            resp = "{\"jsonrpc\":\"2.0\",\"id\":" + extract_id(body) + ",\"result\":{\"capabilities\":{\"textDocumentSync\":1,\"hoverProvider\":true,\"definitionProvider\":true}}}"
+            ru := jfield_str(params, "rootUri")
+            if len(ru) > 0 {
+                ls.root = uri_to_path(ru)
+            }
+            if len(ls.root) == 0 {
+                wf := jarr_first(jsub(params, "workspaceFolders"))
+                if wf != nil {
+                    ls.root = uri_to_path(jfield_str(wf, "uri"))
+                }
+            }
+            res := json.jobj()
+            json.jadd(res, "capabilities", lsp_capabilities())
+            sinfo := json.jobj()
+            json.jadd(sinfo, "name", json.jstr("oxl"))
+            json.jadd(res, "serverInfo", sinfo)
+            resp = lsp_result(idn, res)
         } else if method == "shutdown" {
-            resp = "{\"jsonrpc\":\"2.0\",\"id\":" + extract_id(body) + ",\"result\":null}"
-        } else if method == "textDocument/hover" || method == "textDocument/definition" {
-            id := extract_id(body)
-            uri := json_str(body, "uri")
-            line := json_num(body, "line")
-            col := json_num(body, "character")
+            resp = lsp_result(idn, json.jnull())
+        } else if method == "textDocument/hover" || method == "textDocument/definition" || method == "textDocument/completion" || method == "textDocument/signatureHelp" || method == "textDocument/documentSymbol" || method == "textDocument/documentHighlight" || method == "textDocument/references" || method == "textDocument/rename" || method == "textDocument/formatting" || method == "textDocument/semanticTokens/full" || method == "textDocument/semanticTokens" {
+            td := jsub(params, "textDocument")
+            uri := jfield_str(td, "uri")
             file := uri_to_path(uri)
             key := dir_key(file)
-            resp = "{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"result\":null}"
+            res := json.jnull()
+            ai := anl_at(ls.ans, key)
             src := doc_text_by_uri(ls.docs, uri)
-            if len(src) > 0 {
-                off := lsp_offset(src, line, col)
-                ai := anl_at(ls.ans, key)
-                if ai >= 0 {
-                    u := index_at(ls.ans[ai].res.ck.usev, file, off)
-                    if u >= 0 {
-                        if method == "textDocument/hover" {
-                            sig := ls.ans[ai].res.ck.usev[u].sig
-                            resp = "{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"result\":{\"contents\":{\"kind\":\"plaintext\",\"value\":\"" + json_escape(sig) + "\"}}}"
+            if len(src) == 0 {
+                src = readfile(file)
+            }
+            if ai >= 0 {
+                if method == "textDocument/documentSymbol" {
+                    res = lsp_document_symbol(ls.ans[ai].res.ck, file, src)
+                } else if method == "textDocument/formatting" {
+                    res = lsp_formatting(file, src)
+                } else if method == "textDocument/semanticTokens/full" || method == "textDocument/semanticTokens" {
+                    res = lsp_semantic_tokens(ls.ans[ai].res.ck, file, src)
+                } else {
+                    pos := jsub(params, "position")
+                    line := jfield_num(pos, "line")
+                    col := jfield_num(pos, "character")
+                    off := lsp_offset(src, line, col)
+                    if method == "textDocument/hover" {
+                        u := index_at(ls.ans[ai].res.ck.usev, file, off)
+                        if u >= 0 {
+                            h := json.jobj()
+                            json.jadd(h, "kind", json.jstr("plaintext"))
+                            json.jadd(h, "value", json.jstr(ls.ans[ai].res.ck.usev[u].sig))
+                            ho := json.jobj()
+                            json.jadd(ho, "contents", h)
+                            res = ho
+                        }
+                    } else if method == "textDocument/definition" {
+                        u := index_at(ls.ans[ai].res.ck.usev, file, off)
+                        if u >= 0 {
+                            r := ls.ans[ai].res.ck.usev[u]
+                            dsrc := file_src(ls.docs, r.def_file)
+                            lo := json.jobj()
+                            json.jadd(lo, "uri", json.jstr(lsp_uri_for(r.def_file, file)))
+                            json.jadd(lo, "range", jrange_at(dsrc, r.def_lo, r.def_hi))
+                            res = lo
+                        }
+                    } else if method == "textDocument/completion" {
+                        res = lsp_completion(ls.ans[ai].res.ck, file, src, off)
+                    } else if method == "textDocument/signatureHelp" {
+                        res = lsp_signature_help(ls.ans[ai].res.ck, file, src, off)
+                    } else if method == "textDocument/documentHighlight" {
+                        res = lsp_document_highlight(ls.ans[ai].res.ck, ls.docs, file, src, off)
+                    } else if method == "textDocument/references" {
+                        ctx := jsub(params, "context")
+                        wd := 0
+                        if jboolf(jsub(ctx, "includeDeclaration")) {
+                            wd = 1
+                        }
+                        res = lsp_references(ls.ans[ai].res.ck, ls.docs, file, src, off, wd)
+                    } else if method == "textDocument/rename" {
+                        nn := jfield_str(params, "newName")
+                        bad := 0
+                        if len(nn) == 0 || !is_ident_start(byteat(nn, 0)) || lexlib.is_kw(nn) || check.is_builtin(nn) {
+                            bad = 1
                         } else {
-                            df := ls.ans[ai].res.ck.usev[u].def_file
-                            dl := ls.ans[ai].res.ck.usev[u].def_lo
-                            dh := ls.ans[ai].res.ck.usev[u].def_hi
-                            // def spans index into their own file's
-                            // source — the open doc's buffer wins, then
-                            // the disk copy
-                            dsrc := doc_text_by_path(ls.docs, df)
-                            if len(dsrc) == 0 {
-                                dsrc = readfile(df)
-                            }
-                            lc0 := lsp_line_col(dsrc, dl)
-                            lc1 := lsp_line_col(dsrc, dh)
-                            uri2 := ""
-                            if len(df) > 0 && byteat(df, 0) == 47 {
-                                uri2 = path_to_uri(df)
-                            } else {
-                                // relative decl paths resolve against
-                                // the open doc's dir
-                                base := check.dir_of(file)
-                                if len(base) == 0 {
-                                    base = "."
+                            ni := 1
+                            for ni < len(nn) {
+                                if !is_ident_char(byteat(nn, ni)) {
+                                    bad = 1
                                 }
-                                uri2 = path_to_uri(check.canon_or(base + "/" + df))
+                                ni = ni + 1
                             }
-                            resp = "{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"result\":{\"uri\":\"" + json_escape(uri2) + "\",\"range\":{\"start\":{\"line\":" + itoa(lc0.l) + ",\"character\":" + itoa(lc0.c) + "},\"end\":{\"line\":" + itoa(lc1.l) + ",\"character\":" + itoa(lc1.c) + "}}}}"
+                        }
+                        if bad == 1 {
+                            resp = lsp_error(json.jclone(idn), -32602, "invalid newName")
+                        } else {
+                            res = lsp_rename(ls.ans[ai].res.ck, ls.docs, file, src, off, nn)
                         }
                     }
                 }
             }
+            if len(resp) == 0 {
+                resp = lsp_result(idn, res)
+            }
         } else {
-            handled = 0
+            resp = lsp_error(idn, -32601, "Method not found")
         }
-        if handled == 1 {
+        if len(resp) > 0 {
             lsp_frame(resp)
         }
     }

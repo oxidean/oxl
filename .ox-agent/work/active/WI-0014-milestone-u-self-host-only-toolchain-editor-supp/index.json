@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "id": "WI-0014",
+  "title": "milestone U — self-host-only toolchain + editor support",
+  "state": "planning",
+  "profile": "normal",
+  "current_stage": "planning",
+  "created_at": "2026-11-14T00:24:22Z",
+  "updated_at": "2026-11-14T00:52:06Z"
+}

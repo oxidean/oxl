@@ -11,6 +11,17 @@ the standard library.
 
 ### Added
 
+- **Toolchain**: the Rust seed compiler is gone — `bootstrap/stage0/oxl.c`
+  is a checked-in C snapshot of the driver, rebuilt by `scripts/stage0.sh`
+  with only a C compiler; CI and releases bootstrap from it
+- **LSP**: `oxl lsp` now speaks `std/encoding/json` on the wire and covers
+  completion, signature help, document symbols, document highlight,
+  references, rename (with shadow/capture rejection), whole-document
+  formatting, semantic tokens, `workspace/didChangeWatchedFiles`, and
+  `workspaceFolders` (first folder honored)
+- **Editor assets**: TextMate grammar (`editors/grammars/`), VS Code
+  extension skeleton (`editors/vscode/`), and setup docs
+  (`docs/editors.md`)
 - **Packages**: `package` clauses and directory packages; import paths
   resolve to directories and the bound name is the declared package name
 - **Modules**: `oxl.mod` manifests (`module`/`oxl`/`require`/`replace`),

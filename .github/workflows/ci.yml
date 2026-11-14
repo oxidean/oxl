@@ -29,8 +29,6 @@ jobs:
         with:
           persist-credentials: false # PR code runs here; don't leave a token in git config
 
-      - uses: dtolnay/rust-toolchain@stable
-
       - name: system deps (linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y sqlite3 libsqlite3-dev
@@ -52,12 +50,12 @@ jobs:
           echo "LANG_CC=gcc" >> "$GITHUB_ENV"
           echo "LANG_SQLITE_SRC=$(cygpath -m "$PWD")/sqlite/sqlite-amalgamation-3540100/sqlite3.c" >> "$GITHUB_ENV"
 
-      - name: build compiler
-        run: cargo build --release --manifest-path oxl/Cargo.toml
+      - name: build stage-0 seed
+        run: bash scripts/stage0.sh
 
       - name: run test suite
         shell: bash
-        run: bash tests/run.sh "$PWD/oxl/target/release/oxl${{ runner.os == 'Windows' && '.exe' || '' }}"
+        run: bash tests/run.sh "$PWD/target/oxl${{ runner.os == 'Windows' && '.exe' || '' }}"
 
   # Commit-message gate (see scripts/commit-check.sh): SemVer-prefix
   # grammar on subjects + no-AI-attribution scan, on the PR's commit

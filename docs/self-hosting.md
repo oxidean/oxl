@@ -17,7 +17,7 @@ doc, LSP) is a separate Phase-2 milestone — **toolchain-in-oxl**
   variants with `match` (B2), including `match` itself in the
   grammar. **It parses itself with zero skipped tokens** — full
   round-trip.
-- `bootstrap/check/check.oxl` — a port of the seed typechecker, written in
+- `bootstrap/check/check.oxl` — the typechecker, written in
   `.oxl`: interned integer type handles, scope-slice environments,
   `std/collections` tables, registration + checking passes over the
   parser's AST (fns, structs, enums, globals, imports, bodies,
@@ -29,7 +29,7 @@ doc, LSP) is a separate Phase-2 milestone — **toolchain-in-oxl**
   interface tables, structural method coverage, and `own` move
   tracking (D2) are all ported. Remaining subset: float-typed AST
   distinctions beyond literals.
-- `bootstrap/cmd/codegen` — a port of the seed C emitter, written in
+- `bootstrap/cmd/codegen` — the C emitter, written in
   `.oxl`, consuming the checker's tables over the parser's AST:
   `oxl run bootstrap/cmd/codegen -- file.oxl > out.c`, then
   `cc -O2 -pthread -Iruntime out.c runtime/rt.c -o out`. When `out.c`
@@ -37,12 +37,11 @@ doc, LSP) is a separate Phase-2 milestone — **toolchain-in-oxl**
   before the sources and `-lsqlite3` after them — `emit_and_cc`
   detects the same condition and adds both only then, since `-l`
   must trail the objects that reference it under `--as-needed`.
-  Suspension lowers to the same `o_frm_*`/`o_poll_*` state machines the
-  seed emitter produces; `--test` mirrors `oxl test`'s scope-wrapped
-  runner. **It compiles itself** — the emitted binary regenerates
+  Suspension lowers to `o_frm_*`/`o_poll_*` state machines;
+  `--test` mirrors `oxl test`'s scope-wrapped runner. **It compiles itself** — the emitted binary regenerates
   byte-identical C, closing the classic bootstrap chain.
 
-All five bootstrap components are compiled by the seed compiler and
+All five bootstrap components are compiled by the stage-0 driver and
 run in CI (`tests/run.sh`), so the self-host claim can't rot.
 
 ## What the language already has (sufficient for frontend)
@@ -81,7 +80,7 @@ Ordered by what the checker/codegen port actually needs:
    `w.m()` vtab dispatch, method-constraint generics — see
    `docs/semantics/methods.md`. The bootstrap codegen lowers method
    dispatch too — vtab pairs and generic instantiations emit through
-   `codegen.oxl` the same as the seed pipeline.
+   `codegen.oxl` end to end.
 6. ~~**Maps/sets in stdlib**~~ — **done (B6).** `std/collections`:
    FNV-1a `map`/`set` over `[]Bucket` power-of-2 tables, `int` payloads
    (word-sized, covers env ids and counts). Needed `&`/`|`/`^` infix
@@ -98,23 +97,31 @@ bootstrap/check/       (done — typechecks .oxl, self-checks clean)
 bootstrap/cmd/codegen  (done — emits C, self-compiles byte-identical)
 ```
 
-## The toolchain: seed and product
+## The toolchain: stage-0 snapshot and product
 
-The `oxl/` crate (Rust) is the **seed** — the bootstrap input that
-compiles the first `.oxl`-written toolchain. The **product** driver is
-`cmd/oxl`, written in `.oxl`: argv dispatch, `oxl.mod` resolution,
-get/mod, fmt, doc, and LSP over `bootstrap/check` + `bootstrap/codegen`.
-`tests/run.sh` builds the product driver with the seed, has it rebuild
-itself, and asserts the C each generation emits for the driver sources
-is byte-identical (the fixpoint — ADR-0006); the suite then runs under
-the product driver end-to-end. Cargo stays in the *bootstrap* path
-only.
+There is exactly one compiler implementation, written in `.oxl`:
+`bootstrap/` (lexer → parser → checker → C emitter) plus the **product**
+driver `cmd/oxl` — argv dispatch, `oxl.mod` resolution, get/mod, fmt,
+doc, and LSP — all compiled to C11 through `runtime/`. The LSP
+surface (hover/definition/completion/signature help/symbols/
+highlight/references/rename/formatting/semantic tokens) is covered
+end-to-end by the JSON-RPC fixtures in `tests/run.sh`.
+
+The bootstrap input is `bootstrap/stage0/oxl.c`: a checked-in C
+snapshot of the whole driver, emitted by `codegen.oxl` and committed
+so a plain C compiler suffices to start. `scripts/stage0.sh build`
+compiles it to `target/oxl`; `scripts/stage0.sh emit` regenerates the
+snapshot from an installed `oxl`. `tests/run.sh` then has the snapshot
+build the driver (gen 1), the driver rebuild itself (gen 2), and
+asserts the C each generation emits for the driver sources is
+byte-identical (the fixpoint — ADR-0006/ADR-0014). A stale snapshot
+fails that gate, which is what keeps `stage0/oxl.c` honest.
 
 `codegen.oxl` now lowers the full language surface,
 including `RtIface`/vtable pairs for interface values and
 monomorphized generic instantiations; emitted programs using generics,
-interfaces, or methods compile through either pipeline. The interim C
-backend stays the codegen target.
+interfaces, or methods compile end to end. The interim C backend stays
+the codegen target.
 
 ## Keeping the claim honest
 
@@ -128,10 +135,12 @@ byte-identical C for `hello.oxl`.
 
 Two more gates keep the claim honest:
 
-- **Differential diagnostics** — the `tests/diag/` corpus (programs
-  that parse in both pipelines but fail checking) asserts the seed
-  checker's diagnostics equal `check.oxl`'s line-for-line and in
-  order, after stripping the `file:line:col:` prefix.
+- **Diagnostic plumbing** — the `tests/diag/` corpus (programs that
+  parse but fail checking) asserts the driver build path's diagnostics
+  equal the standalone `check.oxl` binary's line-for-line and in
+  order, after stripping the `file:line:col:` prefix. Both sides run
+  the same checker, so this guards the driver's reporting path rather
+  than a second implementation.
 - **All-four self-compile** — each bootstrap component compiled by
   `codegen.oxl` must produce identical output to `oxl run` (lexer and
   parser output compared in full, checker diagnostics on a corpus

@@ -375,19 +375,18 @@ jobs:
         with:
           ref: ${{ needs.version.outputs.sha }}
           persist-credentials: false # build/test steps run dep code; publish uses github.token directly
-      - uses: dtolnay/rust-toolchain@stable
-      - name: build oxl
-        run: cargo build --release --manifest-path oxl/Cargo.toml
+      - name: build stage-0 seed
+        run: bash scripts/stage0.sh
       - name: test suite (gate)
-        run: bash tests/run.sh ./oxl/target/release/oxl
+        run: bash tests/run.sh ./target/oxl
       - name: package toolchain
         env:
           RELEASE_TAG: ${{ needs.version.outputs.tag }}
         run: |
           mkdir -p dist/oxl-toolchain
           # the suite gate above built and validated the product driver
-          # (target/oxl-self) — ship it, not the Rust seed it was
-          # bootstrapped from
+          # (target/oxl-self) — ship it, not the stage-0 snapshot it
+          # was bootstrapped from
           cp target/oxl-self dist/oxl-toolchain/oxl
           cp -r std examples dist/oxl-toolchain/
           # the product driver locates runtime/rt.c beside the binary
@@ -398,8 +397,8 @@ jobs:
           cp LICENSE dist/oxl-toolchain/
           # the version manager + `oxl version` read this file for the tag
           echo "$RELEASE_TAG" > dist/oxl-toolchain/RELEASE
-          # the repo README documents building from oxl/ and other paths
-          # the archive doesn't ship — give it release-specific steps
+          # the repo README documents building from bootstrap/stage0 and
+          # other paths the archive doesn't ship — give it release steps
           cat > dist/oxl-toolchain/README.md <<'EOF2'
           # oxl toolchain
 
@@ -467,15 +466,14 @@ jobs:
         with:
           ref: ${{ needs.version.outputs.sha }}
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
-      - name: build oxl
-        run: cargo build --release --manifest-path oxl/Cargo.toml
+      - name: build stage-0 seed
+        run: bash scripts/stage0.sh
       - name: extras gate (test every package)
         run: |
           set -eu
           for d in $(find extra -name '*.oxl' -exec dirname {} \; | sort -u); do
             echo "== test $d"
-            ( cd "$d" && "$OLDPWD"/oxl/target/release/oxl test )
+            ( cd "$d" && "$OLDPWD"/target/oxl test )
           done
       - name: tag commit
         if: github.ref_type != 'tag'

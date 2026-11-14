@@ -77,8 +77,8 @@ tarball:
 
 ```bash
 git clone https://github.com/oxidean/oxl && cd oxl
-cd oxl && cargo build --release && cd ..
-export PATH="$PWD/oxl/target/release:$PATH"
+bash scripts/stage0.sh   # stage-0 snapshot -> target/oxl
+export PATH="$PWD/target:$PATH"
 ```
 
 A source-built binary reports `oxl dev (language 0.3)`. The version

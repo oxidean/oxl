@@ -62,7 +62,7 @@ amalgamation `sqlite3.c` where no dev package exists.
 ### Building from source
 
 On macOS, Windows, or any platform without a tarball, build the toolchain
-from the repository (a Rust toolchain plus `cc`):
+from the repository (a C compiler plus pthreads):
 
 ```bash
 git clone https://github.com/oxidean/oxl && cd oxl
@@ -70,8 +70,8 @@ git clone https://github.com/oxidean/oxl && cd oxl
 # only, no auth); skip the checkout to build `main` instead:
 TAG=$(curl -sL -o /dev/null -w '%{url_effective}' \
   https://github.com/oxidean/oxl/releases/latest | sed 's|.*/releases/tag/||')
-git checkout "$TAG" && cargo build --release --manifest-path oxl/Cargo.toml
-# binary: oxl/target/release/oxl; put it on PATH with std/ alongside
+git checkout "$TAG" && bash scripts/stage0.sh
+# binary: target/oxl; put it on PATH with std/ alongside
 ```
 
 `import "std/x"` resolves against `std/` next to the binary, so run it

@@ -1,7 +1,7 @@
 schema_version: 1
 project:
     name: oxl
-    test_command: cargo build --release --manifest-path oxl/Cargo.toml && tests/run.sh oxl/target/release/oxl
+    test_command: bash scripts/stage0.sh && tests/run.sh ./target/oxl
 workflow:
     default_profile: normal
     profiles:

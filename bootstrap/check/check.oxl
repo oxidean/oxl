@@ -5701,8 +5701,7 @@ fn clause_of(ck: ref Ck, dir: str) -> str {
 
 // ---------- module system (mirrors the seed mod_ctx/resolve_pkg) ----------
 
-// language version this self-hosted toolchain implements — kept in
-// lock-step with the seed OXL_VERSION (Cargo.toml major.minor)
+// language version this toolchain implements (oxl 0.3)
 fn tool_ver() -> str {
     return "0.3"
 }

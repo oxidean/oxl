@@ -84,13 +84,14 @@ cleanup() {
 trap cleanup EXIT
 
 echo "== self-built product driver (t6) =="
-# ADR-0006: the Rust seed is the bootstrap input only — it builds the
-# product driver once (gen 1), the product driver rebuilds itself
-# (gen 2), and the C each generation emits for the driver sources must
-# be byte-identical (the fixpoint — not a binary hash: build-ids and
-# embedded paths legitimately differ) — seed emit included, so the
-# seed-vs-self spec criterion is checked directly, not just via
-# output parity. Every section below then runs
+# ADR-0006/ADR-0014: the stage-0 snapshot (bootstrap/stage0/oxl.c,
+# compiled by scripts/stage0.sh) is the bootstrap input only — it
+# builds the product driver once (gen 1), the product driver rebuilds
+# itself (gen 2), and the C each generation emits for the driver
+# sources must be byte-identical (the fixpoint — not a binary hash:
+# build-ids and embedded paths legitimately differ) — seed emit
+# included, so the seed-vs-self spec criterion is checked directly,
+# not just via output parity. Every section below then runs
 # under the product driver; SEEDOXL stays only where a seed-vs-self
 # output comparison needs it.
 SEEDOXL="$OXL"
@@ -607,10 +608,13 @@ for f in bootstrap/check bootstrap/codegen examples/features.oxl tests/match.oxl
 done
 
 echo "== differential diagnostics (c1) =="
-# tests/diag/ holds files that parse cleanly in both pipelines but fail
-# checking — the seed checker's diagnostics must equal the self-hosted
-# one's, line for line and in order. The seed driver prefixes each diag
-# `file:line:col:` (stripped here); check.oxl reports {kind,msg} only.
+# tests/diag/ holds files that parse cleanly but fail checking. Since
+# ADR-0014 both sides run the same self-hosted checker — the "seed"
+# side through the driver build path, the "self" side through the
+# standalone check binary — so this now guards the driver's diag
+# plumbing (prefix strip, ordering, acceptance) rather than a second
+# implementation. The driver prefixes each diag `file:line:col:`
+# (stripped here); check.oxl reports {kind,msg} only.
 # Out of corpus scope by design: parse/lex failures (the [parse]/[lex]
 # kinds don't surface through check.oxl's diag list) and cases neither
 # checker diagnoses (cc or the runtime catches those downstream — that
@@ -644,9 +648,9 @@ done
 echo "== module resolution (m2) =="
 # tests/mod/ holds self-contained module trees; each carries its own
 # oxl.mod so root discovery never escapes into the repo's module.
-# `expected` marks the outcome — `ok` fixtures must build in the seed toolchain and
-# print `ok` in the self-hosted checker; error fixtures must be
-# rejected by both checkers with byte-identical diagnostics. The
+# `expected` marks the outcome — `ok` fixtures must build under the
+# driver and print `ok` in the standalone checker; error fixtures must
+# be rejected by both paths with identical diagnostics. The
 # module cache is pointed at an empty dir so `missing module` is
 # deterministic; `tests/mod/widget` and `tests/mod/intmod` are shared
 # replace-targets, not cases.
@@ -729,11 +733,11 @@ if [ "$seed_rc" != 0 ] || [ "$self_rc" != 0 ] || [ "$self_out" != ok ]; then
 fi
 ;;
 esac
-# invalid UTF-8 inside a comment: the seed's read_to_string rejects the
-# file outright; the self-hosted driver must degrade to the documented
+# invalid UTF-8 inside a comment: strict readers reject the file
+# outright; the driver must degrade to the documented
 # missing-directive diagnostic — validating before comment stripping,
 # not during line parsing. Diagnostics differ by contract, so only the
-# self side's text is asserted.
+# driver side's text is asserted.
 mkdir -p "$scratch/workbadutf8/app"
 printf 'module local/badutf8\noxl 0.3\n' > "$scratch/workbadutf8/oxl.mod"
 printf 'package main\nfn main() {}\n' > "$scratch/workbadutf8/app/main.oxl"

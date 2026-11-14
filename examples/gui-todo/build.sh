@@ -5,10 +5,11 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 if [ -z "${OXL:-}" ]; then
-    # source checkout builds into oxl/target/release; the packaged
-    # toolchain drops `oxl` at the root next to stdlib/ + examples/
-    if [ -x ../../oxl/target/release/oxl ]; then
-        OXL=../../oxl/target/release/oxl
+    # source checkout builds into target/ (scripts/stage0.sh); the
+    # packaged toolchain drops `oxl` at the root next to stdlib/ +
+    # examples/
+    if [ -x ../../target/oxl ]; then
+        OXL=../../target/oxl
     else
         OXL=../../oxl
     fi

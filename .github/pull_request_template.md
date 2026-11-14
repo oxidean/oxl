@@ -11,8 +11,8 @@
 
 <!-- Check what you actually ran. CI runs the full matrix: ubuntu, macos, windows, commit-lint. -->
 
-- [ ] `cargo build --release` in `oxl/` — required for toolchain changes
-- [ ] `./tests/run.sh oxl/target/release/oxl` — the full suite
+- [ ] `bash scripts/stage0.sh` — stage-0 snapshot build (toolchain changes)
+- [ ] `./tests/run.sh ./target/oxl` — the full suite
 - [ ] Self-check (`./tests/run.sh` already covers it) — required when `bootstrap/` changes
 - [ ] `oxl fmt` clean on touched `.oxl` files
 - [ ] Not run — explain below

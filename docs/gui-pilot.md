@@ -105,7 +105,7 @@ isn't installed on the dev box.
 
 ```sh
 cd examples/gui-todo
-./build.sh              # pkg-config gtk4 + ../../oxl/target/release/oxl
+./build.sh              # pkg-config gtk4 + ../../target/oxl (scripts/stage0.sh)
 ./todo                  # interactive (needs a display)
 ./todo --selftest       # signal-path assertions, auto-quits
 ./todo --selftest 50000 # churn-scaled RSS probe

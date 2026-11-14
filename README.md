@@ -65,8 +65,9 @@ source below.
 
 ## Building from source
 
-Requires: a Rust toolchain (cargo) for the seed compiler, a C compiler
-(`cc`), and pthreads. Programs that use the sqlite3 shims also need
+Requires: a C compiler (`cc`) and pthreads. The stage-0 snapshot
+(`bootstrap/stage0/oxl.c`) bootstraps the self-hosted driver — no Rust
+toolchain needed. Programs that use the sqlite3 shims also need
 sqlite3 dev headers (`-lsqlite3` is linked only when the emitted C calls
 it). Supported platforms: Linux (x86_64), macOS (aarch64), and Windows
 (x86_64, via MinGW gcc or LLVM clang — the runtime's `oxl_*` veneer in
@@ -74,9 +75,9 @@ it). Supported platforms: Linux (x86_64), macOS (aarch64), and Windows
 sockets to WinSock2).
 
 ```sh
-cd oxl && cargo build --release && cd ..
-# binary: oxl/target/release/oxl — put it on PATH for the commands below
-export PATH="$PWD/oxl/target/release:$PATH"
+bash scripts/stage0.sh   # compiles bootstrap/stage0/oxl.c -> target/oxl
+# put the built driver on PATH for the commands below
+export PATH="$PWD/target:$PATH"
 ```
 
 `oxl build`/`run` invoke a C compiler for the final link; set
@@ -302,7 +303,7 @@ curl localhost:8080/items                      # → {"items":[{"id":1,"name":"w
 ## Repo layout
 
 ```
-oxl/          the seed compiler (Rust): lexer → parser → check → codegen → C → cc
+bootstrap/stage0/  checked-in C snapshot of the driver — the stage-0 bootstrap input (scripts/stage0.sh)
 runtime/       rt.c/rt.h — arenas, ObjHdr checks, scopes/traps, executor, channels
 docs/          design doc, semantics annex, prototype report
 std/           the standard library, written in the language (strings, testing, http/net, json, csv, base64, hex, binary, sync, time, os, errors, io, bytes, bufio, fmt, strconv, path, filepath, sort, slices, maps, cmp, math, rand, unicode/utf8, flag, log, net, net/http, hash, crypto/{sha256,md5,hmac}, collections, regexp, container/{heap,list,ring})

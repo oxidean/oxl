@@ -3,16 +3,16 @@
 oxl is a young language — the toolchain works end to end and the
 compiler's own components are written in oxl, but expect rough edges.
 The product driver (`cmd/oxl`, written in `.oxl`) emits C11 through
-`runtime/` into a native binary; the Rust crate in `oxl/` is the seed
-toolchain that bootstraps it, and the self-hosted components under
-`bootstrap/` must stay byte-for-byte in step with the seed's compiler
-passes.
+`runtime/` into a native binary. `bootstrap/stage0/oxl.c` — a checked-in
+C snapshot of that driver — is the stage-0 bootstrap input;
+`scripts/stage0.sh` rebuilds it into `target/oxl`, and the self-hosted
+components under `bootstrap/` are the only compiler implementation.
 
 ## Build & test
 
 ```sh
-cargo build --release --manifest-path oxl/Cargo.toml   # the `oxl` toolchain
-bash tests/run.sh ./oxl/target/release/oxl            # end-to-end suite
+bash scripts/stage0.sh              # stage-0 snapshot -> target/oxl
+bash tests/run.sh ./target/oxl      # end-to-end suite
 ```
 
 `tests/run.sh` exercises every example, `oxl test`, the stdlib packages,
@@ -25,8 +25,8 @@ so have Python 3 on `PATH` before running the suite.
 
 - `cmd/oxl/` — the product toolchain driver, written in `.oxl`:
   `build`/`run`/`test`/`fmt`/`doc`/`get`/`mod`/`list`/`lsp`
-- `oxl/` — the seed compiler (Rust), the bootstrap input only:
-  `lexer → parser → check → codegen(C) → cc`
+- `bootstrap/stage0/` — the stage-0 C snapshot of the driver; regenerate
+  with `scripts/stage0.sh emit` (needs an installed `oxl`)
 - `runtime/` — rt.h/rt.c: arenas, ownership checks, scopes, pool executor
 - `std/` — standard library, written in the language (`std/strings`,
   `std/io`, `std/net/http`, …)
@@ -40,14 +40,20 @@ so have Python 3 on `PATH` before running the suite.
 - `.ox-agent/` — ox-agent work items, skills, workflows, and pipelines
   (materialized assets — add extension skills as new dirs, never edit in place)
 
-## Keeping the two implementations in parity
+## Keeping the snapshot fresh
 
-Changes to language semantics must land in **both** the seed toolchain
-(`oxl/src/*.rs`) and the self-hosted components (`bootstrap/**/*.oxl`),
-and their observable behavior must match: same diagnostics byte-for-byte
-(`tests/diag/`), same emitted C where the harness compares it. When you
-touch the checker, run the diag corpus; when you touch codegen, run the
-self-compile comparison. `tests/run.sh` covers both.
+`cmd/oxl`, `bootstrap/`, and `std/` changes alter the driver's emitted
+C, so `bootstrap/stage0/oxl.c` must be regenerated in the same PR:
+
+```sh
+scripts/stage0.sh emit   # OXL=/path/to/oxl to pick a specific toolchain
+```
+
+`tests/run.sh`'s gen1/gen2 fixpoint fails on a stale snapshot — that
+failure is the reminder to re-emit. The diag/module parity sections now
+compare the driver build path against the standalone checker binary
+(same checker, two harnesses), so they keep guarding diagnostic
+plumbing rather than a second implementation.
 
 ## Pull requests
 

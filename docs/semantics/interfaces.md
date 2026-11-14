@@ -2,8 +2,8 @@
 
 Stage boundaries so parallel worktrees can build independently. Each
 stage consumes the previous stage's output; shapes below are the
-contract. Seed implementation language: **Rust** (the self-hosted
-components under `bootstrap/` implement the same contracts).
+contract. Implementation language: **`.oxl`** — the self-hosted
+components under `bootstrap/` are the only implementation.
 
 ## Pipeline
 

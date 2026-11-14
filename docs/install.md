@@ -117,3 +117,10 @@ A source-built binary reports `oxl dev (language 0.3)` — no `RELEASE`
 file sits beside it. The version manager only manages release installs;
 a dev build lives outside `~/.oxl/versions/` and can shadow the shim
 by sitting earlier on `PATH`.
+
+## Editor support
+
+`oxl lsp` starts the stdio language server used by the editor
+integrations — VS Code extension skeleton under `editors/vscode/`,
+TextMate grammar under `editors/grammars/`, setup notes in
+[docs/editors.md](editors.md).

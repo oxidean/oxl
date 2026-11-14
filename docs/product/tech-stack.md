@@ -8,10 +8,11 @@ and a Qt/GTK FFI bridge. Web target (JS/HTML/CSS) parked.
 
 ## Backend
 
-Seed compiler implementation: Rust (`oxl/`). Codegen: C emission
-compiled through the system `cc` (`LANG_CC`/`LANG_LDFLAGS`/
-`LANG_SQLITE_SRC` knobs). The seed compiler remains the reference
-toolchain; the `bootstrap/` components self-compile and run correctly
+Stage-0 bootstrap: `bootstrap/stage0/oxl.c`, a checked-in C snapshot
+of the driver emitted by `bootstrap/cmd/codegen`, compiled through
+the system `cc` (`LANG_CC`/`LANG_LDFLAGS`/`LANG_SQLITE_SRC` knobs).
+The product toolchain is `cmd/oxl`, itself `.oxl` end to end; the
+`bootstrap/` components self-compile and run correctly
 — lexer/parser/check/codegen all four emit identical output under
 self-compilation. "Self-hosted" describes the chain state.
 Runtime: C-compatible (`runtime/rt.c`), arena-based, no tracing GC.

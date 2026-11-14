@@ -102,7 +102,10 @@ bootstrap/cmd/codegen  (done — emits C, self-compiles byte-identical)
 There is exactly one compiler implementation, written in `.oxl`:
 `bootstrap/` (lexer → parser → checker → C emitter) plus the **product**
 driver `cmd/oxl` — argv dispatch, `oxl.mod` resolution, get/mod, fmt,
-doc, and LSP — all compiled to C11 through `runtime/`.
+doc, and LSP — all compiled to C11 through `runtime/`. The LSP
+surface (hover/definition/completion/signature help/symbols/
+highlight/references/rename/formatting/semantic tokens) is covered
+end-to-end by the JSON-RPC fixtures in `tests/run.sh`.
 
 The bootstrap input is `bootstrap/stage0/oxl.c`: a checked-in C
 snapshot of the whole driver, emitted by `codegen.oxl` and committed

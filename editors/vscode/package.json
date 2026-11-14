@@ -1,0 +1,36 @@
+{
+  "name": "oxl-language",
+  "displayName": "OXL Language",
+  "description": "Syntax highlighting and language support for the oxl language.",
+  "version": "0.1.0",
+  "publisher": "oxidean",
+  "engines": { "vscode": "^1.85.0" },
+  "categories": ["Programming Languages"],
+  "contributes": {
+    "languages": [
+      {
+        "id": "oxl",
+        "aliases": ["OXL", "oxl"],
+        "extensions": [".oxl"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "oxl",
+        "scopeName": "source.oxl",
+        "path": "./syntaxes/oxl.tmLanguage.json"
+      }
+    ],
+    "configuration": {
+      "title": "OXL",
+      "properties": {
+        "oxl.lsp.path": {
+          "type": "string",
+          "default": "oxl",
+          "description": "Path to the oxl binary used for the language server."
+        }
+      }
+    }
+  }
+}

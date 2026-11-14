@@ -104,8 +104,11 @@ oxl mod tidy                  # sync requires/oxl.sum with the imports
 oxl mod verify                # re-hash the cache against oxl.sum
 oxl mod list                  # the MVS-selected module build list
 oxl list -m all               # same build list (alias)
-oxl lsp                        # stdio LSP: diagnostics, hover, goto-definition
+oxl lsp                        # stdio LSP: diagnostics, hover, completion, rename, semantic tokens, …
 ```
+
+Editor setup (VS Code extension, Neovim/lspconfig, grammar):
+[docs/editors.md](docs/editors.md).
 
 ## Language surface
 

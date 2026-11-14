@@ -397,8 +397,8 @@ jobs:
           cp LICENSE dist/oxl-toolchain/
           # the version manager + `oxl version` read this file for the tag
           echo "$RELEASE_TAG" > dist/oxl-toolchain/RELEASE
-          # the repo README documents building from oxl/ and other paths
-          # the archive doesn't ship — give it release-specific steps
+          # the repo README documents building from bootstrap/stage0 and
+          # other paths the archive doesn't ship — give it release steps
           cat > dist/oxl-toolchain/README.md <<'EOF2'
           # oxl toolchain
 

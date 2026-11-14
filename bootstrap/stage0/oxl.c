@@ -1302,6 +1302,8 @@ static int64_t o_fnv_wrap_check_k_int(void* _e) { return o_f_check_k_int(); }
 static int64_t o_fnv_wrap_check_ty_parse(void* _e, struct o_s_check_Ck* a0, OxlStr a1) { return o_f_check_ty_parse(a0, a1); }
 static OxlStr o_fnv_wrap_check_ty_str(void* _e, struct o_en_parser_Node* a0) { return o_f_check_ty_str(a0); }
 static struct o_s_parser_NList* o_fnv_wrap_parser_ncons(void* _e, struct o_en_parser_Node* a0, struct o_s_parser_NList* a1) { return o_f_parser_ncons(a0, a1); }
+static int o_fnv_wrap_check_is_builtin(void* _e, OxlStr a0) { return o_f_check_is_builtin(a0); }
+static int o_fnv_wrap_lexlib_is_kw(void* _e, OxlStr a0) { return o_f_lexlib_is_kw(a0); }
 static struct o_s_json_Json* o_fnv_wrap_json_jparse(void* _e, OxlStr a0) { return o_f_json_jparse(a0); }
 static struct o_s_os_File o_fnv_wrap_os_stdin(void* _e) { return o_f_os_stdin(); }
 static OxlStr o_fnv_wrap_check_canon_or(void* _e, OxlStr a0) { return o_f_check_canon_or(a0); }
@@ -21973,7 +21975,7 @@ void o_f_cmd_lsp(void) {
     } else     if ((rt_streq(method, rt_str_lit("textDocument/rename")))) {
     OxlStr nn = ({ OxlStr __rc; rt_borrow_read(params); __rc = o_f_jfield_str(params, rt_str_lit("newName")); rt_unborrow(params); __rc; });
     int64_t bad = 0LL;
-    if (((rt_len(nn) == 0LL) || (!o_f_is_ident_start(rt_byteat(nn, 0LL))))) {
+    if (((((rt_len(nn) == 0LL) || (!o_f_is_ident_start(rt_byteat(nn, 0LL)))) || ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_lexlib_is_kw }; ((int (*)(void*, OxlStr))_fv.fp)(_fv.env, nn); })) || ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_check_is_builtin }; ((int (*)(void*, OxlStr))_fv.fp)(_fv.env, nn); }))) {
     bad = 1LL;
     } else {
     int64_t ni = 1LL;

@@ -1856,6 +1856,12 @@ send({"jsonrpc":"2.0","id":18,"method":"textDocument/rename","params":{"textDocu
 rn2 = recv_id(18)["result"]
 assert all(len(es) == 0 for es in rn2["changes"].values()), rn2
 
+# rename to a keyword or builtin is rejected before any edit is built
+send({"jsonrpc":"2.0","id":181,"method":"textDocument/rename","params":{"textDocument":{"uri":uri},"position":{"line":i2,"character":src_col},"newName":"fn"}})
+ekw = recv_id(181); assert ekw["error"]["code"] == -32602, ekw
+send({"jsonrpc":"2.0","id":182,"method":"textDocument/rename","params":{"textDocument":{"uri":uri},"position":{"line":i2,"character":src_col},"newName":"print"}})
+ebi = recv_id(182); assert ebi["error"]["code"] == -32602, ebi
+
 # formatting returns an edit list (canonical file -> empty)
 send({"jsonrpc":"2.0","id":19,"method":"textDocument/formatting","params":{"textDocument":{"uri":uri}}})
 fmt = recv_id(19)["result"]

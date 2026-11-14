@@ -2421,7 +2421,7 @@ fn cmd_lsp() {
                     } else if method == "textDocument/rename" {
                         nn := jfield_str(params, "newName")
                         bad := 0
-                        if len(nn) == 0 || !is_ident_start(byteat(nn, 0)) {
+                        if len(nn) == 0 || !is_ident_start(byteat(nn, 0)) || lexlib.is_kw(nn) || check.is_builtin(nn) {
                             bad = 1
                         } else {
                             ni := 1

@@ -475,7 +475,10 @@ struct UseRec {
     def_hi: int,
 }
 
-struct DeclEnt { sig: str, file: str, lo: int, hi: int }
+// kind ints for DeclEnt.kind — the LSP maps them to its own enums
+// (0 fn · 1 struct · 2 enum · 3 interface · 4 field · 5 global ·
+// 6 variant · 7 method)
+struct DeclEnt { sig: str, file: str, lo: int, hi: int, name: str, kind: int }
 
 fn env_new() -> own Env {
     e := Env{scopes: mkslice(Scope, 0)}
@@ -526,15 +529,15 @@ fn decl_span(e: ref Env, n: str) -> own Span {
 // ---------- LSP index (E1 port) ----------
 // record a decl — keyed for use-site lookups, plus a self-use so the
 // decl name itself hovers/jumps (smallest-span wins at query time)
-fn rec_decl(ck: mut Ck, key: str, lo: int, hi: int, sig: str) {
+fn rec_decl(ck: mut Ck, key: str, lo: int, hi: int, sig: str, name: str, kind: int) {
     if collections.map_has(ck.decls, key) {
         [di, err] = collections.map_get(ck.decls, key)
         if err == nil {
-            ck.declsv[di] = DeclEnt{sig: sig, file: ck.cur_file, lo: lo, hi: hi}
+            ck.declsv[di] = DeclEnt{sig: sig, file: ck.cur_file, lo: lo, hi: hi, name: name, kind: kind}
         }
     } else {
         collections.map_set(ck.decls, key, len(ck.declsv))
-        ck.declsv = push(ck.declsv, DeclEnt{sig: sig, file: ck.cur_file, lo: lo, hi: hi})
+        ck.declsv = push(ck.declsv, DeclEnt{sig: sig, file: ck.cur_file, lo: lo, hi: hi, name: name, kind: kind})
     }
     ck.usev = push(ck.usev, UseRec{file: ck.cur_file, lo: lo, hi: hi, sig: sig, def_file: ck.cur_file, def_lo: lo, def_hi: hi})
 }
@@ -2173,7 +2176,7 @@ fn reg_tynames(ck: mut Ck, its: []It) {
                     collections.map_set(ck.structs, sn, len(ck.structsv))
                     ck.structsv = push(ck.structsv, SEnt{n: sn, fields: nil})
                 }
-                rec_decl(ck, sn, lo, hi, "struct " + sn)
+                rec_decl(ck, sn, lo, hi, "struct " + sn, name, 1)
             }
             parser.Node.Enum{name, vars, lo, hi} => {
                 en := qname(its[i].mod, name)
@@ -2181,7 +2184,7 @@ fn reg_tynames(ck: mut Ck, its: []It) {
                     collections.map_set(ck.enums, en, len(ck.enumsv))
                     ck.enumsv = push(ck.enumsv, EEnt{n: en, vars: nil})
                 }
-                rec_decl(ck, en, lo, hi, "enum " + en)
+                rec_decl(ck, en, lo, hi, "enum " + en, name, 2)
             }
             parser.Node.Interface{name, lo, hi} => {
                 iname := qname(its[i].mod, name)
@@ -2189,7 +2192,7 @@ fn reg_tynames(ck: mut Ck, its: []It) {
                     collections.map_set(ck.ifaces, iname, len(ck.ifacesv))
                     ck.ifacesv = push(ck.ifacesv, IEnt{n: iname, ops: nil, methods: nil})
                 }
-                rec_decl(ck, iname, lo, hi, "interface " + iname)
+                rec_decl(ck, iname, lo, hi, "interface " + iname, name, 3)
             }
             _ => {
             }
@@ -2252,7 +2255,7 @@ fn reg_variant(ck: mut Ck, en: str, ei: int, vars: ref parser.NList) {
                             vsig = sn + "(" + ts + ")"
                         }
                     }
-                    rec_decl(ck, sn, lo, hi, vsig)
+                    rec_decl(ck, sn, lo, hi, vsig, name, 6)
                 }
             }
             _ => {
@@ -2276,7 +2279,7 @@ fn reg_struct(ck: mut Ck, sn: str, si: int, fields: ref parser.NList) {
                     diag(ck, "own", "borrowed refs may not be stored in heap objects (v0)")
                 }
                 out = fcons(name, t, out)
-                rec_decl(ck, sn + "." + name, lo, hi, name + ": " + ty_str(ty))
+                rec_decl(ck, sn + "." + name, lo, hi, name + ": " + ty_str(ty), name, 4)
             }
             _ => {
             }
@@ -2449,7 +2452,7 @@ fn reg_iface(ck: mut Ck, ii: int, ops: ref parser.NList, methods: ref parser.NLi
                 mc.v = m
                 mc.next = ml
                 ml = mc
-                rec_decl(ck, ck.ifacesv[ii].n + "." + name, lo, hi, "fn " + ck.ifacesv[ii].n + "." + name + "(" + pst + ")" + ret_text(ret))
+                rec_decl(ck, ck.ifacesv[ii].n + "." + name, lo, hi, "fn " + ck.ifacesv[ii].n + "." + name + "(" + pst + ")" + ret_text(ret), name, 7)
             }
             _ => {
             }
@@ -2497,6 +2500,13 @@ fn reg_fields(ck: mut Ck, its: []It) {
         }
         i = i + 1
     }
+}
+
+fn mk_fn_kind(recv: ref parser.Node) -> int {
+    if recv != nil {
+        return 7
+    }
+    return 0
 }
 
 fn reg_fn(ck: mut Ck, mod: str, ex: bool, name: str, recv: ref parser.Node, typarams: ref parser.NList, params: ref parser.NList, ret: ref parser.Node, lo: int, hi: int) {
@@ -2592,7 +2602,7 @@ fn reg_fn(ck: mut Ck, mod: str, ex: bool, name: str, recv: ref parser.Node, typa
         }
     }
     if !ex {
-        rec_decl(ck, qn, lo, hi, fn_sig_text(ck, qn, recv, typarams, params, ret))
+        rec_decl(ck, qn, lo, hi, fn_sig_text(ck, qn, recv, typarams, params, ret), name, mk_fn_kind(recv))
     }
 }
 
@@ -2611,7 +2621,7 @@ fn reg_global(ck: mut Ck, name: str, ty: ref parser.Node, init: ref parser.Node,
     // itself in qualify_item
     gq := qname(ck.cur_mod, name)
     collections.map_set(ck.globals, gq, t)
-    rec_decl(ck, gq, lo, hi, name + ": " + ty_name(ck, t))
+    rec_decl(ck, gq, lo, hi, name + ": " + ty_name(ck, t), name, 5)
 }
 
 fn reg_sigs(ck: mut Ck, its: []It) {

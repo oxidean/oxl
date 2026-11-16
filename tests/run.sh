@@ -2637,4 +2637,141 @@ rm "$tch2/versions/v9.9.9"
 ;;
 esac
 
+
+# ---------- editor distribution assets (WI-0015) ----------
+echo "== editor assets — syntax + structure checks =="
+# sublime-syntax must be valid YAML with the expected scope/extension
+if command -v "$PY" >/dev/null 2>&1; then
+"$PY" - <<'PYCHK'
+import sys
+try:
+    import yaml
+except ImportError:
+    sys.exit(0)  # no pyyaml — skip, CI images vary
+src = open('editors/sublime/oxl.sublime-syntax').read()
+doc = yaml.safe_load(src.split('---', 1)[1])
+assert doc['scope'] == 'source.oxl', doc['scope']
+assert 'oxl' in doc['file_extensions']
+assert 'main' in doc['contexts']
+print('sublime-syntax ok')
+PYCHK
+fi
+# grammars must be valid JSON and the vscode copy must stay identical
+"$PY" - <<'PYCHK'
+import json
+a = json.load(open('editors/grammars/oxl.tmLanguage.json'))
+b = json.load(open('editors/vscode/syntaxes/oxl.tmLanguage.json'))
+assert a == b, 'vscode grammar drifted from editors/grammars'
+assert a['scopeName'] == 'source.oxl'
+print('grammar parity ok')
+PYCHK
+# nvim lua files must parse; plugin must load headless when nvim exists
+if command -v luac >/dev/null 2>&1; then
+    for f in editors/nvim/lua/oxl/init.lua editors/nvim/plugin/oxl.lua \
+             editors/nvim/ftdetect/oxl.lua editors/nvim/ftplugin/oxl.lua; do
+        luac -p "$f" || { echo "FAIL luac -p $f"; exit 1; }
+    done
+    echo "nvim lua parse ok"
+fi
+if command -v nvim >/dev/null 2>&1; then
+    printf 'fn main() -> int {\n    return 0\n}\n' > "$scratch/ftcheck.oxl"
+    out=$(nvim --headless -u NONE \
+        --cmd "set rtp+=$PWD/editors/nvim" \
+        -c "filetype on" \
+        -c "e $scratch/ftcheck.oxl" \
+        -c "lua io.write(vim.bo.filetype)" -c "qa!" 2>/dev/null)
+    [ "$out" = "oxl" ] || { echo "FAIL nvim filetype: '$out'"; exit 1; }
+    echo "nvim filetype ok"
+fi
+# vscode extension: package.json main must point at the esbuild bundle;
+# build it when node+npm are available (soft-skip on bare runners)
+if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1 \
+    && [ -f editors/vscode/package-lock.json ]; then
+    (cd editors/vscode && npm ci --no-audit --no-fund >/dev/null 2>&1 \
+        && node build.mjs >/dev/null 2>&1) || {
+        echo "FAIL vscode extension build"; exit 1; }
+    node -e 'const j=require("./editors/vscode/package.json");
+        if (j.main !== "./dist/extension.js") process.exit(1);
+        if (!j.activationEvents.includes("onLanguage:oxl")) process.exit(1);'
+    grep -q 'vscode-languageclient' editors/vscode/dist/extension.js \
+        || { echo "FAIL vsix bundle missing language client"; exit 1; }
+    echo "vscode extension bundle ok"
+fi
+
+# install-editor.sh — offline file:// release fixture (POSIX-gated like
+# the install.sh pipeline: native curl can't open file:// on Windows)
+case "$(uname -s)" in
+MINGW*|MSYS*|CYGWIN*) ;;
+*)
+echo "== install-editor.sh — file:// release fixture =="
+iedir="$scratch/iedfix"; mkdir -p "$iedir/download/v9.9.9" "$iedir/expanded_assets"
+printf 'fixture vsix\n' > "$iedir/download/v9.9.9/oxl-language.vsix"
+printf '%%YAML 1.2\n---\nname: OXL\n' > "$iedir/download/v9.9.9/oxl.sublime-syntax"
+tar czf "$iedir/download/v9.9.9/oxl-editor-assets.tar.gz" -C "$iedir" download 2>/dev/null || \
+    tar czf "$iedir/download/v9.9.9/oxl-editor-assets.tar.gz" --files-from /dev/null
+printf 'oxl-editor-assets oxl-language.vsix oxl.sublime-syntax\n' \
+    > "$iedir/expanded_assets/v9.9.9"
+# an extras-only release that must be skipped by latest resolution
+mkdir -p "$iedir/download/v9.9.10"
+printf 'no editor assets here\n' > "$iedir/expanded_assets/v9.9.10"
+printf '<feed><entry>releases/tag/v9.9.10</entry><entry>releases/tag/v9.9.9</entry></feed>\n' > "$iedir.atom"
+printf 'latest\n' > "$iedir/latest"
+
+# list prints the asset URLs for an explicit tag
+out=$(OXL_RELEASE_BASE="file://$iedir" sh scripts/install-editor.sh list v9.9.9)
+grep -q "oxl-language.vsix" <<<"$out" && grep -q "nvim-oxl" <<<"$out" \
+    || { echo "FAIL ie-list: $out"; exit 1; }
+
+# latest skips the extras release and lands on v9.9.9
+out=$(OXL_RELEASE_BASE="file://$iedir" sh scripts/install-editor.sh list)
+grep -q "v9.9.9" <<<"$out" || { echo "FAIL ie-latest: $out"; exit 1; }
+
+# bat installs the syntax file into BAT_CONFIG_DIR
+batdir="$scratch/batcfg"
+out=$(BAT_CONFIG_DIR="$batdir" OXL_RELEASE_BASE="file://$iedir" \
+    sh scripts/install-editor.sh bat v9.9.9)
+[ -f "$batdir/syntaxs/oxl.sublime-syntax" ] \
+    || { echo "FAIL ie-bat: $out"; ls -R "$batdir" 2>/dev/null; exit 1; }
+
+# nvim clones the mirror repo (file:// fixture) into the pack dir — twice,
+# to cover both the clone and the fetch/checkout update path
+nvimpak="$scratch/nvimpak"
+mkdir -p "$scratch/nvimirror"
+(
+    cd "$scratch/nvimirror"
+    git init -q -b main .
+    mkdir -p ftdetect lua/oxl syntax plugin ftplugin
+    printf 'vim.filetype.add({extension={oxl="oxl"}})\n' > ftdetect/oxl.lua
+    printf 'return {}\n' > lua/oxl/init.lua
+    printf 'let b:current_syntax="oxl"\n' > syntax/oxl.vim
+    printf 'require("oxl").setup()\n' > plugin/oxl.lua
+    printf 'vim.bo.commentstring="// %%s"\n' > ftplugin/oxl.lua
+    git add -A
+    git -c user.name=t -c user.email=t@t commit -qm init
+    git tag v9.9.9
+)
+out=$(OXL_NVIM_REPO="file://$scratch/nvimirror" OXL_NVIM_HOME="$nvimpak/nvim-oxl" \
+    OXL_RELEASE_BASE="file://$iedir" sh scripts/install-editor.sh nvim v9.9.9)
+[ -f "$nvimpak/nvim-oxl/ftdetect/oxl.lua" ] \
+    || { echo "FAIL ie-nvim clone: $out"; exit 1; }
+out=$(OXL_NVIM_REPO="file://$scratch/nvimirror" OXL_NVIM_HOME="$nvimpak/nvim-oxl" \
+    OXL_RELEASE_BASE="file://$iedir" sh scripts/install-editor.sh nvim v9.9.9)
+grep -q "updating" <<<"$out" || { echo "FAIL ie-nvim update path: $out"; exit 1; }
+
+# vscode: a stub `code` bin records the install URL
+mkdir -p "$scratch/vscbin"
+printf '#!/bin/sh\necho "$@" > "%s/vscode-args"\n' "$scratch" > "$scratch/vscbin/code"
+chmod +x "$scratch/vscbin/code"
+out=$(PATH="$scratch/vscbin:$PATH" OXL_RELEASE_BASE="file://$iedir" \
+    sh scripts/install-editor.sh vscode v9.9.9 code)
+grep -q "oxl-language.vsix" "$scratch/vscode-args" \
+    || { echo "FAIL ie-vscode: $out $(cat "$scratch/vscode-args" 2>/dev/null)"; exit 1; }
+# invalid tag dies
+rc=0
+OXL_RELEASE_BASE="file://$iedir" sh scripts/install-editor.sh list "bad tag" 2>/dev/null || rc=$?
+[ "$rc" != 0 ] || { echo "FAIL ie-tag-validation"; exit 1; }
+echo "install-editor.sh ok"
+;;
+esac
+
 echo "ALL TESTS PASSED"

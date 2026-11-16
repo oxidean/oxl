@@ -1,17 +1,45 @@
 {
   "name": "oxl-language",
   "displayName": "OXL Language",
-  "description": "Syntax highlighting and language support for the oxl language.",
+  "description": "Syntax highlighting and full language-server support (via `oxl lsp`) for the oxl language.",
   "version": "0.1.0",
   "publisher": "oxidean",
-  "engines": { "vscode": "^1.85.0" },
-  "categories": ["Programming Languages"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/oxidean/oxl"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "main": "./dist/extension.js",
+  "activationEvents": [
+    "onLanguage:oxl"
+  ],
+  "scripts": {
+    "build": "node build.mjs",
+    "package": "npm run build && vsce package --no-dependencies"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.85.0",
+    "esbuild": "^0.24.0",
+    "typescript": "^5.6.0",
+    "vscode-languageclient": "^10.1.2"
+  },
   "contributes": {
     "languages": [
       {
         "id": "oxl",
-        "aliases": ["OXL", "oxl"],
-        "extensions": [".oxl"],
+        "aliases": [
+          "OXL",
+          "oxl"
+        ],
+        "extensions": [
+          ".oxl"
+        ],
         "configuration": "./language-configuration.json"
       }
     ],

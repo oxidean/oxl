@@ -1,32 +1,41 @@
 # oxl-language
 
-Syntax highlighting and language configuration for
-[oxl](https://github.com/oxidean/oxl) (`.oxl`
-files).
+VS Code extension for [oxl](https://github.com/oxidean/oxl): syntax
+highlighting plus a bundled language client that spawns `oxl lsp`
+(stdio) for diagnostics, hover, go-to-definition, completion,
+signature help, document symbols/highlight, references, rename,
+formatting, semantic tokens, and watched-file invalidation.
 
 ## Install
 
-From this repository:
+Every toolchain release ships a `.vsix` on
+[GitHub Releases](https://github.com/oxidean/oxl/releases):
+
+```sh
+code --install-extension \
+  https://github.com/oxidean/oxl/releases/latest/download/oxl-language.vsix
+```
+
+The extension is also published to Open VSX (namespace `oxidean`), so
+VS Code forks that use Open VSX (VSCodium, Cursor, …) pick it up from
+their extension panel and keep it updated automatically.
+
+`scripts/install-editor.sh vscode` in the oxl repo wraps the download.
+
+## Requirements
+
+The `oxl` binary on `PATH` (or set `oxl.lsp.path` in settings to its
+absolute path). Install it with `scripts/install.sh` or
+`scripts/install-editor.sh` — see `docs/editors.md`.
+
+## Develop / package locally
 
 ```sh
 cd editors/vscode
-npm install -g @vscode/vsce   # once
-vsce package                  # produces oxl-language-*.vsix
-code --install-extension oxl-language-*.vsix
+npm ci
+npm run build      # bundles src/client.js -> dist/extension.js (esbuild)
+npm run package    # vsce package -> oxl-language-<version>.vsix
 ```
 
-Or symlink `editors/vscode` into `~/.vscode/extensions/oxl-language-0.1.0`
-for development.
-
-## Language server
-
-This extension ships grammar and configuration only. To get diagnostics,
-hover, completion, and the rest of the LSP surface, point any LSP client
-at the `oxl` binary:
-
-```sh
-oxl lsp    # stdio JSON-RPC server
-```
-
-The `oxl.lsp.path` setting records where your `oxl` binary lives (used by
-clients that read it, e.g. a generic LSP launcher).
+The shipped extension is the esbuild bundle — no `node_modules`, no npm
+at install time.

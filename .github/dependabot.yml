@@ -17,3 +17,16 @@ updates:
         update-types:
           - minor
           - patch
+  # the vscode extension's build toolchain (esbuild, vsce deps) —
+  # bundled into the vsix at release time, never shipped to users
+  - package-ecosystem: npm
+    directory: /editors/vscode
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 3
+    groups:
+      vscode-extension:
+        update-types:
+          - minor
+          - patch

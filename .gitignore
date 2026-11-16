@@ -16,3 +16,7 @@ oxl-ostest-*.txt
 
 # ox-agent generated context index — rebuild via `ox-agent context index`
 .ox-agent/context/index.yaml
+
+# editor extension build output
+editors/vscode/node_modules/
+editors/vscode/dist/

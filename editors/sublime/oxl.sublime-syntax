@@ -1,0 +1,82 @@
+%YAML 1.2
+---
+# OXL syntax for Sublime Text, bat (syntect) and other sublime-syntax
+# consumers. Mirrors editors/grammars/oxl.tmLanguage.json.
+name: OXL
+file_extensions:
+  - oxl
+scope: source.oxl
+
+contexts:
+  main:
+    - include: comments
+    - include: strings
+    - include: numbers
+    - include: functions
+    - include: keywords
+    - include: types
+    - include: constants
+
+  comments:
+    - match: '//.*$'
+      scope: comment.line.double-slash.oxl
+    - match: '/\*'
+      scope: punctuation.definition.comment.oxl
+      push: block-comment
+
+  block-comment:
+    - meta_scope: comment.block.oxl
+    - match: '\*/'
+      scope: punctuation.definition.comment.oxl
+      pop: true
+    - match: '.'
+
+  strings:
+    - match: '"'
+      scope: punctuation.definition.string.begin.oxl
+      push: string-double
+    - match: "'"
+      scope: punctuation.definition.string.begin.oxl
+      push: string-single
+
+  string-double:
+    - meta_scope: string.quoted.double.oxl
+    - match: '\\(u[0-9a-fA-F]{4}|x[0-9a-fA-F]{2}|.)'
+      scope: constant.character.escape.oxl
+    - match: '"'
+      scope: punctuation.definition.string.end.oxl
+      pop: true
+    - match: '[^"\\]+'
+
+  string-single:
+    - meta_scope: string.quoted.single.oxl
+    - match: '\\(u[0-9a-fA-F]{4}|x[0-9a-fA-F]{2}|.)'
+      scope: constant.character.escape.oxl
+    - match: "'"
+      scope: punctuation.definition.string.end.oxl
+      pop: true
+    - match: "[^'\\]+"
+
+  numbers:
+    - match: '\b\d+\.\d+([eE][+-]?\d+)?\b'
+      scope: constant.numeric.float.oxl
+    - match: '\b\d[\d_]*\b'
+      scope: constant.numeric.integer.oxl
+
+  functions:
+    - match: '\b(fn)\s+([A-Za-z_][A-Za-z0-9_]*)'
+      captures:
+        1: keyword.declaration.oxl
+        2: entity.name.function.oxl
+
+  keywords:
+    - match: '\b(fn|struct|enum|interface|extern|return|if|else|for|let|scope|spawn|go|goin|spawnBlocking|chan|select|defer|match|as|import|package|break|continue)\b'
+      scope: keyword.control.oxl
+
+  types:
+    - match: '\b(int|float|bool|str|byte|void|err|cstr|own|ref|mut|unsafe|nil|true|false|any|ordered|eq|add)\b'
+      scope: storage.type.oxl
+
+  constants:
+    - match: '\b[A-Z][A-Za-z0-9_]*\b'
+      scope: constant.other.oxl

@@ -474,7 +474,8 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          # vsce 4.x requires Node >= 22
+          node-version: '22'
           cache: npm
           cache-dependency-path: editors/vscode/package-lock.json
       - name: build vsix

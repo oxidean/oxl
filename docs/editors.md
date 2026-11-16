@@ -28,7 +28,7 @@ does this for you).
 `scripts/install-editor.sh` wraps all of them:
 
 ```sh
-scripts/install-editor.sh vscode [tag] [code|codium|cursor]
+scripts/install-editor.sh vscode [tag] [code|codium|cursor|code-insiders]
 scripts/install-editor.sh nvim   [tag]
 scripts/install-editor.sh bat    [tag]
 scripts/install-editor.sh list   [tag]

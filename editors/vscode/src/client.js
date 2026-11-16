@@ -30,7 +30,8 @@ function activate(context) {
     }
   );
 
-  context.subscriptions.push(client.start());
+  context.subscriptions.push(client);
+  client.start();
 }
 
 function deactivate() {

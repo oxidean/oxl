@@ -89,7 +89,7 @@ resolve_tag() { # arg-or-empty|latest -> tag on stdout
 
 cmd_vscode() {
     tag=$(resolve_tag "${1:-}")
-    [ $# -gt 0 ] && shift
+    if [ $# -gt 0 ]; then shift; fi
     bin=""
     for a in "$@"; do
         case "$a" in

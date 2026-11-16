@@ -10,7 +10,7 @@
     "url": "https://github.com/oxidean/oxl"
   },
   "engines": {
-    "vscode": "^1.85.0"
+    "vscode": "^1.91.0"
   },
   "categories": [
     "Programming Languages"
@@ -21,7 +21,7 @@
   ],
   "scripts": {
     "build": "node build.mjs",
-    "package": "npm run build && vsce package --no-dependencies"
+    "package": "npm run build && npx --yes @vscode/vsce@4.1.0 package --no-dependencies"
   },
   "devDependencies": {
     "@types/vscode": "^1.85.0",

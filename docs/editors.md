@@ -16,10 +16,14 @@ with UTF-16 columns; documents sync as full text.
 Every toolchain release publishes editor assets on
 [GitHub Releases](https://github.com/oxidean/oxl/releases):
 
-- `oxl-language.vsix` — the VS Code extension (stable URL under
-  `releases/latest/download/`)
+- `oxl-language.vsix` — the VS Code extension
 - `oxl-editor-assets.tar.gz` — vsix + grammars + nvim plugin bundle
 - `oxl.sublime-syntax` — bat/Sublime Text syntax
+
+Asset URLs are per-tag (`/releases/download/vX.Y.Z/...`) — GitHub's
+`releases/latest` can point at an extras-only release that carries no
+editor assets, so always resolve the tag first (`install-editor.sh`
+does this for you).
 
 `scripts/install-editor.sh` wraps all of them:
 
@@ -36,17 +40,21 @@ scripts/install-editor.sh list   [tag]
 ## VS Code
 
 ```sh
-code --install-extension \
-  https://github.com/oxidean/oxl/releases/latest/download/oxl-language.vsix
+scripts/install-editor.sh vscode        # resolves latest + installs
+# or pinned — download first, --install-extension needs a local path:
+curl -fsSLO https://github.com/oxidean/oxl/releases/download/vX.Y.Z/oxl-language.vsix
+code --install-extension oxl-language.vsix
 ```
 
-The extension bundles a language client — no separate LSP setup. It
-spawns `oxl lsp` from `PATH`; set `oxl.lsp.path` in settings to an
-absolute binary path when `oxl` is not on `PATH`. The same extension
-is published to Open VSX (namespace `oxidean`), so VSCodium, Cursor,
-and other Open-VS-X-default forks install and auto-update it from
-their extension panel. GitHub-vsix installs do not self-update —
-re-run the install command (or `install-editor.sh vscode`) per release.
+`--install-extension` needs a local `.vsix` path, not a URL —
+`install-editor.sh` downloads to a temp file first. The extension
+bundles a language client — no separate LSP setup. It spawns `oxl lsp`
+from `PATH`; set `oxl.lsp.path` in settings to an absolute binary path
+when `oxl` is not on `PATH`. The same extension is published to Open
+VSX (namespace `oxidean`), so VSCodium, Cursor, and other
+Open-VS-X-default forks install and auto-update it from their
+extension panel. GitHub-vsix installs do not self-update — re-run the
+install command per release.
 
 ## Neovim
 
@@ -61,10 +69,12 @@ git clone --depth 1 --branch v0.13.0 \
   ~/.local/share/nvim/site/pack/vendor/start/nvim-oxl
 ```
 
-lazy.nvim / packer:
+lazy.nvim / packer — do not lazy-load on `ft`: the plugin ships the
+filetype detection, so it must be loaded before `.oxl` files are
+recognized:
 
 ```lua
-{ 'oxidean/nvim-oxl', ft = 'oxl' }
+{ 'oxidean/nvim-oxl', lazy = false }
 ```
 
 Requires Neovim 0.11+ (native `vim.lsp.config`) or 0.10 with

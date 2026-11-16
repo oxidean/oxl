@@ -105,8 +105,15 @@ cmd_vscode() {
     [ -n "$bin" ] || die "no VS Code-family binary found (code/codium/cursor) — install one or pass it explicitly"
     url="$BASE/download/$tag/oxl-language.vsix"
     echo "install-editor: installing $tag for $bin"
-    "$bin" --install-extension "$url" \
+    # --install-extension takes a local .vsix path, not a URL — download
+    # first so the install works on every VS Code-family binary
+    tmp=$(mktemp -d "${TMPDIR:-/tmp}/oxl-vsix.XXXXXX")
+    trap 'rm -rf "$tmp"' EXIT
+    fetch "$url" "$tmp/oxl-language.vsix" \
+        || die "no oxl-language.vsix asset at $tag"
+    "$bin" --install-extension "$tmp/oxl-language.vsix" \
         || die "extension install failed — is '$bin' on PATH?"
+    rm -rf "$tmp"; trap - EXIT
     echo "install-editor: done — restart $bin if the extension does not appear"
 }
 

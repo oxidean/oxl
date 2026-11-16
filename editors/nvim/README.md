@@ -14,22 +14,23 @@ release; tags there match `oxl` release tags.
 Native package (no plugin manager):
 
 ```sh
-oxl-editor-install nvim        # see scripts/install-editor.sh in the oxl repo
+scripts/install-editor.sh nvim  # see the oxl repo — native pack dir
 # or manually:
 git clone --depth 1 https://github.com/oxidean/nvim-oxl \
   ~/.local/share/nvim/site/pack/vendor/start/nvim-oxl
 ```
 
-lazy.nvim:
+lazy.nvim — load eagerly; the plugin provides the filetype detection,
+so `ft = 'oxl'` would deadlock (the filetype never exists to trigger it):
 
 ```lua
-{ 'oxidean/nvim-oxl', ft = 'oxl' }
+{ 'oxidean/nvim-oxl', lazy = false }
 ```
 
 packer:
 
 ```lua
-use { 'oxidean/nvim-oxl', ft = 'oxl' }
+use { 'oxidean/nvim-oxl' }
 ```
 
 ## Configuration

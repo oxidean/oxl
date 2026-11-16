@@ -8,19 +8,22 @@ formatting, semantic tokens, and watched-file invalidation.
 
 ## Install
 
-Every toolchain release ships a `.vsix` on
-[GitHub Releases](https://github.com/oxidean/oxl/releases):
+Every toolchain release ships `oxl-language.vsix` on
+[GitHub Releases](https://github.com/oxidean/oxl/releases) under
+`/releases/download/vX.Y.Z/oxl-language.vsix`.
 
 ```sh
-code --install-extension \
-  https://github.com/oxidean/oxl/releases/latest/download/oxl-language.vsix
+scripts/install-editor.sh vscode   # resolves the newest release with
+                                   # editor assets, downloads, installs
 ```
+
+`code --install-extension` needs a local `.vsix` path — download the
+asset first, then install it.
 
 The extension is also published to Open VSX (namespace `oxidean`), so
 VS Code forks that use Open VSX (VSCodium, Cursor, …) pick it up from
-their extension panel and keep it updated automatically.
-
-`scripts/install-editor.sh vscode` in the oxl repo wraps the download.
+their extension panel and keep it updated automatically. Direct
+GitHub-vsix installs do not self-update — re-run per release.
 
 ## Requirements
 

@@ -17,6 +17,9 @@ jobs:
     # re-run on title/body changes
     if: github.event.action != 'edited'
     runs-on: ${{ matrix.os }}
+    # bound the legs: a hung test deadlocks the runner silently otherwise —
+    # observed once at 68min on a docs-only diff vs ~20min normal (#117)
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:

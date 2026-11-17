@@ -7,9 +7,23 @@ import "std/testing"
 fn main() {
     // #136: mkslice(pkg.Type, n) must size/storage the struct element
     // type — the qualified name arrives as Node.Field and the emit
-    // arm used to fall through to int64_t storage
+    // arm used to fall through to int64_t storage. Under the bug the
+    // allocation is n*8 bytes while element access uses the struct
+    // stride, so the LAST element must be touched to observe it.
     hs := mkslice(widget.Header, 4)
     testing.expect(len(hs) == 4, "len 4")
     hs[0].name = "a"
-    testing.expect_streq(hs[0].name, "a", "elem write")
+    hs[0].size = 1
+    hs[1].name = "b"
+    hs[1].size = 2
+    hs[2].name = "c"
+    hs[2].size = 3
+    hs[3].name = "d"
+    hs[3].size = 4
+    testing.expect_streq(hs[0].name, "a", "elem 0 write")
+    testing.expect_streq(hs[1].name, "b", "elem 1 write")
+    testing.expect_streq(hs[2].name, "c", "elem 2 write")
+    testing.expect_streq(hs[3].name, "d", "elem 3 write — past the buggy 32-byte alloc")
+    testing.expect_eq(hs[3].size, 4, "elem 3 readback")
+    println("mkslice-qual ok")
 }

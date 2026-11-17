@@ -1386,6 +1386,13 @@ for f in tests/mod/*/; do
         fi
     fi
 done
+# #136 regression: mkslice-qual must RUN, not just build — the bug
+# was a runtime heap miscompile (int64 storage for a struct element)
+# that compiles cleanly; only the self driver is run since the seed
+# predates the fix.
+"$SELFOXL" build tests/mod/mkslice-qual -o "$scratch/mkslicequal" >/dev/null 2>&1 || { echo "FAIL mkslice-qual build"; exit 1; }
+"$scratch/mkslicequal" > "$scratch/mkslicequal.out" 2>&1 || { echo "FAIL mkslice-qual run"; cat "$scratch/mkslicequal.out"; exit 1; }
+grep -q "mkslice-qual ok" "$scratch/mkslicequal.out" || { echo "FAIL mkslice-qual output"; cat "$scratch/mkslicequal.out"; exit 1; }
 # `oxl list -m all` — the MVS build list with replace markers —
 # byte-identical stdout from the module root
 ( cd tests/mod/mvs && "$SEEDOXL" list -m all ) > "$scratch/mlist.seed" 2>&1 || { echo "FAIL driver list seed rc"; cat "$scratch/mlist.seed"; exit 1; }

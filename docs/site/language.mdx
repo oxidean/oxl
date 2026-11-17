@@ -5,7 +5,7 @@ description: "The v0 surface: types, ownership, structured concurrency, modules,
 
 A taste of v0:
 
-```text title="surface.oxl"
+```oxl title="surface.oxl"
 package main
 
 struct Point { x: int, y: int }
@@ -85,7 +85,7 @@ resolve (the version-manager shim looks the pin up from the current
 working directory instead — a build run from outside the project tree
 can resolve a different pin or the default):
 
-```text title="oxl.mod"
+```oxl title="oxl.mod"
 module github.com/me/app
 
 oxl 0.3

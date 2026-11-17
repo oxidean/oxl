@@ -1,0 +1,23 @@
+{
+  "name": "@oxidean/shiki-oxl",
+  "version": "0.0.0",
+  "description": "Shiki / TextMate grammar for the oxl language",
+  "type": "module",
+  "exports": {
+    ".": "./index.mjs",
+    "./grammar.json": "./oxl.tmLanguage.json"
+  },
+  "files": [
+    "index.mjs",
+    "oxl.tmLanguage.json",
+    "README.md"
+  ],
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/oxidean/oxl.git",
+    "directory": "editors/grammars"
+  }
+}

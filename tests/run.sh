@@ -330,6 +330,10 @@ out=$("$OXL" run tests/httpclient_test.oxl)
 printf '%s
 ' "$out" >&2
 grep -q "httpclient done" <<<"$out" || { echo "FAIL httpclient: $out"; exit 1; }
+out=$("$OXL" run tests/httpclient_rich.oxl)
+printf '%s
+' "$out" >&2
+grep -q "httpclient rich done" <<<"$out" || { echo "FAIL httpclient rich: $out"; exit 1; }
 
 echo "== oxl test: exec + fs (t0) =="
 out=$("$OXL" test tests/exec_test.oxl)

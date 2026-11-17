@@ -1428,13 +1428,10 @@ fn jcall(g: mut G, f: ref parser.Node, args: ref parser.NList) -> str {
     }
     if qn == "mkslice" && args != nil {
         et := check.t_unk(g.ck)
-        if check.nk(args.v) == 2 {
-            match args.v {
-                parser.Node.Name{n} => {
-                    et = check.ty_parse(g.ck, n)
-                }
-                _ => {
-                }
+        if check.nk(args.v) == 2 || check.nk(args.v) == 9 {
+            an := check.callee_name(args.v)
+            if len(an) > 0 {
+                et = check.ty_parse(g.ck, an)
             }
         }
         if check.nk(args.v) == 3 {

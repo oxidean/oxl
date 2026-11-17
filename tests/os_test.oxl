@@ -16,7 +16,9 @@ fn test_file() {
     // path. Cwd-relative: /tmp doesn't exist for a native Windows exe
     p := "oxl-ostest-" + itoa(time.unix_ms()) + ".txt"
     n := os.writefile_(p, "hello os")
-    testing.expect(n == 0, "write ok")
+    testing.expect(n == 8, "write byte count")
+    bad := os.writefile_("no/such/dir/f", "x")
+    testing.expect(bad < 0, "write error is negative errno")
     testing.expect_streq(os.readfile_(p), "hello os", "read back")
 }
 

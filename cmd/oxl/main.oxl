@@ -93,6 +93,7 @@ struct PkgSrc { dir: str, files: []str }
 
 fn pkg_args(start: int) -> PkgArgs {
     fs := mkslice(str, 0)
+    seen_file := 0
     i := start
     for i < argc() && argv(i) != "--" {
         a := argv(i)
@@ -109,14 +110,18 @@ fn pkg_args(start: int) -> PkgArgs {
                 continue
             }
         }
-        if len(fs) == 0 && os.isdir(a) {
+        // dirs are sources only before the file list starts — a dir
+        // after .oxl files is a program arg (run f.oxl ./public),
+        // never a second package
+        if seen_file == 0 && os.isdir(a) {
             fs = push(fs, a)
             i = i + 1
-            break
+            continue
         }
         if strings.endswith(a, ".oxl") == false {
             break
         }
+        seen_file = 1
         fs = push(fs, a)
         i = i + 1
     }
@@ -180,16 +185,68 @@ fn target_is_js() -> int {
     return 0
 }
 
-// source args -> package source: one dir = dir package, files = the
-// file-list package, none = the cwd package
-fn pkg_src(fs: []str) -> PkgSrc {
-    if len(fs) == 1 && os.isdir(fs[0]) {
-        return PkgSrc{dir: fs[0], files: mkslice(str, 0)}
+// source args -> package sources (#131): every leading dir is its own
+// package (oxl test ./a ./b runs both), a run of .oxl files is one
+// file-list package, none = the cwd package. Mixing dirs and files is
+// a usage error — mixed=1 and ps stays empty.
+struct PkgList { ps: []PkgSrc, mixed: int }
+
+fn pkg_srcs(fs: []str) -> PkgList {
+    pl := PkgList{ps: mkslice(PkgSrc, 0), mixed: 0}
+    dirs := 0
+    i := 0
+    for i < len(fs) {
+        if os.isdir(fs[i]) {
+            dirs = dirs + 1
+        }
+        i = i + 1
+    }
+    if dirs > 0 && dirs < len(fs) {
+        pl.mixed = 1
+        return pl
+    }
+    if dirs > 0 {
+        i = 0
+        for i < len(fs) {
+            pl.ps = push(pl.ps, PkgSrc{dir: fs[i], files: mkslice(str, 0)})
+            i = i + 1
+        }
+        return pl
     }
     if len(fs) == 0 {
-        return PkgSrc{dir: ".", files: mkslice(str, 0)}
+        pl.ps = push(pl.ps, PkgSrc{dir: ".", files: mkslice(str, 0)})
+        return pl
     }
-    return PkgSrc{dir: "", files: fs}
+    pl.ps = push(pl.ps, PkgSrc{dir: "", files: fs})
+    return pl
+}
+
+// non-flag tokens left after the source list — build/test take no
+// program argv, so anything stray is a typo'd path or misplaced flag
+// value, not a program argument (run's child-argv scan owns that case)
+fn stray_args(argi: int) -> int {
+    n := 0
+    dd := 0
+    i := argi
+    for i < argc() {
+        a := argv(i)
+        if dd == 1 {
+            n = n + 1
+        } else if a == "--" {
+            dd = 1
+        } else {
+            t := flag_toks(a)
+            if t > 0 {
+                i = i + t
+                continue
+            }
+            if strings.startswith(a, "-") == false {
+                n = n + 1
+            }
+        }
+        i = i + 1
+    }
+    return n
 }
 
 // the dir the entry concept anchors at — the package dir, or the
@@ -673,9 +730,29 @@ fn out_arg() -> str {
     return "a.out"
 }
 
+// shared source-arg gate for build/run/test: mixed dir+file lists are
+// a usage error, and build/run produce a single artifact so they take
+// exactly one package; test fans out over every dir arg (#131)
+fn one_pkg(cmd: str, pa: PkgArgs) -> PkgSrc {
+    pl := pkg_srcs(pa.fs)
+    if pl.mixed == 1 {
+        eprintln("cannot mix package dirs and .oxl file lists — pass dirs or files, not both")
+        exit(2)
+    }
+    if len(pl.ps) != 1 {
+        eprintln("oxl " + cmd + " takes a single package — got " + itoa(len(pl.ps)) + " dirs")
+        exit(2)
+    }
+    return pl.ps[0]
+}
+
 fn cmd_build() {
     pa := pkg_args(2)
-    src := pkg_src(pa.fs)
+    if stray_args(pa.argi) > 0 {
+        eprintln("unexpected argument(s) after the package sources")
+        exit(2)
+    }
+    src := one_pkg("build", pa)
     if target_is_js() == 1 {
         res := compile(src)
         if res.ok == 0 {
@@ -698,7 +775,7 @@ fn cmd_build() {
 
 fn cmd_run() {
     pa := pkg_args(2)
-    src := pkg_src(pa.fs)
+    src := one_pkg("run", pa)
     res := compile(src)
     if res.ok == 0 {
         exit(1)
@@ -766,11 +843,38 @@ fn cmd_run() {
 
 fn cmd_test() {
     pa := pkg_args(2)
-    src := pkg_src(pa.fs)
-    res := compile_mode(src, 1)
-    if res.ok == 0 {
+    pl := pkg_srcs(pa.fs)
+    if pl.mixed == 1 {
+        eprintln("cannot mix package dirs and .oxl file lists — pass dirs or files, not both")
+        exit(2)
+    }
+    if stray_args(pa.argi) > 0 {
+        eprintln("unexpected argument(s) after the package sources")
+        exit(2)
+    }
+    // every dir arg is its own package — `oxl test ./a ./b` runs both
+    // (#131); a failure in one doesn't hide the rest
+    fails := 0
+    i := 0
+    for i < len(pl.ps) {
+        src := pl.ps[i]
+        res := compile_mode(src, 1)
+        if res.ok == 1 {
+            if test_one(src, res) != 0 {
+                fails = 1
+            }
+        } else {
+            fails = 1
+        }
+        i = i + 1
+    }
+    if fails == 1 {
         exit(1)
     }
+}
+
+// compile ok -> emit + run one package's test binary; 1 on any failure
+fn test_one(src: PkgSrc, res: own CRes) -> int {
     dir := mk_scratch_dir("oxl-test")
     if len(dir) == 0 {
         exit(1)
@@ -779,7 +883,8 @@ fn cmd_test() {
     if target_is_js() == 1 {
         out = dir + "/out.mjs"
         if emit_and_js(res.c, out, entry_dir(src)) == 0 {
-            exit(1)
+            os.remove_all(dir)
+            return 1
         }
         nargs := mkslice(str, 0)
         nargs = push(nargs, out)
@@ -789,15 +894,16 @@ fn cmd_test() {
             eprintln("node exec failed: " + errors.msg(e))
         }
         os.remove_all(dir)
-        exit(child_code(st, e))
+        return child_code(st, e)
     }
     if emit_and_cc(res.c, out, entry_dir(src)) == 0 {
-        exit(1)
+        os.remove_all(dir)
+        return 1
     }
     child := exec.cmd(out, mkslice(str, 0))
     [st, e] = child.run()
     os.remove_all(dir)
-    exit(child_code(st, e))
+    return child_code(st, e)
 }
 
 // `oxl list -m all` — the resolved build list: main module then every

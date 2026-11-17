@@ -89,6 +89,20 @@ structs are not generic.
   Methods no interface can dispatch — e.g. `http.Client.get` — may
   suspend normally; the checker reports the claiming interface in the
   diagnostic when the ban applies.
+  The boundary is deliberate, not a missing feature: a vtable slot is
+  an indirect call, and indirect calls have no task frame to suspend
+  into. Designing around it:
+  - Keep interface methods synchronous over non-suspending primitives
+    — blocking `extern fn`s (`rt_sock_*`, `rt_lookup_*`) and `usleep`
+    backoff are the honest substrate; a transport `send` that polls a
+    non-blocking socket with `usleep` fits the vtable contract.
+  - Do the suspending orchestration in code that knows the concrete
+    type — direct calls suspend normally, so a caller holding
+    `*MyTransport` (not the interface) can `await`-style suspend
+    through it; only the vtable hop is banned.
+  - Split the seam: the interface carries the synchronous query
+    surface (`dial`, `read_ready`, `write`) while retry/backoff
+    policy lives in concrete-type wrappers above it.
 - No associated types, no interface generics, no embedding; structs
   aren't generic, so only *method* ty params pin through a vtab slot.
 - A fn-valued struct field `x.m` shadows a method `m` — `x.m()` calls

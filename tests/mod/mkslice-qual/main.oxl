@@ -1,0 +1,15 @@
+package main
+
+import "ex.org/lib/widget"
+
+import "std/testing"
+
+fn main() {
+    // #136: mkslice(pkg.Type, n) must size/storage the struct element
+    // type — the qualified name arrives as Node.Field and the emit
+    // arm used to fall through to int64_t storage
+    hs := mkslice(widget.Header, 4)
+    testing.expect(len(hs) == 4, "len 4")
+    hs[0].name = "a"
+    testing.expect_streq(hs[0].name, "a", "elem write")
+}

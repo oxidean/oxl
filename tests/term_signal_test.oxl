@@ -9,15 +9,11 @@ import "std/testing"
 // term + signal coverage — capability-shaped: `oxl test` runs with
 // piped stdio, so tty paths assert the honest err/0 side and a real
 // terminal (or the run.sh pty probe) exercises the success path.
-
 fn test_isatty() {
     // the probe is a plain bool — stdin_fd() must alias fd 0 exactly
-    testing.expect(term.isatty(term.stdin_fd()) == term.isatty(0),
-        "stdin_fd aliases fd 0")
-    testing.expect(term.isatty(term.stdout_fd()) == term.isatty(1),
-        "stdout_fd aliases fd 1")
-    testing.expect(term.isatty(term.stderr_fd()) == term.isatty(2),
-        "stderr_fd aliases fd 2")
+    testing.expect(term.isatty(term.stdin_fd()) == term.isatty(0), "stdin_fd aliases fd 0")
+    testing.expect(term.isatty(term.stdout_fd()) == term.isatty(1), "stdout_fd aliases fd 1")
+    testing.expect(term.isatty(term.stderr_fd()) == term.isatty(2), "stderr_fd aliases fd 2")
 }
 
 fn test_size() {

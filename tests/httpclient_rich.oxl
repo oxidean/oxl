@@ -139,6 +139,40 @@ fn fake_server() {
             // uppercase scheme — the absolute-URI check is
             // case-insensitive but parse_url's isn't
             resp = "HTTP/1.1 302 Found\r\nlocation: HTTP://127.0.0.1:" + itoa(PORT) + "/who\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+        } else if path == "/i100" {
+            // interim 100 head precedes the real response — the
+            // client must skip it, not deliver it as the result
+            resp = "HTTP/1.1 100 Continue\r\nx-interim: yes\r\n\r\nHTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok"
+        } else if path == "/tedup" {
+            // duplicate TE fields consolidate — "identity" then
+            // "chunked" still reads as chunked (RFC 9112 6.1)
+            resp = "HTTP/1.1 200 OK\r\ntransfer-encoding: identity\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n"
+        } else if path == "/teonly" {
+            // TE present without chunked — body is close-delimited
+            // and the bogus content-length must be ignored
+            resp = "HTTP/1.1 200 OK\r\ntransfer-encoding: identity\r\ncontent-length: 999\r\nconnection: close\r\n\r\nrawbody"
+        } else if path == "/cedup" {
+            // two Content-Encoding fields — identity then gzip; the
+            // decode chain runs in reverse so the gzip payload still
+            // yields plaintext
+            [gz2, ge2] = base64.decode(GZ_B64)
+            if ge2 != nil {
+                resp = "HTTP/1.1 500 Err\r\ncontent-length: 0\r\n\r\n"
+            } else {
+                resp = "HTTP/1.1 200 OK\r\ncontent-encoding: identity\r\ncontent-encoding: gzip\r\ncontent-length: " + itoa(len(gz2)) + "\r\nconnection: close\r\n\r\n" + gz2 as str
+            }
+        } else if find(path, "/qbase/") == 0 && find(path, "/dir/c") < 0 {
+            // relative Location against a query-carrying base — the
+            // merge must cut the directory from the PATH, not the
+            // "?next=/a/b" tail
+            resp = "HTTP/1.1 302 Found\r\nlocation: c\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+        } else if path == "/a/b/c" {
+            // "../d" must resolve dot-segments on the merged path
+            resp = "HTTP/1.1 302 Found\r\nlocation: ../d\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+        } else if path == "/badscheme" {
+            // non-http(s) absolute URI — unsupported scheme, not a
+            // mangled relative target
+            resp = "HTTP/1.1 302 Found\r\nlocation: ftp://example.com/x\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
         } else if path == "/cldup" {
             // conflicting content-length duplicates — framing desync
             resp = "HTTP/1.1 200 OK\r\ncontent-length: 5\r\ncontent-length: 6\r\nconnection: close\r\n\r\nhello!"
@@ -216,6 +250,16 @@ fn main() {
     [_r6, e6] = cl.do(rq4)
     expect(e6 != nil, "CRLF header rejected")
 
+    // other CTLs are just as illegal in field values
+    ctl := mkslice(byte, 3)
+    ctl[0] = 97
+    ctl[1] = 1
+    ctl[2] = 98
+    rq4b := http.request_get(base + "/hdrcheck")
+    rq4b.headers = push(rq4b.headers, http.Header{name: "x-ctl", value: ctl as str})
+    [_r6b, e6c] = cl.do(rq4b)
+    expect(e6c != nil, "CTL header rejected")
+
     // -- bearer + request helpers ----------------------------------
     rq5 := http.request_get(base + "/hdrcheck")
     rq5.headers = push(rq5.headers, http.bearer_auth("tok123"))
@@ -283,6 +327,25 @@ fn main() {
     ck(e8b, "sredir")
     expect(rq8.body == "method=GET target=/who", "uppercase scheme redirect got " + rq8.body)
 
+    // relative Location merges against the base's PATH — a query
+    // tail must not corrupt the directory cut ("/dir/page?next=/a/b"
+    // + "c" resolves to "/dir/c", never "/dir/page?next=/a/c")
+    [rq13a, e20c] = get_retry(cl, base + "/qbase/dir/page?next=/a/b")
+    ck(e20c, "qbase redirect")
+    expect(rq13a.status == 200, "qbase redirect final")
+    expect(find(rq13a.body, "GET /qbase/dir/c HTTP/1.1") >= 0, "query-safe merge got " + rq13a.body)
+
+    // dot-segments resolve on the merged path — "/a/b/c" + "../d"
+    // lands on "/a/d", not the literal "/a/b/../d"
+    [rq14a, e21c] = get_retry(cl, base + "/a/b/c")
+    ck(e21c, "dotseg redirect")
+    expect(find(rq14a.body, "GET /a/d HTTP/1.1") >= 0, "dot-segment merge got " + rq14a.body)
+
+    // non-http(s) schemes are rejected outright — "ftp://x" must not
+    // degrade into a bogus http request-target
+    [_rq15a, e22c] = get_retry(cl, base + "/badscheme")
+    expect(e22c != nil, "ftp: redirect rejected")
+
     // fragments never reach the wire — request-target has no '#'
     rq9 := http.request_get(base + "/frag#section")
     [rq10, e10b] = cl.do(rq9)
@@ -306,6 +369,33 @@ fn main() {
     [_rq15, e13b] = cl.do(rq14)
     expect(e13b != nil, "non-token header name rejected")
 
+    // interim 1xx heads are skipped — the 200 is the response and
+    // its body, not the Continue head's tail
+    [r12a, e23d] = get_retry(cl, base + "/i100")
+    ck(e23d, "i100")
+    expect(r12a.status == 200, "interim skipped status got " + itoa(r12a.status))
+    expect(r12a.body == "ok", "interim body got " + r12a.body)
+
+    // duplicate TE fields consolidate — "identity" + "chunked" is
+    // still chunked; taking only the first field delivered raw chunk
+    // bytes as the body
+    [r13a, e24d] = get_retry(cl, base + "/tedup")
+    ck(e24d, "tedup")
+    expect(r13a.chunked, "dup TE chunked flag")
+    expect(r13a.body == "hello", "dup TE body got " + r13a.body)
+
+    // TE without chunked → close-delimited body; the bogus
+    // content-length is ignored rather than truncating the stream
+    [r14a, e25d] = get_retry(cl, base + "/teonly")
+    ck(e25d, "teonly")
+    expect(r14a.body == "rawbody", "te non-chunked body got " + r14a.body)
+
+    // multiple Content-Encoding fields join into one ordered list —
+    // "identity, gzip" still decodes the gzip payload
+    [r15a, e26d] = get_retry(cl, base + "/cedup")
+    ck(e26d, "cedup")
+    expect(r15a.body == "hello gzip", "dup CE decoded got " + r15a.body)
+
     // NO_PROXY=* matches every host
     expect(http.no_proxy_match("*", "anything.example"), "NO_PROXY * matches")
     expect(http.no_proxy_match(".internal", "a.internal"), "subdomain match")
@@ -321,6 +411,11 @@ fn main() {
     expect(http.is_loopback_host("127.evil.example.com") == false, "127.name is not loopback")
     expect(http.is_loopback_host("127.") == false, "bare 127. is not loopback")
     expect(http.is_loopback_host("example.com") == false, "public host is not loopback")
+    expect(http.is_loopback_host("127.0.evil.example.com") == false, "127.0.name not loopback")
+    expect(http.is_loopback_host("127.0.0.1.evil.com") == false, "v4-suffix not loopback")
+    expect(http.is_loopback_host("LOCALHOST"), "LOCALHOST is loopback")
+    expect(http.is_loopback_host("127.1") == false, "127.1 shorthand not loopback")
+    expect(http.is_loopback_host("localhost.evil.com") == false, "localhost suffix not loopback")
 
     println("httpclient rich done")
     exit(0)

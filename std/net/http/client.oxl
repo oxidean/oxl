@@ -22,6 +22,8 @@ import "std/encoding/base64"
 
 import "std/compress/gzip"
 
+import "std/bytes"
+
 import "std/os"
 
 /// Header is one name/value pair — request and response sides share
@@ -139,18 +141,49 @@ fn proxy_from_env(host: str) -> str {
 }
 
 /// is_loopback_host reports whether host names the local machine —
-/// "localhost", "::1", or a dotted 127.x address. The 127. prefix
-/// needs a digit after the dot: "127.evil.example.com" is a public
-/// name, not loopback.
+/// "localhost" or "::1" case-insensitively, or a full dotted-quad
+/// IPv4 literal in 127.0.0.0/8. Anything looser is a public name:
+/// "127.evil.example.com", "127.0.0.1.evil.com", and "127.1" shorthand
+/// are not loopback (they take the proxy path, which is the safe
+/// direction).
 fn is_loopback_host(host: str) -> bool {
-    if host == "localhost" || host == "::1" {
+    hl := lwr(host)
+    if hl == "localhost" || hl == "::1" {
         return true
     }
-    if len(host) <= 4 || substr(host, 0, 4) != "127." {
+    part := 0
+    val := 0
+    digits := 0
+    first := -1
+    i := 0
+    n := len(hl)
+    for i < n {
+        c := byteat(hl, i)
+        if c == 46 {
+            if digits == 0 || val > 255 {
+                return false
+            }
+            if part == 0 {
+                first = val
+            }
+            part = part + 1
+            val = 0
+            digits = 0
+        } else if c >= 48 && c <= 57 {
+            val = val * 10 + c - 48
+            digits = digits + 1
+            if digits > 3 || val > 255 {
+                return false
+            }
+        } else {
+            return false
+        }
+        i = i + 1
+    }
+    if digits == 0 {
         return false
     }
-    b := byteat(host, 4)
-    return b >= 48 && b <= 57
+    return part == 3 && first == 127
 }
 
 /// no_proxy_match reports whether host falls under the comma-separated
@@ -253,7 +286,10 @@ fn header_value_ok(name: str, value: str) -> bool {
     }
     i = 0
     for i < len(value) {
-        if byteat(value, i) == 13 || byteat(value, i) == 10 {
+        bv := byteat(value, i)
+        // CTLs other than HTAB are never legal field content; obs-text
+        // (>=128) stays allowed per RFC 7230 field-content rules
+        if bv < 32 && bv != 9 || bv == 127 {
             return false
         }
         i = i + 1
@@ -290,19 +326,40 @@ fn resolve_location(base: str, loc: str) -> [str, err] {
     if len(loc) >= 2 && byteat(loc, 0) == 47 && byteat(loc, 1) == 47 {
         return "http:" + loc, nil
     }
+    // any other `scheme:` is unsupported — without this a Location
+    // like "ftp://h/p" falls into the relative branch below and
+    // becomes a bogus "http://…/ftp:…" request target. A colon can
+    // only start a scheme here: relative-path references may not
+    // carry ':' in their first segment (RFC 3986 4.2).
+    ci := find(loc, ":")
+    if ci > 0 {
+        c0 := byteat(loc, 0)
+        ok := c0 >= 65 && c0 <= 90 || c0 >= 97 && c0 <= 122
+        j := 1
+        for ok && j < ci {
+            cj := byteat(loc, j)
+            ok = cj >= 65 && cj <= 90 || cj >= 97 && cj <= 122 || cj >= 48 && cj <= 57 || cj == 43 || cj == 45 || cj == 46
+            j = j + 1
+        }
+        if ok {
+            return "", errors.new("http: redirect to unsupported scheme " + substr(loc, 0, ci))
+        }
+    }
+    // bu.path still carries the base query — merges must run against
+    // the path alone or a "?"-laden base corrupts the directory cut
+    bpath := bu.path
+    bq := find(bpath, "?")
+    if bq >= 0 {
+        bpath = substr(bpath, 0, bq)
+    }
     scheme := "http://" + url_authority(bu)
     if byteat(loc, 0) == 47 {
-        return scheme + loc, nil
+        return scheme + remove_dot_segments(loc), nil
     }
     if byteat(loc, 0) == 63 {
         // "?q" replaces the base query outright (RFC 3986 5.2.2) —
         // appending to bu.path would emit "/p?x=1?y=2"
-        bq := find(bu.path, "?")
-        base := bu.path
-        if bq >= 0 {
-            base = substr(bu.path, 0, bq)
-        }
-        return scheme + base + loc, nil
+        return scheme + bpath + loc, nil
     }
     if byteat(loc, 0) == 35 {
         // "#f" is the same document — fragments never reach the wire,
@@ -310,20 +367,66 @@ fn resolve_location(base: str, loc: str) -> [str, err] {
         return scheme + bu.path, nil
     }
     // relative path — merge against the base's directory (the path
-    // up to and including its LAST slash, per RFC 3986 5.2)
+    // up to and including its LAST slash, per RFC 3986 5.2), then
+    // resolve dot-segments on the merged path
     last := -1
     k := 0
-    for k < len(bu.path) {
-        if byteat(bu.path, k) == 47 {
+    for k < len(bpath) {
+        if byteat(bpath, k) == 47 {
             last = k
         }
         k = k + 1
     }
     dir := "/"
     if last >= 0 {
-        dir = substr(bu.path, 0, last + 1)
+        dir = substr(bpath, 0, last + 1)
     }
-    return scheme + dir + loc, nil
+    return scheme + remove_dot_segments(dir + loc), nil
+}
+
+/// remove_dot_segments applies RFC 3986 5.2.4 to an absolute path —
+/// "." and ".." segments resolve against the stack; ".." at the root
+/// is dropped rather than escaping above "/". A trailing "." or ".."
+/// leaves a trailing '/' per the spec's last-segment rule.
+fn remove_dot_segments(path: str) -> str {
+    parts := mkslice(str, 0)
+    i := 0
+    n := len(path)
+    for true {
+        j := find_from(path, "/", i)
+        if j < 0 {
+            j = n
+        }
+        seg := substr(path, i, j)
+        if seg == "." {
+            if j >= n {
+                parts = push(parts, "")
+            }
+        } else if seg == ".." {
+            if len(parts) > 0 && parts[len(parts) - 1] != "" {
+                parts = parts[:len(parts) - 1]
+            }
+            if j >= n {
+                parts = push(parts, "")
+            }
+        } else {
+            parts = push(parts, seg)
+        }
+        if j >= n {
+            break
+        }
+        i = j + 1
+    }
+    out := ""
+    k := 0
+    for k < len(parts) {
+        if k > 0 {
+            out = out + "/"
+        }
+        out = out + parts[k]
+        k = k + 1
+    }
+    return out
 }
 
 /// redirect_request rewrites the request for a followed redirect —
@@ -668,32 +771,49 @@ fn (cl ref Client) do_once(req: Request) -> [Response, err] {
     }
     c.close()
     resp := out as str
-    he := find(resp, "\r\n\r\n")
-    if he < 0 {
-        return bad, errors.new("http: response never completed headers")
-    }
-    eol := find(resp, "\r\n")
-    line := substr(resp, 0, eol)
-    // "HTTP/1.1 200 OK" — code + reason are the two tokens after the
-    // version; a missing reason is legal, not malformed
-    sp := find(line, " ")
+    // interim 1xx heads (100 Continue etc.) precede the final
+    // response — skip each head block until a non-1xx status arrives.
+    // 101 is final: it completes the HTTP exchange (protocol switch).
+    off := 0
     code := 0
     reason := ""
-    if sp > 0 {
-        rest := substr(line, sp + 1, len(line))
-        sp2 := find(rest, " ")
-        tok := rest
-        if sp2 > 0 {
-            tok = substr(rest, 0, sp2)
-            reason = substr(rest, sp2 + 1, len(rest))
+    hs := mkslice(Header, 0)
+    he := -1
+    for true {
+        he = find_from(resp, "\r\n\r\n", off)
+        if he < 0 {
+            return bad, errors.new("http: response never completed headers")
         }
-        [v, ae] = strconv.atoi(tok)
-        if ae == nil {
-            code = v
+        eol := find_from(resp, "\r\n", off)
+        line := substr(resp, off, eol)
+        // "HTTP/1.1 200 OK" — code + reason are the two tokens after
+        // the version; a missing reason is legal, not malformed
+        sp := find(line, " ")
+        c2 := 0
+        r2 := ""
+        if sp > 0 {
+            rest := substr(line, sp + 1, len(line))
+            sp2 := find(rest, " ")
+            tok := rest
+            if sp2 > 0 {
+                tok = substr(rest, 0, sp2)
+                r2 = substr(rest, sp2 + 1, len(rest))
+            }
+            [v, ae] = strconv.atoi(tok)
+            if ae == nil {
+                c2 = v
+            }
         }
+        if c2 >= 100 && c2 < 200 && c2 != 101 {
+            off = he + 4
+            continue
+        }
+        code = c2
+        reason = r2
+        hs = parse_head_headers(substr(resp, off, he) + "\r\n")
+        break
     }
-    head := substr(resp, 0, he)
-    hs := parse_head_headers(head + "\r\n")
+    raw := substr(resp, he + 4, len(resp))
     rctype := ""
     seen_ct := false
     i := 0
@@ -704,17 +824,20 @@ fn (cl ref Client) do_once(req: Request) -> [Response, err] {
         }
         i = i + 1
     }
-    raw := substr(resp, he + 4, len(resp))
     rbody := ""
     trs := mkslice(Header, 0)
     chunked := false
+    // every Transfer-Encoding field joins into one comma list —
+    // duplicate fields are legal and "TE: identity" + "TE: chunked"
+    // must still read as chunked (RFC 9112 6.1 / TE consolidation)
     te := ""
-    seen_te := false
     i = 0
     for i < len(hs) {
-        if !seen_te && lwr(hs[i].name) == "transfer-encoding" {
-            te = hs[i].value
-            seen_te = true
+        if lwr(hs[i].name) == "transfer-encoding" {
+            if len(te) > 0 {
+                te = te + ","
+            }
+            te = te + hs[i].value
         }
         i = i + 1
     }
@@ -726,6 +849,11 @@ fn (cl ref Client) do_once(req: Request) -> [Response, err] {
         }
         rbody = cb.body
         trs = cb.trailers
+    } else if len(te) > 0 {
+        // TE present but chunked isn't the final coding — the body is
+        // close-delimited and Content-Length is ignored outright
+        // (RFC 9112 6.1); `raw` already holds the whole stream
+        rbody = raw
     } else {
         clv := ""
         has_cl := false
@@ -768,27 +896,111 @@ fn (cl ref Client) do_once(req: Request) -> [Response, err] {
         }
         rbody = raw
     }
-    // content-encoding: gzip decodes only when the client opted in —
-    // an identity/unknown encoding is delivered raw with the header
-    // still visible on `headers` for the caller to handle
-    encv := ""
-    seen_enc := false
+    // content-encoding: codings apply in listed order, so the decode
+    // chain runs in reverse. Multiple Content-Encoding fields join
+    // into one ordered list. Only gzip/identity are decodable — any
+    // other coding delivers the body raw with headers intact (the
+    // same contract unknown encodings always had). Decoding is
+    // opt-in (decompress) and capped — wire data never reaches the
+    // unbounded decompress() path.
+    encs := mkslice(str, 0)
     i = 0
     for i < len(hs) {
-        if !seen_enc && lwr(hs[i].name) == "content-encoding" {
-            encv = hs[i].value
-            seen_enc = true
+        if lwr(hs[i].name) == "content-encoding" {
+            v := hs[i].value
+            k := 0
+            nv := len(v)
+            for k <= nv {
+                j := find_from(v, ",", k)
+                if j < 0 {
+                    j = nv
+                }
+                t := lwr(substr(v, k, j))
+                lo := 0
+                for lo < len(t) && (byteat(t, lo) == 32 || byteat(t, lo) == 9) {
+                    lo = lo + 1
+                }
+                hi := len(t)
+                for hi > lo && (byteat(t, hi - 1) == 32 || byteat(t, hi - 1) == 9) {
+                    hi = hi - 1
+                }
+                if hi > lo {
+                    encs = push(encs, substr(t, lo, hi))
+                }
+                if j >= nv {
+                    break
+                }
+                k = j + 1
+            }
         }
         i = i + 1
     }
-    if req.decompress && has_token(encv, "gzip") {
-        [db, de2] = gzip.decompress(rbody as []byte)
-        if de2 != nil {
-            return bad, errors.new("http: gzip decode: " + errors.msg(de2))
+    if req.decompress && len(encs) > 0 {
+        decodable := true
+        ei := 0
+        for ei < len(encs) {
+            if encs[ei] != "gzip" && encs[ei] != "identity" {
+                decodable = false
+            }
+            ei = ei + 1
         }
-        rbody = db as str
+        if decodable {
+            cur := rbody
+            ei = len(encs) - 1
+            for ei >= 0 {
+                if encs[ei] == "gzip" {
+                    [nb, ne3] = gunzip_capped(cur)
+                    if ne3 != nil {
+                        return bad, errors.new("http: gzip decode: " + errors.msg(ne3))
+                    }
+                    cur = nb
+                }
+                ei = ei - 1
+            }
+            rbody = cur
+        }
     }
     return Response{status: code, reason: reason, headers: hs, body: rbody, ctype: rctype, chunked: chunked, trailers: trs}, nil
+}
+
+/// GUNZIP_MAX caps one response's inflated size — decompress() is
+/// documented for trusted input and grows without bound, so wire
+/// data decodes through the streaming reader under this ceiling.
+let GUNZIP_MAX = 67108864
+
+/// gunzip_capped inflates src through the streaming gzip Reader —
+/// all members concatenated, same as decompress(), but output stops
+/// at GUNZIP_MAX instead of growing without bound.
+fn gunzip_capped(src: str) -> [str, err] {
+    bb := bytes.newbuffer()
+    [wn, we] = bb.write(src as []byte)
+    if we != nil {
+        return "", we
+    }
+    [gr, ge] = gzip.newreader(bb.asreader())
+    if ge != nil {
+        return "", ge
+    }
+    out := mkslice(byte, 0)
+    buf := mkslice(byte, 8192)
+    for true {
+        [n, re] = gr.read(buf)
+        k := 0
+        for k < n {
+            out = push(out, buf[k])
+            k = k + 1
+        }
+        if len(out) > GUNZIP_MAX {
+            return "", errors.new("http: gzip body exceeds 64MiB limit")
+        }
+        if re == io.eof() {
+            break
+        }
+        if re != nil {
+            return "", re
+        }
+    }
+    return out as str, nil
 }
 
 /// do runs req through the redirect policy — each hop is a fresh

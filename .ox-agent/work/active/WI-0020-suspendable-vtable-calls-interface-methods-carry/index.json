@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "id": "WI-0020",
+  "title": "suspendable vtable calls — interface methods carry no task frame (issue #135)",
+  "state": "intake",
+  "profile": "normal",
+  "current_stage": "intake",
+  "created_at": "2026-11-17T19:37:18Z"
+}

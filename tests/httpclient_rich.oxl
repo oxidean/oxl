@@ -276,10 +276,12 @@ fn main() {
     ck(e7b, "fredir")
     expect(rq7.status == 302, "fragment redirect loops to budget")
 
-    // uppercase scheme in an absolute Location still resolves
+    // uppercase scheme in an absolute Location still resolves — the
+    // fake server 200s every unmatched path, so only the echoed
+    // request-target proves the redirect landed on /who
     [rq8, e8b] = get_retry(cl, base + "/sredir")
     ck(e8b, "sredir")
-    expect(rq8.status == 200, "uppercase scheme redirect")
+    expect(rq8.body == "method=GET target=/who", "uppercase scheme redirect got " + rq8.body)
 
     // fragments never reach the wire — request-target has no '#'
     rq9 := http.request_get(base + "/frag#section")

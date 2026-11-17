@@ -41,6 +41,18 @@
           ".oxl"
         ],
         "configuration": "./language-configuration.json"
+      },
+      {
+        "id": "oxlmod",
+        "aliases": [
+          "oxl.mod",
+          "oxl.work",
+          "OXL Mod"
+        ],
+        "filenames": [
+          "oxl.mod",
+          "oxl.work"
+        ]
       }
     ],
     "grammars": [
@@ -48,6 +60,11 @@
         "language": "oxl",
         "scopeName": "source.oxl",
         "path": "./syntaxes/oxl.tmLanguage.json"
+      },
+      {
+        "language": "oxlmod",
+        "scopeName": "source.oxl.mod",
+        "path": "./syntaxes/oxl-mod.tmLanguage.json"
       }
     ],
     "configuration": {

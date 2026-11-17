@@ -58,3 +58,19 @@ const highlighter = await createHighlighter({
 Node-side consumers can `import oxl from "@oxidean/shiki-oxl"` directly —
 `index.mjs` loads the grammar and exports it with `name: "oxl"` and
 `embeddedLangs: []`.
+
+The package also ships `oxl-mod.tmLanguage.json` for the `oxl.mod` /
+`oxl.work` directive DSL — a sibling grammar, not oxl syntax. Register it
+alongside the main grammar:
+
+```ts
+import oxl, { oxlModGrammar } from "@oxidean/shiki-oxl";
+
+const highlighter = await createHighlighter({
+  langs: [oxl, oxlModGrammar],
+  themes: ["github-dark"],
+});
+// fence as ```oxlmod
+```
+
+The raw file is importable as `@oxidean/shiki-oxl/mod-grammar.json`.

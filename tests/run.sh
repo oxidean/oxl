@@ -2663,6 +2663,10 @@ a = json.load(open('editors/grammars/oxl.tmLanguage.json'))
 b = json.load(open('editors/vscode/syntaxes/oxl.tmLanguage.json'))
 assert a == b, 'vscode grammar drifted from editors/grammars'
 assert a['scopeName'] == 'source.oxl'
+am = json.load(open('editors/grammars/oxl-mod.tmLanguage.json'))
+bm = json.load(open('editors/vscode/syntaxes/oxl-mod.tmLanguage.json'))
+assert am == bm, 'vscode mod grammar drifted from editors/grammars'
+assert am['scopeName'] == 'source.oxl.mod'
 print('grammar parity ok')
 PYCHK
 # nvim lua files must parse; plugin must load headless when nvim exists
@@ -2692,7 +2696,11 @@ if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1 \
         echo "FAIL vscode extension build"; exit 1; }
     node -e 'const j=require("./editors/vscode/package.json");
         if (j.main !== "./dist/extension.js") process.exit(1);
-        if (!j.activationEvents.includes("onLanguage:oxl")) process.exit(1);'
+        if (!j.activationEvents.includes("onLanguage:oxl")) process.exit(1);
+        const l = j.contributes.languages.find(x => x.id === "oxlmod");
+        if (!l || JSON.stringify(l.filenames) !== JSON.stringify(["oxl.mod", "oxl.work"])) process.exit(1);
+        const gm = j.contributes.grammars.find(x => x.language === "oxlmod");
+        if (!gm || gm.scopeName !== "source.oxl.mod") process.exit(1);'
     grep -q 'vscode-languageclient' editors/vscode/dist/extension.js \
         || { echo "FAIL vsix bundle missing language client"; exit 1; }
     echo "vscode extension bundle ok"
@@ -2705,16 +2713,20 @@ if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
     node -e 'const j=require("./editors/grammars/package.json");
         if (j.name !== "@oxidean/shiki-oxl") process.exit(1);
         if (j.publishConfig.registry !== "https://npm.pkg.github.com") process.exit(1);
-        if (!j.exports["."] || !j.exports["./grammar.json"]) process.exit(1);
-        for (const f of ["index.mjs", "oxl.tmLanguage.json", "README.md"])
+        if (!j.exports["."] || !j.exports["./grammar.json"]
+            || !j.exports["./mod-grammar.json"]) process.exit(1);
+        for (const f of ["index.mjs", "oxl.tmLanguage.json",
+            "oxl-mod.tmLanguage.json", "README.md"])
             if (!j.files.includes(f)) process.exit(1);'
     packout=$(cd editors/grammars && npm pack --dry-run 2>&1)
-    for f in index.mjs oxl.tmLanguage.json README.md package.json; do
+    for f in index.mjs oxl.tmLanguage.json oxl-mod.tmLanguage.json README.md package.json; do
         grep -q "$f" <<<"$packout" || { echo "FAIL shiki-oxl pack missing $f"; exit 1; }
     done
-    node --input-type=module -e 'import g from "./editors/grammars/index.mjs";
+    node --input-type=module -e 'import g, { oxlModGrammar as m } from "./editors/grammars/index.mjs";
         if (g.name !== "oxl" || g.scopeName !== "source.oxl") process.exit(1);
-        if (!Array.isArray(g.patterns)) process.exit(1);'
+        if (!Array.isArray(g.patterns)) process.exit(1);
+        if (m.name !== "oxlmod" || m.scopeName !== "source.oxl.mod") process.exit(1);
+        if (JSON.stringify(m.aliases) !== JSON.stringify(["oxl.mod", "oxl.work"])) process.exit(1);'
     echo "shiki-oxl package ok"
 fi
 

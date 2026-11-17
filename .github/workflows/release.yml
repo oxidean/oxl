@@ -498,6 +498,7 @@ jobs:
           mkdir -p dist/assets/vscode dist/assets/grammars dist/assets/sublime dist/assets/nvim
           cp editors/vscode/dist/oxl-language.vsix dist/assets/vscode/
           cp editors/grammars/oxl.tmLanguage.json dist/assets/grammars/
+          cp editors/grammars/oxl-mod.tmLanguage.json dist/assets/grammars/
           cp editors/sublime/oxl.sublime-syntax dist/assets/sublime/
           cp -r editors/nvim/. dist/assets/nvim/
           tar czf dist/oxl-editor-assets.tar.gz -C dist/assets .

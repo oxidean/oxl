@@ -345,6 +345,57 @@ for t in test_mkdir_ls_rename_remove test_mkdir_all_idempotent; do
     grep -q "$t ... ok" <<<"$out" || { echo "FAIL fsops: $out"; exit 1; }
 done
 
+echo "== oxl test: term + signal =="
+out=$("$OXL" test tests/term_signal_test.oxl)
+printf '%s
+' "$out" >&2
+for t in test_isatty test_size test_raw_needs_tty test_signal_names test_signal_arm_take test_signal_sigwinch; do
+    grep -q "$t ... ok" <<<"$out" || { echo "FAIL term_signal: $out"; exit 1; }
+done
+# POSIX extras: a pty probe for the real-terminal paths and a shell-
+# delivered SIGUSR1 for the take() observation contract. Windows has
+# no pty/`script` and no POSIX kill semantics — the unit tests above
+# already cover its console-ctrl surface shape.
+case "$(uname -s)" in
+MINGW*|MSYS*|CYGWIN*) ;;
+*)
+    if command -v script >/dev/null 2>&1; then
+        # script(1) differs: util-linux wants -c, BSD/macOS takes the
+        # command as trailing argv. || true keeps set -e from eating
+        # the diagnostic below
+        case "$(uname -s)" in
+        Darwin)
+            pout=$(script -q /dev/null sh -c 'stty rows 24 cols 80; "'"$OXL"'" run tests/term_probe.oxl' 2>/dev/null | tr -d '\r') || true ;;
+        *)
+            pout=$(script -qefc "stty rows 24 cols 80; \"$OXL\" run tests/term_probe.oxl" /dev/null 2>/dev/null | tr -d '\r') || true ;;
+        esac
+        grep -q "term probe ok" <<<"$pout" || { echo "FAIL term probe: $pout"; exit 1; }
+        grep -q "term probe ok" <<<"$pout" || { echo "FAIL term probe: $pout"; exit 1; }
+    fi
+    "$OXL" build tests/sigusr1_wait.oxl -o "$scratch/sigusr1$EXE"         || { echo "FAIL sigusr1 build"; exit 1; }
+    "$scratch/sigusr1$EXE" > "$scratch/sigusr1.out" 2>&1 &
+    sigpid=$!
+    # the child prints "armed" once signal.arm returns — poll for it
+    # rather than racing a fixed sleep on slow CI runners
+    armed=0
+    tries=0
+    while [ "$armed" -eq 0 ] && [ "$tries" -lt 100 ]; do
+        if grep -q "^armed" "$scratch/sigusr1.out" 2>/dev/null; then
+            armed=1
+        else
+            sleep 0.05
+            tries=$((tries + 1))
+        fi
+    done
+    kill -USR1 "$sigpid" 2>/dev/null || true
+    src=0
+    wait "$sigpid" || src=$?
+    cat "$scratch/sigusr1.out" >&2
+    [ "$src" -eq 0 ] || { echo "FAIL sigusr1 delivery rc=$src"; exit 1; }
+    grep -q "got sigusr1" "$scratch/sigusr1.out"         || { echo "FAIL sigusr1 delivery: $(cat "$scratch/sigusr1.out")"; exit 1; }
+    ;;
+esac
+
 echo "== stdmods (json/sync/time) =="
 out=$("$OXL" run tests/stdmods_test.oxl)
 grep -q '"name":"widget"' <<<"$out" || { echo "FAIL stdmods json: $out"; exit 1; }
@@ -2280,7 +2331,7 @@ if command -v node >/dev/null 2>&1; then
         out=$(with_timeout 60 "$SELFOXL" run --target js "tests/$f.oxl" 2>&1) || { echo "FAIL js lane $f: $out"; exit 1; }
         grep -q "$marker" <<<"$out" || { echo "FAIL js lane $f marker '$marker': $out"; exit 1; }
     done
-    for f in enc_test hash_test regexp_test float_test util_test stdlib_test collections_test enum_test defer_test os_test exec_test net_test flaglog_test extra_testutil; do
+    for f in enc_test hash_test regexp_test float_test util_test stdlib_test collections_test enum_test defer_test os_test exec_test net_test flaglog_test extra_testutil term_signal_test; do
         out=$(with_timeout 60 "$SELFOXL" test --target js "tests/$f.oxl" 2>&1) || { echo "FAIL js lane test $f: $out"; exit 1; }
         grep -q 'FAIL' <<<"$out" && { echo "FAIL js lane test $f: $out"; exit 1; }
     done

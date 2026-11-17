@@ -58,6 +58,13 @@ export function install(api) {
     rt_fd_read: () => -22n,
     rt_fd_write: () => -22n,
     rt_fd_close: () => 0n,
+    rt_isatty: () => 0n,
+    rt_term_size: () => -25n, // ENOTTY
+    rt_term_raw: () => -38n, // ENOSYS
+    rt_term_restore: () => -38n,
+    rt_signal_arm: () => -38n,
+    rt_signal_disarm: () => -38n,
+    rt_signal_take: () => -38n,
     rt_remove: () => -22n,
     rt_mkdir: () => -22n,
     rt_rmdir: () => -22n,

@@ -64,7 +64,9 @@ supported). The v0.4 line ships 39 packages:
   (Thompson NFA engine, linear-time matching)
 - **I/O and files**: `std/io`, `std/bytes`, `std/bufio`, `std/fmt`,
   `std/errors`, `std/path`, `std/path/filepath`, `std/os` (args, files,
-  fs primitives, env), `std/os/exec` (process `cmd`/`run`/`output`)
+  fs primitives, env), `std/os/exec` (process `cmd`/`run`/`output`),
+  `std/os/term` (isatty, winsize, raw-mode enter/restore),
+  `std/os/signal` (poll-observed signal flags)
 - **Tooling**: `std/flag`, `std/log`, `std/testing` (assertions for
   `oxl test`), `std/time`, `std/sync`
 - **Data and algorithms**: `std/collections`, `std/container/{heap,

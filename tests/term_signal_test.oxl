@@ -1,0 +1,84 @@
+package main
+
+import "std/os/term"
+
+import "std/os/signal"
+
+import "std/testing"
+
+// term + signal coverage — capability-shaped: `oxl test` runs with
+// piped stdio, so tty paths assert the honest err/0 side and a real
+// terminal (or the run.sh pty probe) exercises the success path.
+fn test_isatty() {
+    // the probe is a plain bool — stdin_fd() must alias fd 0 exactly
+    testing.expect(term.isatty(term.stdin_fd()) == term.isatty(0), "stdin_fd aliases fd 0")
+    testing.expect(term.isatty(term.stdout_fd()) == term.isatty(1), "stdout_fd aliases fd 1")
+    testing.expect(term.isatty(term.stderr_fd()) == term.isatty(2), "stderr_fd aliases fd 2")
+}
+
+fn test_size() {
+    [z, ze] = term.size(term.stdin_fd())
+    if term.isatty(term.stdin_fd()) {
+        testing.expect(ze == nil, "tty size ok")
+        testing.expect(z.cols > 0 && z.rows > 0, "dims positive")
+    } else {
+        testing.expect(ze != nil, "non-tty size errs")
+    }
+}
+
+fn test_raw_needs_tty() {
+    if term.isatty(term.stdin_fd()) {
+        [r, re] = term.raw(term.stdin_fd())
+        testing.expect(re == nil, "tty raw ok")
+        if re == nil {
+            [w, we] = term.size(term.stdin_fd())
+            testing.expect(we == nil && w.cols > 0, "size under raw")
+            testing.expect(r.restore() == nil, "restore ok")
+        }
+    } else {
+        [_r, re] = term.raw(term.stdin_fd())
+        testing.expect(re != nil, "non-tty raw errs")
+    }
+}
+
+fn test_signal_names() {
+    // bad names are err on every verb — never a panic
+    [_b, te] = signal.take("SIGNOPE")
+    testing.expect(te != nil, "take bad name errs")
+    testing.expect(signal.arm("SIGNOPE") != nil, "arm bad name errs")
+    testing.expect(signal.disarm("SIGNOPE") != nil, "disarm bad name errs")
+    // uncatchable signals can't be armed anywhere
+    testing.expect(signal.arm("SIGKILL") != nil, "SIGKILL arm errs")
+    testing.expect(signal.arm("SIGSTOP") != nil, "SIGSTOP arm errs")
+}
+
+fn test_signal_arm_take() {
+    // SIGINT is catchable on every lane we ship (POSIX sigaction,
+    // node process.on, Windows console ctrl) — arm+take round-trips
+    // to "nothing pending" without delivering anything
+    testing.expect(signal.arm("SIGINT") == nil, "arm SIGINT ok")
+    [got, te] = signal.take("SIGINT")
+    testing.expect(te == nil && !got, "no pending SIGINT")
+    testing.expect(signal.disarm("SIGINT") == nil, "disarm SIGINT ok")
+    // disarm clears a stale flag — take still reports clean
+    [got2, te2] = signal.take("SIGINT")
+    testing.expect(te2 == nil && !got2, "post-disarm take clean")
+}
+
+fn test_signal_sigwinch() {
+    // SIGWINCH exists on POSIX; Windows has no such console event —
+    // accept either arm outcome, but take() must be consistent with it
+    ae := signal.arm("SIGWINCH")
+    if ae == nil {
+        [_g, te] = signal.take("SIGWINCH")
+        testing.expect(te == nil, "sigwinch take ok")
+        testing.expect(signal.disarm("SIGWINCH") == nil, "sigwinch disarm")
+    } else {
+        // Windows: the name isn't in the console-event set — take errs
+        // the same way arm did rather than silently reporting "none"
+        [_g, te] = signal.take("SIGWINCH")
+        testing.expect(te != nil, "sigwinch take errs where arm does")
+    }
+}
+
+fn main() {}

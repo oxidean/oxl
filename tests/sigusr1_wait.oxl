@@ -1,0 +1,29 @@
+package main
+
+import "std/os"
+
+import "std/os/signal"
+
+import "std/time"
+
+// delivery probe — arms SIGUSR1 then polls take(); run.sh kills the
+// process with `kill -USR1` mid-run. POSIX-only section.
+fn main() {
+    if signal.arm("SIGUSR1") != nil {
+        println("FAIL arm")
+        os.quit(1)
+    }
+    println("armed")
+    i := 0
+    for i < 100 {
+        [got, te] = signal.take("SIGUSR1")
+        if te == nil && got {
+            println("got sigusr1")
+            os.quit(0)
+        }
+        time.sleep_ms(100)
+        i = i + 1
+    }
+    println("FAIL timeout")
+    os.quit(1)
+}

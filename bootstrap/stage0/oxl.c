@@ -239,6 +239,7 @@ struct o_s_codegen_GAv {    OxlStr f_v;    OxlStr f_pre;    OxlStr f_post;    st
 struct o_s_codegen_GS {    struct o_s_check_SList* f_l;    struct o_s_check_SList* f_binds;};
 struct o_s_PkgArgs {    RtSlice f_fs;    int64_t f_argi;};
 struct o_s_PkgSrc {    OxlStr f_dir;    RtSlice f_files;};
+struct o_s_PkgList {    RtSlice f_ps;    int64_t f_mixed;};
 struct o_s_CRes {    OxlStr f_c;    int64_t f_ok;};
 struct o_vret_io_Reader_read { int64_t val; int64_t err; };
 static int64_t o_g_json_MAX_JDEPTH;static OxlStr o_g_base64_STD;int64_t rt_err_new(OxlStr msg);
@@ -1209,7 +1210,8 @@ struct o_s_PkgArgs o_f_pkg_args(int64_t start);
 OxlStr o_f_flag_value(OxlStr name);
 int64_t o_f_has_flag(OxlStr name);
 int64_t o_f_target_is_js(void);
-struct o_s_PkgSrc o_f_pkg_src(RtSlice fs);
+struct o_s_PkgList o_f_pkg_srcs(RtSlice fs);
+int64_t o_f_stray_args(int64_t argi);
 OxlStr o_f_entry_dir(struct o_s_PkgSrc src);
 struct o_s_CRes* o_f_compile_mode(struct o_s_PkgSrc src, int64_t testm);
 struct o_s_CRes* o_f_compile_res(struct o_s_check_CkRes* r, int64_t testm);
@@ -1228,9 +1230,11 @@ OxlStr o_f_js_html(OxlStr out);
 OxlStr o_f_js_out_name(void);
 int64_t o_f_child_code(int64_t st, int64_t e);
 OxlStr o_f_out_arg(void);
+struct o_s_PkgSrc o_f_one_pkg(OxlStr cmd, struct o_s_PkgArgs pa);
 void o_f_cmd_build(void);
 void o_f_cmd_run(void);
 void o_f_cmd_test(void);
+int64_t o_f_test_one(struct o_s_PkgSrc src, struct o_s_CRes* res);
 void o_f_cmd_list(void);
 void o_f_main(void);
 void o_f_sort_sortfn__UIdx(RtSlice, RtFnv);
@@ -23094,9 +23098,11 @@ int64_t o_f_codegen_xty_call(struct o_s_codegen_G* g, struct o_en_parser_Node* f
     int64_t et = ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_check_t_unk }; ((int64_t (*)(void*, struct o_s_check_Ck*))_fv.fp)(_fv.env, g->f_ck); });
     if ((args != 0)) {
     struct o_en_parser_Node* a = args->f_v;
-    if ((({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_check_nk }; ((int64_t (*)(void*, struct o_en_parser_Node*))_fv.fp)(_fv.env, a); }) == 2LL)) {
-    ({ struct o_en_parser_Node* _ms = a; if ((*_ms).tag == 3) { OxlStr n = (*_ms).u.v3.f_n;     et = ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_check_ty_parse }; ((int64_t (*)(void*, struct o_s_check_Ck*, OxlStr))_fv.fp)(_fv.env, g->f_ck, n); });
-} else { } });
+    if (((({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_check_nk }; ((int64_t (*)(void*, struct o_en_parser_Node*))_fv.fp)(_fv.env, a); }) == 2LL) || (({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_check_nk }; ((int64_t (*)(void*, struct o_en_parser_Node*))_fv.fp)(_fv.env, a); }) == 9LL))) {
+    OxlStr an = ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_check_callee_name }; ((OxlStr (*)(void*, struct o_en_parser_Node*))_fv.fp)(_fv.env, a); });
+    if ((rt_len(an) > 0LL)) {
+    et = ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_check_ty_parse }; ((int64_t (*)(void*, struct o_s_check_Ck*, OxlStr))_fv.fp)(_fv.env, g->f_ck, an); });
+    }
     }
     if ((({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_check_nk }; ((int64_t (*)(void*, struct o_en_parser_Node*))_fv.fp)(_fv.env, a); }) == 3LL)) {
     et = ({ int64_t __rc; struct o_en_parser_Node* _ba845 = a; rt_borrow_read(_ba845); __rc = o_f_codegen_gty(g, _ba845); rt_unborrow(_ba845); __rc; });
@@ -24925,9 +24931,11 @@ OxlStr o_f_codegen_gcall(struct o_s_codegen_G* g, struct o_en_parser_Node* f, st
     }
     if (((rt_streq(qn, rt_str_lit("mkslice"))) && (args != 0))) {
     int64_t et = ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_check_t_unk }; ((int64_t (*)(void*, struct o_s_check_Ck*))_fv.fp)(_fv.env, g->f_ck); });
-    if ((({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_check_nk }; ((int64_t (*)(void*, struct o_en_parser_Node*))_fv.fp)(_fv.env, args->f_v); }) == 2LL)) {
-    ({ struct o_en_parser_Node* _ms = args->f_v; if ((*_ms).tag == 3) { OxlStr n = (*_ms).u.v3.f_n;     et = ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_check_ty_parse }; ((int64_t (*)(void*, struct o_s_check_Ck*, OxlStr))_fv.fp)(_fv.env, g->f_ck, n); });
-} else { } });
+    if (((({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_check_nk }; ((int64_t (*)(void*, struct o_en_parser_Node*))_fv.fp)(_fv.env, args->f_v); }) == 2LL) || (({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_check_nk }; ((int64_t (*)(void*, struct o_en_parser_Node*))_fv.fp)(_fv.env, args->f_v); }) == 9LL))) {
+    OxlStr an = ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_check_callee_name }; ((OxlStr (*)(void*, struct o_en_parser_Node*))_fv.fp)(_fv.env, args->f_v); });
+    if ((rt_len(an) > 0LL)) {
+    et = ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_check_ty_parse }; ((int64_t (*)(void*, struct o_s_check_Ck*, OxlStr))_fv.fp)(_fv.env, g->f_ck, an); });
+    }
     }
     if ((({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_check_nk }; ((int64_t (*)(void*, struct o_en_parser_Node*))_fv.fp)(_fv.env, args->f_v); }) == 3LL)) {
     et = ({ int64_t __rc; struct o_en_parser_Node* _ba940 = args->f_v; rt_borrow_read(_ba940); __rc = o_f_codegen_gty(g, _ba940); rt_unborrow(_ba940); __rc; });
@@ -29189,9 +29197,11 @@ OxlStr o_f_codegen_jcall(struct o_s_codegen_G* g, struct o_en_parser_Node* f, st
     }
     if (((rt_streq(qn, rt_str_lit("mkslice"))) && (args != 0))) {
     int64_t et = ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_check_t_unk }; ((int64_t (*)(void*, struct o_s_check_Ck*))_fv.fp)(_fv.env, g->f_ck); });
-    if ((({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_check_nk }; ((int64_t (*)(void*, struct o_en_parser_Node*))_fv.fp)(_fv.env, args->f_v); }) == 2LL)) {
-    ({ struct o_en_parser_Node* _ms = args->f_v; if ((*_ms).tag == 3) { OxlStr n = (*_ms).u.v3.f_n;     et = ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_check_ty_parse }; ((int64_t (*)(void*, struct o_s_check_Ck*, OxlStr))_fv.fp)(_fv.env, g->f_ck, n); });
-} else { } });
+    if (((({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_check_nk }; ((int64_t (*)(void*, struct o_en_parser_Node*))_fv.fp)(_fv.env, args->f_v); }) == 2LL) || (({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_check_nk }; ((int64_t (*)(void*, struct o_en_parser_Node*))_fv.fp)(_fv.env, args->f_v); }) == 9LL))) {
+    OxlStr an = ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_check_callee_name }; ((OxlStr (*)(void*, struct o_en_parser_Node*))_fv.fp)(_fv.env, args->f_v); });
+    if ((rt_len(an) > 0LL)) {
+    et = ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_check_ty_parse }; ((int64_t (*)(void*, struct o_s_check_Ck*, OxlStr))_fv.fp)(_fv.env, g->f_ck, an); });
+    }
     }
     if ((({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_check_nk }; ((int64_t (*)(void*, struct o_en_parser_Node*))_fv.fp)(_fv.env, args->f_v); }) == 3LL)) {
     et = ({ int64_t __rc; struct o_en_parser_Node* _ba1247 = args->f_v; rt_borrow_read(_ba1247); __rc = o_f_codegen_gty(g, _ba1247); rt_unborrow(_ba1247); __rc; });
@@ -31278,24 +31288,27 @@ int64_t o_f_flag_toks(OxlStr a) {
 struct o_s_PkgArgs o_f_pkg_args(int64_t start) {
     RtDefer *_dmark = rt_defer_mark();
     RtSlice fs = rt_mkslice(0LL, sizeof(OxlStr));
+    int64_t seen_file = 0LL;
     int64_t i = start;
     while (((i < rt_argc()) && (!rt_streq(rt_argv(i), rt_str_lit("--"))))) {
     OxlStr a = rt_argv(i);
-    if (((fs).len == 0LL)) {
     int64_t n = o_f_flag_toks(a);
     if ((n > 0LL)) {
+    if (((n == 2LL) && ((i + 1LL) >= rt_argc()))) {
+    break;
+    }
     i = (i + n);
     continue;
     }
-    }
-    if ((((fs).len == 0LL) && ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_os_isdir }; ((int (*)(void*, OxlStr))_fv.fp)(_fv.env, a); }))) {
+    if (((seen_file == 0LL) && ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_os_isdir }; ((int (*)(void*, OxlStr))_fv.fp)(_fv.env, a); }))) {
     fs = ({ OxlStr _pv = a; rt_slice_push(fs, sizeof(OxlStr), &_pv); });
     i = (i + 1LL);
-    break;
+    continue;
     }
     if ((({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_strings_endswith }; ((int (*)(void*, OxlStr, OxlStr))_fv.fp)(_fv.env, a, rt_str_lit(".oxl")); }) == 0)) {
     break;
     }
+    seen_file = 1LL;
     fs = ({ OxlStr _pv = a; rt_slice_push(fs, sizeof(OxlStr), &_pv); });
     i = (i + 1LL);
     }
@@ -31371,18 +31384,71 @@ int64_t o_f_target_is_js(void) {
     rt_defer_drain_to(_dmark);
 }
 
-struct o_s_PkgSrc o_f_pkg_src(RtSlice fs) {
+struct o_s_PkgList o_f_pkg_srcs(RtSlice fs) {
     RtDefer *_dmark = rt_defer_mark();
-    if ((((fs).len == 1LL) && ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_os_isdir }; ((int (*)(void*, OxlStr))_fv.fp)(_fv.env, (*({ RtSlice _ms = fs; int64_t _mi = 0LL; if (_mi < 0 || _mi >= _ms.len) rt_trap(10); (OxlStr*)_ms.ptr + _mi; }))); }))) {
+    struct o_s_PkgList pl = (struct o_s_PkgList){ .f_ps = rt_mkslice(0LL, sizeof(struct o_s_PkgSrc)), .f_mixed = 0LL };
+    int64_t dirs = 0LL;
+    int64_t i = 0LL;
+    while ((i < (fs).len)) {
+    if (({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_os_isdir }; ((int (*)(void*, OxlStr))_fv.fp)(_fv.env, (*({ RtSlice _ms = fs; int64_t _mi = i; if (_mi < 0 || _mi >= _ms.len) rt_trap(10); (OxlStr*)_ms.ptr + _mi; }))); })) {
+    dirs = (dirs + 1LL);
+    }
+    i = (i + 1LL);
+    }
+    if (((dirs > 0LL) && (dirs < (fs).len))) {
+    pl.f_mixed = 1LL;
     rt_defer_drain_to(_dmark);
-    return (struct o_s_PkgSrc){ .f_dir = (*({ RtSlice _ms = fs; int64_t _mi = 0LL; if (_mi < 0 || _mi >= _ms.len) rt_trap(10); (OxlStr*)_ms.ptr + _mi; })), .f_files = rt_mkslice(0LL, sizeof(OxlStr)) };
+    return pl;
+    }
+    if ((dirs > 0LL)) {
+    i = 0LL;
+    while ((i < (fs).len)) {
+    pl.f_ps = ({ struct o_s_PkgSrc _pv = (struct o_s_PkgSrc){ .f_dir = (*({ RtSlice _ms = fs; int64_t _mi = i; if (_mi < 0 || _mi >= _ms.len) rt_trap(10); (OxlStr*)_ms.ptr + _mi; })), .f_files = rt_mkslice(0LL, sizeof(OxlStr)) }; rt_slice_push(pl.f_ps, sizeof(struct o_s_PkgSrc), &_pv); });
+    i = (i + 1LL);
+    }
+    rt_defer_drain_to(_dmark);
+    return pl;
     }
     if (((fs).len == 0LL)) {
+    pl.f_ps = ({ struct o_s_PkgSrc _pv = (struct o_s_PkgSrc){ .f_dir = rt_str_lit("."), .f_files = rt_mkslice(0LL, sizeof(OxlStr)) }; rt_slice_push(pl.f_ps, sizeof(struct o_s_PkgSrc), &_pv); });
     rt_defer_drain_to(_dmark);
-    return (struct o_s_PkgSrc){ .f_dir = rt_str_lit("."), .f_files = rt_mkslice(0LL, sizeof(OxlStr)) };
+    return pl;
+    }
+    pl.f_ps = ({ struct o_s_PkgSrc _pv = (struct o_s_PkgSrc){ .f_dir = rt_str_lit(""), .f_files = fs }; rt_slice_push(pl.f_ps, sizeof(struct o_s_PkgSrc), &_pv); });
+    rt_defer_drain_to(_dmark);
+    return pl;
+    rt_defer_drain_to(_dmark);
+}
+
+int64_t o_f_stray_args(int64_t argi) {
+    RtDefer *_dmark = rt_defer_mark();
+    int64_t n = 0LL;
+    int64_t dd = 0LL;
+    int64_t i = argi;
+    while ((i < rt_argc())) {
+    OxlStr a = rt_argv(i);
+    if ((dd == 1LL)) {
+    n = (n + 1LL);
+    } else     if ((rt_streq(a, rt_str_lit("--")))) {
+    dd = 1LL;
+    } else {
+    int64_t t = o_f_flag_toks(a);
+    if ((t > 0LL)) {
+    if (((t == 2LL) && ((i + 1LL) >= rt_argc()))) {
+    n = (n + 1LL);
+    break;
+    }
+    i = (i + t);
+    continue;
+    }
+    if ((({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_strings_startswith }; ((int (*)(void*, OxlStr, OxlStr))_fv.fp)(_fv.env, a, rt_str_lit("-")); }) == 0)) {
+    n = (n + 1LL);
+    }
+    }
+    i = (i + 1LL);
     }
     rt_defer_drain_to(_dmark);
-    return (struct o_s_PkgSrc){ .f_dir = rt_str_lit(""), .f_files = fs };
+    return n;
     rt_defer_drain_to(_dmark);
 }
 
@@ -31878,10 +31944,30 @@ OxlStr o_f_out_arg(void) {
     rt_defer_drain_to(_dmark);
 }
 
+struct o_s_PkgSrc o_f_one_pkg(OxlStr cmd, struct o_s_PkgArgs pa) {
+    RtDefer *_dmark = rt_defer_mark();
+    struct o_s_PkgList pl = o_f_pkg_srcs(pa.f_fs);
+    if ((pl.f_mixed == 1LL)) {
+    o_f_eprintln(rt_str_lit("cannot mix package dirs and .oxl file lists — pass dirs or files, not both"));
+    rt_exit(2LL);
+    }
+    if (((pl.f_ps).len != 1LL)) {
+    o_f_eprintln(rt_strcat(rt_strcat(rt_strcat(rt_strcat(rt_str_lit("oxl "), cmd), rt_str_lit(" takes a single package — got ")), rt_itoa((pl.f_ps).len)), rt_str_lit(" dirs")));
+    rt_exit(2LL);
+    }
+    rt_defer_drain_to(_dmark);
+    return (*({ RtSlice _ms = pl.f_ps; int64_t _mi = 0LL; if (_mi < 0 || _mi >= _ms.len) rt_trap(10); (struct o_s_PkgSrc*)_ms.ptr + _mi; }));
+    rt_defer_drain_to(_dmark);
+}
+
 void o_f_cmd_build(void) {
     RtDefer *_dmark = rt_defer_mark();
     struct o_s_PkgArgs pa = o_f_pkg_args(2LL);
-    struct o_s_PkgSrc src = o_f_pkg_src(pa.f_fs);
+    if ((o_f_stray_args(pa.f_argi) > 0LL)) {
+    o_f_eprintln(rt_str_lit("unexpected argument(s) after the package sources"));
+    rt_exit(2LL);
+    }
+    struct o_s_PkgSrc src = o_f_one_pkg(rt_str_lit("build"), pa);
     if ((o_f_target_is_js() == 1LL)) {
     struct o_s_CRes* res = o_f_compile(src);
     if ((res->f_ok == 0LL)) {
@@ -31907,7 +31993,7 @@ void o_f_cmd_build(void) {
 void o_f_cmd_run(void) {
     RtDefer *_dmark = rt_defer_mark();
     struct o_s_PkgArgs pa = o_f_pkg_args(2LL);
-    struct o_s_PkgSrc src = o_f_pkg_src(pa.f_fs);
+    struct o_s_PkgSrc src = o_f_one_pkg(rt_str_lit("run"), pa);
     struct o_s_CRes* res = o_f_compile(src);
     if ((res->f_ok == 0LL)) {
     rt_exit(1LL);
@@ -31974,11 +32060,37 @@ void o_f_cmd_run(void) {
 void o_f_cmd_test(void) {
     RtDefer *_dmark = rt_defer_mark();
     struct o_s_PkgArgs pa = o_f_pkg_args(2LL);
-    struct o_s_PkgSrc src = o_f_pkg_src(pa.f_fs);
+    struct o_s_PkgList pl = o_f_pkg_srcs(pa.f_fs);
+    if ((pl.f_mixed == 1LL)) {
+    o_f_eprintln(rt_str_lit("cannot mix package dirs and .oxl file lists — pass dirs or files, not both"));
+    rt_exit(2LL);
+    }
+    if ((o_f_stray_args(pa.f_argi) > 0LL)) {
+    o_f_eprintln(rt_str_lit("unexpected argument(s) after the package sources"));
+    rt_exit(2LL);
+    }
+    int64_t fails = 0LL;
+    int64_t i = 0LL;
+    while ((i < (pl.f_ps).len)) {
+    struct o_s_PkgSrc src = (*({ RtSlice _ms = pl.f_ps; int64_t _mi = i; if (_mi < 0 || _mi >= _ms.len) rt_trap(10); (struct o_s_PkgSrc*)_ms.ptr + _mi; }));
     struct o_s_CRes* res = o_f_compile_mode(src, 1LL);
-    if ((res->f_ok == 0LL)) {
+    if ((res->f_ok == 1LL)) {
+    if ((o_f_test_one(src, res) != 0LL)) {
+    fails = 1LL;
+    }
+    } else {
+    fails = 1LL;
+    }
+    i = (i + 1LL);
+    }
+    if ((fails == 1LL)) {
     rt_exit(1LL);
     }
+    rt_defer_drain_to(_dmark);
+}
+
+int64_t o_f_test_one(struct o_s_PkgSrc src, struct o_s_CRes* res) {
+    RtDefer *_dmark = rt_defer_mark();
     OxlStr dir = o_f_mk_scratch_dir(rt_str_lit("oxl-test"));
     if ((rt_len(dir) == 0LL)) {
     rt_exit(1LL);
@@ -31987,7 +32099,9 @@ void o_f_cmd_test(void) {
     if ((o_f_target_is_js() == 1LL)) {
     out = rt_strcat(dir, rt_str_lit("/out.mjs"));
     if ((o_f_emit_and_js(res->f_c, out, o_f_entry_dir(src)) == 0LL)) {
-    rt_exit(1LL);
+    ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_os_remove_all }; ((int64_t (*)(void*, OxlStr))_fv.fp)(_fv.env, dir); });
+    rt_defer_drain_to(_dmark);
+    return 1LL;
     }
     RtSlice nargs = rt_mkslice(0LL, sizeof(OxlStr));
     nargs = ({ OxlStr _pv = out; rt_slice_push(nargs, sizeof(OxlStr), &_pv); });
@@ -31999,17 +32113,21 @@ void o_f_cmd_test(void) {
     o_f_eprintln(rt_strcat(rt_str_lit("node exec failed: "), ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_errors_msg }; ((OxlStr (*)(void*, int64_t))_fv.fp)(_fv.env, e); })));
     }
     ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_os_remove_all }; ((int64_t (*)(void*, OxlStr))_fv.fp)(_fv.env, dir); });
-    rt_exit(o_f_child_code(st, e));
+    rt_defer_drain_to(_dmark);
+    return o_f_child_code(st, e);
     }
     if ((o_f_emit_and_cc(res->f_c, out, o_f_entry_dir(src)) == 0LL)) {
-    rt_exit(1LL);
+    ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_os_remove_all }; ((int64_t (*)(void*, OxlStr))_fv.fp)(_fv.env, dir); });
+    rt_defer_drain_to(_dmark);
+    return 1LL;
     }
     struct o_s_exec_Cmd child = ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_exec_cmd }; ((struct o_s_exec_Cmd (*)(void*, OxlStr, RtSlice))_fv.fp)(_fv.env, out, rt_mkslice(0LL, sizeof(OxlStr))); });
     struct o_ret_exec_Cmd_run _r1469 = o_f_exec_Cmd_run(child);
     int64_t st = _r1469.val;
     int64_t e = _r1469.err;
     ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_os_remove_all }; ((int64_t (*)(void*, OxlStr))_fv.fp)(_fv.env, dir); });
-    rt_exit(o_f_child_code(st, e));
+    rt_defer_drain_to(_dmark);
+    return o_f_child_code(st, e);
     rt_defer_drain_to(_dmark);
 }
 

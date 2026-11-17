@@ -20,9 +20,36 @@ fn readfile_(path: str) -> str {
     return readfile(path)
 }
 
-/// write an entire file (truncates); 0 ok, -1 on error
+/// write an entire file (truncates); bytes written on success,
+/// negative errno on error — including a deferred close(2) failure
+/// after a full write (the data may not be durable; the count is
+/// lost with the error, same contract as File.close). Declared
+/// before the fd externs — oxl resolves module fns regardless of
+/// order.
 fn writefile_(path: str, data: str) -> int {
-    return writefile(path, data)
+    fd := rt_open_write(path)
+    if fd < 0 {
+        return fd
+    }
+    b := data as []byte
+    off := 0
+    for off < len(b) {
+        n := rt_fd_write(fd, b[off:])
+        if n <= 0 {
+            c := n
+            if c == 0 {
+                c = -5 // a zero write on nonempty input is EIO
+            }
+            rt_fd_close(fd)
+            return c
+        }
+        off = off + n
+    }
+    r := rt_fd_close(fd)
+    if r < 0 {
+        return r
+    }
+    return off
 }
 
 /// exit the process with code

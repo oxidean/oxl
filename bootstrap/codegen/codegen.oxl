@@ -1092,13 +1092,12 @@ fn xty_call(g: mut G, f: ref parser.Node, args: ref parser.NList) -> int {
         et := check.t_unk(g.ck)
         if args != nil {
             a := args.v
-            if check.nk(a) == 2 {
-                match a {
-                    parser.Node.Name{n} => {
-                        et = check.ty_parse(g.ck, n)
-                    }
-                    _ => {
-                    }
+            // qualified `pkg.T` arrives as Node.Field — flatten to the
+            // dotted path before ty_parse (same as the checker's arm)
+            if check.nk(a) == 2 || check.nk(a) == 9 {
+                an := check.callee_name(a)
+                if len(an) > 0 {
+                    et = check.ty_parse(g.ck, an)
                 }
             }
             if check.nk(a) == 3 {
@@ -2887,13 +2886,10 @@ fn gcall(g: mut G, f: ref parser.Node, args: ref parser.NList) -> str {
     }
     if qn == "mkslice" && args != nil {
         et := check.t_unk(g.ck)
-        if check.nk(args.v) == 2 {
-            match args.v {
-                parser.Node.Name{n} => {
-                    et = check.ty_parse(g.ck, n)
-                }
-                _ => {
-                }
+        if check.nk(args.v) == 2 || check.nk(args.v) == 9 {
+            an := check.callee_name(args.v)
+            if len(an) > 0 {
+                et = check.ty_parse(g.ck, an)
             }
         }
         if check.nk(args.v) == 3 {

@@ -119,6 +119,10 @@ the typechecker proves safety).
 - Dropping a non-`nil` second return value (`err`) silently is a compile
   error. `_` may discard a *value*, never an error.
 - `ref`/`mut` borrows may not be stored in heap objects (v0 restriction;
-  keeps the escape analysis trivial).
+  keeps the escape analysis trivial). Interface-boxed `ref`/`mut`
+  receivers are the load-bearing exception today — an `RtIface`
+  holding a borrow pointer aliases the lender and dangles if the
+  lender's scope ends (see methods.md); escape analysis for iface
+  values is open work.
 - Arena references may not cross a `spawn` boundary — only `own` and
   values may be sent/captured.

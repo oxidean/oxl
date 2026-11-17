@@ -467,6 +467,7 @@ jobs:
     permissions:
       contents: write   # gh release upload
       id-token: write   # Open VSX trusted publishing (OIDC) fallback
+      packages: write   # npm publish @oxidean/shiki-oxl to GitHub Packages
     steps:
       - uses: actions/checkout@v7
         with:
@@ -504,6 +505,17 @@ jobs:
           # fixed names — releases/latest/download/<name> stays stable
           cp editors/vscode/dist/oxl-language.vsix dist/oxl-language.vsix
           cp editors/sublime/oxl.sublime-syntax dist/oxl.sublime-syntax
+      - name: pack shiki-oxl
+        env:
+          TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          set -eu
+          cd editors/grammars
+          # version tracks the release tag, same trick as the vsix
+          VER="${TAG#v}" node -e 'const fs=require("fs");const p="package.json";const j=JSON.parse(fs.readFileSync(p,"utf8"));j.version=process.env.VER;fs.writeFileSync(p,JSON.stringify(j,null,2)+"\n")'
+          npm pack --pack-destination ../../dist
+          # fixed name — releases/latest/download/shiki-oxl.tgz stays stable
+          cp "../../dist/oxidean-shiki-oxl-${TAG#v}.tgz" ../../dist/shiki-oxl.tgz
       - name: upload release assets
         env:
           GH_TOKEN: ${{ github.token }}
@@ -522,7 +534,27 @@ jobs:
             dist/oxl-editor-assets.tar.gz \
             dist/oxl-editor-assets.tar.gz.sha256 \
             dist/oxl.sublime-syntax \
+            "dist/oxidean-shiki-oxl-${TAG#v}.tgz" \
+            dist/shiki-oxl.tgz \
             --clobber
+      - name: publish shiki-oxl to GitHub Packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          set -eu
+          cd editors/grammars
+          # package.json was stamped by the pack step; publishConfig.registry
+          # + .npmrc route this to npm.pkg.github.com. Hard fail on error —
+          # GITHUB_TOKEN + packages:write are always present in this job.
+          # Idempotent across re-runs: skip when the version already exists.
+          VER="${TAG#v}"
+          if npm view --registry=https://npm.pkg.github.com \
+              "@oxidean/shiki-oxl@$VER" version >/dev/null 2>&1; then
+            echo "@oxidean/shiki-oxl@$VER already published — skipping"
+            exit 0
+          fi
+          npm publish
       - name: mirror nvim-oxl
         env:
           MIRROR_TOKEN: ${{ secrets.OXLEDITOR_MIRROR_TOKEN }}

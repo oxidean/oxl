@@ -2698,6 +2698,26 @@ if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1 \
     echo "vscode extension bundle ok"
 fi
 
+# shiki-oxl package: manifest must keep name/registry/exports stable;
+# npm pack must ship exactly the grammar + loader + readme (soft-skip
+# without node/npm like the vscode block above)
+if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
+    node -e 'const j=require("./editors/grammars/package.json");
+        if (j.name !== "@oxidean/shiki-oxl") process.exit(1);
+        if (j.publishConfig.registry !== "https://npm.pkg.github.com") process.exit(1);
+        if (!j.exports["."] || !j.exports["./grammar.json"]) process.exit(1);
+        for (const f of ["index.mjs", "oxl.tmLanguage.json", "README.md"])
+            if (!j.files.includes(f)) process.exit(1);'
+    packout=$(cd editors/grammars && npm pack --dry-run 2>&1)
+    for f in index.mjs oxl.tmLanguage.json README.md package.json; do
+        grep -q "$f" <<<"$packout" || { echo "FAIL shiki-oxl pack missing $f"; exit 1; }
+    done
+    node --input-type=module -e 'import g from "./editors/grammars/index.mjs";
+        if (g.name !== "oxl" || g.scopeName !== "source.oxl") process.exit(1);
+        if (!Array.isArray(g.patterns)) process.exit(1);'
+    echo "shiki-oxl package ok"
+fi
+
 # install-editor.sh — offline file:// release fixture (POSIX-gated like
 # the install.sh pipeline: native curl can't open file:// on Windows)
 case "$(uname -s)" in

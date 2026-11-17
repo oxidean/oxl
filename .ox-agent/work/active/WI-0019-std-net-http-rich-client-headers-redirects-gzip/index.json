@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "id": "WI-0017",
+  "id": "WI-0019",
   "title": "std/net/http rich client: headers, redirects, gzip, auth, proxy (issue #127)",
   "state": "intake",
   "profile": "normal",

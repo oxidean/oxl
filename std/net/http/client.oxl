@@ -156,6 +156,10 @@ fn no_proxy_match(list: str, host: str) -> bool {
             hi = hi - 1
         }
         ent = substr(ent, lo, hi)
+        // "*" disables proxying for every host (curl convention)
+        if ent == "*" {
+            return true
+        }
         // "example.com:8080" matches on the host part; a leading "."
         // is cosmetic — entries match the domain and its subdomains
         ci := find(ent, ":")
@@ -198,15 +202,33 @@ fn managed_header(name: str) -> bool {
     return n == "host" || n == "content-length" || n == "connection" || n == "transfer-encoding" || n == "keep-alive" || n == "upgrade" || n == "te" || n == "trailer" || n == "proxy-authorization" || n == "proxy-connection"
 }
 
-/// header_value_ok rejects CR/LF in name or value — header injection
-/// is a request-smuggling primitive, not a formatting choice
+/// is_tchar — RFC 7230 token characters: ALPHA / DIGIT and
+/// `!#$%&'*+-.^_`|~`. Separators like `:`, `,`, `;`, `=`, `@` are NOT
+/// token chars — admitting them lets `a:b` smuggle a renamed header
+/// onto the wire.
+fn is_tchar(b: int) -> bool {
+    if b >= 48 && b <= 57 {
+        return true
+    }
+    if b >= 65 && b <= 90 {
+        return true
+    }
+    if b >= 97 && b <= 122 {
+        return true
+    }
+    return b == 33 || b == 35 || b == 36 || b == 37 || b == 38 || b == 39 || b == 42 || b == 43 || b == 45 || b == 46 || b == 94 || b == 95 || b == 96 || b == 124 || b == 126
+}
+
+/// header_value_ok rejects non-token names and CR/LF in values —
+/// header injection is a request-smuggling primitive, not a
+/// formatting choice
 fn header_value_ok(name: str, value: str) -> bool {
+    if len(name) == 0 {
+        return false
+    }
     i := 0
     for i < len(name) {
-        b := byteat(name, i)
-        // a name is an RFC token — anything outside 33-126 (SP, HTAB,
-        // CTLs, obs-text) invites obs-fold smuggling
-        if b < 33 || b > 126 {
+        if is_tchar(byteat(name, i)) == false {
             return false
         }
         i = i + 1
@@ -240,7 +262,9 @@ fn resolve_location(base: str, loc: str) -> [str, err] {
     }
     ll := lwr(loc)
     if len(ll) >= 7 && substr(ll, 0, 7) == "http://" {
-        return loc, nil
+        // normalize the scheme — parse_url's prefix check is
+        // case-sensitive and "HTTP://x" would fail downstream
+        return "http:" + substr(loc, 5, len(loc)), nil
     }
     if len(ll) >= 8 && substr(ll, 0, 8) == "https://" {
         return "", errors.new("http: redirect to https unsupported (no TLS)")
@@ -252,9 +276,20 @@ fn resolve_location(base: str, loc: str) -> [str, err] {
     if byteat(loc, 0) == 47 {
         return scheme + loc, nil
     }
-    if byteat(loc, 0) == 63 || byteat(loc, 0) == 35 {
-        // "?q" / "#f" references resolve against the base path itself
-        return scheme + bu.path + loc, nil
+    if byteat(loc, 0) == 63 {
+        // "?q" replaces the base query outright (RFC 3986 5.2.2) —
+        // appending to bu.path would emit "/p?x=1?y=2"
+        bq := find(bu.path, "?")
+        base := bu.path
+        if bq >= 0 {
+            base = substr(bu.path, 0, bq)
+        }
+        return scheme + base + loc, nil
+    }
+    if byteat(loc, 0) == 35 {
+        // "#f" is the same document — fragments never reach the wire,
+        // so the resolved URL is just the base
+        return scheme + bu.path, nil
     }
     // relative path — merge against the base's directory (the path
     // up to and including its LAST slash, per RFC 3986 5.2)
@@ -682,6 +717,10 @@ fn (cl ref Client) do_once(req: Request) -> [Response, err] {
                 if !has_cl {
                     clv = hs[i].value
                     has_cl = true
+                } else if hs[i].value != clv {
+                    // conflicting duplicates desync framing (CWE-444) —
+                    // identical repeats consolidate, differing ones err
+                    return bad, errors.new("http: conflicting content-length")
                 }
             }
             i = i + 1
@@ -693,6 +732,11 @@ fn (cl ref Client) do_once(req: Request) -> [Response, err] {
                 return bad, errors.new("http: empty content-length")
             }
         } else {
+            // atoi wraps on overflow — a 20-digit value can land on a
+            // small positive count; real bodies never need >18 digits
+            if len(clv) > 18 {
+                return bad, errors.new("http: bad content-length " + clv)
+            }
             [cln, cle] = strconv.atoi(clv)
             if cle != nil || cln < 0 {
                 return bad, errors.new("http: bad content-length " + clv)
@@ -731,9 +775,9 @@ fn (cl ref Client) do_once(req: Request) -> [Response, err] {
 
 /// do runs req through the redirect policy — each hop is a fresh
 /// do_once exchange; the loop is bounded by redirects (0 = never
-/// follow, the legacy behavior). A redirect without Location, or one
-/// that fails to resolve, is delivered as the final response/err —
-/// the caller sees exactly what the wire said.
+/// follow, the legacy behavior). A redirect without Location is
+/// delivered as the final response; one that fails to resolve
+/// returns the err — the caller sees exactly what the wire said.
 fn (cl ref Client) do(req: Request) -> [Response, err] {
     bad := Response{status: 0, reason: "", headers: mkslice(Header, 0), body: "", ctype: "", chunked: false, trailers: mkslice(Header, 0)}
     cur := req

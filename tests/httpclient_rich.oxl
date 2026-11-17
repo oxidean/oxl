@@ -125,6 +125,23 @@ fn fake_server() {
             resp = "HTTP/1.1 302 Found\r\nlocation: /who\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
         } else if path == "/r303" {
             resp = "HTTP/1.1 303 See Other\r\nlocation: /who\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+        } else if path == "/r307" {
+            resp = "HTTP/1.1 307 Temporary Redirect\r\nlocation: /who\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+        } else if find(path, "/qredir") == 0 && find(path, "y=2") < 0 {
+            // query-only Location — must REPLACE the base query, not
+            // append a second '?'; the resolved hop carries y=2 and
+            // falls through to the echo branch
+            resp = "HTTP/1.1 302 Found\r\nlocation: ?y=2\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+        } else if path == "/fredir" {
+            // fragment-only Location — resolves to the same document
+            resp = "HTTP/1.1 302 Found\r\nlocation: #top\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+        } else if path == "/sredir" {
+            // uppercase scheme — the absolute-URI check is
+            // case-insensitive but parse_url's isn't
+            resp = "HTTP/1.1 302 Found\r\nlocation: HTTP://127.0.0.1:" + itoa(PORT) + "/who\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+        } else if path == "/cldup" {
+            // conflicting content-length duplicates — framing desync
+            resp = "HTTP/1.1 200 OK\r\ncontent-length: 5\r\ncontent-length: 6\r\nconnection: close\r\n\r\nhello!"
         } else if path == "/chunked" {
             resp = "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\nx-note: chunked-resp\r\n\r\n" + "5\r\nhello\r\n6\r\n world\r\n0\r\nx-trailer: yes\r\n\r\n"
         } else if path == "/gzip" {
@@ -243,6 +260,55 @@ fn main() {
     // traffic regardless of the claimed origin
     ck(e11, "proxy request")
     expect(find(r11.body, "GET http://example.invalid/hdrcheck HTTP/1.1") >= 0, "absolute-URI request target via proxy got " + substr(r11.body, 0, 60))
+
+    // -- redirect resolution edge cases ------------------------------
+    // query-only Location replaces the base query (RFC 3986 5.2.2)
+    [rq6, e6b] = get_retry(cl, base + "/qredir?x=1")
+    ck(e6b, "qredir")
+    // the resolved hop /qredir?y=2 falls to the echo branch — the
+    // request-target must carry y=2 and never a doubled '?'
+    expect(find(rq6.body, "/qredir?y=2") >= 0, "query redirect got " + rq6.body)
+    expect(find(rq6.body, "x=1") < 0, "base query replaced")
+
+    // fragment-only Location resolves to the same document — the
+    // redirect loops until the budget ends it at a delivered 302
+    [rq7, e7b] = get_retry(cl, base + "/fredir")
+    ck(e7b, "fredir")
+    expect(rq7.status == 302, "fragment redirect loops to budget")
+
+    // uppercase scheme in an absolute Location still resolves
+    [rq8, e8b] = get_retry(cl, base + "/sredir")
+    ck(e8b, "sredir")
+    expect(rq8.status == 200, "uppercase scheme redirect")
+
+    // fragments never reach the wire — request-target has no '#'
+    rq9 := http.request_get(base + "/frag#section")
+    [rq10, e10b] = cl.do(rq9)
+    ck(e10b, "frag")
+    expect(find(rq10.body, "#section") < 0, "fragment stripped from wire")
+
+    // 307 preserves method + body (the risky path)
+    rq11 := http.request_post(base + "/r307", "text/plain", "payload")
+    [rq12, e11b] = cl.do(rq11)
+    ck(e11b, "r307")
+    expect(rq12.status == 200, "r307 final 200")
+    expect(find(rq12.body, "method=POST") >= 0, "307 preserves POST got " + rq12.body)
+
+    // conflicting content-length duplicates are a framing error
+    [_rq13, e12b] = get_retry(cl, base + "/cldup")
+    expect(e12b != nil, "conflicting content-length rejected")
+
+    // header names must be RFC tokens — 'a:b' would rename on the wire
+    rq14 := http.request_get(base + "/hdrcheck")
+    rq14.headers = push(rq14.headers, http.Header{name: "a:b", value: "v"})
+    [_rq15, e13b] = cl.do(rq14)
+    expect(e13b != nil, "non-token header name rejected")
+
+    // NO_PROXY=* matches every host
+    expect(http.no_proxy_match("*", "anything.example"), "NO_PROXY * matches")
+    expect(http.no_proxy_match(".internal", "a.internal"), "subdomain match")
+    nm := http.no_proxy_match(".internal", "b.other")
+    expect(nm == false, "non-match")
 
     println("httpclient rich done")
     exit(0)

@@ -388,6 +388,11 @@ fn parse_url(url: str) -> [Url, err] {
     if len(u) == 0 {
         return bad, errors.new("http: empty url")
     }
+    // a fragment is client-side only — never part of the request-target
+    frag := find(u, "#")
+    if frag >= 0 {
+        u = substr(u, 0, frag)
+    }
     slash := find(u, "/")
     hostport := u
     path := "/"

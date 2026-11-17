@@ -68,7 +68,7 @@ fn raw(fd: int) -> [Raw, err] {
 
 /// restore returns the terminal to the mode raw() captured. Safe to
 /// call once; the handle is consumed either way.
-fn (r ref Raw) restore() -> err {
+fn (r mut Raw) restore() -> err {
     if r.handle == 0 {
         return nil
     }

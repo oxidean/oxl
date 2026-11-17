@@ -360,13 +360,33 @@ case "$(uname -s)" in
 MINGW*|MSYS*|CYGWIN*) ;;
 *)
     if command -v script >/dev/null 2>&1; then
-        pout=$(script -qefc "stty rows 24 cols 80; \"$OXL\" run tests/term_probe.oxl" /dev/null 2>/dev/null | tr -d '\r')
+        # script(1) differs: util-linux wants -c, BSD/macOS takes the
+        # command as trailing argv. || true keeps set -e from eating
+        # the diagnostic below
+        case "$(uname -s)" in
+        Darwin)
+            pout=$(script -q /dev/null sh -c 'stty rows 24 cols 80; "'"$OXL"'" run tests/term_probe.oxl' 2>/dev/null | tr -d '\r') || true ;;
+        *)
+            pout=$(script -qefc "stty rows 24 cols 80; \"$OXL\" run tests/term_probe.oxl" /dev/null 2>/dev/null | tr -d '\r') || true ;;
+        esac
+        grep -q "term probe ok" <<<"$pout" || { echo "FAIL term probe: $pout"; exit 1; }
         grep -q "term probe ok" <<<"$pout" || { echo "FAIL term probe: $pout"; exit 1; }
     fi
     "$OXL" build tests/sigusr1_wait.oxl -o "$scratch/sigusr1$EXE"         || { echo "FAIL sigusr1 build"; exit 1; }
     "$scratch/sigusr1$EXE" > "$scratch/sigusr1.out" 2>&1 &
     sigpid=$!
-    sleep 1
+    # the child prints "armed" once signal.arm returns — poll for it
+    # rather than racing a fixed sleep on slow CI runners
+    armed=0
+    tries=0
+    while [ "$armed" -eq 0 ] && [ "$tries" -lt 100 ]; do
+        if grep -q "^armed" "$scratch/sigusr1.out" 2>/dev/null; then
+            armed=1
+        else
+            sleep 0.05
+            tries=$((tries + 1))
+        fi
+    done
     kill -USR1 "$sigpid" 2>/dev/null || true
     src=0
     wait "$sigpid" || src=$?

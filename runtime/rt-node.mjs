@@ -77,6 +77,11 @@ function sig_disarm(name) {
   const no = sig_lookup(name)
   if (no < 0n) return no
   delete sigFlags[no]
+  sigArmed.delete(name)
+  // removing the last listener restores node's default disposition —
+  // without this a disarmed SIGINT/SIGTERM can no longer kill the
+  // process and a late delivery would still set the flag
+  try { process.removeAllListeners(name) } catch {}
   return 0n
 }
 
@@ -197,7 +202,7 @@ export function install(api) {
       try {
         const [w, h] = tty.getWindowSize(Number(fd))
         return (BigInt(w) << 32n) | BigInt(h >>> 0)
-      } catch { return -25n } // ENOTTY
+      } catch (e) { return e && e.code === 'EBADF' ? -9n : -25n } // EBADF / ENOTTY
     },
     // node exposes no termios on arbitrary fds — honest ENOSYS rather
     // than a stdin-only shim that would silently mis-handle fd != 0

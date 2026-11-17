@@ -10,6 +10,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { execFileSync, spawnSync } from 'node:child_process'
 import os from 'node:os'
+import tty from 'node:tty'
 
 let S = null // {u8,off,len} helpers from rt.mjs
 const enc = new TextEncoder()
@@ -42,6 +43,59 @@ function trap21() {
   // rt_trap_native: full scope-marking machinery inside the scheduler,
   // the checked __oxl_trap sentinel outside it (stub/test contexts)
   return S.rt_trap_native(21n)
+}
+
+/* signal observation — process.on delivers the platform's catchable
+ * set; os.constants.signals is the honest name->number map (unknown
+ * names surface as EINVAL, matching rt.c's lookup contract). */
+const sigFlags = {}
+const sigListeners = {}
+
+function sig_lookup(name) {
+  // SIGKILL/SIGSTOP can't be caught on any platform — same EINVAL the
+  // native sigaction path returns for them
+  if (name === 'SIGKILL' || name === 'SIGSTOP') return -22n
+  const no = os.constants.signals[name]
+  return no === undefined ? -22n : BigInt(no) // EINVAL on unknown
+}
+
+function sig_arm(name) {
+  const no = sig_lookup(name)
+  if (no < 0n) return no
+  if (!sigListeners[name]) {
+    const fn = () => { sigFlags[no] = 1 }
+    try {
+      process.on(name, fn)
+      sigListeners[name] = fn
+    } catch {
+      return -38n // ENOSYS — platform can't deliver this signal
+    }
+  }
+  return 0n
+}
+
+function sig_disarm(name) {
+  const no = sig_lookup(name)
+  if (no < 0n) return no
+  delete sigFlags[no]
+  // remove only the listener arm() installed — removeAllListeners
+  // would also strip handlers owned by the embedding JS
+  const fn = sigListeners[name]
+  delete sigListeners[name]
+  if (fn) {
+    try { process.off(name, fn) } catch {}
+  }
+  return 0n
+}
+
+function sig_take(name) {
+  const no = sig_lookup(name)
+  if (no < 0n) return no
+  if (sigFlags[no]) {
+    delete sigFlags[no]
+    return 1n
+  }
+  return 0n
 }
 
 export function install(api) {
@@ -144,6 +198,22 @@ export function install(api) {
     rt_fd_close: (fd) => {
       try { fs.closeSync(Number(fd)); return 0n } catch (e) { return neg_errno(e) }
     },
+    rt_isatty: (fd) => {
+      try { return fs.fstatSync(Number(fd)).isTTY() ? 1n : 0n } catch { return 0n }
+    },
+    rt_term_size: (fd) => {
+      try {
+        const [w, h] = tty.getWindowSize(Number(fd))
+        return (BigInt(w) << 32n) | BigInt(h >>> 0)
+      } catch (e) { return e && e.code === 'EBADF' ? -9n : -25n } // EBADF / ENOTTY
+    },
+    // node exposes no termios on arbitrary fds — honest ENOSYS rather
+    // than a stdin-only shim that would silently mis-handle fd != 0
+    rt_term_raw: () => -38n,
+    rt_term_restore: () => -38n,
+    rt_signal_arm: (name) => sig_arm(js_of_s(name)),
+    rt_signal_disarm: (name) => sig_disarm(js_of_s(name)),
+    rt_signal_take: (name) => sig_take(js_of_s(name)),
     rt_remove: (p) => {
       try {
         const st = fs.lstatSync(path_of(p))

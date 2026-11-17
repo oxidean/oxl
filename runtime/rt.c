@@ -25,6 +25,10 @@
 #include <unistd.h>
 #endif
 #include <sys/stat.h>
+#ifndef _WIN32
+#include <sys/ioctl.h>
+#include <termios.h>
+#endif
 #if defined(__APPLE__)
 #include <mach-o/dyld.h>
 #endif
@@ -3096,6 +3100,262 @@ int64_t rt_fd_close(int64_t fd) {
     int r = close((int)fd);
 #endif
     return r < 0 ? -(int64_t)errno : 0;
+}
+
+/* --- terminal probes + raw mode ---
+ * isatty/size/raw are the TUI substrate: character-at-a-time stdin
+ * without echo, window dimensions, and a restore handle so a crash
+ * path can still hand the terminal back. rt_term_raw returns an
+ * opaque heap handle the caller MUST pass back to rt_term_restore —
+ * the saved attributes can't live in a static because nested or
+ * multi-fd raw sessions would clobber each other. */
+int64_t rt_isatty(int64_t fd) {
+#ifdef _WIN32
+    return _isatty((int)fd) ? 1 : 0;
+#else
+    return isatty((int)fd) ? 1 : 0;
+#endif
+}
+
+/* packed (w << 32) | h — a tty is at most a few hundred cells on an
+ * axis, and a single int return keeps the extern signature flat.
+ * -errno on failure (ENOTTY when fd isn't a terminal). */
+int64_t rt_term_size(int64_t fd) {
+#ifdef _WIN32
+    HANDLE h = (HANDLE)_get_osfhandle((int)fd);
+    CONSOLE_SCREEN_BUFFER_INFO ci;
+    if (h == INVALID_HANDLE_VALUE || !GetConsoleScreenBufferInfo(h, &ci))
+        return -(int64_t)ENOTTY;
+    int64_t w = ci.srWindow.Right - ci.srWindow.Left + 1;
+    int64_t hh = ci.srWindow.Bottom - ci.srWindow.Top + 1;
+    return (w << 32) | (uint32_t)hh;
+#else
+    struct winsize ws;
+    if (ioctl((int)fd, TIOCGWINSZ, &ws) != 0) return -(int64_t)errno;
+    return ((int64_t)ws.ws_col << 32) | (uint32_t)ws.ws_row;
+#endif
+}
+
+int64_t rt_term_raw(int64_t fd) {
+#ifdef _WIN32
+    /* console "raw" = no line buffering, no echo; processed output
+     * stays so ANSI still renders. The saved mode rides in the same
+     * heap slot shape as the POSIX termios pointer. */
+    HANDLE h = (HANDLE)_get_osfhandle((int)fd);
+    DWORD *old = (DWORD *)malloc(sizeof(DWORD));
+    if (!old) return -(int64_t)ENOMEM;
+    DWORD mode;
+    if (h == INVALID_HANDLE_VALUE || !GetConsoleMode(h, &mode)) {
+        free(old);
+        return -(int64_t)ENOTTY;
+    }
+    *old = mode;
+    DWORD raw = mode & ~(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT);
+    if (!SetConsoleMode(h, raw)) {
+        free(old);
+        return -(int64_t)ENOTTY;
+    }
+    return (int64_t)(intptr_t)old;
+#else
+    struct termios *ts = (struct termios *)malloc(sizeof(struct termios));
+    if (!ts) return -(int64_t)ENOMEM;
+    if (tcgetattr((int)fd, ts) != 0) {
+        int e = errno;
+        free(ts);
+        return -(int64_t)e;
+    }
+    struct termios raw = *ts;
+    cfmakeraw(&raw);
+    if (tcsetattr((int)fd, TCSANOW, &raw) != 0) {
+        int e = errno;
+        free(ts);
+        return -(int64_t)e;
+    }
+    return (int64_t)(intptr_t)ts;
+#endif
+}
+
+int64_t rt_term_restore(int64_t fd, int64_t handle) {
+    if (handle == 0) return -(int64_t)EINVAL;
+#ifdef _WIN32
+    HANDLE h = (HANDLE)_get_osfhandle((int)fd);
+    DWORD *old = (DWORD *)(intptr_t)handle;
+    int r = 0;
+    if (h == INVALID_HANDLE_VALUE || !SetConsoleMode(h, *old))
+        r = ENOTTY;
+    free(old);
+    return r ? -(int64_t)r : 0;
+#else
+    struct termios *ts = (struct termios *)(intptr_t)handle;
+    int r = tcsetattr((int)fd, TCSANOW, ts);
+    int e = errno;
+    free(ts);
+    return r != 0 ? -(int64_t)e : 0;
+#endif
+}
+
+/* --- process signal observation ---
+ * Minimal poll model: arm(name) installs a flag-setting handler,
+ * take(name) reads-and-clears. The handler only writes a
+ * sig_atomic_t — POSIX-async-signal-safe by construction. Names
+ * resolve through the platform's own SIG* constants so Linux/macOS
+ * numbering differences never reach .oxl code. SIGKILL/SIGSTOP can't
+ * be caught — sigaction fails EINVAL and the error propagates. */
+#if defined(_NSIG)
+#define OXL_NSIG _NSIG
+#elif defined(NSIG)
+#define OXL_NSIG NSIG
+#else
+#define OXL_NSIG 65
+#endif
+
+static volatile sig_atomic_t oxl_sig_flags[OXL_NSIG];
+
+#ifdef _WIN32
+/* per-signo armed mask — one shared console handler covers every
+ * armable name, so the handler must decline events whose signal isn't
+ * armed (return FALSE -> the OS default disposition still applies).
+ * Without the mask, arming SIGTERM would leave Ctrl+C permanently
+ * swallowed and disarm could never restore default behavior. */
+static volatile sig_atomic_t oxl_sig_armed[OXL_NSIG];
+#endif
+
+static void oxl_sig_flag_handler(int signo) {
+    if (signo > 0 && signo < OXL_NSIG) oxl_sig_flags[signo] = 1;
+}
+
+#ifdef _WIN32
+/* console control events are the only signal-like input Windows
+ * offers: CTRL_C -> SIGINT, CTRL_BREAK -> SIGBREAK, close/logoff/
+ * shutdown -> SIGTERM so a TUI can still restore the terminal. The
+ * handler runs on a new thread under the CRT — flag writes stay
+ * atomic. */
+static BOOL WINAPI oxl_win_ctrl_handler(DWORD ev) {
+    int signo = 0;
+    switch (ev) {
+    case CTRL_C_EVENT: signo = 2; break;
+    case CTRL_BREAK_EVENT: signo = 21; break;
+    case CTRL_CLOSE_EVENT:
+    case CTRL_LOGOFF_EVENT:
+    case CTRL_SHUTDOWN_EVENT: signo = 15; break;
+    default: return FALSE;
+    }
+    if (signo <= 0 || signo >= OXL_NSIG || !oxl_sig_armed[signo])
+        return FALSE;
+    oxl_sig_flags[signo] = 1;
+    return TRUE;
+}
+#endif
+
+static int64_t oxl_sig_lookup(OxlStr name, int *signo) {
+    static const struct { const char *name; int signo; } tab[] = {
+#ifdef _WIN32
+        { "SIGINT", 2 }, { "SIGTERM", 15 }, { "SIGBREAK", 21 },
+#else
+        { "SIGHUP", SIGHUP }, { "SIGINT", SIGINT },
+        { "SIGQUIT", SIGQUIT }, { "SIGILL", SIGILL },
+        { "SIGTRAP", SIGTRAP }, { "SIGABRT", SIGABRT },
+        { "SIGBUS", SIGBUS }, { "SIGFPE", SIGFPE },
+        { "SIGKILL", SIGKILL }, { "SIGUSR1", SIGUSR1 },
+        { "SIGSEGV", SIGSEGV }, { "SIGUSR2", SIGUSR2 },
+        { "SIGPIPE", SIGPIPE }, { "SIGALRM", SIGALRM },
+        { "SIGTERM", SIGTERM }, { "SIGCHLD", SIGCHLD },
+        { "SIGCONT", SIGCONT }, { "SIGSTOP", SIGSTOP },
+        { "SIGTSTP", SIGTSTP }, { "SIGTTIN", SIGTTIN },
+        { "SIGTTOU", SIGTTOU }, { "SIGURG", SIGURG },
+        { "SIGXCPU", SIGXCPU }, { "SIGXFSZ", SIGXFSZ },
+        { "SIGVTALRM", SIGVTALRM }, { "SIGPROF", SIGPROF },
+        { "SIGWINCH", SIGWINCH }, { "SIGIO", SIGIO },
+        { "SIGSYS", SIGSYS },
+#endif
+        { NULL, 0 }
+    };
+    if (name.n > 0 && memchr(name.p, 0, (size_t)name.n)) return -EINVAL;
+    char buf[16];
+    if (name.n <= 0 || name.n >= (int64_t)sizeof(buf)) return -EINVAL;
+    memcpy(buf, name.p, (size_t)name.n);
+    buf[name.n] = 0;
+    for (int i = 0; tab[i].name; i++) {
+        if (strcmp(buf, tab[i].name) == 0) {
+            *signo = tab[i].signo;
+            return 0;
+        }
+    }
+    return -EINVAL;
+}
+
+int64_t rt_signal_arm(OxlStr name) {
+    int signo;
+    int64_t r = oxl_sig_lookup(name, &signo);
+    if (r != 0) return r;
+#ifdef _WIN32
+    /* one process-wide handler covers every armable name — the armed
+     * mask is what disambiguates. Mark armed before installing so a
+     * delivery racing the install can't be declined. Re-arming is
+     * idempotent. */
+    oxl_sig_armed[signo] = 1;
+    if (!SetConsoleCtrlHandler(oxl_win_ctrl_handler, TRUE)) {
+        oxl_sig_armed[signo] = 0;
+        return -(int64_t)ENOTSUP;
+    }
+    return 0;
+#else
+    if (signo <= 0 || signo >= OXL_NSIG) return -(int64_t)EINVAL;
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = oxl_sig_flag_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESTART;
+    if (sigaction(signo, &sa, NULL) != 0) return -(int64_t)errno;
+    return 0;
+#endif
+}
+
+int64_t rt_signal_disarm(OxlStr name) {
+    int signo;
+    int64_t r = oxl_sig_lookup(name, &signo);
+    if (r != 0) return r;
+#ifdef _WIN32
+    /* the shared handler can't be unregistered per-name — clearing
+     * the armed mask makes it decline this event again, which
+     * restores the OS default disposition (terminate on Ctrl+C etc.) */
+    if (signo > 0 && signo < OXL_NSIG) {
+        oxl_sig_armed[signo] = 0;
+        oxl_sig_flags[signo] = 0;
+    }
+    return 0;
+#else
+    if (signo <= 0 || signo >= OXL_NSIG) return -(int64_t)EINVAL;
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = SIG_DFL;
+    sigemptyset(&sa.sa_mask);
+    if (sigaction(signo, &sa, NULL) != 0) return -(int64_t)errno;
+    oxl_sig_flags[signo] = 0;
+    return 0;
+#endif
+}
+
+/* read-and-clear: 1 when the signal arrived since the last take,
+ * 0 otherwise, -errno on a bad name. take() doubles as the poll —
+ * an app looping on it sees each delivery exactly once. */
+int64_t rt_signal_take(OxlStr name) {
+    int signo;
+    int64_t r = oxl_sig_lookup(name, &signo);
+    if (r != 0) return r;
+    if (signo <= 0 || signo >= OXL_NSIG) return -(int64_t)EINVAL;
+#ifdef __GNUC__
+    /* atomic test-and-clear — a delivery landing between a plain
+     * test and store would be cleared without ever being reported */
+    if (__sync_lock_test_and_set(&oxl_sig_flags[signo], 0)) return 1;
+    return 0;
+#else
+    if (oxl_sig_flags[signo]) {
+        oxl_sig_flags[signo] = 0;
+        return 1;
+    }
+    return 0;
+#endif
 }
 int64_t rt_remove(OxlStr path) {
     if (path.n > 0 && memchr(path.p, 0, (size_t)path.n)) return -EINVAL;

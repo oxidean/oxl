@@ -1,0 +1,81 @@
+package term
+
+// std/os/term — terminal probes, window size, and raw-mode
+// enter/restore for full-screen TUIs. fd-level: pass 0/1/2 (the
+// stdin_fd/stdout_fd/stderr_fd helpers name them). Raw returns an
+// opaque handle that MUST go back through restore — defer it so a
+// panic or early exit still hands the terminal back in cooked mode.
+import "std/errors"
+
+extern fn rt_isatty(fd: int) -> int
+
+extern fn rt_term_size(fd: int) -> int
+
+extern fn rt_term_raw(fd: int) -> int
+
+extern fn rt_term_restore(fd: int, handle: int) -> int
+
+extern fn rt_errstr(code: int) -> str
+
+/// stdin / stdout / stderr fd constants — os.File.fd isn't reachable
+/// across packages, so the common case gets named helpers.
+fn stdin_fd() -> int {
+    return 0
+}
+
+fn stdout_fd() -> int {
+    return 1
+}
+
+fn stderr_fd() -> int {
+    return 2
+}
+
+/// isatty reports whether fd is a terminal.
+fn isatty(fd: int) -> bool {
+    return rt_isatty(fd) == 1
+}
+
+/// Size is a terminal's cell dimensions.
+struct Size { cols: int, rows: int }
+
+/// size returns fd's terminal dimensions; err when fd isn't a tty
+/// (ENOTTY on pipes/files) or the platform probe fails.
+fn size(fd: int) -> [Size, err] {
+    n := rt_term_size(fd)
+    if n < 0 {
+        return Size{cols: 0, rows: 0}, errors.new("term size: " + rt_errstr(-n))
+    }
+    // oxl has no shift operators — / and & decode the packed int
+    return Size{cols: n / 4294967296, rows: n & 4294967295}, nil
+}
+
+/// Raw is an entered raw-mode session: the fd plus the opaque saved
+/// state rt_term_raw minted. Call restore to hand the terminal back —
+/// `defer r.restore()` is the intended shape.
+struct Raw { fd: int, handle: int }
+
+/// raw puts fd's terminal into raw mode (char-at-a-time input, no
+/// echo, no line buffering); [Raw, err] — err on non-tty fds or
+/// platforms without a console mode API.
+fn raw(fd: int) -> [Raw, err] {
+    h := rt_term_raw(fd)
+    if h <= 0 {
+        return Raw{fd: -1, handle: 0}, errors.new("term raw: " + rt_errstr(-h))
+    }
+    return Raw{fd: fd, handle: h}, nil
+}
+
+/// restore returns the terminal to the mode raw() captured. Safe to
+/// call once; the handle is consumed either way.
+fn (r mut Raw) restore() -> err {
+    if r.handle == 0 {
+        return nil
+    }
+    rc := rt_term_restore(r.fd, r.handle)
+    r.handle = 0
+    if rc < 0 {
+        return errors.new("term restore: " + rt_errstr(-rc))
+    }
+    return nil
+}

@@ -168,6 +168,19 @@ fn (b mut Reader) asreader() -> io.Reader {
     return b
 }
 
+/// into_reader moves this Reader to the heap and boxes it as an
+/// io.Reader — safe to return or store where `asreader`'s borrow
+/// would dangle. The receiver is consumed: don't use it afterwards.
+fn (b mut Reader) into_reader() -> io.Reader {
+    h := new(Reader)
+    h.r = b.r
+    h.buf = b.buf
+    h.ri = b.ri
+    h.wi = b.wi
+    h.stuck = b.stuck
+    return h
+}
+
 /// Writer buffers an io.Writer — flush() pushes the window.
 struct Writer { w: io.Writer, buf: []byte }
 
@@ -228,4 +241,14 @@ fn (b mut Writer) flush() -> err {
 /// drains them (`&bw`).
 fn (b mut Writer) aswriter() -> io.Writer {
     return b
+}
+
+/// into_writer moves this Writer to the heap and boxes it as an
+/// io.Writer — safe to return or store where `aswriter`'s borrow
+/// would dangle. The receiver is consumed: don't use it afterwards.
+fn (b mut Writer) into_writer() -> io.Writer {
+    h := new(Writer)
+    h.w = b.w
+    h.buf = b.buf
+    return h
 }

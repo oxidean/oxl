@@ -158,6 +158,63 @@ printf '%s
 for t in test_bytes test_strconv test_fmt test_errs test_fill_keeps_err_bytes test_flush_keeps_unwritten test_fill_nop_progress test_stdstreams test_io_files test_err_chain; do
     grep -q "$t ... ok" <<<"$out" || { echo "FAIL io: $out"; exit 1; }
 done
+# iface-boxed borrow escapes (issue #138): `as*` borrows must not leave
+# their scope, while heap-backed receivers and `into_*` owned variants
+# stay legal
+cat > "$scratch/ifaceescape.oxl" <<'EOF'
+package main
+
+import "std/bufio"
+import "std/bytes"
+import "std/io"
+
+fn via_into() -> io.Reader {
+    buf := bytes.newbuffer()
+    [wn, we] = buf.write("owned" as []byte)
+    return buf.into_reader()
+}
+
+fn via_heap() -> io.Reader {
+    h := new(bytes.Buffer)
+    [wn, we] = h.write("heap" as []byte)
+    return h.asreader()
+}
+
+fn via_bufio() -> io.Writer {
+    h := new(bytes.Buffer)
+    bw := bufio.newwriter(h)
+    [wn, we] = bw.write("bufio" as []byte)
+    return bw.into_writer()
+}
+
+fn scoped() -> int {
+    buf := bytes.newbuffer()
+    [wn, we] = buf.write("scoped" as []byte)
+    r := buf.asreader()
+    b := mkslice(byte, 16)
+    [n, err] = r.read(b)
+    return n
+}
+
+fn main() {
+    b := mkslice(byte, 16)
+    r := via_into()
+    [n, err] = r.read(b)
+    println("into:" + substr(b as str, 0, n))
+    r2 := via_heap()
+    [n2, err2] = r2.read(b)
+    println("heap:" + substr(b as str, 0, n2))
+    w := via_bufio()
+    [nw, we2] = w.write("direct" as []byte)
+    println("bufio:" + itoa(nw))
+    println("scoped:" + itoa(scoped()))
+}
+EOF
+out=$("$OXL" run "$scratch/ifaceescape.oxl")
+grep -q "into:owned" <<<"$out" || { echo "FAIL ifaceescape into: $out"; exit 1; }
+grep -q "heap:heap" <<<"$out" || { echo "FAIL ifaceescape heap: $out"; exit 1; }
+grep -q "scoped:6" <<<"$out" || { echo "FAIL ifaceescape scoped: $out"; exit 1; }
+grep -q "bufio:6" <<<"$out" || { echo "FAIL ifaceescape bufio: $out"; exit 1; }
 # char literals decode to their scalar (scratch, not corpus — fmt
 # normalizes 'a' to 97 in formatted files)
 cat > "$scratch/charlit.oxl" <<'EOF'

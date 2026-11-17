@@ -154,13 +154,14 @@ fn is_loopback_host(host: str) -> bool {
     part := 0
     val := 0
     digits := 0
+    lz := false
     first := -1
     i := 0
     n := len(hl)
     for i < n {
         c := byteat(hl, i)
         if c == 46 {
-            if digits == 0 || val > 255 {
+            if digits == 0 || val > 255 || lz && digits > 1 {
                 return false
             }
             if part == 0 {
@@ -169,7 +170,11 @@ fn is_loopback_host(host: str) -> bool {
             part = part + 1
             val = 0
             digits = 0
+            lz = false
         } else if c >= 48 && c <= 57 {
+            if digits == 0 {
+                lz = c == 48
+            }
             val = val * 10 + c - 48
             digits = digits + 1
             if digits > 3 || val > 255 {
@@ -180,7 +185,7 @@ fn is_loopback_host(host: str) -> bool {
         }
         i = i + 1
     }
-    if digits == 0 {
+    if digits == 0 || lz && digits > 1 {
         return false
     }
     return part == 3 && first == 127
@@ -317,14 +322,25 @@ fn resolve_location(base: str, loc: str) -> [str, err] {
     ll := lwr(loc)
     if len(ll) >= 7 && substr(ll, 0, 7) == "http://" {
         // normalize the scheme — parse_url's prefix check is
-        // case-sensitive and "HTTP://x" would fail downstream
-        return "http:" + substr(loc, 5, len(loc)), nil
+        // case-sensitive and "HTTP://x" would fail downstream —
+        // then run the same dot-segment resolution every other form
+        // gets, on the parsed path component only
+        nloc := "http:" + substr(loc, 5, len(loc))
+        [u2, e2] = parse_url(nloc)
+        if e2 != nil {
+            return "", e2
+        }
+        return "http://" + url_authority(u2) + normalize_path_query(u2.path), nil
     }
     if len(ll) >= 8 && substr(ll, 0, 8) == "https://" {
         return "", errors.new("http: redirect to https unsupported (no TLS)")
     }
     if len(loc) >= 2 && byteat(loc, 0) == 47 && byteat(loc, 1) == 47 {
-        return "http:" + loc, nil
+        [u3, e3] = parse_url("http:" + loc)
+        if e3 != nil {
+            return "", e3
+        }
+        return "http://" + url_authority(u3) + normalize_path_query(u3.path), nil
     }
     // any other `scheme:` is unsupported — without this a Location
     // like "ftp://h/p" falls into the relative branch below and
@@ -352,14 +368,29 @@ fn resolve_location(base: str, loc: str) -> [str, err] {
     if bq >= 0 {
         bpath = substr(bpath, 0, bq)
     }
+    // split the reference's own ?query/#fragment off BEFORE any path
+    // math — dot-segments inside a query or fragment are data, not
+    // path segments ("/x?y=/../z" must not collapse to "/z")
+    lend := len(loc)
+    q := find(loc, "?")
+    h := find(loc, "#")
+    lend2 := lend
+    if q >= 0 && q < lend2 {
+        lend2 = q
+    }
+    if h >= 0 && h < lend2 {
+        lend2 = h
+    }
+    lpath := substr(loc, 0, lend2)
+    lsuffix := substr(loc, lend2, lend)
     scheme := "http://" + url_authority(bu)
     if byteat(loc, 0) == 47 {
-        return scheme + remove_dot_segments(loc), nil
+        return scheme + remove_dot_segments(lpath) + lsuffix, nil
     }
     if byteat(loc, 0) == 63 {
         // "?q" replaces the base query outright (RFC 3986 5.2.2) —
         // appending to bu.path would emit "/p?x=1?y=2"
-        return scheme + bpath + loc, nil
+        return scheme + bpath + lsuffix, nil
     }
     if byteat(loc, 0) == 35 {
         // "#f" is the same document — fragments never reach the wire,
@@ -381,7 +412,19 @@ fn resolve_location(base: str, loc: str) -> [str, err] {
     if last >= 0 {
         dir = substr(bpath, 0, last + 1)
     }
-    return scheme + remove_dot_segments(dir + loc), nil
+    return scheme + remove_dot_segments(dir + lpath) + lsuffix, nil
+}
+
+/// normalize_path_query resolves dot-segments in the path component
+/// of a path[?query] string and reattaches the query untouched —
+/// parse_url keeps "?…" inside Url.path, so normalization must split
+/// before it runs.
+fn normalize_path_query(pq: str) -> str {
+    q := find(pq, "?")
+    if q < 0 {
+        return remove_dot_segments(pq)
+    }
+    return remove_dot_segments(substr(pq, 0, q)) + substr(pq, q, len(pq))
 }
 
 /// remove_dot_segments applies RFC 3986 5.2.4 to an absolute path —
@@ -403,7 +446,10 @@ fn remove_dot_segments(path: str) -> str {
                 parts = push(parts, "")
             }
         } else if seg == ".." {
-            if len(parts) > 0 && parts[len(parts) - 1] != "" {
+            // pop the previous segment — including an empty interior
+            // one ("/a//../b" → "/a/b"); only the leading "" root
+            // sentinel is protected so ".." can't escape above "/"
+            if len(parts) > 1 {
                 parts = parts[:len(parts) - 1]
             }
             if j >= n {
@@ -550,6 +596,40 @@ fn has_token(v: str, tok: str) -> bool {
         i = j + 1
     }
     return false
+}
+
+/// last_coding returns the final coding in a consolidated
+/// comma-list header value (trimmed, lowercased) — "" when the list
+/// is empty. Transfer-Encoding only means chunked when chunked is
+/// the LAST coding applied (RFC 9112 6.1): "chunked, gzip" is not a
+/// chunked message.
+fn last_coding(v: str) -> str {
+    last := ""
+    i := 0
+    n := len(v)
+    for i <= n {
+        j := find_from(v, ",", i)
+        if j < 0 {
+            j = n
+        }
+        t := lwr(substr(v, i, j))
+        lo := 0
+        for lo < len(t) && (byteat(t, lo) == 32 || byteat(t, lo) == 9) {
+            lo = lo + 1
+        }
+        hi := len(t)
+        for hi > lo && (byteat(t, hi - 1) == 32 || byteat(t, hi - 1) == 9) {
+            hi = hi - 1
+        }
+        if hi > lo {
+            last = substr(t, lo, hi)
+        }
+        if j >= n {
+            break
+        }
+        i = j + 1
+    }
+    return last
 }
 
 /// unchunk_full is unchunk plus trailer capture — [ChunkedBody, err]
@@ -841,7 +921,7 @@ fn (cl ref Client) do_once(req: Request) -> [Response, err] {
         }
         i = i + 1
     }
-    if has_token(te, "chunked") {
+    if last_coding(te) == "chunked" {
         chunked = true
         [cb, de] = unchunk_full(raw)
         if de != nil {

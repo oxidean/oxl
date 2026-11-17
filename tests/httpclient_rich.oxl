@@ -147,6 +147,11 @@ fn fake_server() {
             // duplicate TE fields consolidate — "identity" then
             // "chunked" still reads as chunked (RFC 9112 6.1)
             resp = "HTTP/1.1 200 OK\r\ntransfer-encoding: identity\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n"
+        } else if path == "/tegf" {
+            // chunked listed first but NOT final — "chunked, gzip"
+            // is close-delimited, not a chunked message; the literal
+            // chunk framing must arrive as the body untouched
+            resp = "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\ntransfer-encoding: gzip\r\nconnection: close\r\n\r\n5\r\nhello\r\n0\r\n\r\n"
         } else if path == "/teonly" {
             // TE present without chunked — body is close-delimited
             // and the bogus content-length must be ignored
@@ -390,11 +395,35 @@ fn main() {
     ck(e25d, "teonly")
     expect(r14a.body == "rawbody", "te non-chunked body got " + r14a.body)
 
+    // chunked that isn't the FINAL coding isn't chunked — the
+    // consolidated "chunked, gzip" list delivers close-delimited raw
+    [r14b, e27d] = get_retry(cl, base + "/tegf")
+    ck(e27d, "tegf")
+    expect(r14b.body == "5\r\nhello\r\n0\r\n\r\n", "non-final chunked raw got " + r14b.body)
+
     // multiple Content-Encoding fields join into one ordered list —
     // "identity, gzip" still decodes the gzip payload
     [r15a, e26d] = get_retry(cl, base + "/cedup")
     ck(e26d, "cedup")
     expect(r15a.body == "hello gzip", "dup CE decoded got " + r15a.body)
+
+    // dot-segments inside a query or fragment are data, not path —
+    // "/x?y=/../z" keeps "/x", never collapses to "/z"
+    [uq1, eq1] = http.resolve_location("http://h/a/b", "/x?y=/../z")
+    expect(eq1 == nil && uq1 == "http://h/x?y=/../z", "query dots preserved got " + uq1)
+    [uq2, eq2] = http.resolve_location("http://h/a/b", "c?x=/../y")
+    expect(eq2 == nil && uq2 == "http://h/a/c?x=/../y", "rel query dots got " + uq2)
+    // absolute-URI and scheme-relative locations normalize too
+    [uq3, eq3] = http.resolve_location("http://h/a", "http://h/x/../y")
+    expect(eq3 == nil && uq3 == "http://h/y", "abs uri dots got " + uq3)
+    [uq4, eq4] = http.resolve_location("http://h/a", "//h/x/./y")
+    expect(eq4 == nil && uq4 == "http://h/x/y", "scheme-rel dots got " + uq4)
+    // ".." pops empty interior segments — "/a//../b" → "/a/b"
+    [uq5, eq5] = http.resolve_location("http://h/", "/a//../b")
+    expect(eq5 == nil && uq5 == "http://h/a/b", "empty seg pop got " + uq5)
+    // leading-zero octets aren't canonical IPv4 literals
+    expect(http.is_loopback_host("127.0.0.01") == false, "leading-zero octet not loopback")
+    expect(http.is_loopback_host("0127.0.0.1") == false, "leading-zero first not loopback")
 
     // NO_PROXY=* matches every host
     expect(http.no_proxy_match("*", "anything.example"), "NO_PROXY * matches")

@@ -568,36 +568,6 @@ fn parse_head_headers(head: str) -> []Header {
 /// the framing facts the flat client dropped
 struct ChunkedBody { body: str, trailers: []Header }
 
-/// has_token reports whether a comma-separated header value lists
-/// tok — "xchunked" must not satisfy a "chunked" check
-fn has_token(v: str, tok: str) -> bool {
-    i := 0
-    n := len(v)
-    for i <= n {
-        j := find_from(v, ",", i)
-        if j < 0 {
-            j = n
-        }
-        t := lwr(substr(v, i, j))
-        lo := 0
-        for lo < len(t) && (byteat(t, lo) == 32 || byteat(t, lo) == 9) {
-            lo = lo + 1
-        }
-        hi := len(t)
-        for hi > lo && (byteat(t, hi - 1) == 32 || byteat(t, hi - 1) == 9) {
-            hi = hi - 1
-        }
-        if substr(t, lo, hi) == tok {
-            return true
-        }
-        if j >= n {
-            return false
-        }
-        i = j + 1
-    }
-    return false
-}
-
 /// last_coding returns the final coding in a consolidated
 /// comma-list header value (trimmed, lowercased) — "" when the list
 /// is empty. Transfer-Encoding only means chunked when chunked is

@@ -312,6 +312,16 @@ fn main() {
     nm := http.no_proxy_match(".internal", "b.other")
     expect(nm == false, "non-match")
 
+    // loopback carve-out: 127. needs a digit after the dot —
+    // "127.evil.example.com" is a public name and must NOT match
+    expect(http.is_loopback_host("localhost"), "localhost is loopback")
+    expect(http.is_loopback_host("::1"), "::1 is loopback")
+    expect(http.is_loopback_host("127.0.0.1"), "127.0.0.1 is loopback")
+    expect(http.is_loopback_host("127.255.1.2"), "127.x is loopback")
+    expect(http.is_loopback_host("127.evil.example.com") == false, "127.name is not loopback")
+    expect(http.is_loopback_host("127.") == false, "bare 127. is not loopback")
+    expect(http.is_loopback_host("example.com") == false, "public host is not loopback")
+
     println("httpclient rich done")
     exit(0)
 }

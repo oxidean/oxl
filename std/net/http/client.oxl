@@ -5,8 +5,11 @@ package http
 // following, gzip decode, auth helpers, proxy support, and the
 // framing facts (chunked, trailers, content-encoding) the flat
 // Resp couldn't express. The legacy Client.request/get/post keep
-// working — they delegate here with redirects and decompression off,
-// matching their historical behavior exactly.
+// working — they delegate here with redirects and decompression off;
+// semantics are the historical ones, with two deliberate tightenings:
+// chunked bodies now decode (the flat path delivered raw chunk bytes)
+// and malformed framing (conflicting/empty content-length, truncated
+// bodies) errors where the old path was lenient.
 import "std/net"
 
 import "std/io"
@@ -27,7 +30,7 @@ struct Header { name: str, value: str }
 
 /// Request is one outgoing HTTP request. `headers` are EXTRA headers —
 /// Host, Content-Length, Connection and Transfer-Encoding are managed
-/// by the client and caller values for them are dropped (a caller
+/// by the client and caller values for them are rejected (a caller
 /// content-length that disagrees with the body is a request-smuggling
 /// primitive, not a feature). Values with CR/LF are rejected outright.
 struct Request {
@@ -129,10 +132,25 @@ fn proxy_from_env(host: str) -> str {
     }
     // loopback never goes through a proxy unless explicitly listed —
     // same carve-out curl makes
-    if host == "localhost" || host == "::1" || substr(host, 0, 4) == "127." {
+    if is_loopback_host(host) {
         return ""
     }
     return p
+}
+
+/// is_loopback_host reports whether host names the local machine —
+/// "localhost", "::1", or a dotted 127.x address. The 127. prefix
+/// needs a digit after the dot: "127.evil.example.com" is a public
+/// name, not loopback.
+fn is_loopback_host(host: str) -> bool {
+    if host == "localhost" || host == "::1" {
+        return true
+    }
+    if len(host) <= 4 || substr(host, 0, 4) != "127." {
+        return false
+    }
+    b := byteat(host, 4)
+    return b >= 48 && b <= 57
 }
 
 /// no_proxy_match reports whether host falls under the comma-separated

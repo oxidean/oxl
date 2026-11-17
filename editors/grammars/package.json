@@ -5,11 +5,13 @@
   "type": "module",
   "exports": {
     ".": "./index.mjs",
-    "./grammar.json": "./oxl.tmLanguage.json"
+    "./grammar.json": "./oxl.tmLanguage.json",
+    "./mod-grammar.json": "./oxl-mod.tmLanguage.json"
   },
   "files": [
     "index.mjs",
     "oxl.tmLanguage.json",
+    "oxl-mod.tmLanguage.json",
     "README.md"
   ],
   "publishConfig": {

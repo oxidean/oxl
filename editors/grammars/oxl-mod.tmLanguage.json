@@ -1,0 +1,74 @@
+{
+  "name": "OXL Mod",
+  "scopeName": "source.oxl.mod",
+  "patterns": [
+    {
+      "include": "#comment"
+    },
+    {
+      "include": "#version"
+    },
+    {
+      "include": "#path"
+    },
+    {
+      "include": "#directive"
+    },
+    {
+      "include": "#operator"
+    },
+    {
+      "include": "#punctuation"
+    }
+  ],
+  "repository": {
+    "comment": {
+      "patterns": [
+        {
+          "name": "comment.line.double-slash.oxl.mod",
+          "match": "//.*$"
+        }
+      ]
+    },
+    "version": {
+      "patterns": [
+        {
+          "name": "constant.numeric.oxl.mod",
+          "match": "\\bv?\\d+\\.\\d+(\\.\\d+)?(-[0-9A-Za-z.-]+)?"
+        }
+      ]
+    },
+    "path": {
+      "patterns": [
+        {
+          "name": "entity.name.path.oxl.mod",
+          "match": "[A-Za-z0-9._~-]+/[A-Za-z0-9._~/-]*"
+        }
+      ]
+    },
+    "directive": {
+      "patterns": [
+        {
+          "name": "keyword.declaration.oxl.mod",
+          "match": "^\\s*(module|oxl|toolchain|require|replace|oxlwork|use)\\b"
+        }
+      ]
+    },
+    "operator": {
+      "patterns": [
+        {
+          "name": "keyword.operator.oxl.mod",
+          "match": "=>"
+        }
+      ]
+    },
+    "punctuation": {
+      "patterns": [
+        {
+          "name": "punctuation.section.block.oxl.mod",
+          "match": "[()]"
+        }
+      ]
+    }
+  }
+}

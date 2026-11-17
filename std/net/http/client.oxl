@@ -130,6 +130,11 @@ fn proxy_from_env(host: str) -> str {
     if len(np) > 0 && no_proxy_match(np, host) {
         return ""
     }
+    // loopback never goes through a proxy unless explicitly listed —
+    // same carve-out curl makes
+    if host == "localhost" || host == "::1" || substr(host, 0, 4) == "127." {
+        return ""
+    }
     return p
 }
 
@@ -154,16 +159,29 @@ fn no_proxy_match(list: str, host: str) -> bool {
             hi = hi - 1
         }
         ent = substr(ent, lo, hi)
-        if len(ent) > 0 {
-            if hl == ent || (len(hl) > len(ent) + 1
-                && substr(hl, len(hl) - len(ent) - 1, len(hl)) == "." + ent) {
-                return true
+        // "example.com:8080" matches on the host part; a leading "."
+        // is cosmetic — entries match the domain and its subdomains
+        ci := find(ent, ":")
+        if ci > 0 {
+            pd := true
+            k := ci + 1
+            for k < len(ent) {
+                if byteat(ent, k) < 48 || byteat(ent, k) > 57 {
+                    pd = false
+                }
+                k = k + 1
             }
-            // a leading-dot entry (".example.com") also matches bare
-            if byteat(ent, 0) == 46 && (hl == substr(ent, 1, len(ent))
-                || substr(hl, len(hl) - len(ent) + 1, len(hl)) == ent) {
-                return true
+            if pd {
+                ent = substr(ent, 0, ci)
             }
+        }
+        if len(ent) > 0 && byteat(ent, 0) == 46 {
+            ent = substr(ent, 1, len(ent))
+        }
+        if len(ent) > 0 && (hl == ent
+            || (len(hl) > len(ent) && byteat(hl, len(hl) - len(ent) - 1) == 46
+                && substr(hl, len(hl) - len(ent), len(hl)) == ent)) {
+            return true
         }
         if j >= len(list) {
             return false
@@ -186,6 +204,7 @@ fn managed_header(name: str) -> bool {
     return n == "host" || n == "content-length" || n == "connection"
         || n == "transfer-encoding" || n == "keep-alive" || n == "upgrade"
         || n == "te" || n == "trailer" || n == "proxy-authorization"
+        || n == "proxy-connection"
 }
 
 /// header_value_ok rejects CR/LF in name or value — header injection
@@ -193,7 +212,10 @@ fn managed_header(name: str) -> bool {
 fn header_value_ok(name: str, value: str) -> bool {
     i := 0
     for i < len(name) {
-        if byteat(name, i) == 13 || byteat(name, i) == 10 {
+        b := byteat(name, i)
+        // a name is an RFC token — anything outside 33-126 (SP, HTAB,
+        // CTLs, obs-text) invites obs-fold smuggling
+        if b < 33 || b > 126 {
             return false
         }
         i = i + 1
@@ -225,10 +247,11 @@ fn resolve_location(base: str, loc: str) -> [str, err] {
     if be != nil {
         return "", be
     }
-    if len(loc) >= 7 && substr(loc, 0, 7) == "http://" {
+    ll := lwr(loc)
+    if len(ll) >= 7 && substr(ll, 0, 7) == "http://" {
         return loc, nil
     }
-    if len(loc) >= 8 && substr(loc, 0, 8) == "https://" {
+    if len(ll) >= 8 && substr(ll, 0, 8) == "https://" {
         return "", errors.new("http: redirect to https unsupported (no TLS)")
     }
     if len(loc) >= 2 && byteat(loc, 0) == 47 && byteat(loc, 1) == 47 {
@@ -238,16 +261,23 @@ fn resolve_location(base: str, loc: str) -> [str, err] {
     if byteat(loc, 0) == 47 {
         return scheme + loc, nil
     }
-    // relative path — resolve against the base's directory
-    slash := find_from(bu.path, "/", 1)
-    dir := bu.path
-    if slash >= 0 {
-        dir = substr(bu.path, 0, slash)
-    } else {
-        dir = "/"
+    if byteat(loc, 0) == 63 || byteat(loc, 0) == 35 {
+        // "?q" / "#f" references resolve against the base path itself
+        return scheme + bu.path + loc, nil
     }
-    if len(dir) > 0 && byteat(dir, len(dir) - 1) != 47 {
-        dir = dir + "/"
+    // relative path — merge against the base's directory (the path
+    // up to and including its LAST slash, per RFC 3986 5.2)
+    last := -1
+    k := 0
+    for k < len(bu.path) {
+        if byteat(bu.path, k) == 47 {
+            last = k
+        }
+        k = k + 1
+    }
+    dir := "/"
+    if last >= 0 {
+        dir = substr(bu.path, 0, last + 1)
     }
     return scheme + dir + loc, nil
 }
@@ -263,15 +293,34 @@ fn redirect_request(cur: Request, status: int, loc: str) -> [Request, err] {
     }
     method := cur.method
     body := cur.body
-    if status == 303 || ((status == 301 || status == 302) && method == "POST") {
+    rewrite_get := status == 303 || ((status == 301 || status == 302) && method == "POST")
+    if rewrite_get {
         method = "GET"
         body = ""
     }
+    // credentials don't cross origins — a redirect to another host
+    // must not carry authorization/cookie/proxy-authorization along
+    [nu, ne2] = parse_url(nurl)
+    if ne2 != nil {
+        return Request{method: "", url: "", headers: mkslice(Header, 0), body: "", redirects: 0, decompress: false, proxy: "direct"}, ne2
+    }
+    // cur.url already parsed inside resolve_location — this cannot
+    // fail, but the err channel must still be handled
+    [cu, ce] = parse_url(cur.url)
+    if ce != nil {
+        return Request{method: "", url: "", headers: mkslice(Header, 0), body: "", redirects: 0, decompress: false, proxy: "direct"}, ce
+    }
+    same_origin := nu.host == cu.host && nu.port == cu.port
     hs := mkslice(Header, 0)
     i := 0
     for i < len(cur.headers) {
         hn := lwr(cur.headers[i].name)
-        if hn != "content-length" && hn != "content-type" {
+        drop := hn == "content-length" || (rewrite_get && hn == "content-type")
+        if !same_origin && (hn == "authorization" || hn == "cookie"
+            || hn == "proxy-authorization") {
+            drop = true
+        }
+        if !drop {
             hs = push(hs, cur.headers[i])
         }
         i = i + 1
@@ -327,6 +376,36 @@ fn parse_head_headers(head: str) -> []Header {
 /// the framing facts the flat client dropped
 struct ChunkedBody { body: str, trailers: []Header }
 
+/// has_token reports whether a comma-separated header value lists
+/// tok — "xchunked" must not satisfy a "chunked" check
+fn has_token(v: str, tok: str) -> bool {
+    i := 0
+    n := len(v)
+    for i <= n {
+        j := find_from(v, ",", i)
+        if j < 0 {
+            j = n
+        }
+        t := lwr(substr(v, i, j))
+        lo := 0
+        for lo < len(t) && (byteat(t, lo) == 32 || byteat(t, lo) == 9) {
+            lo = lo + 1
+        }
+        hi := len(t)
+        for hi > lo && (byteat(t, hi - 1) == 32 || byteat(t, hi - 1) == 9) {
+            hi = hi - 1
+        }
+        if substr(t, lo, hi) == tok {
+            return true
+        }
+        if j >= n {
+            return false
+        }
+        i = j + 1
+    }
+    return false
+}
+
 /// unchunk_full is unchunk plus trailer capture — [ChunkedBody, err]
 fn unchunk_full(b: str) -> [ChunkedBody, err] {
     out := mkslice(byte, 0)
@@ -364,8 +443,24 @@ fn unchunk_full(b: str) -> [ChunkedBody, err] {
                 line := substr(b, pos, nl)
                 colon := find(line, ":")
                 if colon > 0 {
-                    trs = push(trs, Header{name: substr(line, 0, colon),
-                        value: substr(line, colon + 1, len(line))})
+                    tn := substr(line, 0, colon)
+                    tnlo := len(tn)
+                    for tnlo > 0 && (byteat(tn, tnlo - 1) == 32 || byteat(tn, tnlo - 1) == 9) {
+                        tnlo = tnlo - 1
+                    }
+                    tv := substr(line, colon + 1, len(line))
+                    vlo := 0
+                    for vlo < len(tv) && (byteat(tv, vlo) == 32 || byteat(tv, vlo) == 9) {
+                        vlo = vlo + 1
+                    }
+                    vhi := len(tv)
+                    for vhi > vlo && (byteat(tv, vhi - 1) == 32 || byteat(tv, vhi - 1) == 9) {
+                        vhi = vhi - 1
+                    }
+                    if tnlo > 0 {
+                        trs = push(trs, Header{name: substr(tn, 0, tnlo),
+                            value: substr(tv, vlo, vhi)})
+                    }
                 }
                 pos = nl + 2
             }
@@ -393,13 +488,32 @@ fn unchunk_full(b: str) -> [ChunkedBody, err] {
 fn (cl ref Client) do_once(req: Request) -> [Response, err] {
     bad := Response{status: 0, reason: "", headers: mkslice(Header, 0),
         body: "", ctype: "", chunked: false, trailers: mkslice(Header, 0)}
+    // the request line is "METHOD target HTTP/1.1" — a space or CTL in
+    // method or url is request-line injection, same class as header CR/LF
+    if len(req.method) == 0 {
+        return bad, errors.new("http: empty method")
+    }
+    i := 0
+    for i < len(req.method) {
+        if byteat(req.method, i) <= 32 || byteat(req.method, i) >= 127 {
+            return bad, errors.new("http: bad method " + req.method)
+        }
+        i = i + 1
+    }
     [u, ue] = parse_url(req.url)
     if ue != nil {
         return bad, ue
     }
+    i = 0
+    for i < len(req.url) {
+        if byteat(req.url, i) < 33 || byteat(req.url, i) == 127 {
+            return bad, errors.new("http: bad url " + req.url)
+        }
+        i = i + 1
+    }
     // caller headers are validated before anything touches the wire —
     // a CR/LF in a value is header injection, full stop
-    i := 0
+    i = 0
     for i < len(req.headers) {
         h := req.headers[i]
         if managed_header(h.name) {
@@ -540,12 +654,14 @@ fn (cl ref Client) do_once(req: Request) -> [Response, err] {
         }
     }
     head := substr(resp, 0, he)
-    hs := parse_head_headers(head)
+    hs := parse_head_headers(head + "\r\n")
     rctype := ""
+    seen_ct := false
     i := 0
     for i < len(hs) {
-        if lwr(hs[i].name) == "content-type" {
+        if !seen_ct && lwr(hs[i].name) == "content-type" {
             rctype = hs[i].value
+            seen_ct = true
         }
         i = i + 1
     }
@@ -554,14 +670,16 @@ fn (cl ref Client) do_once(req: Request) -> [Response, err] {
     trs := mkslice(Header, 0)
     chunked := false
     te := ""
+    seen_te := false
     i = 0
     for i < len(hs) {
-        if lwr(hs[i].name) == "transfer-encoding" {
+        if !seen_te && lwr(hs[i].name) == "transfer-encoding" {
             te = hs[i].value
+            seen_te = true
         }
         i = i + 1
     }
-    if find(lwr(te), "chunked") >= 0 {
+    if has_token(te, "chunked") {
         chunked = true
         [cb, de] = unchunk_full(raw)
         if de != nil {
@@ -571,24 +689,20 @@ fn (cl ref Client) do_once(req: Request) -> [Response, err] {
         trs = cb.trailers
     } else {
         clv := ""
+        has_cl := false
         i = 0
         for i < len(hs) {
             if lwr(hs[i].name) == "content-length" {
-                clv = hs[i].value
+                if !has_cl {
+                    clv = hs[i].value
+                    has_cl = true
+                }
             }
             i = i + 1
         }
         if len(clv) == 0 {
             // header absent entirely is fine (close-delimited); present
             // but empty is malformed framing — same rule as before
-            has_cl := false
-            i = 0
-            for i < len(hs) {
-                if lwr(hs[i].name) == "content-length" {
-                    has_cl = true
-                }
-                i = i + 1
-            }
             if has_cl {
                 return bad, errors.new("http: empty content-length")
             }
@@ -610,14 +724,16 @@ fn (cl ref Client) do_once(req: Request) -> [Response, err] {
     // an identity/unknown encoding is delivered raw with the header
     // still visible on `headers` for the caller to handle
     encv := ""
+    seen_enc := false
     i = 0
     for i < len(hs) {
-        if lwr(hs[i].name) == "content-encoding" {
+        if !seen_enc && lwr(hs[i].name) == "content-encoding" {
             encv = hs[i].value
+            seen_enc = true
         }
         i = i + 1
     }
-    if req.decompress && find(lwr(encv), "gzip") >= 0 {
+    if req.decompress && has_token(encv, "gzip") {
         [db, de2] = gzip.decompress(rbody as []byte)
         if de2 != nil {
             return bad, errors.new("http: gzip decode: " + errors.msg(de2))

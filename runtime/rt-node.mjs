@@ -49,7 +49,7 @@ function trap21() {
  * set; os.constants.signals is the honest name->number map (unknown
  * names surface as EINVAL, matching rt.c's lookup contract). */
 const sigFlags = {}
-const sigArmed = new Set()
+const sigListeners = {}
 
 function sig_lookup(name) {
   // SIGKILL/SIGSTOP can't be caught on any platform — same EINVAL the
@@ -62,10 +62,11 @@ function sig_lookup(name) {
 function sig_arm(name) {
   const no = sig_lookup(name)
   if (no < 0n) return no
-  if (!sigArmed.has(name)) {
+  if (!sigListeners[name]) {
+    const fn = () => { sigFlags[no] = 1 }
     try {
-      process.on(name, () => { sigFlags[no] = 1 })
-      sigArmed.add(name)
+      process.on(name, fn)
+      sigListeners[name] = fn
     } catch {
       return -38n // ENOSYS — platform can't deliver this signal
     }
@@ -77,11 +78,13 @@ function sig_disarm(name) {
   const no = sig_lookup(name)
   if (no < 0n) return no
   delete sigFlags[no]
-  sigArmed.delete(name)
-  // removing the last listener restores node's default disposition —
-  // without this a disarmed SIGINT/SIGTERM can no longer kill the
-  // process and a late delivery would still set the flag
-  try { process.removeAllListeners(name) } catch {}
+  // remove only the listener arm() installed — removeAllListeners
+  // would also strip handlers owned by the embedding JS
+  const fn = sigListeners[name]
+  delete sigListeners[name]
+  if (fn) {
+    try { process.off(name, fn) } catch {}
+  }
   return 0n
 }
 

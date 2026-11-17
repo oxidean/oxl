@@ -3211,6 +3211,15 @@ int64_t rt_term_restore(int64_t fd, int64_t handle) {
 
 static volatile sig_atomic_t oxl_sig_flags[OXL_NSIG];
 
+#ifdef _WIN32
+/* per-signo armed mask — one shared console handler covers every
+ * armable name, so the handler must decline events whose signal isn't
+ * armed (return FALSE -> the OS default disposition still applies).
+ * Without the mask, arming SIGTERM would leave Ctrl+C permanently
+ * swallowed and disarm could never restore default behavior. */
+static volatile sig_atomic_t oxl_sig_armed[OXL_NSIG];
+#endif
+
 static void oxl_sig_flag_handler(int signo) {
     if (signo > 0 && signo < OXL_NSIG) oxl_sig_flags[signo] = 1;
 }
@@ -3222,14 +3231,19 @@ static void oxl_sig_flag_handler(int signo) {
  * handler runs on a new thread under the CRT — flag writes stay
  * atomic. */
 static BOOL WINAPI oxl_win_ctrl_handler(DWORD ev) {
+    int signo = 0;
     switch (ev) {
-    case CTRL_C_EVENT: oxl_sig_flags[2] = 1; return TRUE;
-    case CTRL_BREAK_EVENT: oxl_sig_flags[21] = 1; return TRUE;
+    case CTRL_C_EVENT: signo = 2; break;
+    case CTRL_BREAK_EVENT: signo = 21; break;
     case CTRL_CLOSE_EVENT:
     case CTRL_LOGOFF_EVENT:
-    case CTRL_SHUTDOWN_EVENT: oxl_sig_flags[15] = 1; return TRUE;
+    case CTRL_SHUTDOWN_EVENT: signo = 15; break;
     default: return FALSE;
     }
+    if (signo <= 0 || signo >= OXL_NSIG || !oxl_sig_armed[signo])
+        return FALSE;
+    oxl_sig_flags[signo] = 1;
+    return TRUE;
 }
 #endif
 
@@ -3275,10 +3289,15 @@ int64_t rt_signal_arm(OxlStr name) {
     int64_t r = oxl_sig_lookup(name, &signo);
     if (r != 0) return r;
 #ifdef _WIN32
-    /* one process-wide handler covers every armable name — the flag
-     * index is what disambiguates. Re-arming is idempotent. */
-    if (!SetConsoleCtrlHandler(oxl_win_ctrl_handler, TRUE))
+    /* one process-wide handler covers every armable name — the armed
+     * mask is what disambiguates. Mark armed before installing so a
+     * delivery racing the install can't be declined. Re-arming is
+     * idempotent. */
+    oxl_sig_armed[signo] = 1;
+    if (!SetConsoleCtrlHandler(oxl_win_ctrl_handler, TRUE)) {
+        oxl_sig_armed[signo] = 0;
         return -(int64_t)ENOTSUP;
+    }
     return 0;
 #else
     if (signo <= 0 || signo >= OXL_NSIG) return -(int64_t)EINVAL;
@@ -3297,9 +3316,13 @@ int64_t rt_signal_disarm(OxlStr name) {
     int64_t r = oxl_sig_lookup(name, &signo);
     if (r != 0) return r;
 #ifdef _WIN32
-    /* no per-name removal — the shared handler stays; disarm just
-     * clears any pending flag so take() can't see a stale hit */
-    if (signo > 0 && signo < OXL_NSIG) oxl_sig_flags[signo] = 0;
+    /* the shared handler can't be unregistered per-name — clearing
+     * the armed mask makes it decline this event again, which
+     * restores the OS default disposition (terminate on Ctrl+C etc.) */
+    if (signo > 0 && signo < OXL_NSIG) {
+        oxl_sig_armed[signo] = 0;
+        oxl_sig_flags[signo] = 0;
+    }
     return 0;
 #else
     if (signo <= 0 || signo >= OXL_NSIG) return -(int64_t)EINVAL;
@@ -3321,11 +3344,18 @@ int64_t rt_signal_take(OxlStr name) {
     int64_t r = oxl_sig_lookup(name, &signo);
     if (r != 0) return r;
     if (signo <= 0 || signo >= OXL_NSIG) return -(int64_t)EINVAL;
+#ifdef __GNUC__
+    /* atomic test-and-clear — a delivery landing between a plain
+     * test and store would be cleared without ever being reported */
+    if (__sync_lock_test_and_set(&oxl_sig_flags[signo], 0)) return 1;
+    return 0;
+#else
     if (oxl_sig_flags[signo]) {
         oxl_sig_flags[signo] = 0;
         return 1;
     }
     return 0;
+#endif
 }
 int64_t rt_remove(OxlStr path) {
     if (path.n > 0 && memchr(path.p, 0, (size_t)path.n)) return -EINVAL;

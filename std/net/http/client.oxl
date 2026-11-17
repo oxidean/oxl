@@ -31,19 +31,19 @@ struct Header { name: str, value: str }
 /// content-length that disagrees with the body is a request-smuggling
 /// primitive, not a feature). Values with CR/LF are rejected outright.
 struct Request {
-    method: str
-    url: str
-    headers: []Header
-    body: str
+    method: str,
+    url: str,
+    headers: []Header,
+    body: str,
     // policy — kept on the request (not Client) because oxl struct
     // literals are exhaustive: growing Client{tmo} would break every
     // existing call site. redirects: -1 = CLIENT_REDIRECTS default,
     // 0 = never follow, >0 = hop budget. decompress: advertise+decode
     // gzip. proxy: "" = honor HTTP_PROXY env, "direct" = bypass,
     // otherwise an http:// proxy URL.
-    redirects: int
-    decompress: bool
-    proxy: str
+    redirects: int,
+    decompress: bool,
+    proxy: str,
 }
 
 /// Response is the full client-side result: status line split into
@@ -52,13 +52,13 @@ struct Request {
 /// `chunked` says the peer used chunked transfer-encoding and
 /// `trailers` carries whatever followed the last chunk.
 struct Response {
-    status: int
-    reason: str
-    headers: []Header
-    body: str
-    ctype: str
-    chunked: bool
-    trailers: []Header
+    status: int,
+    reason: str,
+    headers: []Header,
+    body: str,
+    ctype: str,
+    chunked: bool,
+    trailers: []Header,
 }
 
 /// header returns the first value for name (case-insensitive), ""
@@ -81,8 +81,7 @@ fn (r ref Response) header(name: str) -> str {
 /// is a struct literal away — set redirects/decompress/proxy per
 /// request.
 fn request_get(url: str) -> Request {
-    return Request{method: "GET", url: url, headers: mkslice(Header, 0),
-        body: "", redirects: -1, decompress: true, proxy: ""}
+    return Request{method: "GET", url: url, headers: mkslice(Header, 0), body: "", redirects: -1, decompress: true, proxy: ""}
 }
 
 fn request_post(url: str, ctype: str, body: str) -> Request {
@@ -90,15 +89,13 @@ fn request_post(url: str, ctype: str, body: str) -> Request {
     if len(ctype) > 0 {
         hs = push(hs, Header{name: "content-type", value: ctype})
     }
-    return Request{method: "POST", url: url, headers: hs, body: body,
-        redirects: -1, decompress: true, proxy: ""}
+    return Request{method: "POST", url: url, headers: hs, body: body, redirects: -1, decompress: true, proxy: ""}
 }
 
 /// basic_auth is the Authorization header for HTTP Basic — base64 of
 /// "user:pass". Pair it with `headers = push(req.headers, h)`.
 fn basic_auth(user: str, pass: str) -> Header {
-    return Header{name: "authorization",
-        value: "Basic " + base64.encode((user + ":" + pass) as []byte)}
+    return Header{name: "authorization", value: "Basic " + base64.encode((user + ":" + pass) as []byte)}
 }
 
 /// bearer_auth is the Authorization header for token auth (JWTs and
@@ -178,9 +175,7 @@ fn no_proxy_match(list: str, host: str) -> bool {
         if len(ent) > 0 && byteat(ent, 0) == 46 {
             ent = substr(ent, 1, len(ent))
         }
-        if len(ent) > 0 && (hl == ent
-            || (len(hl) > len(ent) && byteat(hl, len(hl) - len(ent) - 1) == 46
-                && substr(hl, len(hl) - len(ent), len(hl)) == ent)) {
+        if len(ent) > 0 && (hl == ent || len(hl) > len(ent) && byteat(hl, len(hl) - len(ent) - 1) == 46 && substr(hl, len(hl) - len(ent), len(hl)) == ent) {
             return true
         }
         if j >= len(list) {
@@ -193,18 +188,14 @@ fn no_proxy_match(list: str, host: str) -> bool {
 
 /// is_redirect_status — the codes a client may follow
 fn is_redirect_status(status: int) -> bool {
-    return status == 301 || status == 302 || status == 303
-        || status == 307 || status == 308
+    return status == 301 || status == 302 || status == 303 || status == 307 || status == 308
 }
 
 /// managed_headers are generated per request — caller values for them
 /// are dropped so a stale content-length can't desync the body
 fn managed_header(name: str) -> bool {
     n := lwr(name)
-    return n == "host" || n == "content-length" || n == "connection"
-        || n == "transfer-encoding" || n == "keep-alive" || n == "upgrade"
-        || n == "te" || n == "trailer" || n == "proxy-authorization"
-        || n == "proxy-connection"
+    return n == "host" || n == "content-length" || n == "connection" || n == "transfer-encoding" || n == "keep-alive" || n == "upgrade" || n == "te" || n == "trailer" || n == "proxy-authorization" || n == "proxy-connection"
 }
 
 /// header_value_ok rejects CR/LF in name or value — header injection
@@ -293,7 +284,7 @@ fn redirect_request(cur: Request, status: int, loc: str) -> [Request, err] {
     }
     method := cur.method
     body := cur.body
-    rewrite_get := status == 303 || ((status == 301 || status == 302) && method == "POST")
+    rewrite_get := status == 303 || (status == 301 || status == 302) && method == "POST"
     if rewrite_get {
         method = "GET"
         body = ""
@@ -315,9 +306,8 @@ fn redirect_request(cur: Request, status: int, loc: str) -> [Request, err] {
     i := 0
     for i < len(cur.headers) {
         hn := lwr(cur.headers[i].name)
-        drop := hn == "content-length" || (rewrite_get && hn == "content-type")
-        if !same_origin && (hn == "authorization" || hn == "cookie"
-            || hn == "proxy-authorization") {
+        drop := hn == "content-length" || rewrite_get && hn == "content-type"
+        if !same_origin && (hn == "authorization" || hn == "cookie" || hn == "proxy-authorization") {
             drop = true
         }
         if !drop {
@@ -458,8 +448,7 @@ fn unchunk_full(b: str) -> [ChunkedBody, err] {
                         vhi = vhi - 1
                     }
                     if tnlo > 0 {
-                        trs = push(trs, Header{name: substr(tn, 0, tnlo),
-                            value: substr(tv, vlo, vhi)})
+                        trs = push(trs, Header{name: substr(tn, 0, tnlo), value: substr(tv, vlo, vhi)})
                     }
                 }
                 pos = nl + 2
@@ -486,8 +475,7 @@ fn unchunk_full(b: str) -> [ChunkedBody, err] {
 /// redirects, no retries. Shared by do()'s redirect loop and (via
 /// request()) the legacy flat API.
 fn (cl ref Client) do_once(req: Request) -> [Response, err] {
-    bad := Response{status: 0, reason: "", headers: mkslice(Header, 0),
-        body: "", ctype: "", chunked: false, trailers: mkslice(Header, 0)}
+    bad := Response{status: 0, reason: "", headers: mkslice(Header, 0), body: "", ctype: "", chunked: false, trailers: mkslice(Header, 0)}
     // the request line is "METHOD target HTTP/1.1" — a space or CTL in
     // method or url is request-line injection, same class as header CR/LF
     if len(req.method) == 0 {
@@ -559,9 +547,7 @@ fn (cl ref Client) do_once(req: Request) -> [Response, err] {
     if via_proxy {
         target = "http://" + url_authority(u) + u.path
     }
-    wire := req.method + " " + target + " HTTP/1.1\r\n"
-        + "host: " + hosthdr + "\r\n"
-        + "connection: close\r\n"
+    wire := req.method + " " + target + " HTTP/1.1\r\n" + "host: " + hosthdr + "\r\n" + "connection: close\r\n"
     if req.decompress {
         // only advertise what we can decode — and don't double-set a
         // caller-supplied accept-encoding
@@ -740,8 +726,7 @@ fn (cl ref Client) do_once(req: Request) -> [Response, err] {
         }
         rbody = db as str
     }
-    return Response{status: code, reason: reason, headers: hs,
-        body: rbody, ctype: rctype, chunked: chunked, trailers: trs}, nil
+    return Response{status: code, reason: reason, headers: hs, body: rbody, ctype: rctype, chunked: chunked, trailers: trs}, nil
 }
 
 /// do runs req through the redirect policy — each hop is a fresh
@@ -750,8 +735,7 @@ fn (cl ref Client) do_once(req: Request) -> [Response, err] {
 /// that fails to resolve, is delivered as the final response/err —
 /// the caller sees exactly what the wire said.
 fn (cl ref Client) do(req: Request) -> [Response, err] {
-    bad := Response{status: 0, reason: "", headers: mkslice(Header, 0),
-        body: "", ctype: "", chunked: false, trailers: mkslice(Header, 0)}
+    bad := Response{status: 0, reason: "", headers: mkslice(Header, 0), body: "", ctype: "", chunked: false, trailers: mkslice(Header, 0)}
     cur := req
     redirects := req.redirects
     if redirects < 0 {

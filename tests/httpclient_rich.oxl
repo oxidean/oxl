@@ -126,15 +126,13 @@ fn fake_server() {
         } else if path == "/r303" {
             resp = "HTTP/1.1 303 See Other\r\nlocation: /who\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
         } else if path == "/chunked" {
-            resp = "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\nx-note: chunked-resp\r\n\r\n"
-                + "5\r\nhello\r\n6\r\n world\r\n0\r\nx-trailer: yes\r\n\r\n"
+            resp = "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\nx-note: chunked-resp\r\n\r\n" + "5\r\nhello\r\n6\r\n world\r\n0\r\nx-trailer: yes\r\n\r\n"
         } else if path == "/gzip" {
             [gz, ge] = base64.decode(GZ_B64)
             if ge != nil {
                 resp = "HTTP/1.1 500 Err\r\ncontent-length: 0\r\n\r\n"
             } else {
-                resp = "HTTP/1.1 200 OK\r\ncontent-encoding: gzip\r\ncontent-length: "
-                    + itoa(len(gz)) + "\r\nconnection: close\r\n\r\n" + (gz as str)
+                resp = "HTTP/1.1 200 OK\r\ncontent-encoding: gzip\r\ncontent-length: " + itoa(len(gz)) + "\r\nconnection: close\r\n\r\n" + gz as str
             }
         } else {
             // /final, /who, /hdrcheck, /proxycheck — echo what we saw:
@@ -145,8 +143,7 @@ fn fake_server() {
                 m := substr(line, 0, sp1)
                 body = "method=" + m + " target=" + path
             }
-            resp = "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: "
-                + itoa(len(body)) + "\r\nconnection: close\r\n\r\n" + body
+            resp = "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: " + itoa(len(body)) + "\r\nconnection: close\r\n\r\n" + body
         }
         [_wn, _we] = c.write(resp as []byte)
         c.close()
@@ -166,8 +163,7 @@ fn main() {
         println("redirect status=" + itoa(r1.status) + " body=" + r1.body)
     }
     expect(r1.status == 200, "redirect followed to 200")
-    expect(find(r1.body, "target=") >= 0 || len(r1.body) > 0,
-        "redirect landed on final")
+    expect(find(r1.body, "target=") >= 0 || len(r1.body) > 0, "redirect landed on final")
 
     // redirect loop is bounded by max_redirects — the last 302 is
     // delivered, not an error and not an infinite spin
@@ -188,11 +184,9 @@ fn main() {
     rq2.headers = push(rq2.headers, http.Header{name: "x-custom", value: "probe-1"})
     [r4, e4] = cl.do(rq2)
     ck(e4, "hdrcheck")
-    expect(find(r4.body, "authorization: Basic YWxpY2U6czNjcmV0") >= 0,
-        "basic auth header on wire")
+    expect(find(r4.body, "authorization: Basic YWxpY2U6czNjcmV0") >= 0, "basic auth header on wire")
     expect(find(r4.body, "x-custom: probe-1") >= 0, "custom header on wire")
-    expect(find(r4.body, "host: 127.0.0.1:" + itoa(PORT)) >= 0,
-        "host header on wire")
+    expect(find(r4.body, "host: 127.0.0.1:" + itoa(PORT)) >= 0, "host header on wire")
     expect(r4.header("content-type") == "text/plain", "header() lookup")
 
     // managed + injected headers are rejected before the wire
@@ -210,8 +204,7 @@ fn main() {
     rq5.headers = push(rq5.headers, http.bearer_auth("tok123"))
     [r7, e7] = cl.do(rq5)
     ck(e7, "bearer")
-    expect(find(r7.body, "authorization: Bearer tok123") >= 0,
-        "bearer header on wire")
+    expect(find(r7.body, "authorization: Bearer tok123") >= 0, "bearer header on wire")
 
     // -- chunked + trailers ----------------------------------------
     [r8, e8] = get_retry(cl, base + "/chunked")
@@ -235,14 +228,11 @@ fn main() {
     expect(r9.body == "hello gzip", "gzip decoded got len " + itoa(len(r9.body)))
     // decompression off delivers the raw bytes with the header visible
     cl_raw := http.Client{tmo: 30000}
-    rq_raw := http.Request{method: "GET", url: base + "/gzip",
-        headers: mkslice(http.Header, 0), body: "",
-        redirects: 0, decompress: false, proxy: "direct"}
+    rq_raw := http.Request{method: "GET", url: base + "/gzip", headers: mkslice(http.Header, 0), body: "", redirects: 0, decompress: false, proxy: "direct"}
     [r10, e10] = get_retry_req(cl_raw, rq_raw)
     ck(e10, "gzip raw")
     expect(r10.body != "hello gzip", "raw gzip not decoded")
-    expect(find(r10.header("content-encoding"), "gzip") >= 0,
-        "content-encoding header visible")
+    expect(find(r10.header("content-encoding"), "gzip") >= 0, "content-encoding header visible")
 
     // -- proxy -------------------------------------------------------
     cl_p := http.Client{tmo: 30000}
@@ -252,8 +242,7 @@ fn main() {
     // the proxy IS our fake server — it answers /hdrcheck-shaped
     // traffic regardless of the claimed origin
     ck(e11, "proxy request")
-    expect(find(r11.body, "GET http://example.invalid/hdrcheck HTTP/1.1") >= 0,
-        "absolute-URI request target via proxy got " + substr(r11.body, 0, 60))
+    expect(find(r11.body, "GET http://example.invalid/hdrcheck HTTP/1.1") >= 0, "absolute-URI request target via proxy got " + substr(r11.body, 0, 60))
 
     println("httpclient rich done")
     exit(0)

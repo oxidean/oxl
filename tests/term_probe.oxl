@@ -1,0 +1,44 @@
+package main
+
+import "std/os"
+
+import "std/os/term"
+
+// pty probe — run.sh wraps this in `script` so stdin/stdout are a real
+// terminal; prints one verdict line per check.
+fn main() {
+    ok := true
+    if !term.isatty(term.stdin_fd()) {
+        println("FAIL isatty stdin")
+        ok = false
+    }
+    if !term.isatty(term.stdout_fd()) {
+        println("FAIL isatty stdout")
+        ok = false
+    }
+    [z, ze] = term.size(term.stdin_fd())
+    if ze != nil || z.cols <= 0 || z.rows <= 0 {
+        println("FAIL size")
+        ok = false
+    }
+    [r, re] = term.raw(term.stdin_fd())
+    if re != nil {
+        println("FAIL raw")
+        ok = false
+    } else {
+        [w, we] = term.size(term.stdout_fd())
+        if we != nil || w.cols <= 0 {
+            println("FAIL size-under-raw")
+            ok = false
+        }
+        if r.restore() != nil {
+            println("FAIL restore")
+            ok = false
+        }
+    }
+    if ok {
+        println("term probe ok")
+        os.quit(0)
+    }
+    os.quit(1)
+}

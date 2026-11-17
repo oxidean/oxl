@@ -1,0 +1,53 @@
+package signal
+
+// std/os/signal — minimal process-signal observation for poll-loop
+// apps (TUIs, supervisors). arm(name) installs a flag-setting
+// handler, take(name) reads-and-clears: each delivery is observed
+// exactly once. Names are the platform signal names ("SIGINT",
+// "SIGWINCH", "SIGTERM", ...); unknown names and uncatchable signals
+// (SIGKILL/SIGSTOP) are err, not panic. Disarming restores the
+// default disposition and clears any pending flag.
+//
+// The model is observation, not handling: code that needs to DO
+// something different on SIGINT still polls take() in its loop —
+// there are no callbacks, so signal logic can't reenter the runtime.
+import "std/errors"
+
+extern fn rt_signal_arm(name: str) -> int
+
+extern fn rt_signal_disarm(name: str) -> int
+
+extern fn rt_signal_take(name: str) -> int
+
+extern fn rt_errstr(code: int) -> str
+
+/// arm installs the observation handler for `name`; nil on success,
+/// err for unknown names, uncatchable signals, or platforms with no
+/// delivery (Windows covers console Ctrl events only).
+fn arm(name: str) -> err {
+    r := rt_signal_arm(name)
+    if r < 0 {
+        return errors.new("signal arm " + name + ": " + rt_errstr(-r))
+    }
+    return nil
+}
+
+/// disarm restores the default disposition for `name` and clears any
+/// flag it left pending.
+fn disarm(name: str) -> err {
+    r := rt_signal_disarm(name)
+    if r < 0 {
+        return errors.new("signal disarm " + name + ": " + rt_errstr(-r))
+    }
+    return nil
+}
+
+/// take reports whether `name` arrived since the last take (or arm)
+/// and clears the flag — the poll primitive. err only on a bad name.
+fn take(name: str) -> [bool, err] {
+    r := rt_signal_take(name)
+    if r < 0 {
+        return false, errors.new("signal take " + name + ": " + rt_errstr(-r))
+    }
+    return r == 1, nil
+}

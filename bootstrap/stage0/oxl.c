@@ -31292,12 +31292,13 @@ struct o_s_PkgArgs o_f_pkg_args(int64_t start) {
     int64_t i = start;
     while (((i < rt_argc()) && (!rt_streq(rt_argv(i), rt_str_lit("--"))))) {
     OxlStr a = rt_argv(i);
-    if (((fs).len == 0LL)) {
     int64_t n = o_f_flag_toks(a);
     if ((n > 0LL)) {
+    if (((n == 2LL) && ((i + 1LL) >= rt_argc()))) {
+    break;
+    }
     i = (i + n);
     continue;
-    }
     }
     if (((seen_file == 0LL) && ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_os_isdir }; ((int (*)(void*, OxlStr))_fv.fp)(_fv.env, a); }))) {
     fs = ({ OxlStr _pv = a; rt_slice_push(fs, sizeof(OxlStr), &_pv); });
@@ -31433,6 +31434,10 @@ int64_t o_f_stray_args(int64_t argi) {
     } else {
     int64_t t = o_f_flag_toks(a);
     if ((t > 0LL)) {
+    if (((t == 2LL) && ((i + 1LL) >= rt_argc()))) {
+    n = (n + 1LL);
+    break;
+    }
     i = (i + t);
     continue;
     }

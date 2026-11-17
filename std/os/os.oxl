@@ -21,8 +21,11 @@ fn readfile_(path: str) -> str {
 }
 
 /// write an entire file (truncates); bytes written on success,
-/// negative errno on error. Declared before the fd externs — oxl
-/// resolves module fns regardless of order.
+/// negative errno on error — including a deferred close(2) failure
+/// after a full write (the data may not be durable; the count is
+/// lost with the error, same contract as File.close). Declared
+/// before the fd externs — oxl resolves module fns regardless of
+/// order.
 fn writefile_(path: str, data: str) -> int {
     fd := rt_open_write(path)
     if fd < 0 {

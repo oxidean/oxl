@@ -103,12 +103,13 @@ fn pkg_args(start: int) -> PkgArgs {
         // after the sources stay driver vocabulary via flag_value,
         // and run's child-argv scan strips them rather than ending
         // the program's own args)
-        if len(fs) == 0 {
-            n := flag_toks(a)
-            if n > 0 {
-                i = i + n
-                continue
+        n := flag_toks(a)
+        if n > 0 {
+            if n == 2 && i + 1 >= argc() {
+                break // flag value missing — stray_args flags it
             }
+            i = i + n
+            continue
         }
         // dirs are sources only before the file list starts — a dir
         // after .oxl files is a program arg (run f.oxl ./public),
@@ -237,6 +238,10 @@ fn stray_args(argi: int) -> int {
         } else {
             t := flag_toks(a)
             if t > 0 {
+                if t == 2 && i + 1 >= argc() {
+                    n = n + 1
+                    break
+                }
                 i = i + t
                 continue
             }

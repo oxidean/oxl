@@ -1263,6 +1263,33 @@ for inv in "" "bogus" "list"; do
         exit 1
     fi
 done
+
+# #131: package-dir args — `oxl test` fans out over every leading dir,
+# build/run reject multiples, mixed dir+file lists and stray args are
+# loud usage errors (exit 2), and driver flags may interleave between
+# dirs. Scratch fixtures keep this out of the tests/ corpus.
+mkdir -p "$scratch/mp/a" "$scratch/mp/b"
+printf 'package main\nimport "std/testing"\nfn test_a() { testing.expect(1 == 1, "a ok") }\nfn main() {}\n' > "$scratch/mp/a/a_test.oxl"
+printf 'package main\nimport "std/testing"\nfn test_b() { testing.expect(2 == 2, "b ok") }\nfn main() {}\n' > "$scratch/mp/b/b_test.oxl"
+mp_out=$("$SELFOXL" test "$scratch/mp/a" "$scratch/mp/b" 2>&1) && mp_rc=0 || mp_rc=$?
+[ "$mp_rc" = 0 ] || { echo "FAIL multi-dir test rc=$mp_rc"; printf '%s\n' "$mp_out"; exit 1; }
+printf '%s' "$mp_out" | grep -q "test_a" || { echo "FAIL multi-dir: pkg a not run"; printf '%s\n' "$mp_out"; exit 1; }
+printf '%s' "$mp_out" | grep -q "test_b" || { echo "FAIL multi-dir: pkg b not run"; printf '%s\n' "$mp_out"; exit 1; }
+# flags may sit between package dirs
+mp_out=$("$SELFOXL" test "$scratch/mp/a" --target c "$scratch/mp/b" 2>&1) && mp_rc=0 || mp_rc=$?
+[ "$mp_rc" = 0 ] || { echo "FAIL interleaved-flag test rc=$mp_rc"; printf '%s\n' "$mp_out"; exit 1; }
+# build takes exactly one package
+"$SELFOXL" build "$scratch/mp/a" "$scratch/mp/b" -o "$scratch/mpbin" >"$scratch/mpb.out" 2>&1 && mp_rc=0 || mp_rc=$?
+[ "$mp_rc" = 2 ] || { echo "FAIL multi-dir build rc=$mp_rc (want 2)"; cat "$scratch/mpb.out"; exit 1; }
+# a stray non-source arg is a usage error, not silent program argv
+"$SELFOXL" test "$scratch/mp/a" "$scratch/mp/nope" >"$scratch/mps.out" 2>&1 && mp_rc=0 || mp_rc=$?
+[ "$mp_rc" = 2 ] || { echo "FAIL stray-arg test rc=$mp_rc (want 2)"; cat "$scratch/mps.out"; exit 1; }
+# mixing dirs and file lists is a usage error
+"$SELFOXL" test "$scratch/mp/a" "$scratch/mp/b/b_test.oxl" >"$scratch/mpm.out" 2>&1 && mp_rc=0 || mp_rc=$?
+[ "$mp_rc" = 2 ] || { echo "FAIL mixed-args test rc=$mp_rc (want 2)"; cat "$scratch/mpm.out"; exit 1; }
+# a trailing flag with no value is loud, not silently defaulted
+"$SELFOXL" build "$scratch/mp/a" -o >"$scratch/mpo.out" 2>&1 && mp_rc=0 || mp_rc=$?
+[ "$mp_rc" != 0 ] || { echo "FAIL missing -o value accepted"; cat "$scratch/mpo.out"; exit 1; }
 # the diag corpus through the whole driver pipeline (load + check +
 # emit + cc): every fixture must fail identically on both drivers —
 # same text, same exit code, and neither side may accept

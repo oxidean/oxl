@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "id": "WI-0017",
+  "id": "WI-0018",
   "title": "std/os term + signal: raw-mode/isatty/winsize + poll-observed signals (issues #125 #126)",
   "state": "intake",
   "profile": "normal",

@@ -1,0 +1,1088 @@
+package http
+
+// std/net/http client depth — the richer request/response surface
+// issue #127 asked for: structured headers both ways, redirect
+// following, gzip decode, auth helpers, proxy support, and the
+// framing facts (chunked, trailers, content-encoding) the flat
+// Resp couldn't express. The legacy Client.request/get/post keep
+// working — they delegate here with redirects and decompression off;
+// semantics are the historical ones, with two deliberate tightenings:
+// chunked bodies now decode (the flat path delivered raw chunk bytes)
+// and malformed framing (conflicting/empty content-length, truncated
+// bodies) errors where the old path was lenient.
+import "std/net"
+
+import "std/io"
+
+import "std/errors"
+
+import "std/strconv"
+
+import "std/encoding/base64"
+
+import "std/compress/gzip"
+
+import "std/bytes"
+
+import "std/os"
+
+/// Header is one name/value pair — request and response sides share
+/// it; duplicates and ordering are preserved.
+struct Header { name: str, value: str }
+
+/// Request is one outgoing HTTP request. `headers` are EXTRA headers —
+/// Host, Content-Length, Connection and Transfer-Encoding are managed
+/// by the client and caller values for them are rejected (a caller
+/// content-length that disagrees with the body is a request-smuggling
+/// primitive, not a feature). Values with CR/LF are rejected outright.
+struct Request {
+    method: str,
+    url: str,
+    headers: []Header,
+    body: str,
+    // policy — kept on the request (not Client) because oxl struct
+    // literals are exhaustive: growing Client{tmo} would break every
+    // existing call site. redirects: -1 = CLIENT_REDIRECTS default,
+    // 0 = never follow, >0 = hop budget. decompress: advertise+decode
+    // gzip. proxy: "" = honor HTTP_PROXY env, "direct" = bypass,
+    // otherwise an http:// proxy URL.
+    redirects: int,
+    decompress: bool,
+    proxy: str,
+}
+
+/// Response is the full client-side result: status line split into
+/// code + reason, every header, the body after content-encoding
+/// decoding (gzip when decompress is on), and the framing facts —
+/// `chunked` says the peer used chunked transfer-encoding and
+/// `trailers` carries whatever followed the last chunk.
+struct Response {
+    status: int,
+    reason: str,
+    headers: []Header,
+    body: str,
+    ctype: str,
+    chunked: bool,
+    trailers: []Header,
+}
+
+/// header returns the first value for name (case-insensitive), ""
+/// when absent — the common lookup without scanning `headers` by hand
+fn (r ref Response) header(name: str) -> str {
+    want := lwr(name)
+    i := 0
+    for i < len(r.headers) {
+        if lwr(r.headers[i].name) == want {
+            return r.headers[i].value
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+/// request_get/request_post build the common Request shapes with the
+/// rich defaults turned on: redirect following (CLIENT_REDIRECTS
+/// budget), gzip decompression, and env proxy lookup. Everything else
+/// is a struct literal away — set redirects/decompress/proxy per
+/// request.
+fn request_get(url: str) -> Request {
+    return Request{method: "GET", url: url, headers: mkslice(Header, 0), body: "", redirects: -1, decompress: true, proxy: ""}
+}
+
+fn request_post(url: str, ctype: str, body: str) -> Request {
+    hs := mkslice(Header, 0)
+    if len(ctype) > 0 {
+        hs = push(hs, Header{name: "content-type", value: ctype})
+    }
+    return Request{method: "POST", url: url, headers: hs, body: body, redirects: -1, decompress: true, proxy: ""}
+}
+
+/// basic_auth is the Authorization header for HTTP Basic — base64 of
+/// "user:pass". Pair it with `headers = push(req.headers, h)`.
+fn basic_auth(user: str, pass: str) -> Header {
+    return Header{name: "authorization", value: "Basic " + base64.encode((user + ":" + pass) as []byte)}
+}
+
+/// bearer_auth is the Authorization header for token auth (JWTs and
+/// friends): "Bearer <token>".
+fn bearer_auth(token: str) -> Header {
+    return Header{name: "authorization", value: "Bearer " + token}
+}
+
+/// default redirect budget when Request.redirects is -1 — bounded so
+/// a redirect loop can't spin forever
+let CLIENT_REDIRECTS = 10
+
+/// proxy_from_env reads the proxy environment for host — HTTP_PROXY
+/// then http_proxy; NO_PROXY/no_proxy is a comma-separated suffix
+/// list (".internal.example" or "example.com" both match subdomains).
+/// "" means connect directly.
+fn proxy_from_env(host: str) -> str {
+    p := os.getenv("HTTP_PROXY")
+    if len(p) == 0 {
+        p = os.getenv("http_proxy")
+    }
+    if len(p) == 0 {
+        return ""
+    }
+    np := os.getenv("NO_PROXY")
+    if len(np) == 0 {
+        np = os.getenv("no_proxy")
+    }
+    if len(np) > 0 && no_proxy_match(np, host) {
+        return ""
+    }
+    // loopback never goes through a proxy unless explicitly listed —
+    // same carve-out curl makes
+    if is_loopback_host(host) {
+        return ""
+    }
+    return p
+}
+
+/// is_loopback_host reports whether host names the local machine —
+/// "localhost" or "::1" case-insensitively, or a full dotted-quad
+/// IPv4 literal in 127.0.0.0/8. Anything looser is a public name:
+/// "127.evil.example.com", "127.0.0.1.evil.com", and "127.1" shorthand
+/// are not loopback (they take the proxy path, which is the safe
+/// direction).
+fn is_loopback_host(host: str) -> bool {
+    hl := lwr(host)
+    if hl == "localhost" || hl == "::1" {
+        return true
+    }
+    part := 0
+    val := 0
+    digits := 0
+    lz := false
+    first := -1
+    i := 0
+    n := len(hl)
+    for i < n {
+        c := byteat(hl, i)
+        if c == 46 {
+            if digits == 0 || val > 255 || lz && digits > 1 {
+                return false
+            }
+            if part == 0 {
+                first = val
+            }
+            part = part + 1
+            val = 0
+            digits = 0
+            lz = false
+        } else if c >= 48 && c <= 57 {
+            if digits == 0 {
+                lz = c == 48
+            }
+            val = val * 10 + c - 48
+            digits = digits + 1
+            if digits > 3 || val > 255 {
+                return false
+            }
+        } else {
+            return false
+        }
+        i = i + 1
+    }
+    if digits == 0 || lz && digits > 1 {
+        return false
+    }
+    return part == 3 && first == 127
+}
+
+/// no_proxy_match reports whether host falls under the comma-separated
+/// NO_PROXY list — entries match the host itself or any subdomain.
+fn no_proxy_match(list: str, host: str) -> bool {
+    hl := lwr(host)
+    i := 0
+    for i <= len(list) {
+        j := find_from(list, ",", i)
+        if j < 0 {
+            j = len(list)
+        }
+        ent := lwr(substr(list, i, j))
+        // trim SP around the entry
+        lo := 0
+        for lo < len(ent) && (byteat(ent, lo) == 32 || byteat(ent, lo) == 9) {
+            lo = lo + 1
+        }
+        hi := len(ent)
+        for hi > lo && (byteat(ent, hi - 1) == 32 || byteat(ent, hi - 1) == 9) {
+            hi = hi - 1
+        }
+        ent = substr(ent, lo, hi)
+        // "*" disables proxying for every host (curl convention)
+        if ent == "*" {
+            return true
+        }
+        // "example.com:8080" matches on the host part; a leading "."
+        // is cosmetic — entries match the domain and its subdomains
+        ci := find(ent, ":")
+        if ci > 0 {
+            pd := true
+            k := ci + 1
+            for k < len(ent) {
+                if byteat(ent, k) < 48 || byteat(ent, k) > 57 {
+                    pd = false
+                }
+                k = k + 1
+            }
+            if pd {
+                ent = substr(ent, 0, ci)
+            }
+        }
+        if len(ent) > 0 && byteat(ent, 0) == 46 {
+            ent = substr(ent, 1, len(ent))
+        }
+        if len(ent) > 0 && (hl == ent || len(hl) > len(ent) && byteat(hl, len(hl) - len(ent) - 1) == 46 && substr(hl, len(hl) - len(ent), len(hl)) == ent) {
+            return true
+        }
+        if j >= len(list) {
+            return false
+        }
+        i = j + 1
+    }
+    return false
+}
+
+/// is_redirect_status — the codes a client may follow
+fn is_redirect_status(status: int) -> bool {
+    return status == 301 || status == 302 || status == 303 || status == 307 || status == 308
+}
+
+/// managed_headers are generated per request — caller values for them
+/// are dropped so a stale content-length can't desync the body
+fn managed_header(name: str) -> bool {
+    n := lwr(name)
+    return n == "host" || n == "content-length" || n == "connection" || n == "transfer-encoding" || n == "keep-alive" || n == "upgrade" || n == "te" || n == "trailer" || n == "proxy-authorization" || n == "proxy-connection"
+}
+
+/// is_tchar — RFC 7230 token characters: ALPHA / DIGIT and
+/// `!#$%&'*+-.^_`|~`. Separators like `:`, `,`, `;`, `=`, `@` are NOT
+/// token chars — admitting them lets `a:b` smuggle a renamed header
+/// onto the wire.
+fn is_tchar(b: int) -> bool {
+    if b >= 48 && b <= 57 {
+        return true
+    }
+    if b >= 65 && b <= 90 {
+        return true
+    }
+    if b >= 97 && b <= 122 {
+        return true
+    }
+    return b == 33 || b == 35 || b == 36 || b == 37 || b == 38 || b == 39 || b == 42 || b == 43 || b == 45 || b == 46 || b == 94 || b == 95 || b == 96 || b == 124 || b == 126
+}
+
+/// header_value_ok rejects non-token names and CR/LF in values —
+/// header injection is a request-smuggling primitive, not a
+/// formatting choice
+fn header_value_ok(name: str, value: str) -> bool {
+    if len(name) == 0 {
+        return false
+    }
+    i := 0
+    for i < len(name) {
+        if is_tchar(byteat(name, i)) == false {
+            return false
+        }
+        i = i + 1
+    }
+    i = 0
+    for i < len(value) {
+        bv := byteat(value, i)
+        // CTLs other than HTAB are never legal field content; obs-text
+        // (>=128) stays allowed per RFC 7230 field-content rules
+        if bv < 32 && bv != 9 || bv == 127 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+/// authority renders host[:port] for URL building and Host headers
+fn url_authority(u: Url) -> str {
+    if u.port != 80 {
+        return u.host + ":" + itoa(u.port)
+    }
+    return u.host
+}
+
+/// resolve_location turns a Location value into an absolute http://
+/// URL against the request's own URL — absolute URIs, scheme-relative
+/// "//h/p", and root/relative paths all resolve; https stays an err
+/// (no TLS).
+fn resolve_location(base: str, loc: str) -> [str, err] {
+    [bu, be] = parse_url(base)
+    if be != nil {
+        return "", be
+    }
+    ll := lwr(loc)
+    if len(ll) >= 7 && substr(ll, 0, 7) == "http://" {
+        // normalize the scheme — parse_url's prefix check is
+        // case-sensitive and "HTTP://x" would fail downstream —
+        // then run the same dot-segment resolution every other form
+        // gets, on the parsed path component only
+        nloc := "http:" + substr(loc, 5, len(loc))
+        [u2, e2] = parse_url(nloc)
+        if e2 != nil {
+            return "", e2
+        }
+        return "http://" + url_authority(u2) + normalize_path_query(u2.path), nil
+    }
+    if len(ll) >= 8 && substr(ll, 0, 8) == "https://" {
+        return "", errors.new("http: redirect to https unsupported (no TLS)")
+    }
+    if len(loc) >= 2 && byteat(loc, 0) == 47 && byteat(loc, 1) == 47 {
+        [u3, e3] = parse_url("http:" + loc)
+        if e3 != nil {
+            return "", e3
+        }
+        return "http://" + url_authority(u3) + normalize_path_query(u3.path), nil
+    }
+    // any other `scheme:` is unsupported — without this a Location
+    // like "ftp://h/p" falls into the relative branch below and
+    // becomes a bogus "http://…/ftp:…" request target. A colon can
+    // only start a scheme here: relative-path references may not
+    // carry ':' in their first segment (RFC 3986 4.2).
+    ci := find(loc, ":")
+    if ci > 0 {
+        c0 := byteat(loc, 0)
+        ok := c0 >= 65 && c0 <= 90 || c0 >= 97 && c0 <= 122
+        j := 1
+        for ok && j < ci {
+            cj := byteat(loc, j)
+            ok = cj >= 65 && cj <= 90 || cj >= 97 && cj <= 122 || cj >= 48 && cj <= 57 || cj == 43 || cj == 45 || cj == 46
+            j = j + 1
+        }
+        if ok {
+            return "", errors.new("http: redirect to unsupported scheme " + substr(loc, 0, ci))
+        }
+    }
+    // bu.path still carries the base query — merges must run against
+    // the path alone or a "?"-laden base corrupts the directory cut
+    bpath := bu.path
+    bq := find(bpath, "?")
+    if bq >= 0 {
+        bpath = substr(bpath, 0, bq)
+    }
+    // split the reference's own ?query/#fragment off BEFORE any path
+    // math — dot-segments inside a query or fragment are data, not
+    // path segments ("/x?y=/../z" must not collapse to "/z")
+    lend := len(loc)
+    q := find(loc, "?")
+    h := find(loc, "#")
+    lend2 := lend
+    if q >= 0 && q < lend2 {
+        lend2 = q
+    }
+    if h >= 0 && h < lend2 {
+        lend2 = h
+    }
+    lpath := substr(loc, 0, lend2)
+    lsuffix := substr(loc, lend2, lend)
+    scheme := "http://" + url_authority(bu)
+    if byteat(loc, 0) == 47 {
+        return scheme + remove_dot_segments(lpath) + lsuffix, nil
+    }
+    if byteat(loc, 0) == 63 {
+        // "?q" replaces the base query outright (RFC 3986 5.2.2) —
+        // appending to bu.path would emit "/p?x=1?y=2"
+        return scheme + bpath + lsuffix, nil
+    }
+    if byteat(loc, 0) == 35 {
+        // "#f" is the same document — fragments never reach the wire,
+        // so the resolved URL is just the base
+        return scheme + bu.path, nil
+    }
+    // relative path — merge against the base's directory (the path
+    // up to and including its LAST slash, per RFC 3986 5.2), then
+    // resolve dot-segments on the merged path
+    last := -1
+    k := 0
+    for k < len(bpath) {
+        if byteat(bpath, k) == 47 {
+            last = k
+        }
+        k = k + 1
+    }
+    dir := "/"
+    if last >= 0 {
+        dir = substr(bpath, 0, last + 1)
+    }
+    return scheme + remove_dot_segments(dir + lpath) + lsuffix, nil
+}
+
+/// normalize_path_query resolves dot-segments in the path component
+/// of a path[?query] string and reattaches the query untouched —
+/// parse_url keeps "?…" inside Url.path, so normalization must split
+/// before it runs.
+fn normalize_path_query(pq: str) -> str {
+    q := find(pq, "?")
+    if q < 0 {
+        return remove_dot_segments(pq)
+    }
+    return remove_dot_segments(substr(pq, 0, q)) + substr(pq, q, len(pq))
+}
+
+/// remove_dot_segments applies RFC 3986 5.2.4 to an absolute path —
+/// "." and ".." segments resolve against the stack; ".." at the root
+/// is dropped rather than escaping above "/". A trailing "." or ".."
+/// leaves a trailing '/' per the spec's last-segment rule.
+fn remove_dot_segments(path: str) -> str {
+    parts := mkslice(str, 0)
+    i := 0
+    n := len(path)
+    for true {
+        j := find_from(path, "/", i)
+        if j < 0 {
+            j = n
+        }
+        seg := substr(path, i, j)
+        if seg == "." {
+            if j >= n {
+                parts = push(parts, "")
+            }
+        } else if seg == ".." {
+            // pop the previous segment — including an empty interior
+            // one ("/a//../b" → "/a/b"); only the leading "" root
+            // sentinel is protected so ".." can't escape above "/"
+            if len(parts) > 1 {
+                parts = parts[:len(parts) - 1]
+            }
+            if j >= n {
+                parts = push(parts, "")
+            }
+        } else {
+            parts = push(parts, seg)
+        }
+        if j >= n {
+            break
+        }
+        i = j + 1
+    }
+    out := ""
+    k := 0
+    for k < len(parts) {
+        if k > 0 {
+            out = out + "/"
+        }
+        out = out + parts[k]
+        k = k + 1
+    }
+    return out
+}
+
+/// redirect_request rewrites the request for a followed redirect —
+/// 303 always becomes GET; 301/302 turn POST into GET (the historical
+/// browser behavior); 307/308 preserve method and body. Content
+/// headers that no longer apply are dropped with the body.
+fn redirect_request(cur: Request, status: int, loc: str) -> [Request, err] {
+    [nurl, ne] = resolve_location(cur.url, loc)
+    if ne != nil {
+        return Request{method: "", url: "", headers: mkslice(Header, 0), body: "", redirects: 0, decompress: false, proxy: "direct"}, ne
+    }
+    method := cur.method
+    body := cur.body
+    rewrite_get := status == 303 || (status == 301 || status == 302) && method == "POST"
+    if rewrite_get {
+        method = "GET"
+        body = ""
+    }
+    // credentials don't cross origins — a redirect to another host
+    // must not carry authorization/cookie/proxy-authorization along
+    [nu, ne2] = parse_url(nurl)
+    if ne2 != nil {
+        return Request{method: "", url: "", headers: mkslice(Header, 0), body: "", redirects: 0, decompress: false, proxy: "direct"}, ne2
+    }
+    // cur.url already parsed inside resolve_location — this cannot
+    // fail, but the err channel must still be handled
+    [cu, ce] = parse_url(cur.url)
+    if ce != nil {
+        return Request{method: "", url: "", headers: mkslice(Header, 0), body: "", redirects: 0, decompress: false, proxy: "direct"}, ce
+    }
+    same_origin := nu.host == cu.host && nu.port == cu.port
+    hs := mkslice(Header, 0)
+    i := 0
+    for i < len(cur.headers) {
+        hn := lwr(cur.headers[i].name)
+        drop := hn == "content-length" || rewrite_get && hn == "content-type"
+        if !same_origin && (hn == "authorization" || hn == "cookie" || hn == "proxy-authorization") {
+            drop = true
+        }
+        if !drop {
+            hs = push(hs, cur.headers[i])
+        }
+        i = i + 1
+    }
+    return Request{method: method, url: nurl, headers: hs, body: body, redirects: cur.redirects, decompress: cur.decompress, proxy: cur.proxy}, nil
+}
+
+/// parse_head_headers turns the response head (everything before
+/// \r\n\r\n, status line included) into name/value pairs — the status
+/// line itself is skipped, continuation lines are not unfolded.
+fn parse_head_headers(head: str) -> []Header {
+    hs := mkslice(Header, 0)
+    pos := 0
+    eol := find(head, "\r\n")
+    if eol >= 0 {
+        pos = eol + 2
+    }
+    for pos < len(head) {
+        eol = find_from(head, "\r\n", pos)
+        if eol < 0 || eol == pos {
+            break
+        }
+        line := substr(head, pos, eol)
+        colon := find(line, ":")
+        if colon > 0 {
+            nm := substr(line, 0, colon)
+            // trim trailing SP before the colon and leading SP/TAB of
+            // the value — header grammar allows both
+            hn := len(nm)
+            for hn > 0 && (byteat(nm, hn - 1) == 32 || byteat(nm, hn - 1) == 9) {
+                hn = hn - 1
+            }
+            nm = substr(nm, 0, hn)
+            val := substr(line, colon + 1, len(line))
+            lo := 0
+            for lo < len(val) && (byteat(val, lo) == 32 || byteat(val, lo) == 9) {
+                lo = lo + 1
+            }
+            hi := len(val)
+            for hi > lo && (byteat(val, hi - 1) == 32 || byteat(val, hi - 1) == 9) {
+                hi = hi - 1
+            }
+            if len(nm) > 0 {
+                hs = push(hs, Header{name: nm, value: substr(val, lo, hi)})
+            }
+        }
+        pos = eol + 2
+    }
+    return hs
+}
+
+/// ChunkedBody is unchunk's result with the trailer section kept —
+/// the framing facts the flat client dropped
+struct ChunkedBody { body: str, trailers: []Header }
+
+/// last_coding returns the final coding in a consolidated
+/// comma-list header value (trimmed, lowercased) — "" when the list
+/// is empty. Transfer-Encoding only means chunked when chunked is
+/// the LAST coding applied (RFC 9112 6.1): "chunked, gzip" is not a
+/// chunked message.
+fn last_coding(v: str) -> str {
+    last := ""
+    i := 0
+    n := len(v)
+    for i <= n {
+        j := find_from(v, ",", i)
+        if j < 0 {
+            j = n
+        }
+        t := lwr(substr(v, i, j))
+        lo := 0
+        for lo < len(t) && (byteat(t, lo) == 32 || byteat(t, lo) == 9) {
+            lo = lo + 1
+        }
+        hi := len(t)
+        for hi > lo && (byteat(t, hi - 1) == 32 || byteat(t, hi - 1) == 9) {
+            hi = hi - 1
+        }
+        if hi > lo {
+            last = substr(t, lo, hi)
+        }
+        if j >= n {
+            break
+        }
+        i = j + 1
+    }
+    return last
+}
+
+/// unchunk_full is unchunk plus trailer capture — [ChunkedBody, err]
+fn unchunk_full(b: str) -> [ChunkedBody, err] {
+    out := mkslice(byte, 0)
+    trs := mkslice(Header, 0)
+    pos := 0
+    for true {
+        nl := find_from(b, "\r\n", pos)
+        if nl < 0 {
+            return ChunkedBody{body: "", trailers: trs}, errors.new("http: truncated chunk size")
+        }
+        szs := substr(b, pos, nl)
+        semi := find(szs, ";")
+        if semi >= 0 {
+            szs = substr(szs, 0, semi)
+        }
+        if len(szs) > 16 {
+            return ChunkedBody{body: "", trailers: trs}, errors.new("http: chunk size too large " + szs)
+        }
+        [sz, se] = strconv.parseint(szs, 16)
+        if se != nil || sz < 0 {
+            return ChunkedBody{body: "", trailers: trs}, errors.new("http: bad chunk size " + szs)
+        }
+        if sz == 0 {
+            pos = nl + 2
+            // trailer section: "Name: value" lines until the blank
+            // line that terminates the chunked body
+            for true {
+                nl = find_from(b, "\r\n", pos)
+                if nl < 0 {
+                    return ChunkedBody{body: "", trailers: trs}, errors.new("http: truncated trailer")
+                }
+                if nl == pos {
+                    return ChunkedBody{body: out as str, trailers: trs}, nil
+                }
+                line := substr(b, pos, nl)
+                colon := find(line, ":")
+                if colon > 0 {
+                    tn := substr(line, 0, colon)
+                    tnlo := len(tn)
+                    for tnlo > 0 && (byteat(tn, tnlo - 1) == 32 || byteat(tn, tnlo - 1) == 9) {
+                        tnlo = tnlo - 1
+                    }
+                    tv := substr(line, colon + 1, len(line))
+                    vlo := 0
+                    for vlo < len(tv) && (byteat(tv, vlo) == 32 || byteat(tv, vlo) == 9) {
+                        vlo = vlo + 1
+                    }
+                    vhi := len(tv)
+                    for vhi > vlo && (byteat(tv, vhi - 1) == 32 || byteat(tv, vhi - 1) == 9) {
+                        vhi = vhi - 1
+                    }
+                    if tnlo > 0 {
+                        trs = push(trs, Header{name: substr(tn, 0, tnlo), value: substr(tv, vlo, vhi)})
+                    }
+                }
+                pos = nl + 2
+            }
+        }
+        data := nl + 2
+        if sz > len(b) - data {
+            return ChunkedBody{body: "", trailers: trs}, errors.new("http: truncated chunk data")
+        }
+        i := 0
+        for i < sz {
+            out = push(out, byteat(b, data + i))
+            i = i + 1
+        }
+        pos = data + sz
+        if pos + 1 >= len(b) || byteat(b, pos) != 13 || byteat(b, pos + 1) != 10 {
+            return ChunkedBody{body: "", trailers: trs}, errors.new("http: missing CRLF after chunk")
+        }
+        pos = pos + 2
+    }
+}
+
+/// do_once performs exactly one request/response exchange — no
+/// redirects, no retries. Shared by do()'s redirect loop and (via
+/// request()) the legacy flat API.
+fn (cl ref Client) do_once(req: Request) -> [Response, err] {
+    bad := Response{status: 0, reason: "", headers: mkslice(Header, 0), body: "", ctype: "", chunked: false, trailers: mkslice(Header, 0)}
+    // the request line is "METHOD target HTTP/1.1" — a space or CTL in
+    // method or url is request-line injection, same class as header CR/LF
+    if len(req.method) == 0 {
+        return bad, errors.new("http: empty method")
+    }
+    i := 0
+    for i < len(req.method) {
+        if byteat(req.method, i) <= 32 || byteat(req.method, i) >= 127 {
+            return bad, errors.new("http: bad method " + req.method)
+        }
+        i = i + 1
+    }
+    [u, ue] = parse_url(req.url)
+    if ue != nil {
+        return bad, ue
+    }
+    i = 0
+    for i < len(req.url) {
+        if byteat(req.url, i) < 33 || byteat(req.url, i) == 127 {
+            return bad, errors.new("http: bad url " + req.url)
+        }
+        i = i + 1
+    }
+    // caller headers are validated before anything touches the wire —
+    // a CR/LF in a value is header injection, full stop
+    i = 0
+    for i < len(req.headers) {
+        h := req.headers[i]
+        if managed_header(h.name) {
+            return bad, errors.new("http: header " + h.name + " is managed by the client")
+        }
+        if !header_value_ok(h.name, h.value) {
+            return bad, errors.new("http: header " + h.name + " contains CR/LF")
+        }
+        i = i + 1
+    }
+    // proxy policy: "" honors the env, "direct" connects straight,
+    // anything else is an http:// proxy URL. The request target stays
+    // absolute-URI through a proxy (plain-HTTP forwarding — CONNECT
+    // is an HTTPS concern).
+    pxy := req.proxy
+    if len(pxy) == 0 {
+        pxy = proxy_from_env(u.host)
+    }
+    target_host := u.host
+    target_port := u.port
+    dial_host := u.host
+    dial_port := u.port
+    via_proxy := false
+    if len(pxy) > 0 && pxy != "direct" {
+        [pu, pe] = parse_url(pxy)
+        if pe != nil {
+            return bad, errors.new("http: bad proxy url " + pxy)
+        }
+        dial_host = pu.host
+        dial_port = pu.port
+        via_proxy = true
+    }
+    [c, de] = net.dial_timeout(dial_host, dial_port, cl.tmo)
+    if de != nil {
+        return bad, de
+    }
+    // Host header names the ORIGIN, not the proxy
+    hosthdr := target_host
+    if target_port != 80 {
+        hosthdr = hosthdr + ":" + itoa(target_port)
+    }
+    target := u.path
+    if via_proxy {
+        target = "http://" + url_authority(u) + u.path
+    }
+    wire := req.method + " " + target + " HTTP/1.1\r\n" + "host: " + hosthdr + "\r\n" + "connection: close\r\n"
+    if req.decompress {
+        // only advertise what we can decode — and don't double-set a
+        // caller-supplied accept-encoding
+        has_ae := false
+        j := 0
+        for j < len(req.headers) {
+            if lwr(req.headers[j].name) == "accept-encoding" {
+                has_ae = true
+            }
+            j = j + 1
+        }
+        if !has_ae {
+            wire = wire + "accept-encoding: gzip\r\n"
+        }
+    }
+    if len(req.body) > 0 {
+        wire = wire + "content-length: " + itoa(len(req.body)) + "\r\n"
+    }
+    j := 0
+    for j < len(req.headers) {
+        wire = wire + req.headers[j].name + ": " + req.headers[j].value + "\r\n"
+        j = j + 1
+    }
+    wire = wire + "\r\n" + req.body
+    if cl.tmo > 0 {
+        set_sndtimo(c.rawfd(), (cl.tmo + 999) / 1000)
+    }
+    we := write_all(c, wire)
+    if we != nil {
+        c.close()
+        return bad, we
+    }
+    // identical read-until-close contract as the legacy path: the
+    // budget is per-read remaining, and any read error fails rather
+    // than delivering a possibly-truncated body
+    deadline := now_ms() + cl.tmo
+    scratch := mkslice(byte, 8192)
+    out := mkslice(byte, 0)
+    for true {
+        rem := deadline - now_ms()
+        if rem <= 0 {
+            c.close()
+            return bad, errors.new("http: read deadline exceeded")
+        }
+        set_rcvtimo_ms(c.rawfd(), rem)
+        [n, e] = c.read(scratch)
+        if n > 0 {
+            k := 0
+            for k < n {
+                out = push(out, scratch[k])
+                k = k + 1
+            }
+        }
+        if e == io.eof() {
+            break
+        }
+        if e != nil {
+            c.close()
+            return bad, e
+        }
+        if n <= 0 {
+            c.close()
+            return bad, errors.new("http: connection closed mid-response")
+        }
+    }
+    c.close()
+    resp := out as str
+    // interim 1xx heads (100 Continue etc.) precede the final
+    // response — skip each head block until a non-1xx status arrives.
+    // 101 is final: it completes the HTTP exchange (protocol switch).
+    off := 0
+    code := 0
+    reason := ""
+    hs := mkslice(Header, 0)
+    he := -1
+    for true {
+        he = find_from(resp, "\r\n\r\n", off)
+        if he < 0 {
+            return bad, errors.new("http: response never completed headers")
+        }
+        eol := find_from(resp, "\r\n", off)
+        line := substr(resp, off, eol)
+        // "HTTP/1.1 200 OK" — code + reason are the two tokens after
+        // the version; a missing reason is legal, not malformed
+        sp := find(line, " ")
+        c2 := 0
+        r2 := ""
+        if sp > 0 {
+            rest := substr(line, sp + 1, len(line))
+            sp2 := find(rest, " ")
+            tok := rest
+            if sp2 > 0 {
+                tok = substr(rest, 0, sp2)
+                r2 = substr(rest, sp2 + 1, len(rest))
+            }
+            [v, ae] = strconv.atoi(tok)
+            if ae == nil {
+                c2 = v
+            }
+        }
+        if c2 >= 100 && c2 < 200 && c2 != 101 {
+            off = he + 4
+            continue
+        }
+        code = c2
+        reason = r2
+        hs = parse_head_headers(substr(resp, off, he) + "\r\n")
+        break
+    }
+    raw := substr(resp, he + 4, len(resp))
+    rctype := ""
+    seen_ct := false
+    i := 0
+    for i < len(hs) {
+        if !seen_ct && lwr(hs[i].name) == "content-type" {
+            rctype = hs[i].value
+            seen_ct = true
+        }
+        i = i + 1
+    }
+    rbody := ""
+    trs := mkslice(Header, 0)
+    chunked := false
+    // every Transfer-Encoding field joins into one comma list —
+    // duplicate fields are legal and "TE: identity" + "TE: chunked"
+    // must still read as chunked (RFC 9112 6.1 / TE consolidation)
+    te := ""
+    i = 0
+    for i < len(hs) {
+        if lwr(hs[i].name) == "transfer-encoding" {
+            if len(te) > 0 {
+                te = te + ","
+            }
+            te = te + hs[i].value
+        }
+        i = i + 1
+    }
+    if last_coding(te) == "chunked" {
+        chunked = true
+        [cb, de] = unchunk_full(raw)
+        if de != nil {
+            return bad, de
+        }
+        rbody = cb.body
+        trs = cb.trailers
+    } else if len(te) > 0 {
+        // TE present but chunked isn't the final coding — the body is
+        // close-delimited and Content-Length is ignored outright
+        // (RFC 9112 6.1); `raw` already holds the whole stream
+        rbody = raw
+    } else {
+        clv := ""
+        has_cl := false
+        i = 0
+        for i < len(hs) {
+            if lwr(hs[i].name) == "content-length" {
+                if !has_cl {
+                    clv = hs[i].value
+                    has_cl = true
+                } else if hs[i].value != clv {
+                    // conflicting duplicates desync framing (CWE-444) —
+                    // identical repeats consolidate, differing ones err
+                    return bad, errors.new("http: conflicting content-length")
+                }
+            }
+            i = i + 1
+        }
+        if len(clv) == 0 {
+            // header absent entirely is fine (close-delimited); present
+            // but empty is malformed framing — same rule as before
+            if has_cl {
+                return bad, errors.new("http: empty content-length")
+            }
+        } else {
+            // atoi wraps on overflow — a 20-digit value can land on a
+            // small positive count; real bodies never need >18 digits
+            if len(clv) > 18 {
+                return bad, errors.new("http: bad content-length " + clv)
+            }
+            [cln, cle] = strconv.atoi(clv)
+            if cle != nil || cln < 0 {
+                return bad, errors.new("http: bad content-length " + clv)
+            }
+            if len(raw) < cln {
+                return bad, errors.new("http: truncated body — content-length " + clv + ", got " + itoa(len(raw)))
+            }
+            if len(raw) > cln {
+                raw = substr(raw, 0, cln)
+            }
+        }
+        rbody = raw
+    }
+    // content-encoding: codings apply in listed order, so the decode
+    // chain runs in reverse. Multiple Content-Encoding fields join
+    // into one ordered list. Only gzip/identity are decodable — any
+    // other coding delivers the body raw with headers intact (the
+    // same contract unknown encodings always had). Decoding is
+    // opt-in (decompress) and capped — wire data never reaches the
+    // unbounded decompress() path.
+    encs := mkslice(str, 0)
+    i = 0
+    for i < len(hs) {
+        if lwr(hs[i].name) == "content-encoding" {
+            v := hs[i].value
+            k := 0
+            nv := len(v)
+            for k <= nv {
+                j := find_from(v, ",", k)
+                if j < 0 {
+                    j = nv
+                }
+                t := lwr(substr(v, k, j))
+                lo := 0
+                for lo < len(t) && (byteat(t, lo) == 32 || byteat(t, lo) == 9) {
+                    lo = lo + 1
+                }
+                hi := len(t)
+                for hi > lo && (byteat(t, hi - 1) == 32 || byteat(t, hi - 1) == 9) {
+                    hi = hi - 1
+                }
+                if hi > lo {
+                    encs = push(encs, substr(t, lo, hi))
+                }
+                if j >= nv {
+                    break
+                }
+                k = j + 1
+            }
+        }
+        i = i + 1
+    }
+    if req.decompress && len(encs) > 0 {
+        decodable := true
+        ei := 0
+        for ei < len(encs) {
+            if encs[ei] != "gzip" && encs[ei] != "identity" {
+                decodable = false
+            }
+            ei = ei + 1
+        }
+        if decodable {
+            cur := rbody
+            ei = len(encs) - 1
+            for ei >= 0 {
+                if encs[ei] == "gzip" {
+                    [nb, ne3] = gunzip_capped(cur)
+                    if ne3 != nil {
+                        return bad, errors.new("http: gzip decode: " + errors.msg(ne3))
+                    }
+                    cur = nb
+                }
+                ei = ei - 1
+            }
+            rbody = cur
+        }
+    }
+    return Response{status: code, reason: reason, headers: hs, body: rbody, ctype: rctype, chunked: chunked, trailers: trs}, nil
+}
+
+/// GUNZIP_MAX caps one response's inflated size — decompress() is
+/// documented for trusted input and grows without bound, so wire
+/// data decodes through the streaming reader under this ceiling.
+let GUNZIP_MAX = 67108864
+
+/// gunzip_capped inflates src through the streaming gzip Reader —
+/// all members concatenated, same as decompress(), but output stops
+/// at GUNZIP_MAX instead of growing without bound.
+fn gunzip_capped(src: str) -> [str, err] {
+    bb := bytes.newbuffer()
+    [wn, we] = bb.write(src as []byte)
+    if we != nil {
+        return "", we
+    }
+    [gr, ge] = gzip.newreader(bb.asreader())
+    if ge != nil {
+        return "", ge
+    }
+    out := mkslice(byte, 0)
+    buf := mkslice(byte, 8192)
+    for true {
+        [n, re] = gr.read(buf)
+        k := 0
+        for k < n {
+            out = push(out, buf[k])
+            k = k + 1
+        }
+        if len(out) > GUNZIP_MAX {
+            return "", errors.new("http: gzip body exceeds 64MiB limit")
+        }
+        if re == io.eof() {
+            break
+        }
+        if re != nil {
+            return "", re
+        }
+    }
+    return out as str, nil
+}
+
+/// do runs req through the redirect policy — each hop is a fresh
+/// do_once exchange; the loop is bounded by redirects (0 = never
+/// follow, the legacy behavior). A redirect without Location is
+/// delivered as the final response; one that fails to resolve
+/// returns the err — the caller sees exactly what the wire said.
+fn (cl ref Client) do(req: Request) -> [Response, err] {
+    bad := Response{status: 0, reason: "", headers: mkslice(Header, 0), body: "", ctype: "", chunked: false, trailers: mkslice(Header, 0)}
+    cur := req
+    redirects := req.redirects
+    if redirects < 0 {
+        redirects = CLIENT_REDIRECTS
+    }
+    for true {
+        [resp, e] = cl.do_once(cur)
+        if e != nil {
+            return bad, e
+        }
+        if !is_redirect_status(resp.status) || redirects <= 0 {
+            return resp, nil
+        }
+        redirects = redirects - 1
+        loc := resp.header("location")
+        if len(loc) == 0 {
+            return resp, nil
+        }
+        [nreq, ne] = redirect_request(cur, resp.status, loc)
+        if ne != nil {
+            return bad, ne
+        }
+        cur = nreq
+    }
+    return bad, errors.new("http: unreachable")
+}

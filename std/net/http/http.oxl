@@ -13,8 +13,6 @@ package http
 // dial/read budget. HTTPS stays parked (no TLS — see impl-s4).
 import "std/net"
 
-import "std/io"
-
 import "std/errors"
 
 import "std/strconv"
@@ -390,6 +388,11 @@ fn parse_url(url: str) -> [Url, err] {
     if len(u) == 0 {
         return bad, errors.new("http: empty url")
     }
+    // a fragment is client-side only — never part of the request-target
+    frag := find(u, "#")
+    if frag >= 0 {
+        u = substr(u, 0, frag)
+    }
     slash := find(u, "/")
     hostport := u
     path := "/"
@@ -415,236 +418,31 @@ fn parse_url(url: str) -> [Url, err] {
     return Url{host: host, port: port, path: path}, nil
 }
 
-/// hdr_of extracts one header value from the response head —
-/// `lowered` is the case-folded copy of resp[0:he] used for matching;
-/// the value keeps the original casing off resp, trimmed of SP/TAB.
-fn hdr_of(resp: str, lowered: str, key: str) -> str {
-    at := find_from(lowered, "\r\n" + key + ":", 0)
-    if at < 0 {
-        // a first-line header would lack the leading CRLF — only the
-        // status line sits there, so treat absence as absent
-        return ""
-    }
-    val := substr(resp, at + 2 + len(key) + 1, len(resp))
-    e2 := find(val, "\r\n")
-    if e2 >= 0 {
-        // e2 == 0 is an empty value — the header ends at the CRLF
-        // right after the colon, not at the end of the response
-        val = substr(val, 0, e2)
-    }
-    lo := 0
-    for lo < len(val) && (byteat(val, lo) == 32 || byteat(val, lo) == 9) {
-        lo = lo + 1
-    }
-    hi := len(val)
-    for hi > lo && (byteat(val, hi - 1) == 32 || byteat(val, hi - 1) == 9) {
-        hi = hi - 1
-    }
-    if hi <= lo {
-        return ""
-    }
-    return substr(val, lo, hi)
-}
-
-/// unchunk decodes a transfer-encoding: chunked body — size lines,
-/// data runs, and any trailers up to the 0\r\n\r\n terminator.
-fn unchunk(b: str) -> [str, err] {
-    out := mkslice(byte, 0)
-    pos := 0
-    for true {
-        nl := find_from(b, "\r\n", pos)
-        if nl < 0 {
-            return "", errors.new("http: truncated chunk size")
-        }
-        szs := substr(b, pos, nl)
-        semi := find(szs, ";")
-        if semi >= 0 {
-            szs = substr(szs, 0, semi)
-        }
-        if len(szs) > 16 {
-            // parseint wraps silently — 17+ hex digits can land on a
-            // small positive or zero, faking a chunk terminator
-            return "", errors.new("http: chunk size too large " + szs)
-        }
-        [sz, se] = strconv.parseint(szs, 16)
-        if se != nil || sz < 0 {
-            return "", errors.new("http: bad chunk size " + szs)
-        }
-        if sz == 0 {
-            // the trailer section must end with a blank line — a
-            // bare `0\r\n` at stream end is a truncated response.
-            // Each trailer line must be CRLF-terminated; we don't
-            // expose the fields, only their framing
-            pos = nl + 2
-            for true {
-                nl = find_from(b, "\r\n", pos)
-                if nl < 0 {
-                    return "", errors.new("http: truncated trailer")
-                }
-                if nl == pos {
-                    return out as str, nil
-                }
-                pos = nl + 2
-            }
-        }
-        data := nl + 2
-        if sz > len(b) - data {
-            // compare without `data + sz` — a huge sz would wrap the
-            // sum negative and skip the bound
-            return "", errors.new("http: truncated chunk data")
-        }
-        i := 0
-        for i < sz {
-            out = push(out, byteat(b, data + i))
-            i = i + 1
-        }
-        pos = data + sz
-        if pos + 1 >= len(b) || byteat(b, pos) != 13 || byteat(b, pos + 1) != 10 {
-            return "", errors.new("http: missing CRLF after chunk")
-        }
-        pos = pos + 2
-    }
-}
-
 /// default dial+read budget for the package-level get/post (ms)
 let CLIENT_MS = 30000
 
-/// a client with its own dial/read budget — one request at a time
+/// a client with its own dial/read budget — one request at a time.
+/// Redirect/decompress/proxy policy lives on Request (client.oxl) —
+/// struct literals are exhaustive in oxl, so growing this struct
+/// would break every `Client{tmo: X}` call site.
 struct Client { tmo: int }
 
-/// one request: dial, write, read-until-close (bounded by the client's
-/// budget). Status/ctype come off the status line and headers; the body
-/// is whatever follows \r\n\r\n verbatim.
+/// one request through the rich path in client.oxl — legacy flat
+/// shape preserved: redirects off, decompression off, no proxy, so a
+/// `Client{tmo: X}` literal behaves exactly as it always has. The ctype
+/// argument lands as a content-type header (CR/LF in it is dropped,
+/// same as before — header injection isn't a formatting choice).
 fn (cl ref Client) request(method: str, url: str, ctype: str, body: str) -> [Resp, err] {
     bad := Resp{status: 0, body: "", ctype: ""}
-    [u, ue] = parse_url(url)
-    if ue != nil {
-        return bad, ue
-    }
-    [c, de] = net.dial_timeout(u.host, u.port, cl.tmo)
-    if de != nil {
-        return bad, de
-    }
-    req := method + " " + u.path + " HTTP/1.1\r\nhost: " + u.host
-    if u.port != 80 {
-        req = req + ":" + itoa(u.port)
-    }
-    req = req + "\r\nconnection: close\r\n"
+    req := Request{method: method, url: url, headers: mkslice(Header, 0), body: body, redirects: 0, decompress: false, proxy: "direct"}
     if len(ctype) > 0 && !has_crlf(ctype) {
-        req = req + "content-type: " + ctype + "\r\n"
+        req.headers = push(req.headers, Header{name: "content-type", value: ctype})
     }
-    if len(body) > 0 {
-        req = req + "content-length: " + itoa(len(body)) + "\r\n"
+    [r, e] = cl.do(req)
+    if e != nil {
+        return bad, e
     }
-    req = req + "\r\n" + body
-    // bound the send with the request budget — a peer that accepts
-    // but never reads could otherwise hold the write open forever,
-    // and a write failure must surface instead of falling through to
-    // a misleading read error
-    if cl.tmo > 0 {
-        set_sndtimo(c.rawfd(), (cl.tmo + 999) / 1000)
-    }
-    we := write_all(c, req)
-    if we != nil {
-        c.close()
-        return bad, we
-    }
-    // response: connection: close means read-until-EOF is well-defined.
-    // Each read carries only the *remaining* budget — a silent peer
-    // can't stretch the whole-request deadline by answering slowly.
-    deadline := now_ms() + cl.tmo
-    scratch := mkslice(byte, 8192)
-    out := mkslice(byte, 0)
-    for true {
-        rem := deadline - now_ms()
-        if rem <= 0 {
-            c.close()
-            return bad, errors.new("http: read deadline exceeded")
-        }
-        set_rcvtimo_ms(c.rawfd(), rem)
-        [n, e] = c.read(scratch)
-        if n > 0 {
-            j := 0
-            for j < n {
-                // []byte growth is amortized; str concat would copy
-                // the accumulated prefix per read (quadratic)
-                out = push(out, scratch[j])
-                j = j + 1
-            }
-        }
-        if e == io.eof() {
-            break
-        }
-        if e != nil {
-            // a read error (timeout, reset) is not a clean close —
-            // the body may be truncated; fail, don't deliver it
-            c.close()
-            return bad, e
-        }
-        if n <= 0 {
-            c.close()
-            return bad, errors.new("http: connection closed mid-response")
-        }
-    }
-    c.close()
-    resp := out as str
-    he := find(resp, "\r\n\r\n")
-    if he < 0 {
-        return bad, errors.new("http: response never completed headers")
-    }
-    // "HTTP/1.1 200 OK" — code is the token after the first space
-    eol := find(resp, "\r\n")
-    line := substr(resp, 0, eol)
-    sp := find(line, " ")
-    code := 0
-    if sp > 0 {
-        rest := substr(line, sp + 1, len(line))
-        sp2 := find(rest, " ")
-        tok := rest
-        if sp2 > 0 {
-            tok = substr(rest, 0, sp2)
-        }
-        [v, ae] = strconv.atoi(tok)
-        if ae == nil {
-            code = v
-        }
-    }
-    hdrs := lwr(substr(resp, 0, he))
-    rctype := hdr_of(resp, hdrs, "content-type")
-    // framing: we sent HTTP/1.1 so a server may answer chunked, and a
-    // content-length shorter than what arrived means truncation got
-    // past the read loop — neither may slip through as a "body"
-    raw := substr(resp, he + 4, len(resp))
-    te := lwr(hdr_of(resp, hdrs, "transfer-encoding"))
-    rbody := ""
-    if find(te, "chunked") >= 0 {
-        [db, de] = unchunk(raw)
-        if de != nil {
-            return bad, de
-        }
-        rbody = db
-    } else {
-        clv := hdr_of(resp, hdrs, "content-length")
-        if len(clv) == 0 && find(hdrs, "\r\ncontent-length:") >= 0 {
-            // header present but empty — malformed framing, not "no
-            // length given"; silently accepting it hides an error
-            return bad, errors.new("http: empty content-length")
-        }
-        if len(clv) > 0 {
-            [cln, cle] = strconv.atoi(clv)
-            if cle != nil || cln < 0 {
-                return bad, errors.new("http: bad content-length " + clv)
-            }
-            if len(raw) < cln {
-                return bad, errors.new("http: truncated body — content-length " + clv + ", got " + itoa(len(raw)))
-            }
-            if len(raw) > cln {
-                raw = substr(raw, 0, cln)
-            }
-        }
-        rbody = raw
-    }
-    return Resp{status: code, body: rbody, ctype: rctype}, nil
+    return Resp{status: r.status, body: r.body, ctype: r.ctype}, nil
 }
 
 fn (cl ref Client) get(url: str) -> [Resp, err] {

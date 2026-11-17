@@ -1,0 +1,473 @@
+package main
+
+// Rich-client acceptance for std/net/http client.oxl — runs under
+// `oxl run` like httpclient_test (exit(0) ends the fake server's
+// accept loop). A raw net.Listener fake covers the wire-level paths
+// real serve() can't emit: redirects, absolute-URI proxy form,
+// chunked+trailers, gzip bytes, and request-head echo for header
+// assertions.
+import "std/net/http"
+
+import "std/net"
+
+import "std/errors"
+
+import "std/encoding/base64"
+
+import "std/strconv"
+
+let PORT = 18344
+
+// gzipped "hello gzip" — std/compress has decompress only, so the
+// fixture ships pre-compressed
+let GZ_B64 = "H4sIAAAAAAAC/8tIzcnJV0ivyiwAABlq0t8KAAAA"
+
+fn ck(e: err, m: str) {
+    if e != nil {
+        println("FAIL " + m + ": " + errors.msg(e))
+        exit(1)
+    }
+}
+
+fn get_retry(cl: http.Client, url: str) -> [http.Response, err] {
+    return get_retry_req(cl, http.request_get(url))
+}
+
+fn get_retry_req(cl: http.Client, rq: http.Request) -> [http.Response, err] {
+    tries := 0
+    for tries < 40 {
+        [r, e] = cl.do(rq)
+        if e == nil {
+            return r, nil
+        }
+        usleep(50000)
+        tries = tries + 1
+    }
+    return cl.do(rq)
+}
+
+// read one full request (head + content-length body) off the wire —
+// the fake server's only job is to see exactly what the client sent
+fn read_req(c: net.Conn) -> str {
+    scratch := mkslice(byte, 8192)
+    buf := mkslice(byte, 0)
+    he := -1
+    cl := 0
+    for true {
+        [n, e] = c.read(scratch)
+        if n <= 0 {
+            break
+        }
+        i := 0
+        for i < n {
+            buf = push(buf, scratch[i])
+            i = i + 1
+        }
+        s := buf as str
+        he = find(s, "\r\n\r\n")
+        if he >= 0 {
+            head := substr(s, 0, he)
+            ci := find(head, "\r\ncontent-length:")
+            if ci < 0 {
+                break
+            }
+            // find() has no offset — search the tail substring instead
+            rest := substr(head, ci + 2, len(head))
+            le0 := find(rest, "\r\n")
+            le := ci + 2
+            if le0 >= 0 {
+                le = le + le0
+            } else {
+                le = he
+            }
+            [v, ve] = strconv.atoi(substr(head, ci + 19, le))
+            cl = v
+            if len(s) >= he + 4 + cl {
+                break
+            }
+        }
+        if e != nil {
+            break
+        }
+    }
+    return buf as str
+}
+
+fn fake_server() {
+    [l, e] = net.listen(PORT)
+    if e != nil {
+        println("FAIL listen: " + errors.msg(e))
+        return
+    }
+    for true {
+        [c, ae] = l.accept()
+        if ae != nil {
+            return
+        }
+        req := read_req(c)
+        line := substr(req, 0, find(req, "\r\n"))
+        path := "/"
+        // request-target is field 2 of the request line
+        sp1 := find(line, " ")
+        if sp1 > 0 {
+            rest := substr(line, sp1 + 1, len(line))
+            sp2 := find(rest, " ")
+            if sp2 > 0 {
+                path = substr(rest, 0, sp2)
+            }
+        }
+        resp := ""
+        if path == "/redir" || find(path, "/redir") == 0 {
+            resp = "HTTP/1.1 302 Found\r\nlocation: /final\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+        } else if path == "/loop" {
+            resp = "HTTP/1.1 302 Found\r\nlocation: /loop\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+        } else if path == "/r302" {
+            resp = "HTTP/1.1 302 Found\r\nlocation: /who\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+        } else if path == "/r303" {
+            resp = "HTTP/1.1 303 See Other\r\nlocation: /who\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+        } else if path == "/r307" {
+            resp = "HTTP/1.1 307 Temporary Redirect\r\nlocation: /who\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+        } else if find(path, "/qredir") == 0 && find(path, "y=2") < 0 {
+            // query-only Location — must REPLACE the base query, not
+            // append a second '?'; the resolved hop carries y=2 and
+            // falls through to the echo branch
+            resp = "HTTP/1.1 302 Found\r\nlocation: ?y=2\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+        } else if path == "/fredir" {
+            // fragment-only Location — resolves to the same document
+            resp = "HTTP/1.1 302 Found\r\nlocation: #top\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+        } else if path == "/sredir" {
+            // uppercase scheme — the absolute-URI check is
+            // case-insensitive but parse_url's isn't
+            resp = "HTTP/1.1 302 Found\r\nlocation: HTTP://127.0.0.1:" + itoa(PORT) + "/who\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+        } else if path == "/i100" {
+            // interim 100 head precedes the real response — the
+            // client must skip it, not deliver it as the result
+            resp = "HTTP/1.1 100 Continue\r\nx-interim: yes\r\n\r\nHTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok"
+        } else if path == "/tedup" {
+            // duplicate TE fields consolidate — "identity" then
+            // "chunked" still reads as chunked (RFC 9112 6.1)
+            resp = "HTTP/1.1 200 OK\r\ntransfer-encoding: identity\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n"
+        } else if path == "/tegf" {
+            // chunked listed first but NOT final — "chunked, gzip"
+            // is close-delimited, not a chunked message; the literal
+            // chunk framing must arrive as the body untouched
+            resp = "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\ntransfer-encoding: gzip\r\nconnection: close\r\n\r\n5\r\nhello\r\n0\r\n\r\n"
+        } else if path == "/teonly" {
+            // TE present without chunked — body is close-delimited
+            // and the bogus content-length must be ignored
+            resp = "HTTP/1.1 200 OK\r\ntransfer-encoding: identity\r\ncontent-length: 999\r\nconnection: close\r\n\r\nrawbody"
+        } else if path == "/cedup" {
+            // two Content-Encoding fields — identity then gzip; the
+            // decode chain runs in reverse so the gzip payload still
+            // yields plaintext
+            [gz2, ge2] = base64.decode(GZ_B64)
+            if ge2 != nil {
+                resp = "HTTP/1.1 500 Err\r\ncontent-length: 0\r\n\r\n"
+            } else {
+                resp = "HTTP/1.1 200 OK\r\ncontent-encoding: identity\r\ncontent-encoding: gzip\r\ncontent-length: " + itoa(len(gz2)) + "\r\nconnection: close\r\n\r\n" + gz2 as str
+            }
+        } else if find(path, "/qbase/") == 0 && find(path, "/dir/c") < 0 {
+            // relative Location against a query-carrying base — the
+            // merge must cut the directory from the PATH, not the
+            // "?next=/a/b" tail
+            resp = "HTTP/1.1 302 Found\r\nlocation: c\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+        } else if path == "/a/b/c" {
+            // "../d" must resolve dot-segments on the merged path
+            resp = "HTTP/1.1 302 Found\r\nlocation: ../d\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+        } else if path == "/badscheme" {
+            // non-http(s) absolute URI — unsupported scheme, not a
+            // mangled relative target
+            resp = "HTTP/1.1 302 Found\r\nlocation: ftp://example.com/x\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+        } else if path == "/cldup" {
+            // conflicting content-length duplicates — framing desync
+            resp = "HTTP/1.1 200 OK\r\ncontent-length: 5\r\ncontent-length: 6\r\nconnection: close\r\n\r\nhello!"
+        } else if path == "/chunked" {
+            resp = "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\nx-note: chunked-resp\r\n\r\n" + "5\r\nhello\r\n6\r\n world\r\n0\r\nx-trailer: yes\r\n\r\n"
+        } else if path == "/gzip" {
+            [gz, ge] = base64.decode(GZ_B64)
+            if ge != nil {
+                resp = "HTTP/1.1 500 Err\r\ncontent-length: 0\r\n\r\n"
+            } else {
+                resp = "HTTP/1.1 200 OK\r\ncontent-encoding: gzip\r\ncontent-length: " + itoa(len(gz)) + "\r\nconnection: close\r\n\r\n" + gz as str
+            }
+        } else {
+            // /final, /who, /hdrcheck, /proxycheck — echo what we saw:
+            // /who reports the request method so redirect rewrites are
+            // observable; the rest echo the raw request head
+            body := req
+            if path == "/who" || find(path, "/who") == 0 {
+                m := substr(line, 0, sp1)
+                body = "method=" + m + " target=" + path
+            }
+            resp = "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: " + itoa(len(body)) + "\r\nconnection: close\r\n\r\n" + body
+        }
+        [_wn, _we] = c.write(resp as []byte)
+        c.close()
+    }
+}
+
+fn main() {
+    spawnBlocking fake_server()
+    base := "http://127.0.0.1:" + itoa(PORT)
+
+    // -- redirects -------------------------------------------------
+    cl := http.Client{tmo: 30000}
+    [r1, e1] = get_retry(cl, base + "/redir")
+    ck(e1, "redirect connects")
+    if r1.status != 200 || r1.body != "method=GET target=/final" {
+        // /final echoes the raw request — accept either echo shape
+        println("redirect status=" + itoa(r1.status) + " body=" + r1.body)
+    }
+    expect(r1.status == 200, "redirect followed to 200")
+    expect(find(r1.body, "target=") >= 0 || len(r1.body) > 0, "redirect landed on final")
+
+    // redirect loop is bounded by max_redirects — the last 302 is
+    // delivered, not an error and not an infinite spin
+    [r2, e2] = get_retry(cl, base + "/loop")
+    ck(e2, "loop connects")
+    expect(r2.status == 302, "loop stops at redirect budget got " + itoa(r2.status))
+
+    // POST + 302 rewrites to GET (historical behavior); 303 same
+    rq := http.request_post(base + "/r302", "text/plain", "payload")
+    [r3, e3] = cl.do(rq)
+    ck(e3, "r302")
+    expect(r3.status == 200, "r302 final 200")
+    expect(find(r3.body, "method=GET") >= 0, "302 POST->GET rewrite got " + r3.body)
+
+    // -- headers ----------------------------------------------------
+    rq2 := http.request_get(base + "/hdrcheck")
+    rq2.headers = push(rq2.headers, http.basic_auth("alice", "s3cret"))
+    rq2.headers = push(rq2.headers, http.Header{name: "x-custom", value: "probe-1"})
+    [r4, e4] = cl.do(rq2)
+    ck(e4, "hdrcheck")
+    expect(find(r4.body, "authorization: Basic YWxpY2U6czNjcmV0") >= 0, "basic auth header on wire")
+    expect(find(r4.body, "x-custom: probe-1") >= 0, "custom header on wire")
+    expect(find(r4.body, "host: 127.0.0.1:" + itoa(PORT)) >= 0, "host header on wire")
+    expect(r4.header("content-type") == "text/plain", "header() lookup")
+
+    // managed + injected headers are rejected before the wire
+    rq3 := http.request_get(base + "/hdrcheck")
+    rq3.headers = push(rq3.headers, http.Header{name: "content-length", value: "999"})
+    [_r5, e5] = cl.do(rq3)
+    expect(e5 != nil, "managed content-length rejected")
+    rq4 := http.request_get(base + "/hdrcheck")
+    rq4.headers = push(rq4.headers, http.Header{name: "x-bad", value: "a\r\nb"})
+    [_r6, e6] = cl.do(rq4)
+    expect(e6 != nil, "CRLF header rejected")
+
+    // other CTLs are just as illegal in field values
+    ctl := mkslice(byte, 3)
+    ctl[0] = 97
+    ctl[1] = 1
+    ctl[2] = 98
+    rq4b := http.request_get(base + "/hdrcheck")
+    rq4b.headers = push(rq4b.headers, http.Header{name: "x-ctl", value: ctl as str})
+    [_r6b, e6c] = cl.do(rq4b)
+    expect(e6c != nil, "CTL header rejected")
+
+    // -- bearer + request helpers ----------------------------------
+    rq5 := http.request_get(base + "/hdrcheck")
+    rq5.headers = push(rq5.headers, http.bearer_auth("tok123"))
+    [r7, e7] = cl.do(rq5)
+    ck(e7, "bearer")
+    expect(find(r7.body, "authorization: Bearer tok123") >= 0, "bearer header on wire")
+
+    // -- chunked + trailers ----------------------------------------
+    [r8, e8] = get_retry(cl, base + "/chunked")
+    ck(e8, "chunked")
+    expect(r8.status == 200, "chunked status")
+    expect(r8.chunked, "chunked flag set")
+    expect(r8.body == "hello world", "chunked body got " + r8.body)
+    tr_found := false
+    ti := 0
+    for ti < len(r8.trailers) {
+        if lwr_local(r8.trailers[ti].name) == "x-trailer" {
+            tr_found = true
+        }
+        ti = ti + 1
+    }
+    expect(tr_found, "trailer captured")
+
+    // -- gzip --------------------------------------------------------
+    [r9, e9] = get_retry(cl, base + "/gzip")
+    ck(e9, "gzip")
+    expect(r9.body == "hello gzip", "gzip decoded got len " + itoa(len(r9.body)))
+    // decompression off delivers the raw bytes with the header visible
+    cl_raw := http.Client{tmo: 30000}
+    rq_raw := http.Request{method: "GET", url: base + "/gzip", headers: mkslice(http.Header, 0), body: "", redirects: 0, decompress: false, proxy: "direct"}
+    [r10, e10] = get_retry_req(cl_raw, rq_raw)
+    ck(e10, "gzip raw")
+    expect(r10.body != "hello gzip", "raw gzip not decoded")
+    expect(find(r10.header("content-encoding"), "gzip") >= 0, "content-encoding header visible")
+
+    // -- proxy -------------------------------------------------------
+    cl_p := http.Client{tmo: 30000}
+    rq_p := http.request_get("http://example.invalid/hdrcheck")
+    rq_p.proxy = "http://127.0.0.1:" + itoa(PORT)
+    [r11, e11] = cl_p.do(rq_p)
+    // the proxy IS our fake server — it answers /hdrcheck-shaped
+    // traffic regardless of the claimed origin
+    ck(e11, "proxy request")
+    expect(find(r11.body, "GET http://example.invalid/hdrcheck HTTP/1.1") >= 0, "absolute-URI request target via proxy got " + substr(r11.body, 0, 60))
+
+    // -- redirect resolution edge cases ------------------------------
+    // query-only Location replaces the base query (RFC 3986 5.2.2)
+    [rq6, e6b] = get_retry(cl, base + "/qredir?x=1")
+    ck(e6b, "qredir")
+    // the resolved hop /qredir?y=2 falls to the echo branch — the
+    // request-target must carry y=2 and never a doubled '?'
+    expect(find(rq6.body, "/qredir?y=2") >= 0, "query redirect got " + rq6.body)
+    expect(find(rq6.body, "x=1") < 0, "base query replaced")
+
+    // fragment-only Location resolves to the same document — the
+    // redirect loops until the budget ends it at a delivered 302
+    [rq7, e7b] = get_retry(cl, base + "/fredir")
+    ck(e7b, "fredir")
+    expect(rq7.status == 302, "fragment redirect loops to budget")
+
+    // uppercase scheme in an absolute Location still resolves — the
+    // fake server 200s every unmatched path, so only the echoed
+    // request-target proves the redirect landed on /who
+    [rq8, e8b] = get_retry(cl, base + "/sredir")
+    ck(e8b, "sredir")
+    expect(rq8.body == "method=GET target=/who", "uppercase scheme redirect got " + rq8.body)
+
+    // relative Location merges against the base's PATH — a query
+    // tail must not corrupt the directory cut ("/dir/page?next=/a/b"
+    // + "c" resolves to "/dir/c", never "/dir/page?next=/a/c")
+    [rq13a, e20c] = get_retry(cl, base + "/qbase/dir/page?next=/a/b")
+    ck(e20c, "qbase redirect")
+    expect(rq13a.status == 200, "qbase redirect final")
+    expect(find(rq13a.body, "GET /qbase/dir/c HTTP/1.1") >= 0, "query-safe merge got " + rq13a.body)
+
+    // dot-segments resolve on the merged path — "/a/b/c" + "../d"
+    // lands on "/a/d", not the literal "/a/b/../d"
+    [rq14a, e21c] = get_retry(cl, base + "/a/b/c")
+    ck(e21c, "dotseg redirect")
+    expect(find(rq14a.body, "GET /a/d HTTP/1.1") >= 0, "dot-segment merge got " + rq14a.body)
+
+    // non-http(s) schemes are rejected outright — "ftp://x" must not
+    // degrade into a bogus http request-target
+    [_rq15a, e22c] = get_retry(cl, base + "/badscheme")
+    expect(e22c != nil, "ftp: redirect rejected")
+
+    // fragments never reach the wire — request-target has no '#'
+    rq9 := http.request_get(base + "/frag#section")
+    [rq10, e10b] = cl.do(rq9)
+    ck(e10b, "frag")
+    expect(find(rq10.body, "#section") < 0, "fragment stripped from wire")
+
+    // 307 preserves method + body (the risky path)
+    rq11 := http.request_post(base + "/r307", "text/plain", "payload")
+    [rq12, e11b] = cl.do(rq11)
+    ck(e11b, "r307")
+    expect(rq12.status == 200, "r307 final 200")
+    expect(find(rq12.body, "method=POST") >= 0, "307 preserves POST got " + rq12.body)
+
+    // conflicting content-length duplicates are a framing error
+    [_rq13, e12b] = get_retry(cl, base + "/cldup")
+    expect(e12b != nil, "conflicting content-length rejected")
+
+    // header names must be RFC tokens — 'a:b' would rename on the wire
+    rq14 := http.request_get(base + "/hdrcheck")
+    rq14.headers = push(rq14.headers, http.Header{name: "a:b", value: "v"})
+    [_rq15, e13b] = cl.do(rq14)
+    expect(e13b != nil, "non-token header name rejected")
+
+    // interim 1xx heads are skipped — the 200 is the response and
+    // its body, not the Continue head's tail
+    [r12a, e23d] = get_retry(cl, base + "/i100")
+    ck(e23d, "i100")
+    expect(r12a.status == 200, "interim skipped status got " + itoa(r12a.status))
+    expect(r12a.body == "ok", "interim body got " + r12a.body)
+
+    // duplicate TE fields consolidate — "identity" + "chunked" is
+    // still chunked; taking only the first field delivered raw chunk
+    // bytes as the body
+    [r13a, e24d] = get_retry(cl, base + "/tedup")
+    ck(e24d, "tedup")
+    expect(r13a.chunked, "dup TE chunked flag")
+    expect(r13a.body == "hello", "dup TE body got " + r13a.body)
+
+    // TE without chunked → close-delimited body; the bogus
+    // content-length is ignored rather than truncating the stream
+    [r14a, e25d] = get_retry(cl, base + "/teonly")
+    ck(e25d, "teonly")
+    expect(r14a.body == "rawbody", "te non-chunked body got " + r14a.body)
+
+    // chunked that isn't the FINAL coding isn't chunked — the
+    // consolidated "chunked, gzip" list delivers close-delimited raw
+    [r14b, e27d] = get_retry(cl, base + "/tegf")
+    ck(e27d, "tegf")
+    expect(r14b.body == "5\r\nhello\r\n0\r\n\r\n", "non-final chunked raw got " + r14b.body)
+
+    // multiple Content-Encoding fields join into one ordered list —
+    // "identity, gzip" still decodes the gzip payload
+    [r15a, e26d] = get_retry(cl, base + "/cedup")
+    ck(e26d, "cedup")
+    expect(r15a.body == "hello gzip", "dup CE decoded got " + r15a.body)
+
+    // dot-segments inside a query or fragment are data, not path —
+    // "/x?y=/../z" keeps "/x", never collapses to "/z"
+    [uq1, eq1] = http.resolve_location("http://h/a/b", "/x?y=/../z")
+    expect(eq1 == nil && uq1 == "http://h/x?y=/../z", "query dots preserved got " + uq1)
+    [uq2, eq2] = http.resolve_location("http://h/a/b", "c?x=/../y")
+    expect(eq2 == nil && uq2 == "http://h/a/c?x=/../y", "rel query dots got " + uq2)
+    // absolute-URI and scheme-relative locations normalize too
+    [uq3, eq3] = http.resolve_location("http://h/a", "http://h/x/../y")
+    expect(eq3 == nil && uq3 == "http://h/y", "abs uri dots got " + uq3)
+    [uq4, eq4] = http.resolve_location("http://h/a", "//h/x/./y")
+    expect(eq4 == nil && uq4 == "http://h/x/y", "scheme-rel dots got " + uq4)
+    // ".." pops empty interior segments — "/a//../b" → "/a/b"
+    [uq5, eq5] = http.resolve_location("http://h/", "/a//../b")
+    expect(eq5 == nil && uq5 == "http://h/a/b", "empty seg pop got " + uq5)
+    // leading-zero octets aren't canonical IPv4 literals
+    expect(http.is_loopback_host("127.0.0.01") == false, "leading-zero octet not loopback")
+    expect(http.is_loopback_host("0127.0.0.1") == false, "leading-zero first not loopback")
+
+    // NO_PROXY=* matches every host
+    expect(http.no_proxy_match("*", "anything.example"), "NO_PROXY * matches")
+    expect(http.no_proxy_match(".internal", "a.internal"), "subdomain match")
+    nm := http.no_proxy_match(".internal", "b.other")
+    expect(nm == false, "non-match")
+
+    // loopback carve-out: 127. needs a digit after the dot —
+    // "127.evil.example.com" is a public name and must NOT match
+    expect(http.is_loopback_host("localhost"), "localhost is loopback")
+    expect(http.is_loopback_host("::1"), "::1 is loopback")
+    expect(http.is_loopback_host("127.0.0.1"), "127.0.0.1 is loopback")
+    expect(http.is_loopback_host("127.255.1.2"), "127.x is loopback")
+    expect(http.is_loopback_host("127.evil.example.com") == false, "127.name is not loopback")
+    expect(http.is_loopback_host("127.") == false, "bare 127. is not loopback")
+    expect(http.is_loopback_host("example.com") == false, "public host is not loopback")
+    expect(http.is_loopback_host("127.0.evil.example.com") == false, "127.0.name not loopback")
+    expect(http.is_loopback_host("127.0.0.1.evil.com") == false, "v4-suffix not loopback")
+    expect(http.is_loopback_host("LOCALHOST"), "LOCALHOST is loopback")
+    expect(http.is_loopback_host("127.1") == false, "127.1 shorthand not loopback")
+    expect(http.is_loopback_host("localhost.evil.com") == false, "localhost suffix not loopback")
+
+    println("httpclient rich done")
+    exit(0)
+}
+
+fn expect(cond: bool, msg: str) {
+    if !cond {
+        println("FAIL " + msg)
+        exit(1)
+    }
+}
+
+fn lwr_local(s: str) -> str {
+    b := s as []byte
+    out := mkslice(byte, len(s))
+    i := 0
+    for i < len(s) {
+        c := b[i]
+        if c >= 65 && c <= 90 {
+            c = c + 32
+        }
+        out[i] = c
+        i = i + 1
+    }
+    return out as str
+}

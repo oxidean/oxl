@@ -7,9 +7,17 @@
 #         message, PKCS#1 v1.5 + PSS signatures over sha256/384/512,
 #         plus negative fixtures (raw-pad, odd salt length)
 #
-# (X5's x509 bundle and X6's `flight` capture append sections here.)
+#   x509  tests/fixtures/x509/ — X5: a two-root PKI (RSA root CA +
+#         Ed25519 root CA) with ECDSA P-256/P-384 intermediates and
+#         leaves (RSA, ECDSA, Ed25519 keys; expired, wrong-name,
+#         wildcard, sha1-signed, PSS-signed, EKU-restricted, not-a-CA
+#         issuer, and untrusted-root chains). roots.pem is the
+#         OXL_SSL_CERT_FILE bundle; dir/ is the OXL_SSL_CERT_DIR store
+#         (a *.pem + a *.crt file — plain-dir layout, not capath).
 #
-# Usage: gen_tls_fixtures.sh [rsa|all]   — default "all"
+# (X6's `flight` capture appends a section here.)
+#
+# Usage: gen_tls_fixtures.sh [rsa|x509|all]   — default "all"
 # The openssl version is recorded in tests/fixtures/OPENSSL-VERSION
 # so a future regeneration can tell what minted the fixtures.
 set -euo pipefail
@@ -70,8 +78,226 @@ gen_rsa() {
     echo "gen_tls_fixtures: wrote $outdir ($(cat tests/fixtures/OPENSSL-VERSION))"
 }
 
+gen_x509() {
+    local outdir=tests/fixtures/x509
+    local work
+    work=$(mktemp -d)
+    trap 'rm -rf "$work"' RETURN
+    mkdir -p "$outdir/dir"
+
+    # extension blocks: CAs are critical-CA:keyCertSign with SKID;
+    # leaves are critical-CA:FALSE + digitalSignature + serverAuth +
+    # SKID/AKID (the AKID=keyid vs issuer SKID pairing exercises the
+    # tightened link rule)
+    cat > "$work/ca.cnf" <<'EOF'
+basicConstraints=critical,CA:TRUE,pathlen:1
+keyUsage=critical,keyCertSign,cRLSign
+subjectKeyIdentifier=hash
+authorityKeyIdentifier=keyid
+EOF
+    cat > "$work/ca_eku.cnf" <<'EOF'
+basicConstraints=critical,CA:TRUE
+keyUsage=critical,keyCertSign,cRLSign
+extendedKeyUsage=clientAuth
+subjectKeyIdentifier=hash
+authorityKeyIdentifier=keyid
+EOF
+    cat > "$work/leaf.cnf" <<'EOF'
+basicConstraints=critical,CA:FALSE
+keyUsage=critical,digitalSignature
+extendedKeyUsage=serverAuth
+subjectKeyIdentifier=hash
+authorityKeyIdentifier=keyid
+EOF
+    cat > "$work/leaf_badeku.cnf" <<'EOF'
+basicConstraints=critical,CA:FALSE
+keyUsage=critical,digitalSignature
+extendedKeyUsage=clientAuth
+subjectKeyIdentifier=hash
+authorityKeyIdentifier=keyid
+EOF
+
+    # --- keys -------------------------------------------------------
+    # RSA-2048 keeps verify fast; roots/intermediates mix RSA, ECDSA
+    # P-256/P-384 and Ed25519 so every accepted signature scheme and
+    # SPKI family appears in a real chain
+    openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$work/root.key" 2>/dev/null
+    openssl genpkey -algorithm ED25519 -out "$work/root_ed.key" 2>/dev/null
+    openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$work/inter.key" 2>/dev/null
+    openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-384 -out "$work/inter384.key" 2>/dev/null
+    openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$work/inter_eku.key" 2>/dev/null
+    openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$work/leaf.key" 2>/dev/null
+    openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$work/leaf_ec.key" 2>/dev/null
+    openssl genpkey -algorithm ED25519 -out "$work/leaf_ed.key" 2>/dev/null
+    openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$work/notca.key" 2>/dev/null
+    openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$work/rogue.key" 2>/dev/null
+
+    # --- roots (self-signed anchors) --------------------------------
+    for r in root root_ed rogue; do
+        case $r in
+            root)    subj="/CN=Oxl Test Root CA" ;;
+            root_ed) subj="/CN=Oxl Test Ed25519 Root CA" ;;
+            rogue)   subj="/CN=Oxl Untrusted Root CA" ;;
+        esac
+        openssl req -x509 -new -key "$work/$r.key" -sha256 -days 3650 \
+            -subj "$subj" \
+            -addext "basicConstraints=critical,CA:TRUE" \
+            -addext "keyUsage=critical,keyCertSign,cRLSign" \
+            -addext "subjectKeyIdentifier=hash" \
+            -out "$work/$r.pem"
+    done
+
+    # --- intermediates, signed by the RSA root -----------------------
+    csr() { openssl req -new -key "$work/$1.key" -subj "$2" -out "$work/$1.csr"; }
+    # issue <csr> <cacert> <cakey> <days> <md> <out> [sigopt...]
+    issue() {
+        local csrfile=$1 cacert=$2 cakey=$3 days=$4 md=$5 out=$6
+        shift 6
+        # md "" means the key's own default digest (ed25519 has none)
+        openssl x509 -req -in "$csrfile" -CA "$cacert" -CAkey "$cakey" \
+            -CAcreateserial -days "$days" ${md:+$md} "$@" -out "$work/$out"
+    }
+    csr inter    "/CN=Oxl Test P256 Intermediate CA"
+    csr inter384 "/CN=Oxl Test P384 Intermediate CA"
+    csr inter_eku "/CN=Oxl Test ClientAuth Intermediate CA"
+    csr notca    "/CN=Oxl Not A CA"
+    issue "$work/inter.csr" "$work/root.pem" "$work/root.key" 3650 -sha256 inter.pem \
+        -extfile "$work/ca.cnf"
+    issue "$work/inter384.csr" "$work/root.pem" "$work/root.key" 3650 -sha384 inter384.pem \
+        -extfile "$work/ca.cnf"
+    issue "$work/inter_eku.csr" "$work/root.pem" "$work/root.key" 3650 -sha256 inter_eku.pem \
+        -extfile "$work/ca_eku.cnf"
+    # notca is an end-entity cert whose key still signs leaf_badca —
+    # openssl issues through any cert+key pair regardless of cA
+    issue "$work/notca.csr" "$work/root.pem" "$work/root.key" 3650 -sha256 notca.pem \
+        -extfile "$work/leaf.cnf"
+
+    # --- leaves ------------------------------------------------------
+    # leafext <name> — leaf.cnf plus a per-cert subjectAltName
+    leafext() { cat "$work/leaf.cnf" > "$work/x_$1.cnf"; printf 'subjectAltName=%s\n' "$2" >> "$work/x_$1.cnf"; }
+    csr leaf "/CN=www.example.com"
+    leafext leaf "DNS:www.example.com"
+    issue "$work/leaf.csr" "$work/inter.pem" "$work/inter.key" 3650 -sha256 leaf.pem \
+        -extfile "$work/x_leaf.cnf"
+    csr leaf_ec "/CN=www.example.com"
+    leafext leaf_ec "DNS:www.example.com"
+    issue "$work/leaf_ec.csr" "$work/inter384.pem" "$work/inter384.key" 3650 -sha384 leaf_ec.pem \
+        -extfile "$work/x_leaf_ec.cnf"
+    csr leaf_ed "/CN=www.example.com"
+    leafext leaf_ed "DNS:www.example.com"
+    issue "$work/leaf_ed.csr" "$work/root_ed.pem" "$work/root_ed.key" 3650 "" leaf_ed.pem \
+        -extfile "$work/x_leaf_ed.cnf"
+
+    # RSA-PSS-signed leaf: signatureAlgorithm rsassaPss (sha256/mgf1)
+    csr leaf "/CN=www.example.com"
+    issue "$work/leaf.csr" "$work/root.pem" "$work/root.key" 3650 -sha256 leaf_pss.pem \
+        -extfile "$work/x_leaf.cnf" \
+        -sigopt rsa_padding_mode:pss -sigopt rsa_pss_saltlen:digest
+
+    # IP-SAN leaf: exercises match_hostname's ip_addrs leg — v4 dotted
+    # quad plus a v6 literal the canonical form compresses
+    csr leaf "/CN=www.example.com"
+    leafext leaf_ip "IP:10.0.0.9,IP:fd00::1,DNS:ip.example.com"
+    issue "$work/leaf.csr" "$work/inter.pem" "$work/inter.key" 3650 -sha256 leaf_ip.pem \
+        -extfile "$work/x_leaf_ip.cnf"
+
+    # genuinely expired leaf: openssl ca carries arbitrary validity
+    # windows; the fixture's window is 2020→2021, dead by any clock
+    mkdir -p "$work/cadb/newcerts"
+    touch "$work/cadb/index.txt"
+    echo 2000 > "$work/cadb/serial"
+    cat > "$work/expired_ca.cnf" <<EOF
+[ ca ]
+default_ca = cadef
+[ cadef ]
+database = $work/cadb/index.txt
+new_certs_dir = $work/cadb/newcerts
+certificate = $work/inter.pem
+private_key = $work/inter.key
+serial = $work/cadb/serial
+default_md = sha256
+policy = pol
+x509_extensions = exts
+default_days = 365
+[ pol ]
+commonName = supplied
+[ exts ]
+basicConstraints = critical,CA:FALSE
+keyUsage = critical,digitalSignature
+extendedKeyUsage = serverAuth
+subjectAltName = DNS:www.example.com
+EOF
+    openssl ca -batch -config "$work/expired_ca.cnf" \
+        -startdate 20200101000000Z -enddate 20210101000000Z \
+        -in "$work/leaf.csr" -out "$work/leaf_expired.pem" >/dev/null 2>&1
+
+    # wrong-name and wildcard leaves
+    csr leaf "/CN=www.wrong-name.example"
+    leafext leaf_wrongname "DNS:www.wrong-name.example"
+    issue "$work/leaf.csr" "$work/inter.pem" "$work/inter.key" 3650 -sha256 leaf_wrongname.pem \
+        -extfile "$work/x_leaf_wrongname.cnf"
+    csr leaf "/CN=*.example.com"
+    leafext leaf_wildcard "DNS:*.example.com"
+    issue "$work/leaf.csr" "$work/inter.pem" "$work/inter.key" 3650 -sha256 leaf_wildcard.pem \
+        -extfile "$work/x_leaf_wildcard.cnf"
+
+    # sha1-signed leaf (issuer = RSA root): sig_alg is outside the
+    # acceptance set — verify must hard-fail err_alg even though the
+    # signature itself is cryptographically valid
+    csr leaf "/CN=www.example.com"
+    issue "$work/leaf.csr" "$work/root.pem" "$work/root.key" 3650 -sha1 leaf_sha1.pem \
+        -extfile "$work/x_leaf.cnf"
+
+    # EKU-restricted CA chain: inter_eku is a CA whose EKU vouches
+    # clientAuth only — a leaf under it fails err_eku
+    csr leaf "/CN=www.example.com"
+    issue "$work/leaf.csr" "$work/inter_eku.pem" "$work/inter_eku.key" 3650 -sha256 leaf_eku.pem \
+        -extfile "$work/x_leaf.cnf"
+    # leaf_badeku carries clientAuth (not serverAuth) itself
+    cat "$work/leaf_badeku.cnf" > "$work/x_badeku.cnf"
+    printf 'subjectAltName=%s\n' "DNS:www.example.com" >> "$work/x_badeku.cnf"
+    issue "$work/leaf.csr" "$work/inter.pem" "$work/inter.key" 3650 -sha256 leaf_badeku.pem \
+        -extfile "$work/x_badeku.cnf"
+
+    # not-a-CA issuer: leaf_badca's issuer is notca (cA=false) — the
+    # link matches by name but the CA-worthiness check must reject
+    csr leaf "/CN=www.example.com"
+    issue "$work/leaf.csr" "$work/notca.pem" "$work/notca.key" 3650 -sha256 leaf_badca.pem \
+        -extfile "$work/x_leaf.cnf"
+
+    # untrusted-root chain: a fully well-formed chain that anchors to
+    # a root the store doesn't contain
+    csr leaf "/CN=www.example.com"
+    issue "$work/leaf.csr" "$work/rogue.pem" "$work/rogue.key" 3650 -sha256 leaf_rogue.pem \
+        -extfile "$work/x_leaf.cnf"
+
+    # --- publish -----------------------------------------------------
+    for f in root root_ed rogue inter inter384 inter_eku notca \
+             leaf leaf_ec leaf_ed leaf_pss leaf_expired leaf_wrongname \
+             leaf_wildcard leaf_sha1 leaf_eku leaf_badeku leaf_badca \
+             leaf_rogue leaf_ip; do
+        cp "$work/$f.pem" "$outdir/$f.pem"
+    done
+    # DER forms for the parse tests (PEM covers the same content, but
+    # parse_cert's raw-DER path wants a DER file to read)
+    openssl x509 -in "$work/root.pem" -outform DER -out "$outdir/root.der"
+    openssl x509 -in "$work/leaf.pem" -outform DER -out "$outdir/leaf.der"
+    # the env-override fixtures: a one-file bundle and a scan dir
+    cat "$work/root.pem" "$work/root_ed.pem" > "$outdir/roots.pem"
+    cp "$work/root.pem" "$outdir/dir/root.pem"
+    cp "$work/root_ed.pem" "$outdir/dir/root_ed.crt"
+    # a non-certificate block mixed in proves parse_pem's skip rule —
+    # a PUBLIC KEY block (no secret material) ahead of a real cert
+    openssl pkey -in "$work/root.key" -pubout > "$outdir/mixed.pem"
+    cat "$work/root_ed.pem" >> "$outdir/mixed.pem"
+
+    openssl version > tests/fixtures/OPENSSL-VERSION
+    echo "gen_tls_fixtures: wrote $outdir ($(cat tests/fixtures/OPENSSL-VERSION))"
+}
+
 case "${1:-all}" in
     rsa) gen_rsa ;;
-    all) gen_rsa ;;
-    *) echo "usage: gen_tls_fixtures.sh [rsa|all]" >&2; exit 2 ;;
+    x509) gen_x509 ;;
+    all) gen_rsa; gen_x509 ;;
+    *) echo "usage: gen_tls_fixtures.sh [rsa|x509|all]" >&2; exit 2 ;;
 esac

@@ -1,0 +1,2355 @@
+package x509
+
+// std/crypto/x509 — the X5 certificate trust story: a definite-length
+// DER TLV reader (unexported), Cert parsing into owned fields, path
+// building leaf→root with real signature verification through
+// crypto/rsa, crypto/nistec and crypto/ed25519, the trust-roots
+// resolution chain (env override → POSIX bundle paths → platform
+// store exec, memoized), and hostname matching with no CN fallback.
+//
+// Callers branch on the sentinel errors, never on message text —
+// every failure returns errors.wrap(detail, sentinel) so errors.is
+// matches the category while the message carries the cert name.
+import "std/bytes"
+
+import "std/crypto/ed25519"
+
+import "std/crypto/nistec"
+
+import "std/crypto/rsa"
+
+import "std/crypto/sha256"
+
+import "std/crypto/sha512"
+
+import "std/encoding/base64"
+
+import "std/errors"
+
+import "std/hash"
+
+import "std/os"
+
+import "std/os/exec"
+
+import "std/slices"
+
+import "std/strings"
+
+extern fn rt_free(p: own void)
+
+extern fn rt_is_windows() -> int
+
+// ---- sentinel errors --------------------------------------------------
+// interned by message text — each returns a stable code; verify/root
+// paths wrap a detail message around them so errors.is keeps working
+// when the message names the offending certificate.
+
+/// err_der — malformed DER/PEM structure.
+fn err_der() -> err {
+    return errors.new("x509: malformed certificate")
+}
+
+/// err_alg — signature or key algorithm outside the acceptance set.
+fn err_alg() -> err {
+    return errors.new("x509: unacceptable algorithm")
+}
+
+/// err_sig — a link's signature failed to verify.
+fn err_sig() -> err {
+    return errors.new("x509: bad signature")
+}
+
+/// err_expired — `at` is after not_after.
+fn err_expired() -> err {
+    return errors.new("x509: certificate expired")
+}
+
+/// err_notyet — `at` is before not_before.
+fn err_notyet() -> err {
+    return errors.new("x509: certificate not yet valid")
+}
+
+/// err_ca — an issuer link fails CA-worthiness (cA, keyCertSign).
+fn err_ca() -> err {
+    return errors.new("x509: issuer is not a CA")
+}
+
+/// err_eku — key usage / extended key usage incompatible with TLS
+/// server authentication.
+fn err_eku() -> err {
+    return errors.new("x509: incompatible key usage")
+}
+
+/// err_path — path building exceeded its bound (link cap, max_path).
+fn err_path() -> err {
+    return errors.new("x509: path constraint violated")
+}
+
+/// err_root — the chain does not terminate at a roots member.
+fn err_root() -> err {
+    return errors.new("x509: unknown root")
+}
+
+/// err_name — hostname mismatch, or an empty name.
+fn err_name() -> err {
+    return errors.new("x509: name mismatch")
+}
+
+/// err_roots — no usable trust-root source.
+fn err_roots() -> err {
+    return errors.new("x509: no trust roots")
+}
+
+// ---- algorithm enums --------------------------------------------------
+// Cert.sig_alg — the acceptance set. Parse maps every OID outside it
+// to 0, so verify's `sig_alg <= 0` check is what rejects sha1/md5/
+// sha224 and unknown OIDs — identically at leaf, intermediate, or a
+// root that signed anything.
+let SIG_rsa_pkcs1_sha256 = 1
+
+let SIG_rsa_pkcs1_sha384 = 2
+
+let SIG_rsa_pkcs1_sha512 = 3
+
+let SIG_rsa_pss_sha256 = 4
+
+let SIG_rsa_pss_sha384 = 5
+
+let SIG_rsa_pss_sha512 = 6
+
+let SIG_ecdsa_p256_sha256 = 7
+
+let SIG_ecdsa_p384_sha384 = 8
+
+let SIG_ed25519 = 9
+
+// Cert.spki_alg — subjectPublicKeyInfo families.
+let SPKI_rsa = 1
+
+let SPKI_ec_p256 = 2
+
+let SPKI_ec_p384 = 3
+
+let SPKI_ed25519 = 4
+
+// keyUsage bitmask bits (RFC 5280 bit numbering)
+let KU_digitalSignature = 1
+
+let KU_keyCertSign = 32
+
+let KU_cRLSign = 64
+
+// EKU OID strings appearing in Cert.eku
+let EKU_serverauth = "1.3.6.1.5.5.7.3.1"
+
+let EKU_clientauth = "1.3.6.1.5.5.7.3.2"
+
+let EKU_any = "2.5.29.37.0"
+
+// ---- the parsed certificate -------------------------------------------
+
+/// Cert is a parsed certificate. Every slice/str field is an owned
+/// copy made at parse — nothing aliases `raw`'s parse buffer (the
+/// cert may outlive it). issuer/subject are display-only strings;
+/// path building compares issuer_der/subject_der bytes. Slice fields
+/// are always non-nil — an absent SAN/EKU is an empty list.
+struct Cert {
+    raw: own []byte, // the exact bytes parsed
+    version: int,
+    serial: own []byte,
+    issuer: str,
+    subject: str,
+    issuer_der: own []byte,
+    subject_der: own []byte,
+    not_before: int,
+    not_after: int, // epoch seconds, inclusive bounds
+    dns_names: own []str, // SAN dNSName entries, lowercased
+    ip_addrs: own []str, // SAN iPAddress entries — canonical text
+    is_ca: int,
+    max_path: int, // pathLenConstraint; -1 = unset
+    ku: int, // KeyUsage bitmask; -1 = absent
+    eku: own []str, // EKU OID strings; empty = absent
+    sig_alg: int, // SIG_*; 0 = outside the acceptance set
+    spki_alg: int, // SPKI_*; 0 = unrecognized
+    spki: own []byte, // raw subjectPublicKeyInfo element
+    skid: own []byte,
+    akid: own []byte,
+    sig: own []byte,
+    tbs: own []byte, // the raw TBSCertificate — verify input
+}
+
+/// Roots is a trust-anchor pool. `cas` nil means "no pool" — the tls
+/// layer falls through to load_system_roots; a non-nil-but-empty cas
+/// is a deliberate pin to zero anchors (every chain ends err_root).
+struct Roots { cas: own []Cert }
+
+fn zcert() -> Cert {
+    return Cert{raw: nil, version: 0, serial: nil, issuer: "", subject: "", issuer_der: nil, subject_der: nil, not_before: 0, not_after: 0, dns_names: nil, ip_addrs: nil, is_ca: 0, max_path: -1, ku: -1, eku: nil, sig_alg: 0, spki_alg: 0, spki: nil, skid: nil, akid: nil, sig: nil, tbs: nil}
+}
+
+// ---- definite-length DER ----------------------------------------------
+// TLV walk over the cert surface. Indefinite form, high-tag-number
+// form, non-minimal lengths (long form where short suffices or a
+// leading zero length byte), lengths past the input or overflowing
+// int, negative INTEGERs, a BIT STRING's nonzero-unused-bits byte
+// where the field requires it, and trailing garbage after the top
+// SEQUENCE are all err_der.
+struct tlv { tag: int, off: int, len: int, hlen: int } // off = content start
+
+fn ztlv() -> tlv {
+    return tlv{tag: 0, off: 0, len: 0, hlen: 0}
+}
+
+// dnext parses one TLV at pos.
+fn dnext(der: []byte, pos: int) -> [tlv, err] {
+    z := ztlv()
+    if pos < 0 || pos + 2 > len(der) {
+        return z, errors.wrap("x509: truncated tlv", err_der())
+    }
+    tag := der[pos]
+    if tag % 32 == 31 {
+        return z, errors.wrap("x509: high-tag-number form", err_der())
+    }
+    lb := der[pos + 1]
+    off := pos + 2
+    ln := 0
+    if lb < 128 {
+        ln = lb
+    } else {
+        nb := lb - 128
+        if nb == 0 {
+            return z, errors.wrap("x509: indefinite length", err_der())
+        }
+        if nb > 8 || off + nb > len(der) {
+            return z, errors.wrap("x509: bad long-form length", err_der())
+        }
+        if der[off] == 0 {
+            return z, errors.wrap("x509: non-minimal length", err_der())
+        }
+        i := 0
+        for i < nb {
+            ln = ln * 256 + der[off + i]
+            if ln < 0 {
+                return z, errors.wrap("x509: length overflow", err_der())
+            }
+            i = i + 1
+        }
+        if ln < 128 {
+            return z, errors.wrap("x509: non-minimal length", err_der())
+        }
+        off = off + nb
+    }
+    if ln < 0 || off + ln > len(der) || off + ln < off {
+        return z, errors.wrap("x509: length past end of input", err_der())
+    }
+    return tlv{tag: tag, off: off, len: ln, hlen: off - pos}, nil
+}
+
+fn tlend(t: tlv) -> int {
+    return t.off + t.len
+}
+
+// el renders the element window [tbeg, tlend) of t.
+fn el(der: []byte, t: tlv) -> []byte {
+    return der[t.off - t.hlen:t.off + t.len]
+}
+
+// need checks tag or fails err_der with what
+fn need(t: tlv, tag: int, what: str) -> err {
+    if t.tag != tag {
+        return errors.wrap("x509: expected " + what, err_der())
+    }
+    return nil
+}
+
+// int_win is the positive-magnitude window of an INTEGER content —
+// a set high bit means negative, then zero padding is stripped.
+struct IntWin { off: int, len: int, ok: bool }
+
+fn int_win(der: []byte, t: tlv) -> IntWin {
+    z := IntWin{off: 0, len: 0, ok: false}
+    if t.len == 0 || der[t.off] >= 128 {
+        return z
+    }
+    o := t.off
+    l := t.len
+    for l > 1 && der[o] == 0 {
+        o = o + 1
+        l = l - 1
+    }
+    return IntWin{off: o, len: l, ok: true}
+}
+
+// dint reads a small positive INTEGER (version, pathLen, trailer).
+fn dint(der: []byte, t: tlv) -> [int, err] {
+    w := int_win(der, t)
+    if !w.ok {
+        return 0, errors.wrap("x509: bad INTEGER", err_der())
+    }
+    if w.len > 7 {
+        return 0, errors.wrap("x509: INTEGER too large", err_der())
+    }
+    v := 0
+    i := 0
+    for i < w.len {
+        v = v * 256 + der[w.off + i]
+        i = i + 1
+    }
+    return v, nil
+}
+
+// bit_str validates a BIT STRING content window and returns the bit
+// payload bounds [off, len); strict pins the unused-bits count to 0
+// (signatureValue, SPKI key) — keyUsage allows the DER-canonical
+// trailing-zero form since real certs use it.
+fn bit_str(der: []byte, t: tlv, strict: int) -> [IntWin, err] {
+    z := IntWin{off: 0, len: 0, ok: false}
+    if t.len == 0 {
+        return z, errors.wrap("x509: empty BIT STRING", err_der())
+    }
+    unused := der[t.off]
+    if unused > 7 {
+        return z, errors.wrap("x509: bad BIT STRING", err_der())
+    }
+    if strict != 0 && unused != 0 {
+        return z, errors.wrap("x509: BIT STRING with unused bits", err_der())
+    }
+    if unused > 0 && t.len == 1 {
+        return z, errors.wrap("x509: BIT STRING bits missing", err_der())
+    }
+    return IntWin{off: t.off + 1, len: t.len - 1, ok: true}, nil
+}
+
+// ---- OID ---------------------------------------------------------------
+fn isdig(c: int) -> bool {
+    return c >= 48 && c <= 57
+}
+
+// oid_str renders the dotted form of an OID content.
+fn oid_str(der: []byte, t: tlv) -> [str, err] {
+    if t.len == 0 {
+        return "", errors.wrap("x509: empty oid", err_der())
+    }
+    out := ""
+    i := 0
+    first := 1
+    for i < t.len {
+        v := 0
+        done := 0
+        for i < t.len && done == 0 {
+            b := der[t.off + i]
+            i = i + 1
+            v = v * 128 + (b - b / 128 * 128)
+            if v < 0 {
+                return "", errors.wrap("x509: oid arc overflow", err_der())
+            }
+            if b < 128 {
+                done = 1
+            }
+        }
+        if done == 0 {
+            return "", errors.wrap("x509: unterminated oid arc", err_der())
+        }
+        if first == 1 {
+            first = 0
+            if v < 40 {
+                out = "0." + itoa(v)
+            } else if v < 80 {
+                out = "1." + itoa(v - 40)
+            } else {
+                out = "2." + itoa(v - 80)
+            }
+        } else {
+            out = out + "." + itoa(v)
+        }
+    }
+    return out, nil
+}
+
+// oid_short maps the RDN attribute OIDs to display names — anything
+// else stays dotted.
+fn oid_short(oid: str) -> str {
+    if oid == "2.5.4.3" {
+        return "CN"
+    }
+    if oid == "2.5.4.4" {
+        return "SN"
+    }
+    if oid == "2.5.4.5" {
+        return "serialNumber"
+    }
+    if oid == "2.5.4.6" {
+        return "C"
+    }
+    if oid == "2.5.4.7" {
+        return "L"
+    }
+    if oid == "2.5.4.8" {
+        return "ST"
+    }
+    if oid == "2.5.4.9" {
+        return "street"
+    }
+    if oid == "2.5.4.10" {
+        return "O"
+    }
+    if oid == "2.5.4.11" {
+        return "OU"
+    }
+    if oid == "2.5.4.12" {
+        return "title"
+    }
+    if oid == "2.5.4.17" {
+        return "postalCode"
+    }
+    if oid == "2.5.4.42" {
+        return "GN"
+    }
+    if oid == "1.2.840.113549.1.9.1" {
+        return "emailAddress"
+    }
+    if oid == "0.9.2342.19200300.100.1.25" {
+        return "DC"
+    }
+    return oid
+}
+
+// ---- names (display only) ----------------------------------------------
+struct sval { s: str, ok: bool }
+
+// str_val decodes an RDN value for display — PrintableString,
+// UTF8String, IA5String and BMPString are the accepted set; every
+// other string tag (T61String/TeletexString and friends) is skipped,
+// never an error: the display string is cosmetic, DER bytes are the
+// comparison key.
+fn str_val(der: []byte, t: tlv) -> sval {
+    z := sval{s: "", ok: false}
+    if t.tag == 19 || t.tag == 12 || t.tag == 22 {
+        return sval{s: der[t.off:t.off + t.len] as str, ok: true}
+    }
+    if t.tag == 30 {
+        return sval{s: bmp_str(der, t), ok: true}
+    }
+    return z
+}
+
+// bmp_str decodes UTF-16BE (BMPString) to a UTF-8 str.
+fn bmp_str(der: []byte, t: tlv) -> str {
+    b := mkslice(byte, 0)
+    i := 0
+    for i + 1 < t.len {
+        u := der[t.off + i] * 256 + der[t.off + i + 1]
+        i = i + 2
+        if u >= 55296 && u <= 56319 && i + 1 < t.len {
+            u2 := der[t.off + i] * 256 + der[t.off + i + 1]
+            if u2 >= 56320 && u2 <= 57343 {
+                u = 65536 + (u - 55296) * 1024 + (u2 - 56320)
+                i = i + 2
+            }
+        }
+        if u < 128 {
+            b = push(b, u)
+        } else if u < 2048 {
+            b = push(b, 192 + u / 64)
+            b = push(b, 128 + u % 64)
+        } else if u < 65536 {
+            b = push(b, 224 + u / 4096)
+            b = push(b, 128 + u / 64 % 64)
+            b = push(b, 128 + u % 64)
+        } else {
+            b = push(b, 240 + u / 262144)
+            b = push(b, 128 + u / 4096 % 64)
+            b = push(b, 128 + u / 64 % 64)
+            b = push(b, 128 + u % 64)
+        }
+    }
+    return b as str
+}
+
+// name_str renders a Name (SEQUENCE OF RDN SETs) as "K=V,K=V" in DER
+// order — display only; path linking compares issuer_der bytes.
+fn name_str(der: []byte, t: tlv) -> str {
+    out := ""
+    p := t.off
+    for p < tlend(t) {
+        [st, e] = dnext(der, p)
+        if e != nil {
+            break
+        }
+        p = tlend(st)
+        if st.tag != 49 {
+            continue
+        }
+        q := st.off
+        for q < tlend(st) {
+            [atv, e2] = dnext(der, q)
+            if e2 != nil {
+                break
+            }
+            q = tlend(atv)
+            if atv.tag != 48 {
+                continue
+            }
+            [o, e3] = dnext(der, atv.off)
+            if e3 != nil || o.tag != 6 {
+                continue
+            }
+            [oid, e4] = oid_str(der, o)
+            if e4 != nil {
+                continue
+            }
+            [v, e5] = dnext(der, tlend(o))
+            if e5 != nil {
+                continue
+            }
+            sv := str_val(der, v)
+            if !sv.ok {
+                continue
+            }
+            if len(out) > 0 {
+                out = out + ","
+            }
+            out = out + oid_short(oid) + "=" + sv.s
+        }
+    }
+    return out
+}
+
+// ---- validity times -----------------------------------------------------
+
+// days_from_civil — Howard Hinnant's algorithm; epoch is 1970-01-01.
+fn days_from_civil(y: int, m: int, d: int) -> int {
+    y2 := y
+    if m <= 2 {
+        y2 = y2 - 1
+    }
+    era := y2 / 400
+    if y2 < 0 && y2 % 400 != 0 {
+        era = era - 1
+    }
+    yoe := y2 - era * 400
+    mp := (m + 9) % 12
+    doy := (153 * mp + 2) / 5 + d - 1
+    doe := yoe * 365 + yoe / 4 - yoe / 100 + doy
+    return era * 146097 + doe - 719468
+}
+
+fn dig2(der: []byte, o: int) -> int {
+    return (der[o] - 48) * 10 + (der[o + 1] - 48)
+}
+
+// dtime parses UTCTime/GeneralizedTime to epoch seconds — strict
+// Zulu suffix, all-digit fields, sane ranges. UTCTime's 2-digit year
+// is RFC 5280: YY < 50 → 20YY, else 19YY.
+fn dtime(der: []byte, t: tlv) -> [int, err] {
+    if t.tag != 23 && t.tag != 24 {
+        return 0, errors.wrap("x509: expected a time", err_der())
+    }
+    base := 1900
+    nl := 13
+    if t.tag == 24 {
+        base = 0
+        nl = 15
+    }
+    if t.len != nl || der[t.off + t.len - 1] != 90 {
+        return 0, errors.wrap("x509: bad time encoding", err_der())
+    }
+    i := 0
+    for i < t.len - 1 {
+        if !isdig(der[t.off + i]) {
+            return 0, errors.wrap("x509: non-digit time field", err_der())
+        }
+        i = i + 1
+    }
+    y := 0
+    o := t.off
+    if t.tag == 23 {
+        y = dig2(der, o)
+        if y < 50 {
+            y = y + 2000
+        } else {
+            y = y + 1900
+        }
+        o = o + 2
+    } else {
+        y = dig2(der, o) * 100 + dig2(der, o + 2)
+        o = o + 4
+    }
+    mo := dig2(der, o)
+    dy := dig2(der, o + 2)
+    hh := dig2(der, o + 4)
+    mi := dig2(der, o + 6)
+    ss := dig2(der, o + 8)
+    if mo < 1 || mo > 12 || dy < 1 || dy > 31 || hh > 23 || mi > 59 || ss > 59 {
+        return 0, errors.wrap("x509: time field out of range", err_der())
+    }
+    return days_from_civil(y, mo, dy) * 86400 + hh * 3600 + mi * 60 + ss, nil
+}
+
+// ---- extensions ---------------------------------------------------------
+// The processed critical set is exactly {basicConstraints, keyUsage,
+// extKeyUsage, SAN, SKID, AKID}: a critical extension outside it fails
+// err_der (a critical nameConstraints we can't honor must not
+// validate), while a non-critical unknown extension is ignored.
+struct exts {
+    is_ca: int,
+    max_path: int,
+    ku: int,
+    eku: []str,
+    dns: []str,
+    ips: []str,
+    skid: []byte,
+    akid: []byte,
+}
+
+fn ext_known_critical(oid: str) -> bool {
+    return oid == "2.5.29.19" || oid == "2.5.29.15" || oid == "2.5.29.37" || oid == "2.5.29.17" || oid == "2.5.29.14" || oid == "2.5.29.35"
+}
+
+// ip_str renders a SAN iPAddress — v4 dotted quad, v6 RFC 5952
+// canonical (lowercase, one longest zero run as ::).
+fn ip_str(b: []byte) -> sval {
+    z := sval{s: "", ok: false}
+    if len(b) == 4 {
+        return sval{s: itoa(b[0]) + "." + itoa(b[1]) + "." + itoa(b[2]) + "." + itoa(b[3]), ok: true}
+    }
+    if len(b) == 16 {
+        return sval{s: v6_str(b), ok: true}
+    }
+    return z
+}
+
+fn hexstr(v: int) -> str {
+    h := "0123456789abcdef"
+    if v == 0 {
+        return "0"
+    }
+    out := ""
+    for v > 0 {
+        out = substr(h, v % 16, v % 16 + 1) + out
+        v = v / 16
+    }
+    return out
+}
+
+fn v6_str(b: []byte) -> str {
+    best := -1
+    bestlen := 0
+    i := 0
+    for i < 8 {
+        if b[2 * i] == 0 && b[2 * i + 1] == 0 {
+            j := i
+            for j < 8 && b[2 * j] == 0 && b[2 * j + 1] == 0 {
+                j = j + 1
+            }
+            if j - i > bestlen {
+                best = i
+                bestlen = j - i
+            }
+            i = j
+        } else {
+            i = i + 1
+        }
+    }
+    if bestlen < 2 {
+        best = -1
+        bestlen = 0
+    }
+    out := ""
+    i = 0
+    for i < 8 {
+        if i == best {
+            out = out + "::"
+            i = i + bestlen
+            continue
+        }
+        g := hexstr(b[2 * i] * 256 + b[2 * i + 1])
+        if len(out) == 0 {
+            out = g
+        } else if byteat(out, len(out) - 1) == 58 {
+            out = out + g
+        } else {
+            out = out + ":" + g
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// lower_ascii — SAN names lowercased at parse so match_hostname is a
+// plain compare.
+fn lower_ascii(s: str) -> str {
+    buf := mkbuf(len(s) + 1)
+    i := 0
+    for i < len(s) {
+        c := byteat(s, i)
+        if c >= 65 && c <= 90 {
+            c = c + 32
+        }
+        poke8(buf, i, c)
+        i = i + 1
+    }
+    out := bufstr(buf, len(s))
+    rt_free(buf)
+    return out
+}
+
+// ext_bc — BasicConstraints ::= SEQUENCE { cA BOOLEAN DEFAULT FALSE,
+// pathLenConstraint INTEGER OPTIONAL }
+fn ext_bc(der: []byte, t: tlv, x: mut exts) -> err {
+    [seq, e] = dnext(der, t.off)
+    if e != nil {
+        return e
+    }
+    e = need(seq, 48, "basicConstraints sequence")
+    if e != nil {
+        return e
+    }
+    if tlend(seq) != tlend(t) {
+        return errors.wrap("x509: trailing data in basicConstraints", err_der())
+    }
+    p := seq.off
+    for p < tlend(seq) {
+        [v, e2] = dnext(der, p)
+        if e2 != nil {
+            return e2
+        }
+        p = tlend(v)
+        if v.tag == 1 {
+            if v.len > 0 && der[v.off] != 0 {
+                x.is_ca = 1
+            }
+        } else if v.tag == 2 {
+            [mp, e3] = dint(der, v)
+            if e3 != nil {
+                return e3
+            }
+            x.max_path = mp
+        }
+    }
+    return nil
+}
+
+// ext_ku — KeyUsage ::= BIT STRING (DER bit numbering: bit 0 is the
+// first content byte's MSB; digitalSignature=0, keyCertSign=5,
+// cRLSign=6).
+fn ext_ku(der: []byte, t: tlv, x: mut exts) -> err {
+    [bs, e0] = dnext(der, t.off)
+    if e0 != nil {
+        return e0
+    }
+    e0 = need(bs, 3, "keyUsage bit string")
+    if e0 != nil {
+        return e0
+    }
+    if tlend(bs) != tlend(t) {
+        return errors.wrap("x509: trailing data in keyUsage", err_der())
+    }
+    [w, e] = bit_str(der, bs, 0)
+    if e != nil {
+        return e
+    }
+    ku := 0
+    n := 0
+    for n < w.len {
+        vb := der[w.off + n]
+        j := 0
+        for j < 8 {
+            bit := 1
+            k := 0
+            for k < 7 - j {
+                bit = bit * 2
+                k = k + 1
+            }
+            if (vb & bit) != 0 {
+                m := 1
+                k = 0
+                for k < 8 * n + j {
+                    m = m * 2
+                    k = k + 1
+                }
+                ku = ku + m
+            }
+            j = j + 1
+        }
+        n = n + 1
+    }
+    x.ku = ku
+    return nil
+}
+
+// ext_eku — ExtKeyUsageSyntax ::= SEQUENCE OF OID.
+fn ext_eku(der: []byte, t: tlv, x: mut exts) -> err {
+    [seq, e] = dnext(der, t.off)
+    if e != nil {
+        return e
+    }
+    e = need(seq, 48, "eku sequence")
+    if e != nil {
+        return e
+    }
+    if tlend(seq) != tlend(t) {
+        return errors.wrap("x509: trailing data in eku", err_der())
+    }
+    p := seq.off
+    for p < tlend(seq) {
+        [o, e2] = dnext(der, p)
+        if e2 != nil {
+            return e2
+        }
+        p = tlend(o)
+        if o.tag != 6 {
+            return errors.wrap("x509: eku entry is not an OID", err_der())
+        }
+        [s, e3] = oid_str(der, o)
+        if e3 != nil {
+            return e3
+        }
+        x.eku = push(x.eku, s)
+    }
+    return nil
+}
+
+// ext_san — GeneralNames ::= SEQUENCE OF GeneralName; only dNSName
+// [2] (IA5String, implicit primitive) and iPAddress [7] (OCTET
+// STRING, implicit primitive) feed the matching fields.
+fn ext_san(der: []byte, t: tlv, x: mut exts) -> err {
+    [seq, e] = dnext(der, t.off)
+    if e != nil {
+        return e
+    }
+    e = need(seq, 48, "san sequence")
+    if e != nil {
+        return e
+    }
+    if tlend(seq) != tlend(t) {
+        return errors.wrap("x509: trailing data in san", err_der())
+    }
+    p := seq.off
+    for p < tlend(seq) {
+        [g, e2] = dnext(der, p)
+        if e2 != nil {
+            return e2
+        }
+        p = tlend(g)
+        if g.tag == 130 {
+            x.dns = push(x.dns, lower_ascii(der[g.off:g.off + g.len] as str))
+        } else if g.tag == 135 {
+            sv := ip_str(der[g.off:g.off + g.len])
+            if !sv.ok {
+                return errors.wrap("x509: bad iPAddress length", err_der())
+            }
+            x.ips = push(x.ips, sv.s)
+        }
+    }
+    return nil
+}
+
+// ext_skid — SubjectKeyIdentifier ::= OCTET STRING.
+fn ext_skid(der: []byte, t: tlv, x: mut exts) -> err {
+    [o, e] = dnext(der, t.off)
+    if e != nil {
+        return e
+    }
+    e = need(o, 4, "skid octet string")
+    if e != nil {
+        return e
+    }
+    if tlend(o) != tlend(t) {
+        return errors.wrap("x509: trailing data in skid", err_der())
+    }
+    x.skid = slices.clone(der[o.off:o.off + o.len])
+    return nil
+}
+
+// ext_akid — AuthorityKeyIdentifier ::= SEQUENCE { keyIdentifier
+// [0] IMPLICIT OCTET STRING OPTIONAL, ... }
+fn ext_akid(der: []byte, t: tlv, x: mut exts) -> err {
+    [seq, e] = dnext(der, t.off)
+    if e != nil {
+        return e
+    }
+    e = need(seq, 48, "akid sequence")
+    if e != nil {
+        return e
+    }
+    if tlend(seq) != tlend(t) {
+        return errors.wrap("x509: trailing data in akid", err_der())
+    }
+    p := seq.off
+    for p < tlend(seq) {
+        [v, e2] = dnext(der, p)
+        if e2 != nil {
+            return e2
+        }
+        p = tlend(v)
+        if v.tag == 128 {
+            x.akid = slices.clone(der[v.off:v.off + v.len])
+        }
+    }
+    return nil
+}
+
+// parse_exts walks the [3] EXPLICIT extensions element.
+fn parse_exts(der: []byte, t: tlv, x: mut exts) -> err {
+    [seq, e] = dnext(der, t.off)
+    if e != nil {
+        return e
+    }
+    e = need(seq, 48, "extensions sequence")
+    if e != nil {
+        return e
+    }
+    if tlend(seq) != tlend(t) {
+        return errors.wrap("x509: trailing data in extensions", err_der())
+    }
+    p := seq.off
+    for p < tlend(seq) {
+        [ext, e2] = dnext(der, p)
+        if e2 != nil {
+            return e2
+        }
+        p = tlend(ext)
+        e2 = need(ext, 48, "extension sequence")
+        if e2 != nil {
+            return e2
+        }
+        [o, e3] = dnext(der, ext.off)
+        if e3 != nil {
+            return e3
+        }
+        e3 = need(o, 6, "extension oid")
+        if e3 != nil {
+            return e3
+        }
+        [oid, e4] = oid_str(der, o)
+        if e4 != nil {
+            return e4
+        }
+        inner := tlend(o)
+        [nv, e5] = dnext(der, inner)
+        if e5 != nil {
+            return e5
+        }
+        crit := 0
+        if nv.tag == 1 {
+            if nv.len > 0 && der[nv.off] != 0 {
+                crit = 1
+            }
+            inner = tlend(nv)
+            [nv2, e6] = dnext(der, inner)
+            if e6 != nil {
+                return e6
+            }
+            nv = nv2
+        }
+        e5 = need(nv, 4, "extension value")
+        if e5 != nil {
+            return e5
+        }
+        if tlend(nv) != tlend(ext) {
+            return errors.wrap("x509: trailing data in extension", err_der())
+        }
+        if crit != 0 && !ext_known_critical(oid) {
+            return errors.wrap("x509: unhandled critical extension " + oid, err_der())
+        }
+        if oid == "2.5.29.19" {
+            e5 = ext_bc(der, nv, x)
+            if e5 != nil {
+                return e5
+            }
+        } else if oid == "2.5.29.15" {
+            e5 = ext_ku(der, nv, x)
+            if e5 != nil {
+                return e5
+            }
+        } else if oid == "2.5.29.37" {
+            e5 = ext_eku(der, nv, x)
+            if e5 != nil {
+                return e5
+            }
+        } else if oid == "2.5.29.17" {
+            e5 = ext_san(der, nv, x)
+            if e5 != nil {
+                return e5
+            }
+        } else if oid == "2.5.29.14" {
+            e5 = ext_skid(der, nv, x)
+            if e5 != nil {
+                return e5
+            }
+        } else if oid == "2.5.29.35" {
+            e5 = ext_akid(der, nv, x)
+            if e5 != nil {
+                return e5
+            }
+        }
+    }
+    return nil
+}
+
+// ---- signature and key algorithm mapping --------------------------------
+
+// pss_hash maps a PSS params hash OID to its SIG_rsa_pss_* number —
+// 0 when the params hash is outside the acceptance set.
+fn pss_hash(oid: str) -> int {
+    if oid == "2.16.840.1.101.3.4.2.1" {
+        return SIG_rsa_pss_sha256
+    }
+    if oid == "2.16.840.1.101.3.4.2.2" {
+        return SIG_rsa_pss_sha384
+    }
+    if oid == "2.16.840.1.101.3.4.2.3" {
+        return SIG_rsa_pss_sha512
+    }
+    return 0
+}
+
+// pss_params decodes RSASSA-PSS-params: [0] hashAlgorithm,
+// [1] maskGenAlgorithm (mgf1 whose inner hash must equal the [0]
+// hash), [2] saltLength, [3] trailerField (=1). Absent fields take
+// RFC 8017 defaults (sha1/mgf1-sha1/20/1) — a sha1 default lands on
+// the 0-reject path like any other unacceptable algorithm.
+fn pss_params(der: []byte, t: tlv) -> [int, err] {
+    hash_oid := "1.3.14.3.2.26" // sha1 default → rejected below
+    p := t.off
+    for p < tlend(t) {
+        [v, e] = dnext(der, p)
+        if e != nil {
+            return 0, e
+        }
+        p = tlend(v)
+        if v.tag == 160 {
+            // [0] hashAlgorithm — EXPLICIT AlgorithmIdentifier
+            [alg, e2] = dnext(der, v.off)
+            if e2 != nil {
+                return 0, e2
+            }
+            e2 = need(alg, 48, "pss hash algid")
+            if e2 != nil {
+                return 0, e2
+            }
+            [o, e3] = dnext(der, alg.off)
+            if e3 != nil {
+                return 0, e3
+            }
+            e3 = need(o, 6, "pss hash oid")
+            if e3 != nil {
+                return 0, e3
+            }
+            [s, e4] = oid_str(der, o)
+            if e4 != nil {
+                return 0, e4
+            }
+            hash_oid = s
+        } else if v.tag == 161 {
+            // [1] maskGenAlgorithm — must be mgf1 with the same hash
+            [alg, e2] = dnext(der, v.off)
+            if e2 != nil {
+                return 0, e2
+            }
+            e2 = need(alg, 48, "pss mgf algid")
+            if e2 != nil {
+                return 0, e2
+            }
+            [o, e3] = dnext(der, alg.off)
+            if e3 != nil {
+                return 0, e3
+            }
+            e3 = need(o, 6, "pss mgf oid")
+            if e3 != nil {
+                return 0, e3
+            }
+            [mgf, e4] = oid_str(der, o)
+            if e4 != nil {
+                return 0, e4
+            }
+            if mgf != "1.2.840.113549.1.1.8" {
+                return 0, errors.wrap("x509: pss mask is not mgf1", err_alg())
+            }
+            [hp, e5] = dnext(der, tlend(o))
+            if e5 != nil {
+                return 0, e5
+            }
+            e5 = need(hp, 48, "pss mgf hash algid")
+            if e5 != nil {
+                return 0, e5
+            }
+            [ho, e6] = dnext(der, hp.off)
+            if e6 != nil {
+                return 0, e6
+            }
+            e6 = need(ho, 6, "pss mgf hash oid")
+            if e6 != nil {
+                return 0, e6
+            }
+            [mh, e7] = oid_str(der, ho)
+            if e7 != nil {
+                return 0, e7
+            }
+            if mh != hash_oid && !(hash_oid == "1.3.14.3.2.26" && mh == "1.3.14.3.2.26") {
+                return 0, errors.wrap("x509: pss mgf hash mismatch", err_alg())
+            }
+            hash_oid = mh
+        } else if v.tag == 163 {
+            // [3] trailerField — must be 1
+            [iv, e2] = dnext(der, v.off)
+            if e2 != nil {
+                return 0, e2
+            }
+            [tv, e3] = dint(der, iv)
+            if e3 != nil {
+                return 0, e3
+            }
+            if tv != 1 {
+                return 0, errors.wrap("x509: pss trailer field != 1", err_alg())
+            }
+        }
+        // [2] saltLength — honored implicitly: verify_pss(-1)
+        // recovers the encoded salt length
+    }
+    return pss_hash(hash_oid), nil
+}
+
+// sig_alg_of maps a signatureAlgorithm AlgorithmIdentifier to its
+// SIG_* number — 0 outside the acceptance set.
+fn sig_alg_of(der: []byte, t: tlv) -> [int, err] {
+    [o, e] = dnext(der, t.off)
+    if e != nil {
+        return 0, e
+    }
+    e = need(o, 6, "signature algorithm oid")
+    if e != nil {
+        return 0, e
+    }
+    [oid, e2] = oid_str(der, o)
+    if e2 != nil {
+        return 0, e2
+    }
+    if oid == "1.2.840.113549.1.1.11" {
+        return SIG_rsa_pkcs1_sha256, nil
+    }
+    if oid == "1.2.840.113549.1.1.12" {
+        return SIG_rsa_pkcs1_sha384, nil
+    }
+    if oid == "1.2.840.113549.1.1.13" {
+        return SIG_rsa_pkcs1_sha512, nil
+    }
+    if oid == "1.2.840.10045.4.3.2" {
+        return SIG_ecdsa_p256_sha256, nil
+    }
+    if oid == "1.2.840.10045.4.3.3" {
+        return SIG_ecdsa_p384_sha384, nil
+    }
+    if oid == "1.3.101.112" {
+        return SIG_ed25519, nil
+    }
+    if oid == "1.2.840.113549.1.1.10" {
+        // rsassaPss — the params carry the hash
+        p := tlend(o)
+        if p >= tlend(t) {
+            return 0, errors.wrap("x509: pss params missing", err_der())
+        }
+        [ps, e3] = dnext(der, p)
+        if e3 != nil {
+            return 0, e3
+        }
+        e3 = need(ps, 48, "pss params")
+        if e3 != nil {
+            return 0, e3
+        }
+        if tlend(ps) != tlend(t) {
+            return 0, errors.wrap("x509: trailing data in sig algid", err_der())
+        }
+        return pss_params(der, ps)
+    }
+    return 0, nil
+}
+
+// spki_alg_of maps subjectPublicKeyInfo's algorithm + params to an
+// SPKI_* number — 0 unrecognized.
+fn spki_alg_of(der: []byte, t: tlv) -> [int, err] {
+    [alg, e] = dnext(der, t.off)
+    if e != nil {
+        return 0, e
+    }
+    e = need(alg, 48, "spki algid")
+    if e != nil {
+        return 0, e
+    }
+    [o, e2] = dnext(der, alg.off)
+    if e2 != nil {
+        return 0, e2
+    }
+    e2 = need(o, 6, "spki oid")
+    if e2 != nil {
+        return 0, e2
+    }
+    [oid, e3] = oid_str(der, o)
+    if e3 != nil {
+        return 0, e3
+    }
+    if oid == "1.2.840.113549.1.1.1" || oid == "1.2.840.113549.1.1.10" {
+        return SPKI_rsa, nil
+    }
+    if oid == "1.3.101.112" {
+        return SPKI_ed25519, nil
+    }
+    if oid == "1.2.840.10045.2.1" {
+        p := tlend(o)
+        if p >= tlend(alg) {
+            return 0, errors.wrap("x509: ec params missing", err_der())
+        }
+        [co, e4] = dnext(der, p)
+        if e4 != nil {
+            return 0, e4
+        }
+        e4 = need(co, 6, "ec curve oid")
+        if e4 != nil {
+            return 0, e4
+        }
+        [curve, e5] = oid_str(der, co)
+        if e5 != nil {
+            return 0, e5
+        }
+        if curve == "1.2.840.10045.3.1.7" {
+            return SPKI_ec_p256, nil
+        }
+        if curve == "1.3.132.0.34" {
+            return SPKI_ec_p384, nil
+        }
+        return 0, nil
+    }
+    return 0, nil
+}
+
+// ---- certificate parse ---------------------------------------------------
+
+/// parse_cert parses one DER certificate. Every Cert field is an
+/// owned copy — nothing aliases `der`, so the buffer may die after
+/// the call. Structure errors are err_der-wrapped; an algorithm OID
+/// outside the acceptance set lands as sig_alg == 0 (verify's job is
+/// to reject it), so a sha1-signed cert still parses for inspection.
+fn parse_cert(der: []byte) -> [Cert, err] {
+    z := zcert()
+    [top, e0] = dnext(der, 0)
+    if e0 != nil {
+        return z, e0
+    }
+    e0 = need(top, 48, "certificate sequence")
+    if e0 != nil {
+        return z, e0
+    }
+    if tlend(top) != len(der) {
+        return z, errors.wrap("x509: trailing data after certificate", err_der())
+    }
+    // Certificate ::= SEQUENCE { tbs, signatureAlgorithm, signatureValue }
+    [tbs, e1] = dnext(der, top.off)
+    if e1 != nil {
+        return z, e1
+    }
+    e1 = need(tbs, 48, "tbs sequence")
+    if e1 != nil {
+        return z, e1
+    }
+    [salgo, e2] = dnext(der, tlend(tbs))
+    if e2 != nil {
+        return z, e2
+    }
+    e2 = need(salgo, 48, "signature algorithm")
+    if e2 != nil {
+        return z, e2
+    }
+    [sigb, e3] = dnext(der, tlend(salgo))
+    if e3 != nil {
+        return z, e3
+    }
+    e3 = need(sigb, 3, "signature value")
+    if e3 != nil {
+        return z, e3
+    }
+    if tlend(sigb) != tlend(top) {
+        return z, errors.wrap("x509: trailing data in certificate", err_der())
+    }
+    [sbw, e4] = bit_str(der, sigb, 1)
+    if e4 != nil {
+        return z, e4
+    }
+    sig := slices.clone(der[sbw.off:sbw.off + sbw.len])
+    [sig_alg, e5] = sig_alg_of(der, salgo)
+    if e5 != nil {
+        return z, e5
+    }
+    // TBSCertificate ::= SEQUENCE { version[0] EXPLICIT DEFAULT v1,
+    // serial, signature, issuer, validity, subject, spki,
+    // issuerUID[1] IMPLICIT OPT, subjectUID[2] IMPLICIT OPT,
+    // extensions[3] EXPLICIT OPT }
+    p := tbs.off
+    tend := tlend(tbs)
+    [f, e6] = dnext(der, p)
+    if e6 != nil {
+        return z, e6
+    }
+    version := 1
+    if f.tag == 160 {
+        // [0] EXPLICIT Version — the inner INTEGER is the encoded
+        // v1/v2/v3 (0/1/2); the reported version is +1
+        [iv, e7] = dnext(der, f.off)
+        if e7 != nil {
+            return z, e7
+        }
+        e7 = need(iv, 2, "version integer")
+        if e7 != nil {
+            return z, e7
+        }
+        if tlend(iv) != tlend(f) {
+            return z, errors.wrap("x509: trailing data in version", err_der())
+        }
+        [vv, e8] = dint(der, iv)
+        if e8 != nil {
+            return z, e8
+        }
+        version = vv + 1
+        p = tlend(f)
+        [f2, e9] = dnext(der, p)
+        if e9 != nil {
+            return z, e9
+        }
+        f = f2
+    }
+    e6 = need(f, 2, "serial number")
+    if e6 != nil {
+        return z, e6
+    }
+    serw := int_win(der, f)
+    if !serw.ok {
+        return z, errors.wrap("x509: bad serial number", err_der())
+    }
+    serial := slices.clone(der[serw.off:serw.off + serw.len])
+    p = tlend(f)
+    // tbs signature must be byte-equal to the outer one
+    [sa2, e9] = dnext(der, p)
+    if e9 != nil {
+        return z, e9
+    }
+    e9 = need(sa2, 48, "tbs signature algorithm")
+    if e9 != nil {
+        return z, e9
+    }
+    if !bytes.equal(el(der, sa2), el(der, salgo)) {
+        return z, errors.wrap("x509: signature algorithms differ", err_der())
+    }
+    p = tlend(sa2)
+    // issuer Name
+    [iss, e10] = dnext(der, p)
+    if e10 != nil {
+        return z, e10
+    }
+    e10 = need(iss, 48, "issuer name")
+    if e10 != nil {
+        return z, e10
+    }
+    issuer_der := slices.clone(el(der, iss))
+    issuer := name_str(der, iss)
+    p = tlend(iss)
+    // validity
+    [val, e11] = dnext(der, p)
+    if e11 != nil {
+        return z, e11
+    }
+    e11 = need(val, 48, "validity sequence")
+    if e11 != nil {
+        return z, e11
+    }
+    [nb, e12] = dnext(der, val.off)
+    if e12 != nil {
+        return z, e12
+    }
+    [nbt, e13] = dtime(der, nb)
+    if e13 != nil {
+        return z, e13
+    }
+    [na, e14] = dnext(der, tlend(nb))
+    if e14 != nil {
+        return z, e14
+    }
+    [nat, e15] = dtime(der, na)
+    if e15 != nil {
+        return z, e15
+    }
+    if tlend(na) != tlend(val) {
+        return z, errors.wrap("x509: trailing data in validity", err_der())
+    }
+    p = tlend(val)
+    // subject Name
+    [sub, e16] = dnext(der, p)
+    if e16 != nil {
+        return z, e16
+    }
+    e16 = need(sub, 48, "subject name")
+    if e16 != nil {
+        return z, e16
+    }
+    subject_der := slices.clone(el(der, sub))
+    subject := name_str(der, sub)
+    p = tlend(sub)
+    // subjectPublicKeyInfo
+    [spk, e17] = dnext(der, p)
+    if e17 != nil {
+        return z, e17
+    }
+    e17 = need(spk, 48, "spki sequence")
+    if e17 != nil {
+        return z, e17
+    }
+    spki := slices.clone(el(der, spk))
+    [spki_alg, e18] = spki_alg_of(der, spk)
+    if e18 != nil {
+        return z, e18
+    }
+    p = tlend(spk)
+    // optional tail: [1] issuerUID, [2] subjectUID, [3] extensions
+    x := new(exts{is_ca: 0, max_path: -1, ku: -1, eku: mkslice(str, 0), dns: mkslice(str, 0), ips: mkslice(str, 0), skid: mkslice(byte, 0), akid: mkslice(byte, 0)})
+    for p < tend {
+        [u, e19] = dnext(der, p)
+        if e19 != nil {
+            return z, e19
+        }
+        p = tlend(u)
+        if u.tag == 129 || u.tag == 130 {
+            continue
+        }
+        if u.tag == 163 {
+            e19 = parse_exts(der, u, x)
+            if e19 != nil {
+                return z, e19
+            }
+            continue
+        }
+        return z, errors.wrap("x509: unexpected tbs field tag " + itoa(u.tag), err_der())
+    }
+    return Cert{raw: slices.clone(der), version: version, serial: serial, issuer: issuer, subject: subject, issuer_der: issuer_der, subject_der: subject_der, not_before: nbt, not_after: nat, dns_names: new(x.dns), ip_addrs: new(x.ips), is_ca: x.is_ca, max_path: x.max_path, ku: x.ku, eku: new(x.eku), sig_alg: sig_alg, spki_alg: spki_alg, spki: spki, skid: new(x.skid), akid: new(x.akid), sig: sig, tbs: slices.clone(el(der, tbs))}, nil
+}
+
+// ---- PEM ------------------------------------------------------------------
+
+// b64clean strips the whitespace base64 ignores inside a PEM body.
+fn b64clean(s: str) -> str {
+    buf := mkbuf(len(s) + 1)
+    n := 0
+    i := 0
+    for i < len(s) {
+        c := byteat(s, i)
+        if c != 32 && c != 9 && c != 10 && c != 13 {
+            poke8(buf, n, c)
+            n = n + 1
+        }
+        i = i + 1
+    }
+    out := bufstr(buf, n)
+    rt_free(buf)
+    return out
+}
+
+// pem_scan walks "-----BEGIN <label>-----" blocks. strict: a bad
+// base64 body or a cert that fails parse_cert is the returned err;
+// non-strict (platform bundles, exec output) skips those blocks and
+// keeps the good ones — a malformed block must not nuke a store.
+// Non-CERTIFICATE labels are always skipped.
+fn pem_scan(text: str, strict: int) -> [own []Cert, err] {
+    out := mkslice(Cert, 0)
+    pos := 0
+    for pos < len(text) {
+        b := find(substr(text, pos, len(text)), "-----BEGIN ")
+        if b < 0 {
+            break
+        }
+        b = b + pos
+        rest := substr(text, b + 11, len(text))
+        he := find(rest, "-----")
+        if he < 0 {
+            if strict != 0 {
+                return nil, errors.wrap("x509: unterminated pem header", err_der())
+            }
+            break
+        }
+        label := substr(rest, 0, he)
+        body_start := b + 11 + he + 5
+        endmark := "-----END " + label + "-----"
+        ee := find(substr(text, body_start, len(text)), endmark)
+        if ee < 0 {
+            if strict != 0 {
+                return nil, errors.wrap("x509: unterminated pem block", err_der())
+            }
+            break
+        }
+        body := substr(text, body_start, body_start + ee)
+        pos = body_start + ee + len(endmark)
+        if label != "CERTIFICATE" {
+            continue
+        }
+        [raw, e1] = base64.decode(b64clean(body))
+        if e1 != nil {
+            if strict != 0 {
+                return nil, errors.wrap("x509: pem base64: " + errors.msg(e1), err_der())
+            }
+            continue
+        }
+        [c, e2] = parse_cert(raw)
+        if e2 != nil {
+            if strict != 0 {
+                return nil, errors.wrap("x509: pem cert: " + errors.msg(e2), err_der())
+            }
+            continue
+        }
+        out = push(out, c)
+    }
+    return new(out), nil
+}
+
+/// parse_pem parses every CERTIFICATE block in a PEM bundle — a bad
+/// base64 body or a block that fails DER parse is err_der.
+fn parse_pem(text: str) -> [own []Cert, err] {
+    return pem_scan(text, 1)
+}
+
+// ---- Roots ------------------------------------------------------------------
+
+/// append adds c to the pool. Boxed-empty stays distinct from nil:
+/// appending then never matching still reports "explicitly empty".
+fn (r mut Roots) append(c: Cert) {
+    cs := mkslice(Cert, 0)
+    if r.cas != nil {
+        i := 0
+        for i < len(r.cas) {
+            cs = push(cs, r.cas[i])
+            i = i + 1
+        }
+    }
+    cs = push(cs, c)
+    r.cas = new(cs)
+}
+
+/// load_pem strict-parses every CERTIFICATE block in text and appends
+/// them to the pool — returns how many were added; a malformed block
+/// is the returned err (and nothing is added).
+fn (r mut Roots) load_pem(text: str) -> [int, err] {
+    [cs, e] = parse_pem(text)
+    if e != nil {
+        return 0, e
+    }
+    i := 0
+    for i < len(cs) {
+        r.append(cs[i])
+        i = i + 1
+    }
+    return len(cs), nil
+}
+
+// ---- system trust roots ---------------------------------------------------
+// Resolution chain, first non-empty wins:
+//   1. OXL_SSL_CERT_FILE, then OXL_SSL_CERT_DIR
+//   2. SSL_CERT_FILE, then SSL_CERT_DIR
+//   3. the POSIX bundle paths
+//   4. macOS security(1) against the System Root Certificates keychain
+//   5. Windows powershell dumping the LocalMachine+CurrentUser stores
+// A set env override that doesn't yield certs is err_roots naming the
+// var — overrides fail loud, never silently fall through. Platform
+// candidates yield nil on miss and the walk continues. Everything
+// empty → err_roots pointing at OXL_SSL_CERT_FILE.
+
+// pem_of_file strict-parses one PEM bundle path; a DER single-cert
+// file is accepted as a fallback (capath-style .cer). nil,nil = the
+// file is absent/unreadable (platform candidates keep walking).
+fn pem_of_file(path: str) -> [own []Cert, err] {
+    if !os.exists(path) || os.isdir(path) {
+        return nil, nil
+    }
+    text := os.readfile_(path)
+    if len(text) == 0 {
+        return nil, nil
+    }
+    [cs, e] = parse_pem(text)
+    if e == nil && len(cs) > 0 {
+        return cs, nil
+    }
+    [c, e2] = parse_cert(text as []byte)
+    if e2 == nil {
+        one := mkslice(Cert, 0)
+        one = push(one, c)
+        return new(one), nil
+    }
+    if e != nil {
+        return nil, e
+    }
+    return nil, nil
+}
+
+// env_file handles a set OXL_/SSL_ _FILE override — any miss
+// (absent, unreadable, bad pem) is err_roots naming the var.
+fn env_file(v: str) -> [own []Cert, err] {
+    path := os.getenv(v)
+    if len(path) == 0 {
+        return nil, nil
+    }
+    [cs, e] = pem_of_file(path)
+    if e != nil {
+        return nil, errors.wrap("x509: " + v + " (" + path + "): " + errors.msg(e), err_roots())
+    }
+    if cs == nil || len(cs) == 0 {
+        return nil, errors.wrap("x509: " + v + " (" + path + ") yielded no certificates", err_roots())
+    }
+    return cs, nil
+}
+
+// env_dir handles a set _DIR override — every *.pem/*.crt/*.cer file
+// must parse (strict: an override is explicit config). nil,nil = var
+// unset; err = bad dir, bad file, or zero certs — all err_roots
+// naming the var.
+fn env_dir(v: str) -> [own []Cert, err] {
+    dir := os.getenv(v)
+    if len(dir) == 0 {
+        return nil, nil
+    }
+    if !os.isdir(dir) {
+        return nil, errors.wrap("x509: " + v + " (" + dir + ") is not a directory", err_roots())
+    }
+    names := os.ls(dir)
+    out := mkslice(Cert, 0)
+    i := 0
+    for i < len(names) {
+        n := names[i]
+        if strings.endswith(n, ".pem") || strings.endswith(n, ".crt") || strings.endswith(n, ".cer") {
+            [cs, e2] = pem_of_file(dir + "/" + n)
+            if e2 != nil {
+                return nil, errors.wrap("x509: " + v + " (" + dir + "/" + n + "): " + errors.msg(e2), err_roots())
+            }
+            j := 0
+            for j < len(cs) {
+                out = push(out, cs[j])
+                j = j + 1
+            }
+        }
+        i = i + 1
+    }
+    if len(out) == 0 {
+        return nil, errors.wrap("x509: " + v + " (" + dir + ") yielded no certificates", err_roots())
+    }
+    return new(out), nil
+}
+
+// env_roots tries one FILE/DIR var pair in order. Returns nil,nil
+// when neither var is set (walk continues) — a set-but-broken
+// override is err_roots.
+fn env_roots(fvar: str, dvar: str) -> [own []Cert, err] {
+    [cs, e] = env_file(fvar)
+    if e != nil || cs != nil {
+        return cs, e
+    }
+    return env_dir(dvar)
+}
+
+// ---- exec-backed platform stores ------------------------------------------
+// The child is spawned once per process; the PEM bytes memoize in a
+// shared cell while each caller parses a fresh Roots — handshakes get
+// per-call pools, process exec is amortized.
+let sysroots_state = mkshared(0)
+
+let sysroots_pem: own []byte = nil
+
+fn roots_exec(which: int) -> [own []byte, err] {
+    c := exec.cmd("", mkslice(str, 0))
+    if which == 0 {
+        // macOS — the explicit System Root Certificates keychain, not
+        // a bare `security find-certificate` (which searches the
+        // user's default chain too)
+        args := mkslice(str, 0)
+        args = push(args, "find-certificate")
+        args = push(args, "-a")
+        args = push(args, "-p")
+        args = push(args, "/System/Library/Keychains/SystemRootCertificates.keychain")
+        c = exec.cmd("security", args)
+    } else {
+        // Windows — LocalMachine\Root + CurrentUser\Root, each cert's
+        // RawData base64'd into PEM-shaped blocks for pem_scan
+        args := mkslice(str, 0)
+        args = push(args, "-NoProfile")
+        args = push(args, "-Command")
+        args = push(args, "foreach($s in 'Cert:\\LocalMachine\\Root','Cert:\\CurrentUser\\Root'){Get-ChildItem $s -ErrorAction SilentlyContinue|ForEach-Object{$b=[Convert]::ToBase64String($_.RawData,[System.Base64FormattingOptions]::InsertLineBreaks);\"-----BEGIN CERTIFICATE-----`n$b`n-----END CERTIFICATE-----`n\"}}")
+        c = exec.cmd("powershell.exe", args)
+    }
+    [o, e] = c.output()
+    if e != nil {
+        return nil, e
+    }
+    if o.status != 0 {
+        return nil, errors.new("x509: roots command exited " + itoa(o.status) + ": " + o.stderr as str)
+    }
+    return new(o.stdout), nil
+}
+
+// pem_exec returns the memoized exec output for `which` (0 = macOS
+// security, 1 = Windows powershell) — the shared cell claims the
+// once-slot so racing handshakes still spawn exactly one child; a
+// failed exec releases it so the next caller retries.
+fn pem_exec(which: int) -> [own []byte, err] {
+    for sget(sysroots_state) != 2 {
+        if scas(sysroots_state, 0, 1) != 0 {
+            continue
+        }
+        [o, e] = roots_exec(which)
+        if e == nil && len(o) > 0 {
+            sysroots_pem = o
+            sset(sysroots_state, 2)
+        } else {
+            sset(sysroots_state, 0)
+            if e != nil {
+                return nil, e
+            }
+            return nil, errors.new("x509: roots command produced no output")
+        }
+    }
+    return slices.clone(sysroots_pem), nil
+}
+
+/// load_system_roots walks the resolution chain and returns the first
+/// non-empty pool. err_roots on total failure (or a set-but-broken
+/// env override, whose message names the var).
+fn load_system_roots() -> [Roots, err] {
+    z := Roots{cas: nil}
+    // env overrides — OXL_ first, then the conventional SSL_ names
+    [cs, e] = env_roots("OXL_SSL_CERT_FILE", "OXL_SSL_CERT_DIR")
+    if e != nil {
+        return z, e
+    }
+    if cs == nil {
+        [cs, e] = env_roots("SSL_CERT_FILE", "SSL_CERT_DIR")
+        if e != nil {
+            return z, e
+        }
+    }
+    if cs != nil {
+        return Roots{cas: cs}, nil
+    }
+    // POSIX bundle paths — first file that parses to ≥1 cert wins
+    paths := mkslice(str, 0)
+    paths = push(paths, "/etc/ssl/certs/ca-certificates.crt")
+    paths = push(paths, "/etc/pki/tls/certs/ca-bundle.crt")
+    paths = push(paths, "/etc/ssl/cert.pem")
+    paths = push(paths, "/etc/ssl/certs/ca-bundle.crt")
+    paths = push(paths, "/etc/ssl/certs/ca-bundle.trust.crt")
+    paths = push(paths, "/var/lib/ca-certificates/ca-bundle.pem")
+    paths = push(paths, "/etc/ssl/certs/ca-certificates.pem")
+    i := 0
+    for i < len(paths) {
+        [cs2, e2] = pem_of_file(paths[i])
+        if e2 == nil && cs2 != nil && len(cs2) > 0 {
+            return Roots{cas: cs2}, nil
+        }
+        i = i + 1
+    }
+    // macOS System Root Certificates keychain
+    if os.exists("/System/Library/Keychains/SystemRootCertificates.keychain") {
+        [pem, e3] = pem_exec(0)
+        if e3 == nil {
+            [cs3, e4] = pem_scan(pem as str, 0)
+            if e4 == nil && len(cs3) > 0 {
+                return Roots{cas: cs3}, nil
+            }
+        }
+    }
+    // Windows machine+user Root stores via powershell
+    if rt_is_windows() != 0 {
+        [pem, e5] = pem_exec(1)
+        if e5 == nil {
+            [cs4, e6] = pem_scan(pem as str, 0)
+            if e6 == nil && len(cs4) > 0 {
+                return Roots{cas: cs4}, nil
+            }
+        }
+    }
+    return z, errors.wrap("x509: no usable trust roots — set OXL_SSL_CERT_FILE or OXL_SSL_CERT_DIR", err_roots())
+}
+
+// ---- signature verification -------------------------------------------------
+
+// sig_hash maps a SIG_* to its digest constructor.
+fn sig_hash(alg: int) -> fn() -> hash.Hash {
+    if alg == SIG_rsa_pkcs1_sha256 || alg == SIG_rsa_pss_sha256 || alg == SIG_ecdsa_p256_sha256 {
+        return sha256.new
+    }
+    if alg == SIG_rsa_pkcs1_sha384 || alg == SIG_rsa_pss_sha384 || alg == SIG_ecdsa_p384_sha384 {
+        return sha512.new384
+    }
+    return sha512.new
+}
+
+// spki_key extracts the public-key BIT STRING payload (the SEC1 point
+// for EC, the RSAPublicKey sequence for RSA, the 32-byte key for
+// Ed25519).
+fn spki_key(spki: []byte) -> [own []byte, err] {
+    [seq, e] = dnext(spki, 0)
+    if e != nil {
+        return nil, e
+    }
+    e = need(seq, 48, "spki sequence")
+    if e != nil {
+        return nil, e
+    }
+    if tlend(seq) != len(spki) {
+        return nil, errors.wrap("x509: trailing data in spki", err_der())
+    }
+    [alg, e2] = dnext(spki, seq.off)
+    if e2 != nil {
+        return nil, e2
+    }
+    [bs, e3] = dnext(spki, tlend(alg))
+    if e3 != nil {
+        return nil, e3
+    }
+    e3 = need(bs, 3, "spki public key")
+    if e3 != nil {
+        return nil, e3
+    }
+    if tlend(bs) != tlend(seq) {
+        return nil, errors.wrap("x509: trailing data in spki", err_der())
+    }
+    [w, e4] = bit_str(spki, bs, 1)
+    if e4 != nil {
+        return nil, e4
+    }
+    return slices.clone(spki[w.off:w.off + w.len]), nil
+}
+
+// ecdsa_rs splits the ECDSA-Sig-Value SEQUENCE into r and s
+// magnitudes.
+struct SigRS { r: own []byte, s: own []byte }
+
+fn ecdsa_rs(sig: []byte) -> [SigRS, err] {
+    z := SigRS{r: nil, s: nil}
+    [seq, e] = dnext(sig, 0)
+    if e != nil {
+        return z, e
+    }
+    e = need(seq, 48, "ecdsa signature sequence")
+    if e != nil {
+        return z, e
+    }
+    if tlend(seq) != len(sig) {
+        return z, errors.wrap("x509: trailing data in ecdsa sig", err_der())
+    }
+    [ri, e2] = dnext(sig, seq.off)
+    if e2 != nil {
+        return z, e2
+    }
+    e2 = need(ri, 2, "ecdsa r")
+    if e2 != nil {
+        return z, e2
+    }
+    rw := int_win(sig, ri)
+    if !rw.ok {
+        return z, errors.wrap("x509: bad ecdsa r", err_der())
+    }
+    [si, e3] = dnext(sig, tlend(ri))
+    if e3 != nil {
+        return z, e3
+    }
+    e3 = need(si, 2, "ecdsa s")
+    if e3 != nil {
+        return z, e3
+    }
+    if tlend(si) != tlend(seq) {
+        return z, errors.wrap("x509: trailing data in ecdsa sig", err_der())
+    }
+    sw := int_win(sig, si)
+    if !sw.ok {
+        return z, errors.wrap("x509: bad ecdsa s", err_der())
+    }
+    return SigRS{r: slices.clone(sig[rw.off:rw.off + rw.len]), s: slices.clone(sig[sw.off:sw.off + sw.len])}, nil
+}
+
+// verify_sig checks child's signature under issuer's public key —
+// child's sig_alg picks the scheme, issuer's spki_alg must match the
+// family, and both must be inside the acceptance set. Errors ride
+// err_sig (a failed check) or err_alg (family mismatch).
+fn verify_sig(issuer: Cert, child: Cert) -> err {
+    alg := child.sig_alg
+    [key, ke] = spki_key(issuer.spki)
+    if ke != nil {
+        return errors.wrap("x509: " + issuer.subject + " spki: " + errors.msg(ke), err_der())
+    }
+    if alg == SIG_rsa_pkcs1_sha256 || alg == SIG_rsa_pkcs1_sha384 || alg == SIG_rsa_pkcs1_sha512 {
+        if issuer.spki_alg != SPKI_rsa {
+            return errors.wrap("x509: " + issuer.subject + " has no rsa key", err_alg())
+        }
+        [pk, e] = rsa.parse_pub_key(key)
+        if e != nil {
+            return errors.wrap("x509: " + issuer.subject + " rsa key: " + errors.msg(e), err_alg())
+        }
+        e = rsa.verify_v15(pk, sig_hash(alg), child.tbs, child.sig)
+        if e != nil {
+            return errors.wrap("x509: " + issuer.subject + " -> " + child.subject + ": " + errors.msg(e), err_sig())
+        }
+        return nil
+    }
+    if alg == SIG_rsa_pss_sha256 || alg == SIG_rsa_pss_sha384 || alg == SIG_rsa_pss_sha512 {
+        if issuer.spki_alg != SPKI_rsa {
+            return errors.wrap("x509: " + issuer.subject + " has no rsa key", err_alg())
+        }
+        [pk, e] = rsa.parse_pub_key(key)
+        if e != nil {
+            return errors.wrap("x509: " + issuer.subject + " rsa key: " + errors.msg(e), err_alg())
+        }
+        // saltlen -1: recover the encoded length from the params-free
+        // signature — the params check already pinned the hash
+        e = rsa.verify_pss(pk, sig_hash(alg), child.tbs, child.sig, -1)
+        if e != nil {
+            return errors.wrap("x509: " + issuer.subject + " -> " + child.subject + ": " + errors.msg(e), err_sig())
+        }
+        return nil
+    }
+    if alg == SIG_ecdsa_p256_sha256 || alg == SIG_ecdsa_p384_sha384 {
+        want := SPKI_ec_p256
+        c := nistec.p256()
+        if alg == SIG_ecdsa_p384_sha384 {
+            want = SPKI_ec_p384
+            c = nistec.p384()
+        }
+        if issuer.spki_alg != want {
+            return errors.wrap("x509: " + issuer.subject + " has the wrong ec key", err_alg())
+        }
+        [rs, e] = ecdsa_rs(child.sig)
+        if e != nil {
+            return e
+        }
+        e = nistec.ecdsa_verify(c, key, sig_hash(alg), child.tbs, rs.r, rs.s)
+        if e != nil {
+            return errors.wrap("x509: " + issuer.subject + " -> " + child.subject + ": " + errors.msg(e), err_sig())
+        }
+        return nil
+    }
+    if alg == SIG_ed25519 {
+        if issuer.spki_alg != SPKI_ed25519 {
+            return errors.wrap("x509: " + issuer.subject + " has no ed25519 key", err_alg())
+        }
+        e := ed25519.verify(key, child.tbs, child.sig)
+        if e != nil {
+            return errors.wrap("x509: " + issuer.subject + " -> " + child.subject + ": " + errors.msg(e), err_sig())
+        }
+        return nil
+    }
+    return errors.wrap("x509: " + child.subject + " has an unacceptable signature algorithm", err_alg())
+}
+
+// ---- path building ------------------------------------------------------------
+// Depth-first search over untrusted intermediates + pool members —
+// Go's model. A candidate is only committed after its issuer-of-child
+// signature verifies; failures at any link note a candidate error and
+// the search backtracks so an alternate route can succeed.
+struct Builder { path: []Cert, pn: int, cause: err }
+
+fn note(b: mut Builder, e: err) {
+    if b.cause == nil {
+        b.cause = e
+    }
+}
+
+// in_roots — anchor membership is by certificate identity (the whole
+// DER element), matching Go's "root in the pool" rule.
+fn in_roots(cand: Cert, roots: Roots) -> bool {
+    if roots.cas == nil {
+        return false
+    }
+    i := 0
+    for i < len(roots.cas) {
+        if bytes.equal(cand.raw, roots.cas[i].raw) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn in_path(b: mut Builder, cand: Cert) -> bool {
+    i := 0
+    for i < b.pn {
+        if bytes.equal(cand.raw, b.path[i].raw) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn has_eku(c: Cert, oid: str) -> bool {
+    return slices.contains(c.eku, oid)
+}
+
+// extend tries to lengthen the chain above child — untrusted
+// intermediates first, then pool members; the first link that both
+// cryptographically verifies and reaches an anchor wins.
+fn extend(b: mut Builder, child: Cert, untrusted: []Cert, roots: Roots, at: int) -> bool {
+    if b.pn >= len(b.path) {
+        note(b, errors.wrap("x509: chain exceeds 8 links", err_path()))
+        return false
+    }
+    i := 0
+    for i < len(untrusted) {
+        if try_link(b, child, untrusted[i], untrusted, roots, at) {
+            return true
+        }
+        i = i + 1
+    }
+    if roots.cas != nil {
+        i = 0
+        for i < len(roots.cas) {
+            if try_link(b, child, roots.cas[i], untrusted, roots, at) {
+                return true
+            }
+            i = i + 1
+        }
+    }
+    if b.cause == nil {
+        b.cause = errors.wrap("x509: no issuer found for " + child.subject, err_root())
+    }
+    return false
+}
+
+// try_link attempts cand as child's issuer: DER-equal names, the
+// akid/skid link hint when both exist, then anchor rules (pool
+// membership ends the path — the anchor's own validity and CA flags
+// are trusted by membership, only the link signature verifies) or
+// intermediate rules (CA-worthiness, usages, validity, max_path)
+// before the recursion.
+fn try_link(b: mut Builder, child: Cert, cand: Cert, untrusted: []Cert, roots: Roots, at: int) -> bool {
+    if !bytes.equal(child.issuer_der, cand.subject_der) {
+        return false
+    }
+    if len(child.akid) > 0 && len(cand.skid) > 0 && !bytes.equal(child.akid, cand.skid) {
+        return false
+    }
+    if in_path(b, cand) {
+        return false
+    }
+    if in_roots(cand, roots) {
+        if child.sig_alg <= 0 {
+            note(b, errors.wrap("x509: " + child.subject + " has an unacceptable signature algorithm", err_alg()))
+            return false
+        }
+        e := verify_sig(cand, child)
+        if e != nil {
+            note(b, e)
+            return false
+        }
+        b.path[b.pn] = cand
+        b.pn = b.pn + 1
+        return true
+    }
+    // non-anchor candidate — a full intermediate
+    if cand.is_ca == 0 {
+        note(b, errors.wrap("x509: " + cand.subject + " is not a CA", err_ca()))
+        return false
+    }
+    if cand.ku >= 0 && (cand.ku & KU_keyCertSign) == 0 {
+        note(b, errors.wrap("x509: " + cand.subject + " key usage lacks keyCertSign", err_ca()))
+        return false
+    }
+    if cand.max_path >= 0 && cand.max_path < b.pn - 1 {
+        note(b, errors.wrap("x509: " + cand.subject + " pathLenConstraint violated", err_path()))
+        return false
+    }
+    if len(cand.eku) > 0 && !has_eku(cand, EKU_serverauth) && !has_eku(cand, EKU_any) {
+        note(b, errors.wrap("x509: " + cand.subject + " eku excludes server auth", err_eku()))
+        return false
+    }
+    if at < cand.not_before {
+        note(b, errors.wrap("x509: " + cand.subject + " not valid until " + itoa(cand.not_before), err_notyet()))
+        return false
+    }
+    if at > cand.not_after {
+        note(b, errors.wrap("x509: " + cand.subject + " expired at " + itoa(cand.not_after), err_expired()))
+        return false
+    }
+    if child.sig_alg <= 0 {
+        note(b, errors.wrap("x509: " + child.subject + " has an unacceptable signature algorithm", err_alg()))
+        return false
+    }
+    e := verify_sig(cand, child)
+    if e != nil {
+        note(b, e)
+        return false
+    }
+    b.path[b.pn] = cand
+    b.pn = b.pn + 1
+    if extend(b, cand, untrusted, roots, at) {
+        return true
+    }
+    b.pn = b.pn - 1
+    return false
+}
+
+// leaf_checks — the leaf's own gates before path building: validity
+// at `at` (inclusive bounds), an acceptable signature algorithm, and
+// the TLS-server-auth usage profile (EKU absent/anyEKU/serverAuth;
+// an assertive KU must carry digitalSignature).
+fn leaf_checks(leaf: Cert, at: int) -> err {
+    if at < leaf.not_before {
+        return errors.wrap("x509: " + leaf.subject + " not valid until " + itoa(leaf.not_before), err_notyet())
+    }
+    if at > leaf.not_after {
+        return errors.wrap("x509: " + leaf.subject + " expired at " + itoa(leaf.not_after), err_expired())
+    }
+    if leaf.sig_alg <= 0 {
+        return errors.wrap("x509: " + leaf.subject + " has an unacceptable signature algorithm", err_alg())
+    }
+    if len(leaf.eku) > 0 && !has_eku(leaf, EKU_serverauth) && !has_eku(leaf, EKU_any) {
+        return errors.wrap("x509: " + leaf.subject + " eku excludes server auth", err_eku())
+    }
+    if leaf.ku >= 0 && (leaf.ku & KU_digitalSignature) == 0 {
+        return errors.wrap("x509: " + leaf.subject + " key usage lacks digitalSignature", err_eku())
+    }
+    return nil
+}
+
+/// verify builds and cryptographically verifies a chain from leaf to
+/// a roots member. untrusted carries the wire intermediates; roots is
+/// the anchor pool (a nil-cas pool falls back to nothing — callers
+/// wanting the system store call load_system_roots first). `at` is
+/// the epoch-second validity instant; name == "" skips hostname
+/// verification, otherwise the leaf's SANs must match. The returned
+/// path is owned — [leaf, intermediates..., anchor].
+fn verify(leaf: Cert, untrusted: []Cert, roots: Roots, name: str, at: int) -> [own []Cert, err] {
+    e := leaf_checks(leaf, at)
+    if e != nil {
+        return nil, e
+    }
+    b := new(Builder{path: mkslice(Cert, 9), pn: 0, cause: nil})
+    b.path[0] = leaf
+    b.pn = 1
+    if !extend(b, leaf, untrusted, roots, at) {
+        if b.cause != nil {
+            return nil, b.cause
+        }
+        return nil, errors.wrap("x509: no path to a trusted root", err_root())
+    }
+    if len(name) > 0 {
+        e = match_hostname(leaf, name)
+        if e != nil {
+            return nil, e
+        }
+    }
+    out := mkslice(Cert, b.pn)
+    i := 0
+    for i < b.pn {
+        out[i] = b.path[i]
+        i = i + 1
+    }
+    return new(out), nil
+}
+
+// ---- hostname matching -----------------------------------------------------
+// RFC 6125-flavored, SANs only — no Common Name fallback. IP
+// literals (v4 dotted quad, [v6] bracketed) compare against
+// ip_addrs, never dns_names; DNS names lowercase-compare against
+// dns_names where "*." wildcard only spans exactly one left-most
+// label and a "*" anywhere else is literal.
+
+// parse_v4 parses a strict dotted quad into out[0..4].
+fn parse_v4(s: str, out: []byte) -> bool {
+    parts := strings.split(s, ".")
+    n := 0
+    for parts != nil {
+        if n >= 4 {
+            return false
+        }
+        p := parts.v
+        if len(p) == 0 || len(p) > 3 {
+            return false
+        }
+        v := 0
+        i := 0
+        for i < len(p) {
+            c := byteat(p, i)
+            if !isdig(c) {
+                return false
+            }
+            v = v * 10 + (c - 48)
+            i = i + 1
+        }
+        if v > 255 {
+            return false
+        }
+        out[n] = v
+        n = n + 1
+        parts = parts.next
+    }
+    return n == 4
+}
+
+fn hexval(s: str) -> int {
+    if len(s) == 0 || len(s) > 4 {
+        return -1
+    }
+    v := 0
+    i := 0
+    for i < len(s) {
+        c := byteat(s, i)
+        d := -1
+        if c >= 48 && c <= 57 {
+            d = c - 48
+        }
+        if c >= 97 && c <= 102 {
+            d = c - 87
+        }
+        if c >= 65 && c <= 70 {
+            d = c - 55
+        }
+        if d < 0 {
+            return -1
+        }
+        v = v * 16 + d
+        i = i + 1
+    }
+    return v
+}
+
+// parse_v6 parses an RFC 4291 literal (with one optional "::" and an
+// optional embedded v4 tail) into out[0..16].
+fn parse_v6(s: str, out: []byte) -> bool {
+    if len(s) == 0 {
+        return false
+    }
+    d := find(s, "::")
+    left := s
+    right := ""
+    if d >= 0 {
+        if find(substr(s, d + 2, len(s)), "::") >= 0 {
+            return false
+        }
+        left = substr(s, 0, d)
+        right = substr(s, d + 2, len(s))
+    }
+    li := 0
+    ri := 16
+    if len(left) > 0 {
+        parts := strings.split(left, ":")
+        for parts != nil {
+            v := hexval(parts.v)
+            if v < 0 || li + 2 > ri {
+                return false
+            }
+            out[li] = v / 256
+            out[li + 1] = v % 256
+            li = li + 2
+            parts = parts.next
+        }
+    }
+    if len(right) > 0 {
+        gs := mkslice(str, 0)
+        parts := strings.split(right, ":")
+        for parts != nil {
+            gs = push(gs, parts.v)
+            parts = parts.next
+        }
+        k := len(gs) - 1
+        if k >= 0 && find(gs[k], ".") >= 0 {
+            // embedded v4 counts as two groups
+            ri = ri - 4
+            if ri < li {
+                return false
+            }
+            if !parse_v4(gs[k], out[ri:ri + 4]) {
+                return false
+            }
+            k = k - 1
+        }
+        for k >= 0 {
+            v := hexval(gs[k])
+            if v < 0 {
+                return false
+            }
+            ri = ri - 2
+            if ri < li {
+                return false
+            }
+            out[ri] = v / 256
+            out[ri + 1] = v % 256
+            k = k - 1
+        }
+    }
+    if d < 0 {
+        return li == 16
+    }
+    if li > ri {
+        return false
+    }
+    for li < ri {
+        out[li] = 0
+        li = li + 1
+    }
+    return true
+}
+
+/// match_hostname checks name against the cert's SANs. An empty name
+/// is err_name; so is any name the SAN set doesn't cover — a cert
+/// with no SANs at all fails every name check.
+fn match_hostname(c: Cert, name: str) -> err {
+    if len(name) == 0 {
+        return errors.wrap("x509: empty hostname", err_name())
+    }
+    // IP literals match ip_addrs only, never a dNSName
+    if byteat(name, 0) == 91 {
+        // [v6] bracketed literal
+        if len(name) < 3 || byteat(name, len(name) - 1) != 93 {
+            return errors.wrap("x509: bad bracketed ip " + name, err_name())
+        }
+        ip := mkslice(byte, 16)
+        if !parse_v6(substr(name, 1, len(name) - 1), ip) {
+            return errors.wrap("x509: bad ipv6 literal " + name, err_name())
+        }
+        canon := v6_str(ip)
+        i := 0
+        for i < len(c.ip_addrs) {
+            if c.ip_addrs[i] == canon {
+                return nil
+            }
+            i = i + 1
+        }
+        return errors.wrap("x509: no ip san matches " + name, err_name())
+    }
+    v4 := mkslice(byte, 4)
+    if parse_v4(name, v4) {
+        canon := itoa(v4[0]) + "." + itoa(v4[1]) + "." + itoa(v4[2]) + "." + itoa(v4[3])
+        i := 0
+        for i < len(c.ip_addrs) {
+            if c.ip_addrs[i] == canon {
+                return nil
+            }
+            i = i + 1
+        }
+        return errors.wrap("x509: no ip san matches " + name, err_name())
+    }
+    // DNS name — lowercase compare against the parse-time-lowered
+    // dns_names; "*." alone at the head is the only wildcard, and it
+    // spans exactly one label
+    lname := lower_ascii(name)
+    i := 0
+    for i < len(c.dns_names) {
+        pat := c.dns_names[i]
+        if pat == lname {
+            return nil
+        }
+        if len(pat) > 1 && byteat(pat, 0) == 42 && byteat(pat, 1) == 46 {
+            suf := substr(pat, 1, len(pat))
+            if strings.endswith(lname, suf) {
+                lab := substr(lname, 0, len(lname) - len(suf))
+                if len(lab) > 0 && find(lab, ".") < 0 {
+                    return nil
+                }
+            }
+        }
+        i = i + 1
+    }
+    return errors.wrap("x509: " + name + " matches no san", err_name())
+}

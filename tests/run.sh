@@ -550,9 +550,77 @@ out=$("$OXL" test tests/tls_handshake_test.oxl) || { printf '%s
 ' "$out" >&2; exit 1; }
 printf '%s
 ' "$out" >&2
-for t in test_handshake test_rawfd_and_adapters; do
+for t in test_handshake test_handshake_hrr test_handshake_cookie test_rawfd_and_adapters; do
     grep -q "$t ... ok" <<<"$out" || { echo "FAIL tls_handshake: $out"; exit 1; }
 done
+
+echo "== openssl interop: tls (x6) =="
+# Live wire: real openssl s_server instances answer each scenario —
+# the only suite piece that execs openssl. Where it is absent the
+# lane skips cleanly; the replay fixtures above still pin the wire
+# contract. Scenarios:
+#   ok      trusted-root handshake + -www page round trip
+#   hrr     s_server -groups P-384 demands a group CH1 didn't share
+#           → HelloRetryRequest → CH2 → full flight
+#   badroot chain under an unrelated CA bundle → err_root
+#   badname trusted root, wrong server_name    → err_name
+# A cookie-only HRR can't be coaxed out of s_server over TCP
+# (-stateless is DTLS); that branch is replay-pinned by
+# tests/tls/flight_cookie.hex from tests/tls/cookie_server.py.
+# LibreSSL s_server lacks -tls1_3/-groups — that's "openssl absent"
+# for this lane's purposes; macos-latest's stock openssl is LibreSSL
+if command -v openssl >/dev/null 2>&1 && openssl version 2>/dev/null | grep -q '^OpenSSL'; then
+    tls_interop() { # <scenario> <port> <ca.pem> <marker>
+        local out
+        out=$("$OXL" run tests/tls/interop.oxl -- "$1" "$2" "$3") || {
+            printf '%s\n' "$out" >&2
+            return 1
+        }
+        grep -q "$4" <<<"$out"
+    }
+    iport="${TLS_INTEROP_PORT:-24443}"
+    hport=$((iport + 1))
+    openssl s_server -accept "$iport" \
+        -cert tests/tls/server.pem -key tests/tls/server-key.pem \
+        -tls1_3 -www -naccept 16 -quiet >/dev/null 2>&1 &
+    isrv=$!
+    openssl s_server -accept "$hport" \
+        -cert tests/tls/server.pem -key tests/tls/server-key.pem \
+        -tls1_3 -www -groups P-384 -naccept 4 -quiet >/dev/null 2>&1 &
+    hsrv=$!
+    # wait for both listeners — each probe connect eats one -naccept
+    # slot, which the counts above already budget for
+    iready=0
+    for i in $(seq 1 50); do
+        kill -0 "$isrv" 2>/dev/null || break
+        (exec 3<>"/dev/tcp/127.0.0.1/$iport") 2>/dev/null && { exec 3>&- 3<&-; iready=1; break; }
+        sleep 0.1
+    done
+    hready=0
+    for i in $(seq 1 50); do
+        kill -0 "$hsrv" 2>/dev/null || break
+        (exec 3<>"/dev/tcp/127.0.0.1/$hport") 2>/dev/null && { exec 3>&- 3<&-; hready=1; break; }
+        sleep 0.1
+    done
+    if [ "$iready" != 1 ] || [ "$hready" != 1 ]; then
+        echo "FAIL tls interop: s_server did not listen" >&2
+        kill "$isrv" "$hsrv" 2>/dev/null || true
+        exit 1
+    fi
+    tls_interop ok "$iport" tests/tls/ca.pem INTEROP_OK \
+        || { echo "FAIL tls interop ok"; kill "$isrv" "$hsrv" 2>/dev/null || true; exit 1; }
+    tls_interop hrr "$hport" tests/tls/ca.pem INTEROP_HRR \
+        || { echo "FAIL tls interop hrr"; kill "$isrv" "$hsrv" 2>/dev/null || true; exit 1; }
+    tls_interop badroot "$iport" tests/fixtures/x509/roots.pem INTEROP_BADROOT \
+        || { echo "FAIL tls interop badroot"; kill "$isrv" "$hsrv" 2>/dev/null || true; exit 1; }
+    tls_interop badname "$iport" tests/tls/ca.pem INTEROP_BADNAME \
+        || { echo "FAIL tls interop badname"; kill "$isrv" "$hsrv" 2>/dev/null || true; exit 1; }
+    kill "$isrv" "$hsrv" 2>/dev/null || true
+    wait "$isrv" "$hsrv" 2>/dev/null || true
+    echo "  interop: ok hrr badroot badname"
+else
+    echo "  openssl not found — skipping live interop"
+fi
 
 echo "== oxl test: compress & archive =="
 out=$("$OXL" test tests/compress_flate.oxl)
@@ -1551,7 +1619,7 @@ done
 for t in test_keyschedule test_record; do
     grep -q "$t ... ok" "$cgen_dir/tls_keys.out" || { echo "FAIL codegen tls_keys $t"; cat "$cgen_dir/tls_keys.out"; exit 1; }
 done
-for t in test_handshake test_rawfd_and_adapters; do
+for t in test_handshake test_handshake_hrr test_handshake_cookie test_rawfd_and_adapters; do
     grep -q "$t ... ok" "$cgen_dir/tls_handshake.out" || { echo "FAIL codegen tls_handshake $t"; cat "$cgen_dir/tls_handshake.out"; exit 1; }
 done
 # x5 env-root discovery through codegen — the same three

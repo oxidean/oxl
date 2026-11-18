@@ -31,7 +31,18 @@
 #         replay asserts consumes and rotates. CA key is committed
 #         deliberately: regenerating the flight needs the same PKI.
 #
-# Usage: gen_tls_fixtures.sh [rsa|x509|flight|all]   — default "all"
+#   flight_hrr — X6: same, but `s_server -groups P-384` answers the
+#         x25519/p256 ClientHello with a HelloRetryRequest demanding
+#         P-384. Captures tests/tls/flight_hrr.hex.
+#
+#   cookie — X6: a cookie-ONLY HelloRetryRequest flight. openssl
+#         s_server can't emit one over TCP (-stateless is DTLS), so
+#         tests/tls/cookie_server.py plays the server side — it also
+#         fails the capture if the client doesn't echo the cookie.
+#         Captures tests/tls/flight_cookie.hex.
+#
+# Usage: gen_tls_fixtures.sh [rsa|x509|flight|flight_hrr|cookie|all]
+#   — default "all"
 # The openssl version is recorded in tests/fixtures/OPENSSL-VERSION
 # so a future regeneration can tell what minted the fixtures.
 set -euo pipefail
@@ -421,10 +432,79 @@ CNF
     echo "gen_tls_fixtures: wrote $outdir ($(cat "$outdir/OPENSSL-VERSION"), $(wc -c < "$outdir/flight.hex") hex chars)"
 }
 
+# gen_flight_hrr captures a second flight against `s_server -groups
+# P-384` — the demanded-group HelloRetryRequest case — reusing the
+# committed PKI (regenerating needs the same CA so the replay still
+# verifies). Requires ./target/oxl built.
+gen_flight_hrr() {
+    local outdir=tests/tls
+    local oxl="${OXL:-./target/oxl}"
+    [ -x "$oxl" ] || { echo "gen_tls_fixtures: $oxl not built (run ./scripts/stage0.sh)" >&2; exit 1; }
+    [ -f "$outdir/server.pem" ] || { echo "gen_tls_fixtures: run 'flight' first to mint the PKI" >&2; exit 1; }
+    local work
+    work=$(mktemp -d)
+    trap 'rm -rf "$work"' RETURN
+
+    local port="${TLS_FIXTURE_PORT:-24433}"
+    openssl s_server -accept "$port" \
+        -cert "$outdir/server.pem" -key "$outdir/server-key.pem" \
+        -tls1_3 -www -groups P-384 -naccept 8 -quiet \
+        >"$work/s_server.log" 2>&1 &
+    local srv=$!
+    local i
+    for i in $(seq 1 50); do
+        kill -0 "$srv" 2>/dev/null || break
+        (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null && { exec 3>&- 3<&-; break; }
+        sleep 0.1
+    done
+
+    "$oxl" run tests/tls/capture.oxl -- "$port" "$outdir/ca.pem" "$work/flight_hrr.hex"
+    kill "$srv" 2>/dev/null || true
+    wait "$srv" 2>/dev/null || true
+
+    cp "$work/flight_hrr.hex" "$outdir/flight_hrr.hex"
+    echo "gen_tls_fixtures: wrote $outdir/flight_hrr.hex ($(wc -c < "$outdir/flight_hrr.hex") hex chars)"
+}
+
+# gen_cookie captures the cookie-only-HRR flight. No TCP TLS server
+# emits one, so tests/tls/cookie_server.py implements the server side
+# (python3 + cryptography); it also asserts the client echoes the
+# cookie in CH2. Requires ./target/oxl built.
+gen_cookie() {
+    local outdir=tests/tls
+    local oxl="${OXL:-./target/oxl}"
+    [ -x "$oxl" ] || { echo "gen_tls_fixtures: $oxl not built (run ./scripts/stage0.sh)" >&2; exit 1; }
+    [ -f "$outdir/server.pem" ] || { echo "gen_tls_fixtures: run 'flight' first to mint the PKI" >&2; exit 1; }
+    local work
+    work=$(mktemp -d)
+    trap 'rm -rf "$work"' RETURN
+
+    local port="${TLS_FIXTURE_PORT:-24433}"
+    python3 tests/tls/cookie_server.py "$port" \
+        "$outdir/server.pem" "$outdir/server-key.pem" \
+        >"$work/cookie_server.log" 2>&1 &
+    local srv=$!
+    local i
+    for i in $(seq 1 50); do
+        kill -0 "$srv" 2>/dev/null || break
+        (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null && { exec 3>&- 3<&-; break; }
+        sleep 0.1
+    done
+
+    "$oxl" run tests/tls/capture.oxl -- "$port" "$outdir/ca.pem" "$work/flight_cookie.hex"
+    kill "$srv" 2>/dev/null || true
+    wait "$srv" 2>/dev/null || true
+
+    cp "$work/flight_cookie.hex" "$outdir/flight_cookie.hex"
+    echo "gen_tls_fixtures: wrote $outdir/flight_cookie.hex ($(wc -c < "$outdir/flight_cookie.hex") hex chars)"
+}
+
 case "${1:-all}" in
     rsa) gen_rsa ;;
     x509) gen_x509 ;;
     flight) gen_flight ;;
-    all) gen_rsa; gen_x509; gen_flight ;;
-    *) echo "usage: gen_tls_fixtures.sh [rsa|x509|flight|all]" >&2; exit 2 ;;
+    flight_hrr) gen_flight_hrr ;;
+    cookie) gen_cookie ;;
+    all) gen_rsa; gen_x509; gen_flight; gen_flight_hrr; gen_cookie ;;
+    *) echo "usage: gen_tls_fixtures.sh [rsa|x509|flight|flight_hrr|cookie|all]" >&2; exit 2 ;;
 esac

@@ -140,6 +140,116 @@ fn test_handshake() {
     testing.expect(ce == nil, "double close")
 }
 
+// test_handshake_hrr replays flight_hrr.hex — an openssl flight
+// captured with `s_server -groups P-384`, which answers the
+// x25519/p256 ClientHello with a HelloRetryRequest demanding P-384.
+// The client must resynthesize the transcript (message_hash), emit
+// CH2 with a fresh p384 share at record version 0x0303, and finish
+// the full flight. c.s.hrr / c.s.group prove the HRR ran.
+// Regenerate: gen_tls_fixtures.sh flight_hrr.
+fn test_handshake_hrr() {
+    flight := hx(os.readfile_("tests/tls/flight_hrr.hex"))
+    testing.expect(len(flight) > 1000, "hrr flight fixture nonempty")
+
+    roots := x509.Roots{cas: nil}
+    [n, le] = roots.load_pem(os.readfile_("tests/tls/ca.pem"))
+    testing.expect(le == nil && n == 1, "ca load")
+
+    tls.fixture_hook()
+    port := mkshared(0)
+    ready := mkshared(0)
+    spawnBlocking fixture_server("tests/tls/flight_hrr.hex", port, ready)
+    i := 0
+    for sget(ready) == 0 && i < 500 {
+        usleep(10000)
+        i = i + 1
+    }
+    testing.expect(sget(ready) == 1, "fixture server listen")
+
+    cfg := tls.default_cfg()
+    cfg.roots = roots
+    [c, e] = tls.dial("127.0.0.1", sget(port), cfg)
+    testing.expect(e == nil, "hrr handshake: " + errors.msg(e))
+    testing.expect(c.s.hrr == 1, "hrr seen")
+    testing.expect(c.s.group == tls.G_P384, "demanded group negotiated, got " + itoa(c.s.group))
+
+    r := c.asreader()
+    buf := mkslice(byte, 2048)
+    got := ""
+    done := 0
+    for done == 0 {
+        [nr, re] = r.read(buf)
+        if nr > 0 {
+            got = got + buf[0:nr] as str
+        }
+        if re != nil {
+            testing.expect(re == io.eof(), "read end is close_notify, got " + errors.msg(re))
+            done = 1
+        }
+    }
+    testing.expect(strings.contains(got, "HTTP/1.0"), "server page in hrr flight")
+    testing.expect(strings.contains(got, "hello-x6-replay"), "post-KeyUpdate app data")
+
+    ce := c.close()
+    testing.expect(ce == nil, "close")
+}
+
+// test_handshake_cookie replays flight_cookie.hex — a synthetic
+// flight from tests/tls/cookie_server.py (python, fixture-generator
+// only) whose HelloRetryRequest carries a cookie and NO key_share
+// demand. CH2 must resend the original shares plus the cookie echo;
+// the server then picks x25519 out of them. This is the branch
+// openssl s_server cannot produce over TCP (-stateless is DTLS):
+// s.group stays 0 through CH2 and the SH2 accept path is the
+// plain-ServerHello rule — any share we sent. c.s.group == x25519
+// proves it.
+fn test_handshake_cookie() {
+    flight := hx(os.readfile_("tests/tls/flight_cookie.hex"))
+    testing.expect(len(flight) > 500, "cookie flight fixture nonempty")
+
+    roots := x509.Roots{cas: nil}
+    [n, le] = roots.load_pem(os.readfile_("tests/tls/ca.pem"))
+    testing.expect(le == nil && n == 1, "ca load")
+
+    tls.fixture_hook()
+    port := mkshared(0)
+    ready := mkshared(0)
+    spawnBlocking fixture_server("tests/tls/flight_cookie.hex", port, ready)
+    i := 0
+    for sget(ready) == 0 && i < 500 {
+        usleep(10000)
+        i = i + 1
+    }
+    testing.expect(sget(ready) == 1, "fixture server listen")
+
+    cfg := tls.default_cfg()
+    cfg.roots = roots
+    [c, e] = tls.dial("127.0.0.1", sget(port), cfg)
+    testing.expect(e == nil, "cookie-hrr handshake: " + errors.msg(e))
+    testing.expect(c.s.hrr == 1, "hrr seen")
+    testing.expect(c.s.group == tls.G_X25519, "server picked an original share, got " + itoa(c.s.group))
+
+    r := c.asreader()
+    buf := mkslice(byte, 2048)
+    got := ""
+    done := 0
+    for done == 0 {
+        [nr, re] = r.read(buf)
+        if nr > 0 {
+            got = got + buf[0:nr] as str
+        }
+        if re != nil {
+            testing.expect(re == io.eof(), "read end is close_notify, got " + errors.msg(re))
+            done = 1
+        }
+    }
+    testing.expect(strings.contains(got, "cookie-hrr fixture page"), "server page in cookie flight")
+    testing.expect(strings.contains(got, "hello-x6-replay"), "post-KeyUpdate app data")
+
+    ce := c.close()
+    testing.expect(ce == nil, "close")
+}
+
 // test_rawfd_and_adapters pins the net.Conn parity surface: rawfd is
 // the inner socket, and the io adapters are live objects.
 fn test_rawfd_and_adapters() {

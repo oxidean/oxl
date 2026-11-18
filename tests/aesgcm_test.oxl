@@ -122,8 +122,9 @@ fn test_gcm_carry() {
     // counter-carry regression (X6 interop find): inc32 must carry
     // out of the low byte at 256-block boundary — a TLS record past
     // ~4 KiB crosses it. Sealing was self-consistent under the bug,
-    // so only a cross-implementation pin catches it: sha256 of the
-    // whole ct is pinned to the AES-GCM reference answer.
+    // so only a cross-implementation pin catches it: the ciphertext
+    // of the boundary block (block 254, offset 4064) is pinned to
+    // the AES-GCM reference answer.
     key := mkslice(byte, 16)
     key[0] = 0
     key[1] = 17

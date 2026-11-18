@@ -112,6 +112,8 @@ struct Session {
     gsk_pub: []byte, // public share for a HRR-demanded p384
     hrr: int, // HRR already seen
     cookie: []byte, // HRR cookie to echo in CH2
+    hver: int, // plaintext-epoch record version: first CH writes
+    // 0x0301 (middlebox allowance), everything after is 0x0303
     cr_seen: int, // CertificateRequest arrived mid-flight
     cr_ctx: []byte, // its certificate_request_context
     alpn: str, // negotiated ALPN ("" = none)
@@ -265,7 +267,7 @@ fn client_tmo(c: net.Conn, cfg: Config, tmo_ms: int) -> [Conn, err] {
     if len(cfg.server_name) == 0 && cfg.verify == nil {
         return badconn(), errors.wrap("tls: server_name empty and no verifier", x509.err_name())
     }
-    tc := mkconn(c, new(Session{suite: 0, aead: 0, hlen: 0, hf: sha256.new, th: nil, ch1: nil, rkey: nil, riv: nil, rseq: 0, ren: 0, wkey: nil, wiv: nil, wseq: 0, wen: 0, rsecret: nil, wsecret: nil, c_hs: nil, ks: KeySched{hf: sha256.new, hlen: 0, early: nil, hs: nil, master: nil, c_hs: nil, s_hs: nil, c_ap: nil, s_ap: nil}, hsbuf: mkslice(byte, 0), appbuf: mkslice(byte, 0), ccs: 0, notify: 0, wclosed: 0, random: nil, session_id: nil, xsk: nil, xpk: nil, psk2: nil, ppk: nil, group: 0, gsk: nil, gsk_pub: nil, hrr: 0, cookie: nil, cr_seen: 0, cr_ctx: nil, alpn: "", leaf: x509.Cert{raw: nil, version: 0, serial: nil, issuer: "", subject: "", issuer_der: nil, subject_der: nil, not_before: 0, not_after: 0, dns_names: nil, ip_addrs: nil, is_ca: 0, max_path: -1, ku: -1, eku: nil, sig_alg: 0, spki_alg: 0, spki: nil, skid: nil, akid: nil, sig: nil, tbs: nil}, has_leaf: 0, deadline: 0, hs_tmo: tmo_ms, capin: nil, capout: nil}))
+    tc := mkconn(c, new(Session{suite: 0, aead: 0, hlen: 0, hf: sha256.new, th: nil, ch1: nil, rkey: nil, riv: nil, rseq: 0, ren: 0, wkey: nil, wiv: nil, wseq: 0, wen: 0, rsecret: nil, wsecret: nil, c_hs: nil, ks: KeySched{hf: sha256.new, hlen: 0, early: nil, hs: nil, master: nil, c_hs: nil, s_hs: nil, c_ap: nil, s_ap: nil}, hsbuf: mkslice(byte, 0), appbuf: mkslice(byte, 0), ccs: 0, notify: 0, wclosed: 0, random: nil, session_id: nil, xsk: nil, xpk: nil, psk2: nil, ppk: nil, group: 0, gsk: nil, gsk_pub: nil, hrr: 0, cookie: nil, hver: 0, cr_seen: 0, cr_ctx: nil, alpn: "", leaf: x509.Cert{raw: nil, version: 0, serial: nil, issuer: "", subject: "", issuer_der: nil, subject_der: nil, not_before: 0, not_after: 0, dns_names: nil, ip_addrs: nil, is_ca: 0, max_path: -1, ku: -1, eku: nil, sig_alg: 0, spki_alg: 0, spki: nil, skid: nil, akid: nil, sig: nil, tbs: nil}, has_leaf: 0, deadline: 0, hs_tmo: tmo_ms, capin: nil, capout: nil}))
     e := hs_client(tc, cfg)
     if e != nil {
         tc.close()
@@ -355,6 +357,10 @@ fn (c ref Conn) rawfd() -> int {
 /// field cloned, so mutating it touches neither the conn's stored
 /// cert nor later peer() calls.
 fn (c ref Conn) peer() -> x509.Cert {
+    if c.s == nil || c.s.has_leaf == 0 {
+        // no handshake (badconn) or no verified leaf — the zero Cert
+        return x509.Cert{raw: nil, version: 0, serial: nil, issuer: "", subject: "", issuer_der: nil, subject_der: nil, not_before: 0, not_after: 0, dns_names: nil, ip_addrs: nil, is_ca: 0, max_path: -1, ku: -1, eku: nil, sig_alg: 0, spki_alg: 0, spki: nil, skid: nil, akid: nil, sig: nil, tbs: nil}
+    }
     l := c.s.leaf
     return x509.Cert{raw: slices.clone(l.raw), version: l.version, serial: slices.clone(l.serial), issuer: l.issuer, subject: l.subject, issuer_der: slices.clone(l.issuer_der), subject_der: slices.clone(l.subject_der), not_before: l.not_before, not_after: l.not_after, dns_names: slices.clone(l.dns_names), ip_addrs: slices.clone(l.ip_addrs), is_ca: l.is_ca, max_path: l.max_path, ku: l.ku, eku: slices.clone(l.eku), sig_alg: l.sig_alg, spki_alg: l.spki_alg, spki: slices.clone(l.spki), skid: slices.clone(l.skid), akid: slices.clone(l.akid), sig: slices.clone(l.sig), tbs: slices.clone(l.tbs)}
 }

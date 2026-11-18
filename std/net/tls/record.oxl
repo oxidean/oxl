@@ -294,11 +294,12 @@ fn rec_write(c: mut Conn, typ: int, content: []byte) -> err {
         s.wseq = s.wseq + 1
     } else {
         w.u8(typ)
-        // legacy_record_version: 0x0301 is the CH-only middlebox
-        // allowance; every other plaintext record is MUST-be-0x0303
-        // (RFC 8446 §5.1) — openssl's tls13 header check enforces it
-        if typ == CT_HANDSHAKE {
+        // legacy_record_version: 0x0301 is the first-ClientHello
+        // middlebox allowance; every other plaintext record —
+        // including ClientHello#2 — is MUST-be-0x0303 (RFC 8446 §5.1)
+        if typ == CT_HANDSHAKE && s.hver == 0 {
             w.u16(769)
+            s.hver = 1
         } else {
             w.u16(771)
         }
@@ -439,8 +440,11 @@ fn rec_read(c: mut Conn) -> [Rec, err] {
 // carrying the alert's name.
 fn alert_recv(c: mut Conn, pl: []byte) -> [Rec, err] {
     z := Rec{ty: 0, pl: nil}
-    if len(pl) < 2 {
-        return z, fail(c, AL_DECODE_ERR, "short alert record")
+    if len(pl) != 2 {
+        return z, fail(c, AL_DECODE_ERR, "bad alert record length")
+    }
+    if pl[0] != 1 && pl[0] != 2 {
+        return z, fail(c, AL_DECODE_ERR, "bad alert level " + itoa(pl[0]))
     }
     desc := pl[1]
     if desc == 0 {
@@ -509,8 +513,11 @@ fn hs_next(c: mut Conn) -> [HsMsg, err] {
             if e != nil {
                 return z, e
             }
+        } else if rc.ty != CT_CCS {
+            // CT_CCS is the only non-handshake record tolerated
+            // mid-flight — anything else is unexpected_message
+            return z, fail(c, AL_UNEXPECTED, "record type " + itoa(rc.ty) + " mid-handshake")
         }
-        // rc.ty == CT_CCS: consumed, keep looping
     }
     return z, errors.new("tls: unreachable")
 }
@@ -545,8 +552,11 @@ fn rec_pump(c: mut Conn) -> err {
             if e != nil {
                 return e
             }
+        } else if rc.ty != CT_CCS {
+            // unknown inner types are unexpected_message, not
+            // silently swallowed
+            return fail(c, AL_UNEXPECTED, "record type " + itoa(rc.ty))
         }
-        // CT_CCS: consumed, keep pumping
     }
     return nil
 }
@@ -563,6 +573,12 @@ fn post_hs_dispatch(c: mut Conn) -> err {
         }
         ty := raw[0]
         body := raw[4:len(raw)]
+        // post-handshake messages still join the running transcript —
+        // a later CertificateRequest's Finished hashes them in
+        e := th_update(c, raw)
+        if e != nil {
+            return e
+        }
         if ty == HS_NEW_SESSION_TICKET {
             // parsed and dropped — resumption is out of scope;
             // erroring would break interop with every real server
@@ -607,8 +623,9 @@ fn key_update_recv(c: mut Conn, body: []byte) -> err {
     s.rseq = 0
     if req == 1 {
         // answer update_not_requested under the current write epoch,
-        // then rotate our send keys
-        e = hs_send(c, HS_KEY_UPDATE, mkslice(byte, 1))
+        // then rotate our send keys — it joins the transcript like
+        // every handshake message we emit
+        e = hs_send_t(c, HS_KEY_UPDATE, mkslice(byte, 1))
         if e != nil {
             return e
         }
@@ -654,19 +671,16 @@ fn cert_request_recv(c: mut Conn, body: []byte) -> err {
     if r.ok == 0 {
         return fail(c, AL_DECODE_ERR, "bad certificate_request")
     }
-    // feed the CR into the running transcript, then emit the flight:
-    // Certificate(ctx echo, empty list) + Finished keyed by c_hs —
-    // the same shape as the mid-flight answer (RFC 8446 forbids CV
-    // without a non-empty Certificate)
-    e := th_update(c, raw_msg(HS_CERT_REQUEST, body))
-    if e != nil {
-        return e
-    }
+    // the CR already joined the running transcript in
+    // post_hs_dispatch; emit the answer flight: Certificate(ctx
+    // echo, empty list) + Finished keyed by c_hs — the same shape as
+    // the mid-flight answer (RFC 8446 forbids CV without a non-empty
+    // Certificate)
     certw := mkwr()
     certw.u8(len(ctx))
     certw.put(ctx)
     certw.u24(0) // empty certificate_list
-    e = hs_send_t(c, HS_CERTIFICATE, certw.b)
+    e := hs_send_t(c, HS_CERTIFICATE, certw.b)
     if e != nil {
         return e
     }

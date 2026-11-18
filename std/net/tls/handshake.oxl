@@ -335,7 +335,7 @@ struct ShInfo {
 fn sh_parse(body: []byte) -> [ShInfo, err] {
     z := ShInfo{random: nil, suite: 0, vers_ok: 0, ks_group: 0, ks_key: nil, cookie: nil, badext: -1}
     r := mkrd(body)
-    r.u16() // legacy_version — checked by caller
+    lv := r.u16() // legacy_version — pinned below (0x0303 always)
     z.random = r.bytes(32)
     sidlen := r.u8()
     sid := r.bytes(sidlen)
@@ -344,6 +344,9 @@ fn sh_parse(body: []byte) -> [ShInfo, err] {
     elen := r.u16()
     if r.ok == 0 {
         return z, errors.new("tls: malformed server_hello")
+    }
+    if lv != 771 {
+        return z, errors.new("tls: server_hello legacy_version " + itoa(lv))
     }
     end := r.p + elen
     for r.ok != 0 && r.p < end {
@@ -619,7 +622,7 @@ fn cv_verify(c: mut Conn, body: []byte) -> err {
     r := mkrd(body)
     alg := r.u16()
     sig := r.bytes(r.u16())
-    if r.ok == 0 {
+    if r.ok == 0 || r.p != len(body) {
         return fail(c, AL_DECODE_ERR, "bad certificate_verify")
     }
     // CV-legal set: rsa_pss_rsae_*, ecdsa_*, ed25519 — rsa_pkcs1_*
@@ -828,6 +831,11 @@ fn hs_client(c: mut Conn, cfg: Config) -> err {
         return fail(c, AL_ILLEGAL_PARAM, "unoffered cipher suite")
     }
     is_hrr := bequal(sh.random, hrr_magic())
+    if !is_hrr && len(sh.cookie) > 0 {
+        // cookie is HRR-only — in a plain ServerHello it is an
+        // extension we never offered
+        return fail(c, AL_ILLEGAL_PARAM, "cookie extension in server_hello")
+    }
     if !is_hrr {
         tail := sh.random[24:32]
         if bequal(tail, downgrade_v12()) || bequal(tail, downgrade_v11()) {
@@ -906,12 +914,35 @@ fn hs_client(c: mut Conn, cfg: Config) -> err {
         if sh3.badext >= 0 {
             return fail(c, AL_ILLEGAL_PARAM, "unoffered extension " + itoa(sh3.badext))
         }
-        // post-HRR the only share that carries a secret is the
-        // demanded one
-        if sh3.ks_group != s.group || len(sh3.ks_key) == 0 {
+        // post-HRR: a demanded group pins the share to it; a
+        // cookie-only HRR leaves s.group == 0 (CH2 resent the
+        // original shares) and the server picks any share we sent —
+        // same acceptance rule as the plain-ServerHello path
+        if len(sh3.ks_key) == 0 {
             return fail(c, AL_ILLEGAL_PARAM, "bad key_share after hrr")
         }
-        th_update(c, raw3)
+        if s.group != 0 {
+            if sh3.ks_group != s.group {
+                return fail(c, AL_ILLEGAL_PARAM, "bad key_share after hrr")
+            }
+        } else {
+            if !share_sent(sh3.ks_group, shares) {
+                return fail(c, AL_ILLEGAL_PARAM, "bad key_share after hrr")
+            }
+            s.group = sh3.ks_group
+            e = sel_share(c, sh3.ks_group)
+            if e != nil {
+                return fail(c, AL_ILLEGAL_PARAM, "key_share for unsent group")
+            }
+        }
+        if len(sh3.cookie) > 0 {
+            // cookie is HRR-only — a second one is an unoffered ext
+            return fail(c, AL_ILLEGAL_PARAM, "cookie extension in server_hello")
+        }
+        e = th_update(c, raw3)
+        if e != nil {
+            return e
+        }
         sh = sh3
         raw = raw3
     } else {
@@ -953,9 +984,16 @@ fn hs_client(c: mut Conn, cfg: Config) -> err {
     if e != nil {
         return e
     }
+    // arm the write epoch now, not after the flight — a mid-flight
+    // failure alerts under c_hs like every other 1.3 client rather
+    // than going out plaintext
+    e = arm_write(c, s.ks.c_hs)
+    if e != nil {
+        return e
+    }
 
     // ---- server flight: EE [CR] Cert CV Fin ----
-    state := 0 // 0=expect EE, 1=Cert|CR, 2=CV, 3=Fin
+    state := 0 // 0=expect EE, 1=Cert|CR, 2=CV, 3=Fin, 4=Cert after CR
     done := 0
     for done == 0 {
         [hm, me] = hs_next(c)
@@ -980,13 +1018,16 @@ fn hs_client(c: mut Conn, cfg: Config) -> err {
             }
             rr := mkrd(body)
             ctx := rr.bytes(rr.u8())
+            el := rr.u16()
+            rr.bytes(el) // extensions — ignored, must be well-formed
             if rr.ok == 0 {
                 return fail(c, AL_DECODE_ERR, "bad certificate_request")
             }
             s.cr_seen = 1
             s.cr_ctx = bclone(ctx)
+            state = 4
         } else if mty == HS_CERTIFICATE {
-            if state != 1 {
+            if state != 1 && state != 4 {
                 return fail(c, AL_UNEXPECTED, "certificate out of order")
             }
             [cm, pe] = cert_msg_parse(body)
@@ -1053,10 +1094,6 @@ fn hs_client(c: mut Conn, cfg: Config) -> err {
     }
 
     // ---- client flight + app epoch ----
-    e = arm_write(c, s.ks.c_hs)
-    if e != nil {
-        return e
-    }
     // transcript(CH..server Finished) keys the app traffic secrets —
     // snapshot BEFORE our own Finished joins the transcript
     th_app := th_sum(c)
@@ -1095,6 +1132,11 @@ fn hrr_apply(c: mut Conn, raw: []byte, sh: ShInfo, shares: []int, cfg: Config) -
     s.hrr = 1
     if sh.badext >= 0 {
         return fail(c, AL_ILLEGAL_PARAM, "unoffered hrr extension " + itoa(sh.badext))
+    }
+    // HRR's key_share is a bare group demand — a full key entry is
+    // malformed here
+    if len(sh.ks_key) != 0 {
+        return fail(c, AL_ILLEGAL_PARAM, "hrr key_share carries a key")
     }
     // demanded group must be one we advertise
     if sh.ks_group != 0 && sh.ks_group != G_X25519 && sh.ks_group != G_P256 && sh.ks_group != G_P384 {

@@ -1,0 +1,116 @@
+package main
+
+// tests/tls/interop.oxl — the live openssl interop client (X6). The
+// suite's "== openssl interop: tls (x6) ==" lane runs it against
+// `openssl s_server -www -tls1_3`; it is the only suite piece that
+// execs openssl, and the lane skips cleanly where openssl is absent.
+//
+//   oxl run tests/tls/interop.oxl -- <scenario> <port> <ca.pem>
+//
+//   ok      trusted-root handshake + GET + page read       → INTEROP_OK
+//   hrr     same, against `s_server -groups P-384`; asserts
+//           the demanded-group HRR actually ran            → INTEROP_HRR
+//   badroot dial against an unrelated CA bundle; the
+//           handshake must fail with err_root              → INTEROP_BADROOT
+//   badname trusted CA but server_name is wrong; the
+//           handshake must fail with err_name              → INTEROP_BADNAME
+import "std/crypto/x509"
+
+import "std/errors"
+
+import "std/net/tls"
+
+import "std/os"
+
+import "std/strings"
+
+fn die(msg: str) {
+    println("interop: " + msg)
+    exit(1)
+}
+
+fn roots_of(cafile: str) -> x509.Roots {
+    roots := x509.Roots{cas: nil}
+    [n, le] = roots.load_pem(os.readfile_(cafile))
+    if le != nil || n < 1 {
+        die("ca load " + cafile)
+    }
+    return roots
+}
+
+fn roundtrip(c: tls.Conn) {
+    [nw, we] = c.write("GET / HTTP/1.0\r\nhost: x\r\n\r\n" as []byte)
+    if we != nil || nw <= 0 {
+        die("write: " + errors.msg(we))
+    }
+    set_rcvtimo(c.rawfd(), 10)
+    buf := mkslice(byte, 4096)
+    page := ""
+    deadline := now_ms() + 8000
+    for now_ms() < deadline && len(page) < 60 {
+        [nr, re] = c.read(buf)
+        if nr > 0 {
+            page = page + buf[0:nr] as str
+        }
+        if re != nil {
+            break
+        }
+    }
+    if !strings.contains(page, "HTTP") {
+        die("no page: " + page)
+    }
+    c.close()
+}
+
+fn main() {
+    if os.nargs() < 4 {
+        die("usage: interop.oxl <scenario> <port> <ca.pem>")
+    }
+    scen := os.args(1)
+    port := atoi(os.args(2))
+    cafile := os.args(3)
+
+    cfg := tls.default_cfg()
+    cfg.roots = roots_of(cafile)
+    if scen == "badname" {
+        cfg.server_name = "wrong-name.invalid"
+    } else {
+        // dial 127.0.0.1 but verify the DNS SAN like a real client
+        cfg.server_name = "localhost"
+    }
+    [c, e] = tls.dial("127.0.0.1", port, cfg)
+
+    if scen == "badroot" {
+        if e == nil {
+            die("untrusted CA handshake unexpectedly succeeded")
+        }
+        if !errors.is(e, x509.err_root()) {
+            die("expected err_root, got: " + errors.msg(e))
+        }
+        println("INTEROP_BADROOT")
+        return
+    }
+    if scen == "badname" {
+        if e == nil {
+            die("wrong-name handshake unexpectedly succeeded")
+        }
+        if !errors.is(e, x509.err_name()) {
+            die("expected err_name, got: " + errors.msg(e))
+        }
+        println("INTEROP_BADNAME")
+        return
+    }
+
+    if e != nil {
+        die("handshake: " + errors.msg(e))
+    }
+    if scen == "hrr" && c.s.hrr == 0 {
+        die("expected demanded-group hrr, plain sh seen")
+    }
+    roundtrip(c)
+    if scen == "hrr" {
+        println("INTEROP_HRR")
+    } else {
+        println("INTEROP_OK")
+    }
+}

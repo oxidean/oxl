@@ -1,0 +1,395 @@
+package sha512
+
+// std/crypto/sha512 — FIPS 180-4 SHA-512/SHA-384 written fresh from
+// the spec. u64 lanes ride in int as two's-complement bit patterns:
+// + wraps mod 2^64 (the same congruence math/rand's LCG relies on)
+// and & | ^ work on the raw bits. The language has no shifts, so
+// rotates and logical shifts split each lane into u32 hi/lo halves
+// (both non-negative, M32-masked) and reassemble — nb*2^32+na wraps
+// back to the right pattern even when the top bit is set.
+import "std/hash"
+
+import "std/slices"
+
+import "std/encoding/binary"
+
+import "std/encoding/hex"
+
+let M32: int = 4294967295
+
+let P32: int = 4294967296
+
+// powers of two — eager table: a lazy fill published a shared global
+// unsynchronized (two tasks could both see nil and store through it);
+// the let initializer runs at program start, before any task exists
+fn mkp2() -> []int {
+    t := mkslice(int, 33)
+    v := 1
+    i := 0
+    for i < 33 {
+        t[i] = v
+        v = v * 2
+        i = i + 1
+    }
+    return slices.clone(t)
+}
+
+let P2: []int = mkp2()
+
+// K — the 80 u64 round constants (cube roots of the first 80 primes),
+// stored as signed int64 literals: the bit pattern is what matters
+fn mkkt() -> []int {
+    t := mkslice(int, 80)
+    t[0] = 4794697086780616226
+    t[1] = 8158064640168781261
+    t[2] = -5349999486874862801
+    t[3] = -1606136188198331460
+    t[4] = 4131703408338449720
+    t[5] = 6480981068601479193
+    t[6] = -7908458776815382629
+    t[7] = -6116909921290321640
+    t[8] = -2880145864133508542
+    t[9] = 1334009975649890238
+    t[10] = 2608012711638119052
+    t[11] = 6128411473006802146
+    t[12] = 8268148722764581231
+    t[13] = -9160688886553864527
+    t[14] = -7215885187991268811
+    t[15] = -4495734319001033068
+    t[16] = -1973867731355612462
+    t[17] = -1171420211273849373
+    t[18] = 1135362057144423861
+    t[19] = 2597628984639134821
+    t[20] = 3308224258029322869
+    t[21] = 5365058923640841347
+    t[22] = 6679025012923562964
+    t[23] = 8573033837759648693
+    t[24] = -7476448914759557205
+    t[25] = -6327057829258317296
+    t[26] = -5763719355590565569
+    t[27] = -4658551843659510044
+    t[28] = -4116276920077217854
+    t[29] = -3051310485924567259
+    t[30] = 489312712824947311
+    t[31] = 1452737877330783856
+    t[32] = 2861767655752347644
+    t[33] = 3322285676063803686
+    t[34] = 5560940570517711597
+    t[35] = 5996557281743188959
+    t[36] = 7280758554555802590
+    t[37] = 8532644243296465576
+    t[38] = -9096487096722542874
+    t[39] = -7894198246740708037
+    t[40] = -6719396339535248540
+    t[41] = -6333637450476146687
+    t[42] = -4446306890439682159
+    t[43] = -4076793802049405392
+    t[44] = -3345356375505022440
+    t[45] = -2983346525034927856
+    t[46] = -860691631967231958
+    t[47] = 1182934255886127544
+    t[48] = 1847814050463011016
+    t[49] = 2177327727835720531
+    t[50] = 2830643537854262169
+    t[51] = 3796741975233480872
+    t[52] = 4115178125766777443
+    t[53] = 5681478168544905931
+    t[54] = 6601373596472566643
+    t[55] = 7507060721942968483
+    t[56] = 8399075790359081724
+    t[57] = 8693463985226723168
+    t[58] = -8878714635349349518
+    t[59] = -8302665154208450068
+    t[60] = -8016688836872298968
+    t[61] = -6606660893046293015
+    t[62] = -4685533653050689259
+    t[63] = -4147400797238176981
+    t[64] = -3880063495543823972
+    t[65] = -3348786107499101689
+    t[66] = -1523767162380948706
+    t[67] = -757361751448694408
+    t[68] = 500013540394364858
+    t[69] = 748580250866718886
+    t[70] = 1242879168328830382
+    t[71] = 1977374033974150939
+    t[72] = 2944078676154940804
+    t[73] = 3659926193048069267
+    t[74] = 4368137639120453308
+    t[75] = 4836135668995329356
+    t[76] = 5532061633213252278
+    t[77] = 6448918945643986474
+    t[78] = 6902733635092675308
+    t[79] = 7801388544844847127
+    return slices.clone(t)
+}
+
+let KT: []int = mkkt()
+
+// rotr is the u64 rotate-right — hi/lo u32 halves keep every
+// intermediate non-negative so / and * stay exact
+fn rotr(x: int, n: int) -> int {
+    p := P2
+    a := x & M32
+    b := (x - a) / P32
+    if n < 32 {
+        m := p[n] - 1
+        na := a / p[n] | (b & m) * p[32 - n]
+        nb := (b & M32) / p[n] | (a & m) * p[32 - n]
+        return nb * P32 + na
+    }
+    // n in 32..63: rotr(n) == rotl(64-n), shift amount < 32
+    m := 64 - n
+    na := a * p[m] & M32 | (b & M32) / p[32 - m]
+    nb := (b & M32) * p[m] & M32 | a / p[32 - m]
+    return nb * P32 + na
+}
+
+// shr is the u64 logical shift-right (zero-fill — / on the u32
+// halves, never on the signed lane)
+fn shr(x: int, n: int) -> int {
+    p := P2
+    a := x & M32
+    b := (x - a) / P32
+    if n < 32 {
+        m := p[n] - 1
+        na := a / p[n] | (b & m) * p[32 - n]
+        nb := (b & M32) / p[n]
+        return nb * P32 + na
+    }
+    return (b & M32) / p[n - 32]
+}
+
+// Sha512 is an incremental SHA-512/SHA-384 state — write bytes in,
+// sum appends the digest (size selects 64 vs 48). Implements
+// hash.Hash.
+struct Sha512 {
+    st: []int,
+    buf: []byte,
+    total: int,
+    size: int,
+    w: []int, // per-hasher message schedule — one 640B scratch instead
+    // of a fresh allocation per compressed block
+}
+
+// fill_st loads the variant IV — out-param, []T returns are banned
+// as arena escapes
+fn fill_st(st: []int, size: int) {
+    if size == 48 {
+        // SHA-384 IV (the truncated variant's own constants)
+        st[0] = -3766243637369397544
+        st[1] = 7105036623409894663
+        st[2] = -7973340178411365097
+        st[3] = 1526699215303891257
+        st[4] = 7436329637833083697
+        st[5] = -8163818279084223215
+        st[6] = -2662702644619276377
+        st[7] = 5167115440072839076
+    } else {
+        st[0] = 7640891576956012808
+        st[1] = -4942790177534073029
+        st[2] = 4354685564936845355
+        st[3] = -6534734903238641935
+        st[4] = 5840696475078001361
+        st[5] = -7276294671716946913
+        st[6] = 2270897969802886507
+        st[7] = 6620516959819538809
+    }
+}
+
+fn mksha(size: int) -> Sha512 {
+    // heap-backed retained state — same clone-not-new pattern as
+    // sha256 (`new` is this package's constructor name). The hasher's
+    // storage lives in the caller's scope domain: create hashers in a
+    // scope that ends when the digest work is done.
+    let st: []int = slices.clone(mkslice(int, 8))
+    fill_st(st, size)
+    let buf: []byte = slices.clone(mkslice(byte, 0))
+    let w: []int = slices.clone(mkslice(int, 80))
+    return Sha512{st: st, buf: buf, total: 0, size: size, w: w}
+}
+
+fn compress(st: []int, blk: []byte, off: int, w: []int) {
+    k := KT
+    t := 0
+    for t < 16 {
+        w[t] = binary.be_u64(blk, off + t * 8)
+        t = t + 1
+    }
+    for t < 80 {
+        x := w[t - 15]
+        y := w[t - 2]
+        s0 := rotr(x, 1) ^ rotr(x, 8) ^ shr(x, 7)
+        s1 := rotr(y, 19) ^ rotr(y, 61) ^ shr(y, 6)
+        w[t] = w[t - 16] + s0 + w[t - 7] + s1
+        t = t + 1
+    }
+    a := st[0]
+    b := st[1]
+    c := st[2]
+    d := st[3]
+    e := st[4]
+    f := st[5]
+    g := st[6]
+    h := st[7]
+    t = 0
+    for t < 80 {
+        s1 := rotr(e, 14) ^ rotr(e, 18) ^ rotr(e, 41)
+        ch := e & f ^ 0 - e - 1 & g
+        t1 := h + s1 + ch + k[t] + w[t]
+        s0 := rotr(a, 28) ^ rotr(a, 34) ^ rotr(a, 39)
+        maj := a & b ^ a & c ^ b & c
+        t2 := s0 + maj
+        h = g
+        g = f
+        f = e
+        e = d + t1
+        d = c
+        c = b
+        b = a
+        a = t1 + t2
+        t = t + 1
+    }
+    st[0] = st[0] + a
+    st[1] = st[1] + b
+    st[2] = st[2] + c
+    st[3] = st[3] + d
+    st[4] = st[4] + e
+    st[5] = st[5] + f
+    st[6] = st[6] + g
+    st[7] = st[7] + h
+}
+
+/// new returns a fresh incremental SHA-512 hasher as hash.Hash.
+fn new() -> hash.Hash {
+    s := mksha(64)
+    return s.ashash()
+}
+
+/// new384 returns a fresh incremental SHA-384 hasher as hash.Hash —
+/// the TLS 1.3 SHA-384 suite's hash (hkdf takes it as a factory).
+fn new384() -> hash.Hash {
+    s := mksha(48)
+    return s.ashash()
+}
+
+fn (s mut Sha512) write(b: []byte) -> [int, err] {
+    s.total = s.total + len(b)
+    i := 0
+    // top up the pending block first — compress it, keep the backing
+    if len(s.buf) > 0 {
+        need := 128 - len(s.buf)
+        for i < need && i < len(b) {
+            s.buf = push(s.buf, b[i])
+            i = i + 1
+        }
+        if len(s.buf) == 128 {
+            compress(s.st, s.buf, 0, s.w)
+            s.buf = s.buf[0:0]
+        }
+    }
+    // complete blocks compress straight out of the caller's bytes —
+    // a 64 MiB write never lands in the pending buffer at all
+    for i + 128 <= len(b) {
+        compress(s.st, b, i, s.w)
+        i = i + 128
+    }
+    // only the partial tail is copied
+    for i < len(b) {
+        s.buf = push(s.buf, b[i])
+        i = i + 1
+    }
+    return len(b), nil
+}
+
+fn (s mut Sha512) sum(b: []byte) -> own []byte {
+    // snapshot — Sum must not disturb the running state
+    st := mkslice(int, 8)
+    i := 0
+    for i < 8 {
+        st[i] = s.st[i]
+        i = i + 1
+    }
+    // padding on a private copy of the pending tail — SHA-512 pads to
+    // a 128-bit boundary with a 128-bit big-endian bit length
+    tb := mkslice(byte, 0)
+    i = 0
+    for i < len(s.buf) {
+        tb = push(tb, s.buf[i])
+        i = i + 1
+    }
+    ml := s.total * 8
+    tb = push(tb, 128)
+    for len(tb) % 128 != 112 {
+        tb = push(tb, 0)
+    }
+    // length field: high 64 bits are 0 at any reachable size, low 64
+    // carry the bit count — put_be_u64 splits the u64 pattern
+    // correctly even when ml's top bit is set
+    lb := mkslice(byte, 8)
+    binary.put_be_u64(lb, 0, ml)
+    i = 0
+    for i < 8 {
+        tb = push(tb, 0)
+        i = i + 1
+    }
+    i = 0
+    for i < 8 {
+        tb = push(tb, lb[i])
+        i = i + 1
+    }
+    off := 0
+    for off + 128 <= len(tb) {
+        compress(st, tb, off, s.w)
+        off = off + 128
+    }
+    // the digest is the first `size` bytes of the 64-byte state —
+    // SHA-384 is SHA-512 with a different IV and this truncation;
+    // put_be_u64 splits each lane's u64 pattern correctly even when
+    // the top bit is set (a /% ladder would lose the sign)
+    full := mkslice(byte, 64)
+    i = 0
+    for i < 8 {
+        binary.put_be_u64(full, i * 8, st[i])
+        i = i + 1
+    }
+    out := mkslice(byte, s.size)
+    i = 0
+    for i < s.size {
+        out[i] = full[i]
+        i = i + 1
+    }
+    return slices.concat(b, out)
+}
+
+fn (s mut Sha512) reset() {
+    fill_st(s.st, s.size)
+    s.buf = s.buf[0:0]
+    s.total = 0
+}
+
+fn (s mut Sha512) blocksize() -> int {
+    return 128
+}
+
+fn (s Sha512) ashash() -> hash.Hash {
+    return s
+}
+
+/// sum512 is the one-shot form.
+fn sum512(b: []byte) -> own []byte {
+    s := mksha(64)
+    [wn, we] = s.write(b)
+    return s.sum(nil)
+}
+
+/// sum384 is the one-shot SHA-384 form.
+fn sum384(b: []byte) -> own []byte {
+    s := mksha(48)
+    [wn, we] = s.write(b)
+    return s.sum(nil)
+}
+
+/// hexdigest is sum512 + hex — the printable form.
+fn hexdigest(b: []byte) -> str {
+    return hex.encode(sum512(b))
+}

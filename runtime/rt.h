@@ -435,6 +435,7 @@ double  rt_m_inf(int64_t);
 int64_t rt_m_isnan(double);
 int64_t rt_m_isinf(double);
 int64_t rt_m_signbit(double);
+int64_t rt_csrand(RtSlice b);   /* crypto fill — 0 or -errno/GLE; -DOXL_CRYPTO */
 OxlStr rt_readfile(OxlStr path);
 int64_t rt_writefile(OxlStr path, OxlStr data);
 void rt_exit(int64_t code);

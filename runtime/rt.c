@@ -4111,6 +4111,78 @@ OxlStr rt_timestr(void) {
     return (OxlStr){ p, (int64_t)n };
 }
 
+/* crypto entropy — the rt_csrand prefix is what emit_and_cc and
+ * tests/run.sh grep for -DOXL_CRYPTO (+ -lbcrypt on Windows, the
+ * ws2_32/net pairing). Fills b.ptr[0..b.len); 0 on success,
+ * -errno/-GLE on failure — the fd contract. */
+#ifdef OXL_CRYPTO
+#if defined(_WIN32)
+#include <bcrypt.h>
+#include <winternl.h>
+#elif defined(__linux__) || defined(__ANDROID__)
+#include <sys/random.h>
+#endif
+int64_t rt_csrand(RtSlice b) {
+    if (b.len <= 0) return 0;
+    uint8_t *p = (uint8_t *)b.ptr;
+    int64_t left = b.len;
+#ifdef _WIN32
+    /* CNG system-preferred RNG — the only flag the client fill needs.
+     * NTSTATUS is not a GetLastError code and failure values are
+     * negative: report CNG failures as -EIO in the errno domain
+     * rt_errstr decodes — a bare -st would flip the sign and read as
+     * success-tagged garbage. */
+    while (left > 0) {
+        ULONG chunk = left > 0xFFFFFFFFLL ? 0xFFFFFFFFUL : (ULONG)left;
+        NTSTATUS st = BCryptGenRandom(NULL, p, chunk,
+                                      BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+        if (st != 0)
+            return -(int64_t)EIO;
+        p += chunk;
+        left -= chunk;
+    }
+    return 0;
+#elif defined(__linux__) || defined(__ANDROID__)
+    while (left > 0) {
+        ssize_t r = getrandom(p, (size_t)left, 0);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            return -(int64_t)errno;
+        }
+        if (r == 0) return -5; /* EIO — getrandom can't legally short-fill */
+        p += r;
+        left -= r;
+    }
+    return 0;
+#elif defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || \
+      defined(__NetBSD__) || defined(__DragonFly__) || defined(__sun)
+    arc4random_buf(p, (size_t)left);
+    return 0;
+#else
+    /* no getrandom/arc4random — drain /dev/urandom to full */
+    int fd = open("/dev/urandom", O_RDONLY);
+    if (fd < 0) return -(int64_t)errno;
+    while (left > 0) {
+        ssize_t r = read(fd, p, (size_t)left);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            int e = errno;
+            close(fd);
+            return -(int64_t)e;
+        }
+        if (r == 0) { /* short read before EOF would be an urandom bug */
+            close(fd);
+            return -5; /* EIO */
+        }
+        p += r;
+        left -= r;
+    }
+    close(fd);
+    return 0;
+#endif
+}
+#endif /* OXL_CRYPTO */
+
 /* libm wrappers — the rt_m_ prefix is what the driver greps for
  * -DOXL_MATH + -lm. Unguarded would force -lm onto every build even
  * without gc-sections; the flag/lib pair arrives together, like

@@ -11,6 +11,7 @@ import path from 'node:path'
 import { execFileSync, spawnSync } from 'node:child_process'
 import os from 'node:os'
 import tty from 'node:tty'
+import crypto from 'node:crypto'
 
 let S = null // {u8,off,len} helpers from rt.mjs
 const enc = new TextEncoder()
@@ -139,7 +140,7 @@ export function install(api) {
         [-22]: 'invalid argument', [-24]: 'too many open files',
         [-28]: 'no space left on device', [-32]: 'broken pipe',
       }
-      return s_of_js(table[code] || `error ${code}`)
+      return s_of_js(table[code] ?? table[-code] ?? `error ${code}`)
     },
 
     /* ---------- fs ---------- */
@@ -291,6 +292,18 @@ export function install(api) {
         return ok_int(r.status == null ? (r.signal ? 128 + (os.constants.signals[r.signal] || 15) : 1) : r.status)
       } catch (e) {
         return ok_int(neg_errno(e))
+      }
+    },
+
+    /* crypto entropy — node:crypto maps 1:1; chunked below the
+     * getRandomValues-size conventions other lanes inherit */
+    rt_csrand: (b) => {
+      try {
+        for (let i = 0; i < b.len; i += 65536)
+          crypto.randomFillSync(b.a.subarray(b.off + i, b.off + i + Math.min(65536, b.len - i)))
+        return 0n
+      } catch (e) {
+        return neg_errno(e)
       }
     },
 

@@ -1,0 +1,80 @@
+package hkdf
+
+// std/crypto/hkdf — RFC 5869 HKDF over any hash.Hash factory.
+// extract is the PRK step (HMAC(salt, ikm)); expand is the OKM
+// generator (T(i) = HMAC(prk, T(i-1) | info | i)). expand needs a
+// FRESH hash state per round — hmac.new consumes the factory — so
+// every entry point takes `hf: fn() -> hash.Hash` (sha256.new,
+// sha512.new, sha512.new384), never a Hash instance.
+//
+// The TLS "tls13 " label prefix is NOT here — expand_label is
+// TLS-shaped and lives in std/net/tls (X6), per the spec.
+import "std/hash"
+
+import "std/crypto/hmac"
+
+import "std/errors"
+
+/// extract runs the extract step: prk = HMAC-Hash(salt, ikm).
+/// An empty salt means a hashlen block of zeros (RFC 5869 §2.2).
+/// The factory's Hash must honor io.Writer — a short write without an
+/// error silently truncates, so hkdf checks both halves of [n, err].
+fn extract(hf: fn() -> hash.Hash, salt: []byte, ikm: []byte) -> [own []byte, err] {
+    if len(salt) == 0 {
+        // HashLen zeros — RFC 5869 §2.2's default salt
+        hz := hf()
+        salt = mkslice(byte, len(hz.sum(nil)))
+    }
+    hm := hmac.new(hf, salt)
+    [wn, we] = hm.write(ikm)
+    if we != nil || wn != len(ikm) {
+        return nil, errors.new("hkdf: hash write failed")
+    }
+    return hm.sum(nil), nil
+}
+
+/// expand runs the expand step: okm = T(1) | T(2) | ... truncated to
+/// length bytes. Errs when length exceeds 255 * HashLen — the
+/// one-octet counter's hard ceiling (RFC 5869 §2.3).
+fn expand(hf: fn() -> hash.Hash, prk: []byte, info: []byte, length: int) -> [own []byte, err] {
+    hz := hf()
+    hlen := len(hz.sum(nil))
+    if length < 0 {
+        return nil, errors.new("hkdf: negative expand length")
+    }
+    if length > 255 * hlen {
+        return nil, errors.new("hkdf: expand length exceeds 255*HashLen")
+    }
+    // RFC 5869 §2.3: the PRK must be at least HashLen — a shorter one
+    // would zero-pad into predictable key material
+    if len(prk) < hlen {
+        return nil, errors.new("hkdf: prk shorter than HashLen")
+    }
+    okm := mkslice(byte, 0)
+    prev := mkslice(byte, 0)
+    // one HMAC for all rounds — the key is the same prk every round, so
+    // reset() restores the keyed pads without re-allocating them
+    hm := hmac.new(hf, prk)
+    i := 1
+    for len(okm) < length {
+        hm.reset()
+        [w1, e1] = hm.write(prev)
+        [w2, e2] = hm.write(info)
+        cb := mkslice(byte, 1)
+        cb[0] = i
+        [w3, e3] = hm.write(cb)
+        if e1 != nil || w1 != len(prev) || e2 != nil || w2 != len(info) || e3 != nil || w3 != 1 {
+            return nil, errors.new("hkdf: hash write failed")
+        }
+        t := hm.sum(nil)
+        // append up to hlen bytes — the last round may overshoot
+        j := 0
+        for j < hlen && len(okm) < length {
+            okm = push(okm, t[j])
+            j = j + 1
+        }
+        prev = t
+        i = i + 1
+    }
+    return new(okm), nil
+}

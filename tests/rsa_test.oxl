@@ -1,0 +1,175 @@
+package main
+
+// X3: std/crypto/rsa — PKCS#1 v1.5 + PSS verify against checked-in
+// openssl-minted fixtures (scripts/gen_tls_fixtures.sh), including
+// bad-padding and tamper rejects, plus the spec's RSA-4096 verify
+// wall-clock gate (< 250 ms).
+import "std/crypto/bignum"
+
+import "std/crypto/rsa"
+
+import "std/crypto/sha256"
+
+import "std/crypto/sha512"
+
+import "std/encoding/hex"
+
+import "std/os"
+
+import "std/strings"
+
+import "std/testing"
+
+import "std/time"
+
+// fixture loads a hex file under tests/fixtures/rsa/
+// hx decodes a hex literal — DER fragment helper
+fn hx(s: str) -> own []byte {
+    [b, e] = hex.decode(s)
+    testing.expect(e == nil, "hex decode")
+    return b
+}
+
+fn fixture(name: str) -> own []byte {
+    s := strings.trim(os.readfile_("tests/fixtures/rsa/" + name))
+    testing.expect(len(s) > 0, "fixture missing " + name)
+    [b, e] = hex.decode(s)
+    testing.expect(e == nil, "fixture hex " + name)
+    return b
+}
+
+fn loadkey() -> rsa.PubKey {
+    [pk, e] = rsa.parse_pub_key(fixture("pub4096.hex"))
+    testing.expect(e == nil, "pub4096 parse")
+    testing.expect(bignum.bitlen(pk.n) == 4096, "pub4096 bits")
+    testing.expect(bignum.cmp(pk.e, bignum.from_int(65537)) == 0, "pub4096 exponent")
+    return pk
+}
+
+fn test_rsav15() {
+    pk := loadkey()
+    msg := fixture("msg.hex")
+
+    // good signatures across the whole accepted hash set
+    e := rsa.verify_v15(pk, sha256.new, msg, fixture("sig_v15_sha256.hex"))
+    testing.expect(e == nil, "v15 sha256 verify")
+    e = rsa.verify_v15(pk, sha512.new384, msg, fixture("sig_v15_sha384.hex"))
+    testing.expect(e == nil, "v15 sha384 verify")
+    e = rsa.verify_v15(pk, sha512.new, msg, fixture("sig_v15_sha512.hex"))
+    testing.expect(e == nil, "v15 sha512 verify")
+
+    // hash/signature mismatches reject
+    e = rsa.verify_v15(pk, sha512.new, msg, fixture("sig_v15_sha256.hex"))
+    testing.expect(e != nil, "v15 wrong-hash accepted")
+    e = rsa.verify_v15(pk, sha256.new, msg, fixture("sig_v15_sha512.hex"))
+    testing.expect(e != nil, "v15 wrong-hash-2 accepted")
+
+    // structurally valid padding but T carries no DigestInfo —
+    // the raw rsautl-signed digest must not verify
+    e = rsa.verify_v15(pk, sha256.new, msg, fixture("sig_rawpad.hex"))
+    testing.expect(e != nil, "v15 raw-pad accepted")
+
+    // tampered signatures reject — mid-padding, digest tail, and a
+    // truncated signature
+    bad := fixture("sig_v15_sha256.hex")
+    bad[7] = bad[7] ^ 1
+    e = rsa.verify_v15(pk, sha256.new, msg, bad)
+    testing.expect(e != nil, "v15 padding tamper accepted")
+    bad2 := fixture("sig_v15_sha256.hex")
+    bad2[len(bad2) - 1] = bad2[len(bad2) - 1] ^ 1
+    e = rsa.verify_v15(pk, sha256.new, msg, bad2)
+    testing.expect(e != nil, "v15 digest tamper accepted")
+    e = rsa.verify_v15(pk, sha256.new, msg, bad2[0:100])
+    testing.expect(e != nil, "v15 short signature accepted")
+
+    // s >= n rejects — a signature integer at or above the modulus
+    // is not a valid RSA representative (all-ff is always >= n)
+    huge := mkslice(byte, len(bad2))
+    i := 0
+    for i < len(huge) {
+        huge[i] = 255
+        i = i + 1
+    }
+    e = rsa.verify_v15(pk, sha256.new, msg, huge)
+    testing.expect(e != nil, "v15 s >= n accepted")
+
+    // wrong message rejects
+    e = rsa.verify_v15(pk, sha256.new, fixture("pub4096.hex"), fixture("sig_v15_sha256.hex"))
+    testing.expect(e != nil, "v15 wrong-message accepted")
+
+    // garbage DER is a parse error, not a trap
+    [_z, pe] = rsa.parse_pub_key(fixture("msg.hex"))
+    testing.expect(pe != nil, "garbage key parsed")
+
+    // parameter validation: e = 1 would make verify a universal
+    // forgery, even e is invalid, e >= n is out of range, and
+    // oversized exponents are a cpu-hang DoS — all reject at parse
+    [_z2, pe2] = rsa.parse_pub_key(hx("300602010b020101"))
+    testing.expect(pe2 != nil, "e=1 key parsed")
+    [_z3, pe3] = rsa.parse_pub_key(hx("3006020111020104"))
+    testing.expect(pe3 != nil, "even-e key parsed")
+    [_z4, pe4] = rsa.parse_pub_key(hx("3006020103020105"))
+    testing.expect(pe4 != nil, "e >= n key parsed")
+    [_z5, pe5] = rsa.parse_pub_key(hx("300e0201110209010000000000000001"))
+    testing.expect(pe5 != nil, "65-bit-e key parsed")
+    // non-minimal DER length (leading-zero long form) rejects
+    [_z6, pe6] = rsa.parse_pub_key(hx("3082000602010b020101"))
+    testing.expect(pe6 != nil, "non-minimal der length parsed")
+}
+
+fn test_rsapss() {
+    pk := loadkey()
+    msg := fixture("msg.hex")
+
+    // salt-length recovery accepts the openssl minted digest-len salts
+    e := rsa.verify_pss(pk, sha256.new, msg, fixture("sig_pss_sha256.hex"), -1)
+    testing.expect(e == nil, "pss sha256 verify")
+    e = rsa.verify_pss(pk, sha512.new384, msg, fixture("sig_pss_sha384.hex"), -1)
+    testing.expect(e == nil, "pss sha384 verify")
+    e = rsa.verify_pss(pk, sha512.new, msg, fixture("sig_pss_sha512.hex"), -1)
+    testing.expect(e == nil, "pss sha512 verify")
+
+    // the TLS pin — saltlen = hash length — holds on minted fixtures
+    e = rsa.verify_pss(pk, sha256.new, msg, fixture("sig_pss_sha256.hex"), 32)
+    testing.expect(e == nil, "pss pinned saltlen")
+
+    // a 20-byte salt recovers under -1 and 20, but fails the 32 pin
+    e = rsa.verify_pss(pk, sha256.new, msg, fixture("sig_pss_salt20.hex"), -1)
+    testing.expect(e == nil, "pss salt20 recover")
+    e = rsa.verify_pss(pk, sha256.new, msg, fixture("sig_pss_salt20.hex"), 20)
+    testing.expect(e == nil, "pss salt20 pinned")
+    e = rsa.verify_pss(pk, sha256.new, msg, fixture("sig_pss_salt20.hex"), 32)
+    testing.expect(e != nil, "pss salt20 pin accepted")
+
+    // tampered signatures reject — masked DB head, hash region,
+    // trailer byte
+    bad := fixture("sig_pss_sha256.hex")
+    bad[3] = bad[3] ^ 1
+    e = rsa.verify_pss(pk, sha256.new, msg, bad, -1)
+    testing.expect(e != nil, "pss db tamper accepted")
+    bad2 := fixture("sig_pss_sha256.hex")
+    bad2[300] = bad2[300] ^ 1
+    e = rsa.verify_pss(pk, sha256.new, msg, bad2, -1)
+    testing.expect(e != nil, "pss hash tamper accepted")
+    bad3 := fixture("sig_pss_sha256.hex")
+    bad3[len(bad3) - 1] = 0
+    e = rsa.verify_pss(pk, sha256.new, msg, bad3, -1)
+    testing.expect(e != nil, "pss trailer tamper accepted")
+
+    // wrong hash / wrong message / short signature reject
+    e = rsa.verify_pss(pk, sha512.new, msg, fixture("sig_pss_sha256.hex"), -1)
+    testing.expect(e != nil, "pss wrong-hash accepted")
+    e = rsa.verify_pss(pk, sha256.new, fixture("pub4096.hex"), fixture("sig_pss_sha256.hex"), -1)
+    testing.expect(e != nil, "pss wrong-message accepted")
+    e = rsa.verify_pss(pk, sha256.new, msg, bad3[0:100], -1)
+    testing.expect(e != nil, "pss short signature accepted")
+
+    // perf gate: RSA-4096 verify < 250 ms (spec bound; the observed
+    // number prints for the run log)
+    t0 := time.unix_ms()
+    e = rsa.verify_pss(pk, sha256.new, msg, fixture("sig_pss_sha256.hex"), -1)
+    dt := time.unix_ms() - t0
+    testing.expect(e == nil, "pss timed verify")
+    println("rsa4096 pss verify ms=" + itoa(dt))
+    testing.expect(dt < 250, "rsa4096 verify perf gate")
+}

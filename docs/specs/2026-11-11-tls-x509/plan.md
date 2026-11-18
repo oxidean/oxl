@@ -136,7 +136,7 @@ last fix commit.
       is absent (node-gate precedent).
       Exit: replay + interop green; handshake crypto < 1 s end to
       end on CI.
-- [ ] **X7 — https + closeout.** `std/net/http`: `Url.secure`,
+- [done] **X7 — https + closeout.** `std/net/http`: `Url.secure`,
       `https://` in `parse_url` (port 443), `Client.tlscfg`,
       `secure` → `tls.dial_timeout` (with `tlscfg.server_name`
       defaulted to the URL host; ALPN `["http/1.1"]`).

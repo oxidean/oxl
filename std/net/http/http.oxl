@@ -10,12 +10,14 @@ package http
 // `h.route` is dispatched per request on the blocking pool; it returns a
 // Resp — the status becomes the response's HTTP status line and the body
 // is sent as text/plain. Client side: `get`/`post` or a `Client` with a
-// dial/read budget. HTTPS stays parked (no TLS — see impl-s4).
+// dial/read budget; `https://` URLs dial TLS through std/net/tls (X7).
 import "std/net"
 
 import "std/errors"
 
 import "std/strconv"
+
+import "std/net/tls"
 
 // a client that resets mid-write must not kill the process before
 // Conn.write() returns EPIPE — runtime wrapper (libc signal can't be
@@ -116,7 +118,7 @@ fn conn_cleanup(c: net.Conn, inflight: shared) {
 /// Conn.write() may return short — loop until the whole response is on
 /// the wire or the conn dies (n <= 0 covers EPIPE + resets). Dropping the
 /// raw count would silently truncate bodies on a partial write.
-fn write_all(c: net.Conn, s: str) -> err {
+fn write_all(c: xconn, s: str) -> err {
     off := 0
     for off < len(s) {
         [n, e] = c.write(substr(s, off, len(s)) as []byte)
@@ -371,16 +373,21 @@ fn serve(port: int, h: Handler) {
     }
 }
 
-/// a parsed request URL — `http://` only; port defaults to 80, path to /
-struct Url { host: str, port: int, path: str }
+/// a parsed request URL — `http://` or `https://`; port defaults to the
+/// scheme's (80/443), path to /; secure marks the https scheme
+struct Url { host: str, port: int, path: str, secure: int }
 
-/// `http://host[:port][/path]` — IPv4 or host names net.dial accepts.
-/// Anything else (https, userinfo, query-less garbage) is an err, not a
+/// `[http|https]://host[:port][/path]` — IPv4 or host names net.dial
+/// accepts. Anything else (other schemes, userinfo) is an err, not a
 /// silent misparsed request
 fn parse_url(url: str) -> [Url, err] {
-    bad := Url{host: "", port: 0, path: ""}
+    bad := Url{host: "", port: 0, path: "", secure: 0}
     u := url
-    if len(u) >= 7 && substr(u, 0, 7) == "http://" {
+    secure := 0
+    if len(u) >= 8 && substr(u, 0, 8) == "https://" {
+        u = substr(u, 8, len(u))
+        secure = 1
+    } else if len(u) >= 7 && substr(u, 0, 7) == "http://" {
         u = substr(u, 7, len(u))
     } else if find(u, "://") >= 0 {
         return bad, errors.new("http: unsupported scheme in " + url)
@@ -403,6 +410,9 @@ fn parse_url(url: str) -> [Url, err] {
     colon := find(hostport, ":")
     host := hostport
     port := 80
+    if secure != 0 {
+        port = 443
+    }
     if colon >= 0 {
         host = substr(hostport, 0, colon)
         ps := substr(hostport, colon + 1, len(hostport))
@@ -415,21 +425,30 @@ fn parse_url(url: str) -> [Url, err] {
     if len(host) == 0 {
         return bad, errors.new("http: empty host in " + url)
     }
-    return Url{host: host, port: port, path: path}, nil
+    return Url{host: host, port: port, path: path, secure: secure}, nil
 }
 
 /// default dial+read budget for the package-level get/post (ms)
 let CLIENT_MS = 30000
 
 /// a client with its own dial/read budget — one request at a time.
-/// Redirect/decompress/proxy policy lives on Request (client.oxl) —
-/// struct literals are exhaustive in oxl, so growing this struct
-/// would break every `Client{tmo: X}` call site.
-struct Client { tmo: int }
+/// tlscfg is the TLS config for https:// URLs — server_name defaults
+/// to the URL host and ALPN to ["http/1.1"] per request when left
+/// empty; `new_client(tmo)` spells the default-config literal (struct
+/// literals are exhaustive in oxl — write the full pair only when
+/// pinning roots or a Verifier). Redirect/decompress/proxy policy
+/// lives on Request (client.oxl).
+struct Client { tmo: int, tlscfg: tls.Config }
+
+/// new_client is the Client with the default TLS config — the
+/// starting point for callers that only tune the budget
+fn new_client(tmo: int) -> Client {
+    return Client{tmo: tmo, tlscfg: tls.default_cfg()}
+}
 
 /// one request through the rich path in client.oxl — legacy flat
 /// shape preserved: redirects off, decompression off, no proxy, so a
-/// `Client{tmo: X}` literal behaves exactly as it always has. The ctype
+/// `new_client` value behaves exactly as it always has. The ctype
 /// argument lands as a content-type header (CR/LF in it is dropped,
 /// same as before — header injection isn't a formatting choice).
 fn (cl ref Client) request(method: str, url: str, ctype: str, body: str) -> [Resp, err] {
@@ -455,12 +474,12 @@ fn (cl ref Client) post(url: str, ctype: str, body: str) -> [Resp, err] {
 
 /// package-level GET with the default budget — build a Client to tune it
 fn get(url: str) -> [Resp, err] {
-    cl := Client{tmo: CLIENT_MS}
+    cl := new_client(CLIENT_MS)
     return cl.get(url)
 }
 
 /// package-level POST with the default budget
 fn post(url: str, ctype: str, body: str) -> [Resp, err] {
-    cl := Client{tmo: CLIENT_MS}
+    cl := new_client(CLIENT_MS)
     return cl.post(url, ctype, body)
 }

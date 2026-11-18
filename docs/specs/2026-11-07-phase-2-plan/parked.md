@@ -44,8 +44,18 @@ firing moves the item into the milestone map via a new work item.
   templates): need runtime type descriptors — type-descriptor
   milestone spec merged (`docs/specs/2026-11-11-type-descriptors/`);
   implementation tracked as WI-0008 (un-parks on impl)
-- `crypto/tls`, `x509`, asymmetric crypto: a TLS stack is a project,
-  not a package — spec in flight on `docs/tls-x509-spec`
+- `crypto/tls`, `x509`, asymmetric crypto: **shipped** — milestone X
+  (`docs/specs/2026-11-11-tls-x509/`): TLS 1.3 client `std/net/tls`,
+  `std/crypto/x509`, `https://` in `std/net/http`, and the crypto
+  beneath (`crypto/rand`, `sha512`, `hkdf`, AEAD, `bignum`, `rsa`,
+  curves). Parked under live triggers: TLS server (`tls.listen`/
+  `accept` — first serving consumer needing inbound TLS), TLS 1.2
+  fallback (first 1.2-only endpoint), session resumption/PSK
+  (measured reconnect cost), client certs/mTLS (first mutual-auth
+  consumer), revocation OCSP/CRL (first consumer needing proof), a
+  bundled root list (platform image with no store and no env
+  override), and a constant-time pass (first server-side or signing
+  consumer).
 - `compress`/`archive` landed (`compress/{flate,zlib,gzip}`,
   `archive/{tar,zip}`); `net/url`, `container/{heap,list,ring}`
   implementations in flight on their own PRs — drop from this list

@@ -26,6 +26,18 @@ import "std/bytes"
 
 import "std/os"
 
+import "std/net/tls"
+
+/// xconn is the connection do_once talks over — net.Conn (http) and
+/// tls.Conn (https) both satisfy it; rawfd stays reachable through the
+/// box so the fd-level timeout builtins keep working on either
+interface xconn {
+    read(b: []byte) -> [int, err],
+    write(b: []byte) -> [int, err],
+    close() -> err,
+    rawfd() -> int,
+}
+
 /// Header is one name/value pair — request and response sides share
 /// it; duplicates and ordering are preserved.
 struct Header { name: str, value: str }
@@ -40,12 +52,13 @@ struct Request {
     url: str,
     headers: []Header,
     body: str,
-    // policy — kept on the request (not Client) because oxl struct
-    // literals are exhaustive: growing Client{tmo} would break every
-    // existing call site. redirects: -1 = CLIENT_REDIRECTS default,
-    // 0 = never follow, >0 = hop budget. decompress: advertise+decode
-    // gzip. proxy: "" = honor HTTP_PROXY env, "direct" = bypass,
-    // otherwise an http:// proxy URL.
+    // policy — kept on the request rather than grown onto Client
+    // (struct literals are exhaustive; tlscfg is the only field X7
+    // added there, and new_client covers the default). redirects:
+    // -1 = CLIENT_REDIRECTS default, 0 = never follow, >0 = hop
+    // budget. decompress: advertise+decode gzip. proxy: "" = honor
+    // HTTP_PROXY env, "direct" = bypass, otherwise an http:// proxy
+    // URL.
     redirects: int,
     decompress: bool,
     proxy: str,
@@ -302,18 +315,35 @@ fn header_value_ok(name: str, value: str) -> bool {
     return true
 }
 
-/// authority renders host[:port] for URL building and Host headers
+/// default_port is the scheme's implicit port — 443 for https, 80 else
+fn default_port(u: Url) -> int {
+    if u.secure != 0 {
+        return 443
+    }
+    return 80
+}
+
+/// scheme_name is the URL's wire scheme — "https" when secure
+fn scheme_name(u: Url) -> str {
+    if u.secure != 0 {
+        return "https"
+    }
+    return "http"
+}
+
+/// authority renders host[:port] for URL building and Host headers —
+/// the port rides only when it differs from the scheme default
 fn url_authority(u: Url) -> str {
-    if u.port != 80 {
+    if u.port != default_port(u) {
         return u.host + ":" + itoa(u.port)
     }
     return u.host
 }
 
-/// resolve_location turns a Location value into an absolute http://
-/// URL against the request's own URL — absolute URIs, scheme-relative
-/// "//h/p", and root/relative paths all resolve; https stays an err
-/// (no TLS).
+/// resolve_location turns a Location value into an absolute URL
+/// against the request's own URL — absolute URIs, scheme-relative
+/// "//h/p", and root/relative paths all resolve, keeping the base's
+/// scheme; other schemes stay an err.
 fn resolve_location(base: str, loc: str) -> [str, err] {
     [bu, be] = parse_url(base)
     if be != nil {
@@ -333,14 +363,19 @@ fn resolve_location(base: str, loc: str) -> [str, err] {
         return "http://" + url_authority(u2) + normalize_path_query(u2.path), nil
     }
     if len(ll) >= 8 && substr(ll, 0, 8) == "https://" {
-        return "", errors.new("http: redirect to https unsupported (no TLS)")
+        nloc := "https:" + substr(loc, 6, len(loc))
+        [us, es] = parse_url(nloc)
+        if es != nil {
+            return "", es
+        }
+        return "https://" + url_authority(us) + normalize_path_query(us.path), nil
     }
     if len(loc) >= 2 && byteat(loc, 0) == 47 && byteat(loc, 1) == 47 {
-        [u3, e3] = parse_url("http:" + loc)
+        [u3, e3] = parse_url(scheme_name(bu) + ":" + loc)
         if e3 != nil {
             return "", e3
         }
-        return "http://" + url_authority(u3) + normalize_path_query(u3.path), nil
+        return scheme_name(bu) + "://" + url_authority(u3) + normalize_path_query(u3.path), nil
     }
     // any other `scheme:` is unsupported — without this a Location
     // like "ftp://h/p" falls into the relative branch below and
@@ -383,7 +418,7 @@ fn resolve_location(base: str, loc: str) -> [str, err] {
     }
     lpath := substr(loc, 0, lend2)
     lsuffix := substr(loc, lend2, lend)
-    scheme := "http://" + url_authority(bu)
+    scheme := scheme_name(bu) + "://" + url_authority(bu)
     if byteat(loc, 0) == 47 {
         return scheme + remove_dot_segments(lpath) + lsuffix, nil
     }
@@ -503,7 +538,7 @@ fn redirect_request(cur: Request, status: int, loc: str) -> [Request, err] {
     if ce != nil {
         return Request{method: "", url: "", headers: mkslice(Header, 0), body: "", redirects: 0, decompress: false, proxy: "direct"}, ce
     }
-    same_origin := nu.host == cu.host && nu.port == cu.port
+    same_origin := nu.host == cu.host && nu.port == cu.port && nu.secure == cu.secure
     hs := mkslice(Header, 0)
     i := 0
     for i < len(cur.headers) {
@@ -677,6 +712,56 @@ fn unchunk_full(b: str) -> [ChunkedBody, err] {
     }
 }
 
+/// exchange writes wire and reads the response to close — one
+/// request/response pair on the given transport. The contract is the
+/// legacy one: connection: close was sent, the budget is per-read
+/// remaining, and any read error fails rather than delivering a
+/// possibly-truncated body — on TLS that includes err_eof for a peer
+/// that drops TCP without close_notify (fail-loud on truncation where
+/// permissive HTTP/1.1 handling would return the partial body).
+fn exchange(c: xconn, wire: str, tmo: int) -> [str, err] {
+    if tmo > 0 {
+        set_sndtimo(c.rawfd(), (tmo + 999) / 1000)
+    }
+    we := write_all(c, wire)
+    if we != nil {
+        c.close()
+        return "", we
+    }
+    deadline := now_ms() + tmo
+    scratch := mkslice(byte, 8192)
+    out := mkslice(byte, 0)
+    for true {
+        rem := deadline - now_ms()
+        if rem <= 0 {
+            c.close()
+            return "", errors.new("http: read deadline exceeded")
+        }
+        set_rcvtimo_ms(c.rawfd(), rem)
+        [n, e] = c.read(scratch)
+        if n > 0 {
+            k := 0
+            for k < n {
+                out = push(out, scratch[k])
+                k = k + 1
+            }
+        }
+        if e == io.eof() {
+            break
+        }
+        if e != nil {
+            c.close()
+            return "", e
+        }
+        if n <= 0 {
+            c.close()
+            return "", errors.new("http: connection closed mid-response")
+        }
+    }
+    c.close()
+    return out as str, nil
+}
+
 /// do_once performs exactly one request/response exchange — no
 /// redirects, no retries. Shared by do()'s redirect loop and (via
 /// request()) the legacy flat API.
@@ -740,13 +825,16 @@ fn (cl ref Client) do_once(req: Request) -> [Response, err] {
         dial_port = pu.port
         via_proxy = true
     }
-    [c, de] = net.dial_timeout(dial_host, dial_port, cl.tmo)
-    if de != nil {
-        return bad, de
+    // https through an HTTP proxy needs CONNECT tunneling — parked;
+    // a configured proxy on a secure URL errors, never silently goes
+    // direct or cleartext
+    if u.secure != 0 && via_proxy {
+        return bad, errors.new("http: https via proxy unsupported (no CONNECT)")
     }
-    // Host header names the ORIGIN, not the proxy
+    // Host header names the ORIGIN, not the proxy; the port rides
+    // only when it differs from the scheme default — no spurious :443
     hosthdr := target_host
-    if target_port != 80 {
+    if target_port != default_port(u) {
         hosthdr = hosthdr + ":" + itoa(target_port)
     }
     target := u.path
@@ -778,49 +866,37 @@ fn (cl ref Client) do_once(req: Request) -> [Response, err] {
         j = j + 1
     }
     wire = wire + "\r\n" + req.body
-    if cl.tmo > 0 {
-        set_sndtimo(c.rawfd(), (cl.tmo + 999) / 1000)
+    resp := ""
+    if u.secure != 0 {
+        // the tls seam: cfg.server_name defaults to the URL host and
+        // ALPN to ["http/1.1"] — a caller-supplied Config wins both
+        cfg := cl.tlscfg
+        if len(cfg.server_name) == 0 {
+            cfg.server_name = u.host
+        }
+        if len(cfg.alpn) == 0 {
+            cfg.alpn = push(mkslice(str, 0), "http/1.1")
+        }
+        [tc, te] = tls.dial_timeout(u.host, u.port, cl.tmo, cfg)
+        if te != nil {
+            return bad, te
+        }
+        [rs, re] = exchange(tc, wire, cl.tmo)
+        if re != nil {
+            return bad, re
+        }
+        resp = rs
+    } else {
+        [c, de] = net.dial_timeout(dial_host, dial_port, cl.tmo)
+        if de != nil {
+            return bad, de
+        }
+        [rs, re] = exchange(c, wire, cl.tmo)
+        if re != nil {
+            return bad, re
+        }
+        resp = rs
     }
-    we := write_all(c, wire)
-    if we != nil {
-        c.close()
-        return bad, we
-    }
-    // identical read-until-close contract as the legacy path: the
-    // budget is per-read remaining, and any read error fails rather
-    // than delivering a possibly-truncated body
-    deadline := now_ms() + cl.tmo
-    scratch := mkslice(byte, 8192)
-    out := mkslice(byte, 0)
-    for true {
-        rem := deadline - now_ms()
-        if rem <= 0 {
-            c.close()
-            return bad, errors.new("http: read deadline exceeded")
-        }
-        set_rcvtimo_ms(c.rawfd(), rem)
-        [n, e] = c.read(scratch)
-        if n > 0 {
-            k := 0
-            for k < n {
-                out = push(out, scratch[k])
-                k = k + 1
-            }
-        }
-        if e == io.eof() {
-            break
-        }
-        if e != nil {
-            c.close()
-            return bad, e
-        }
-        if n <= 0 {
-            c.close()
-            return bad, errors.new("http: connection closed mid-response")
-        }
-    }
-    c.close()
-    resp := out as str
     // interim 1xx heads (100 Continue etc.) precede the final
     // response — skip each head block until a non-1xx status arrives.
     // 101 is final: it completes the HTTP exchange (protocol switch).

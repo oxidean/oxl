@@ -164,11 +164,13 @@ fn ghash(hh: int, hl: int, aad: []byte, ct: []byte) -> Hl {
 fn inc32(ctr: []byte) {
     i := 15
     for i >= 12 {
-        ctr[i] = ctr[i] + 1
-        if ctr[i] < 256 {
+        // test the int value before byte-store wraps — storing first
+        // would read back 0 and drop the carry at every 256-block
+        v := ctr[i] + 1
+        ctr[i] = v % 256
+        if v < 256 {
             return
         }
-        ctr[i] = 0
         i = i - 1
     }
 }

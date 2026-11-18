@@ -1,0 +1,165 @@
+package tls
+
+// std/net/tls — wire.go-style byte plumbing for the TLS 1.3 record
+// and handshake codecs. oxl has no hex literals, so the constants
+// tables live next to the code that reads them.
+
+// ---- byte-slice reader -------------------------------------------------
+
+// rd walks a byte slice left to right; every take bounds-checks and
+// reports through the `ok` latch instead of trapping, so a malformed
+// peer message surfaces as decode_error, never a bounds panic.
+struct rd { b: []byte, p: int, ok: int }
+
+fn mkrd(b: []byte) -> rd {
+    return rd{b: b, p: 0, ok: 1}
+}
+
+fn (r mut rd) left() -> int {
+    return len(r.b) - r.p
+}
+
+fn (r mut rd) u8() -> int {
+    if r.left() < 1 {
+        r.ok = 0
+        return 0
+    }
+    v := r.b[r.p]
+    r.p = r.p + 1
+    return v
+}
+
+fn (r mut rd) u16() -> int {
+    hi := r.u8()
+    lo := r.u8()
+    return hi * 256 + lo
+}
+
+fn (r mut rd) u24() -> int {
+    hi := r.u8()
+    mid := r.u8()
+    lo := r.u8()
+    return hi * 65536 + mid * 256 + lo
+}
+
+// bytes takes n bytes as a subslice of the input (shared backing —
+// callers clone when the window must outlive the parse buffer).
+fn (r mut rd) bytes(n: int) -> []byte {
+    if n < 0 || r.left() < n {
+        r.ok = 0
+        return r.b[r.p:r.p]
+    }
+    off := r.p
+    r.p = r.p + n
+    return r.b[off:r.p]
+}
+
+// ---- byte-vector writer ------------------------------------------------
+struct wr { b: []byte }
+
+fn mkwr() -> own wr {
+    return new(wr{b: mkslice(byte, 0)})
+}
+
+fn (w mut wr) u8(v: int) {
+    w.b = push(w.b, v % 256)
+}
+
+fn (w mut wr) u16(v: int) {
+    w.b = push(w.b, v / 256 % 256)
+    w.b = push(w.b, v % 256)
+}
+
+fn (w mut wr) u24(v: int) {
+    w.b = push(w.b, v / 65536 % 256)
+    w.b = push(w.b, v / 256 % 256)
+    w.b = push(w.b, v % 256)
+}
+
+fn (w mut wr) put(v: []byte) {
+    i := 0
+    for i < len(v) {
+        w.b = push(w.b, v[i])
+        i = i + 1
+    }
+}
+
+// putstr appends the string's bytes.
+fn (w mut wr) putstr(s: str) {
+    i := 0
+    for i < len(s) {
+        w.b = push(w.b, byteat(s, i))
+        i = i + 1
+    }
+}
+
+// lenpatch rewrites the len field of a length-prefixed region once the
+// region's real length is known — off is where the length field sits,
+// sz its byte width (2 or 3); the patched value is bytes written
+// after the field.
+fn (w mut wr) lenpatch(off: int, sz: int) {
+    n := len(w.b) - off - sz
+    if sz == 2 {
+        w.b[off] = n / 256 % 256
+        w.b[off + 1] = n % 256
+    } else {
+        w.b[off] = n / 65536 % 256
+        w.b[off + 1] = n / 256 % 256
+        w.b[off + 2] = n % 256
+    }
+}
+
+// subslice copies out — slices of wr stay valid only until the next
+// push, so anything kept must be cloned.
+fn bclone(b: []byte) -> own []byte {
+    out := mkslice(byte, len(b))
+    i := 0
+    for i < len(b) {
+        out[i] = b[i]
+        i = i + 1
+    }
+    return new(out)
+}
+
+fn bcat(a: []byte, b: []byte) -> own []byte {
+    out := mkslice(byte, len(a) + len(b))
+    i := 0
+    for i < len(a) {
+        out[i] = a[i]
+        i = i + 1
+    }
+    for i < len(b) {
+        out[len(a) + i] = b[i]
+        i = i + 1
+    }
+    return new(out)
+}
+
+fn bzeros(n: int) -> []byte {
+    return mkslice(byte, n)
+}
+
+fn biszero(b: []byte) -> bool {
+    i := 0
+    for i < len(b) {
+        if b[i] != 0 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn bequal(a: []byte, b: []byte) -> bool {
+    if len(a) != len(b) {
+        return false
+    }
+    i := 0
+    for i < len(a) {
+        if a[i] != b[i] {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}

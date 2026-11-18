@@ -2,10 +2,15 @@
 
 Status by milestone: X1 shipped `crypto/rand` + hashing, X2 AEAD
 primitives, X3 bignum + RSA verify, X4 P-256/P-384 + Ed25519 +
-X25519, and **X5 ships `std/crypto/x509`** — certificate parsing,
-path building, trust anchors, hostname verification, and platform
-root discovery. The TLS record/handshake layer and `https://` in
-`net/http` are later milestones; this document grows with them.
+X25519, **X5 ships `std/crypto/x509`** — certificate parsing, path
+building, trust anchors, hostname verification, and platform root
+discovery — and **X6 ships `std/net/tls`** — a client-only TLS 1.3
+stack: record layer, the CH→(single) HRR→server-flight→CV→Finished
+state machine, the full HKDF key schedule, X.509 chain + hostname
+verification, NST consume-ignore, KeyUpdate consume+reply+rotate,
+and `dial`/`dial_timeout`/`client` over `net.Conn`. `https://` in
+`net/http` is the remaining milestone (X7); this document grows
+with it.
 
 ## `crypto/x509` surface
 
@@ -123,3 +128,38 @@ explicit ask, not a bug report.
 - **Display names are lossy.** issuer/subject strings skip
   T61String/TeletexString and other unmapped tags; DER bytes are
   the comparison key, so path building is unaffected.
+
+## `net/tls` surface (X6)
+
+```oxl
+struct Config { server_name: str, roots: x509.Roots,
+                alpn: []str, verify: Verifier }
+iface Verifier { check(leaf: x509.Cert, untrusted: []x509.Cert) -> err }
+struct Conn { ... }   // net.Conn parity: read/write/close/rawfd +
+                      // asreader/aswriter/ascloser/asreadwriter, peer()
+
+default_cfg() -> Config
+dial(host, port, cfg) -> [Conn, err]             // server_name <- host
+dial_timeout(host, port, tmo_ms, cfg) -> [Conn, err]
+client(inner: net.Conn, cfg) -> [Conn, err]
+```
+
+Client-only TLS 1.3. Cipher suites `TLS_AES_128_GCM_SHA256`,
+`TLS_CHACHA20_POLY1305_SHA256`, `TLS_AES_256_GCM_SHA384` in that
+order; groups x25519 + secp256r1/secp384r1 key shares; one
+HelloRetryRequest honoured (cookie echoed, demanded group must be
+offered). Verification defaults to `x509.verify` + `match_hostname`
+against `cfg.roots` (nil roots = lazy system store); a non-nil
+`verify` replaces both — there is no `insecure_skip_verify`.
+Reads deliver application data only: post-handshake
+NewSessionTickets are consumed and ignored, KeyUpdate is consumed,
+answered when `update_requested`, and both epochs rotate; an
+orderly `close_notify` reads as `io.eof()` while a bare TCP close
+surfaces `err_eof` — truncation is never silent. `close()` emits a
+best-effort `close_notify` then closes the inner socket and is
+idempotent.
+
+Explicitly out of scope: TLS <= 1.2, server side, resumption/PSK/
+0-RTT, client certificates (a CertificateRequest is answered with
+an empty Certificate per RFC 8446), OCSP/CRL, and `https://` in
+`net/http` (X7).

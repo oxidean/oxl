@@ -20,9 +20,29 @@
 #         (a *.pem + a *.crt + a DER-form *.cer — plain-dir layout,
 #         not capath).
 #
-# (X6's `flight` capture appends a section here.)
+#   flight tests/tls/ — X6: a live TLS 1.3 handshake against
+#         `openssl s_server -www -tls1_3`, captured by
+#         tests/tls/capture.oxl running under the freshly built
+#         ./target/oxl with the deterministic fixture hook armed.
+#         Mints tests/tls/{ca,ca-key,server,server-key}.pem and
+#         records the raw server->client wire bytes (server flight,
+#         session tickets, the -www status page) in flight.hex,
+#         plus a forged KeyUpdate/app-data/close_notify tail the
+#         replay asserts consumes and rotates. CA key is committed
+#         deliberately: regenerating the flight needs the same PKI.
 #
-# Usage: gen_tls_fixtures.sh [rsa|x509|all]   — default "all"
+#   flight_hrr — X6: same, but `s_server -groups P-384` answers the
+#         x25519/p256 ClientHello with a HelloRetryRequest demanding
+#         P-384. Captures tests/tls/flight_hrr.hex.
+#
+#   cookie — X6: a cookie-ONLY HelloRetryRequest flight. openssl
+#         s_server can't emit one over TCP (-stateless is DTLS), so
+#         tests/tls/cookie_server.py plays the server side — it also
+#         fails the capture if the client doesn't echo the cookie.
+#         Captures tests/tls/flight_cookie.hex.
+#
+# Usage: gen_tls_fixtures.sh [rsa|x509|flight|flight_hrr|cookie|all]
+#   — default "all"
 # The openssl version is recorded in tests/fixtures/OPENSSL-VERSION
 # so a future regeneration can tell what minted the fixtures.
 set -euo pipefail
@@ -344,9 +364,147 @@ EOF
     echo "gen_tls_fixtures: wrote $outdir ($(cat tests/fixtures/OPENSSL-VERSION))"
 }
 
+# gen_flight captures a real TLS 1.3 server flight from openssl
+# s_server and commits the raw inbound bytes plus the throw-away PKI
+# that makes the handshake verify. The suite only replays the bytes;
+# it never execs openssl.
+gen_flight() {
+    local outdir=tests/tls
+    local oxl="${OXL:-./target/oxl}"
+    [ -x "$oxl" ] || { echo "gen_tls_fixtures: $oxl not built (run ./scripts/stage0.sh)" >&2; exit 1; }
+    mkdir -p "$outdir"
+    local work
+    work=$(mktemp -d)
+    trap 'rm -rf "$work"' RETURN
+
+    # PKI: ECDSA P-256 CA -> leaf with both SAN shapes the client
+    # dials (IP:127.0.0.1 is what server_name carries; DNS:localhost
+    # documents the name side). ECDSA leaf pins the
+    # ecdsa_secp256r1_sha256 CertificateVerify path.
+    openssl ecparam -name prime256v1 -genkey -noout -out "$work/ca.key"
+    openssl req -x509 -new -key "$work/ca.key" -sha256 -days 3650 \
+        -subj "/CN=Oxl TLS X6 Test CA" \
+        -addext "basicConstraints=critical,CA:TRUE" \
+        -addext "keyUsage=critical,keyCertSign,cRLSign" \
+        -addext "subjectKeyIdentifier=hash" \
+        -out "$work/ca.pem"
+    openssl ecparam -name prime256v1 -genkey -noout -out "$work/server.key"
+    openssl req -new -key "$work/server.key" -subj "/CN=localhost" \
+        -out "$work/server.csr"
+    cat > "$work/leaf.cnf" <<'CNF'
+basicConstraints=critical,CA:FALSE
+keyUsage=critical,digitalSignature
+extendedKeyUsage=serverAuth
+subjectAltName=DNS:localhost,IP:127.0.0.1
+subjectKeyIdentifier=hash
+authorityKeyIdentifier=keyid
+CNF
+    openssl x509 -req -in "$work/server.csr" -CA "$work/ca.pem" \
+        -CAkey "$work/ca.key" -CAcreateserial -days 3650 -sha256 \
+        -extfile "$work/leaf.cnf" -out "$work/server.pem"
+    # s_server serves the leaf followed by every cert in -cert_chain
+    cat "$work/server.pem" "$work/ca.pem" > "$work/server_chain.pem"
+
+    local port="${TLS_FIXTURE_PORT:-24433}"
+    openssl s_server -accept "$port" \
+        -cert "$work/server_chain.pem" -key "$work/server.key" \
+        -tls1_3 -www -naccept 8 -quiet \
+        >"$work/s_server.log" 2>&1 &
+    local srv=$!
+    # wait for the listener
+    local i
+    for i in $(seq 1 50); do
+        kill -0 "$srv" 2>/dev/null || break
+        (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null && { exec 3>&- 3<&-; break; }
+        sleep 0.1
+    done
+
+    "$oxl" run tests/tls/capture.oxl -- "$port" "$work/ca.pem" "$work/flight.hex"
+    kill "$srv" 2>/dev/null || true
+    wait "$srv" 2>/dev/null || true
+
+    cp "$work/ca.pem" "$outdir/ca.pem"
+    cp "$work/ca.key" "$outdir/ca-key.pem"
+    cp "$work/server_chain.pem" "$outdir/server.pem"
+    cp "$work/server.key" "$outdir/server-key.pem"
+    cp "$work/flight.hex" "$outdir/flight.hex"
+    openssl version > "$outdir/OPENSSL-VERSION"
+    echo "gen_tls_fixtures: wrote $outdir ($(cat "$outdir/OPENSSL-VERSION"), $(wc -c < "$outdir/flight.hex") hex chars)"
+}
+
+# gen_flight_hrr captures a second flight against `s_server -groups
+# P-384` — the demanded-group HelloRetryRequest case — reusing the
+# committed PKI (regenerating needs the same CA so the replay still
+# verifies). Requires ./target/oxl built.
+gen_flight_hrr() {
+    local outdir=tests/tls
+    local oxl="${OXL:-./target/oxl}"
+    [ -x "$oxl" ] || { echo "gen_tls_fixtures: $oxl not built (run ./scripts/stage0.sh)" >&2; exit 1; }
+    [ -f "$outdir/server.pem" ] || { echo "gen_tls_fixtures: run 'flight' first to mint the PKI" >&2; exit 1; }
+    local work
+    work=$(mktemp -d)
+    trap 'rm -rf "$work"' RETURN
+
+    local port="${TLS_FIXTURE_PORT:-24433}"
+    openssl s_server -accept "$port" \
+        -cert "$outdir/server.pem" -key "$outdir/server-key.pem" \
+        -tls1_3 -www -groups P-384 -naccept 8 -quiet \
+        >"$work/s_server.log" 2>&1 &
+    local srv=$!
+    local i
+    for i in $(seq 1 50); do
+        kill -0 "$srv" 2>/dev/null || break
+        (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null && { exec 3>&- 3<&-; break; }
+        sleep 0.1
+    done
+
+    "$oxl" run tests/tls/capture.oxl -- "$port" "$outdir/ca.pem" "$work/flight_hrr.hex"
+    kill "$srv" 2>/dev/null || true
+    wait "$srv" 2>/dev/null || true
+
+    cp "$work/flight_hrr.hex" "$outdir/flight_hrr.hex"
+    echo "gen_tls_fixtures: wrote $outdir/flight_hrr.hex ($(wc -c < "$outdir/flight_hrr.hex") hex chars)"
+}
+
+# gen_cookie captures the cookie-only-HRR flight. No TCP TLS server
+# emits one, so tests/tls/cookie_server.py implements the server side
+# (python3 + cryptography); it also asserts the client echoes the
+# cookie in CH2. Requires ./target/oxl built.
+gen_cookie() {
+    local outdir=tests/tls
+    local oxl="${OXL:-./target/oxl}"
+    [ -x "$oxl" ] || { echo "gen_tls_fixtures: $oxl not built (run ./scripts/stage0.sh)" >&2; exit 1; }
+    [ -f "$outdir/server.pem" ] || { echo "gen_tls_fixtures: run 'flight' first to mint the PKI" >&2; exit 1; }
+    local work
+    work=$(mktemp -d)
+    trap 'rm -rf "$work"' RETURN
+
+    local port="${TLS_FIXTURE_PORT:-24433}"
+    python3 tests/tls/cookie_server.py "$port" \
+        "$outdir/server.pem" "$outdir/server-key.pem" \
+        >"$work/cookie_server.log" 2>&1 &
+    local srv=$!
+    local i
+    for i in $(seq 1 50); do
+        kill -0 "$srv" 2>/dev/null || break
+        (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null && { exec 3>&- 3<&-; break; }
+        sleep 0.1
+    done
+
+    "$oxl" run tests/tls/capture.oxl -- "$port" "$outdir/ca.pem" "$work/flight_cookie.hex"
+    kill "$srv" 2>/dev/null || true
+    wait "$srv" 2>/dev/null || true
+
+    cp "$work/flight_cookie.hex" "$outdir/flight_cookie.hex"
+    echo "gen_tls_fixtures: wrote $outdir/flight_cookie.hex ($(wc -c < "$outdir/flight_cookie.hex") hex chars)"
+}
+
 case "${1:-all}" in
     rsa) gen_rsa ;;
     x509) gen_x509 ;;
-    all) gen_rsa; gen_x509 ;;
-    *) echo "usage: gen_tls_fixtures.sh [rsa|x509|all]" >&2; exit 2 ;;
+    flight) gen_flight ;;
+    flight_hrr) gen_flight_hrr ;;
+    cookie) gen_cookie ;;
+    all) gen_rsa; gen_x509; gen_flight; gen_flight_hrr; gen_cookie ;;
+    *) echo "usage: gen_tls_fixtures.sh [rsa|x509|flight|flight_hrr|cookie|all]" >&2; exit 2 ;;
 esac

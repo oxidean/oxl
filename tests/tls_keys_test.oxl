@@ -1,0 +1,177 @@
+package main
+
+// X6: std/net/tls key schedule — RFC 8448 §3's published simple-1RTT
+// trace. The fixture feeds the published ClientHello/ServerHello/
+// server flight and the published ECDHE shared secret, then asserts
+// every stage of the HKDF chain byte-for-byte: early/handshake/master
+// secrets, c/s hs and c/s ap traffic secrets, the derived AEAD
+// key+iv pairs, and both Finished verify_data values. This is the
+// gate that proves the whole key schedule against an external answer.
+// test_record opens the trace's own protected app-data record through
+// the record layer's nonce/AEAD/strip path.
+import "std/crypto/sha256"
+
+import "std/crypto/x25519"
+
+import "std/encoding/hex"
+
+import "std/errors"
+
+import "std/net/tls"
+
+import "std/testing"
+
+// hx decodes a hex literal — test data, so a bad literal is a bug.
+fn hx(s: str) -> []byte {
+    [b, e] = hex.decode(s)
+    testing.expect(e == nil, "hx")
+    return b[0:len(b)]
+}
+
+fn heq(b: []byte, want: str, msg: str) {
+    testing.expect_streq(hex.encode(b), want, msg + " got " + hex.encode(b))
+}
+
+// thash hashes concatenated handshake messages — the Transcript-Hash
+// at each key-schedule scope.
+fn thash(msgs: [][]byte) -> []byte {
+    h := sha256.new()
+    i := 0
+    for i < len(msgs) {
+        [n, e] = h.write(msgs[i])
+        testing.expect(e == nil && n == len(msgs[i]), "transcript write")
+        i = i + 1
+    }
+    return h.sum(nil)
+}
+
+fn test_keyschedule() {
+    // published handshake messages (RFC 8448 §3)
+    ch := hx("010000c00303cb34ecb1e78163ba1c38c6dacb196a6dffa21a8d9912ec18a2ef" + "6283024dece7000006130113031302010000910000000b000900000673657276" + "6572ff01000100000a00140012001d0017001800190100010101020103010400" + "230000003300260024001d002099381de560e4bd43d23d8e435a7dbafeb3c06e" + "51c13cae4d5413691e529aaf2c002b0003020304000d0020001e040305030603" + "020308040805080604010501060102010402050206020202002d00020101001c" + "00024001")
+    sh := hx("020000560303a6af06a4121860dc5e6e60249cd34c95930c8ac5cb1434dac155" + "772ed3e2692800130100002e00330024001d0020c9828876112095fe66762bdb" + "f7c672e156d6cc253b833df1dd69b1b04e751f0f002b00020304")
+    ee := hx("080000240022000a00140012001d00170018001901000101010201030104001c" + "0002400100000000")
+    cert := hx("0b0001b9000001b50001b0308201ac30820115a003020102020102300d06092a" + "864886f70d01010b0500300e310c300a06035504031303727361301e170d3136" + "303733303031323335395a170d3236303733303031323335395a300e310c300a" + "0603550403130372736130819f300d06092a864886f70d010101050003818d00" + "30818902818100b4bb498f8279303d980836399b36c6988c0c68de55e1bdb826" + "d3901a2461eafd2de49a91d015abbc9a95137ace6c1af19eaa6af98c7ced4312" + "0998e187a80ee0ccb0524b1b018c3e0b63264d449a6d38e22a5fda4308467480" + "30530ef0461c8ca9d9efbfae8ea6d1d03e2bd193eff0ab9a8002c47428a6d35a" + "8d88d79f7f1e3f0203010001a31a301830090603551d1304023000300b060355" + "1d0f0404030205a0300d06092a864886f70d01010b05000381810085aad2a0e5" + "b9276b908c65f73a7267170618a54c5f8a7b337d2df7a594365417f2eae8f8a5" + "8c8f8172f9319cf36b7fd6c55b80f21a03015156726096fd335e5e67f2dbf102" + "702e608ccae6bec1fc63a42a99be5c3eb7107c3c54e9b9eb2bd5203b1c3b84e0" + "a8b2f759409ba3eac9d91d402dcc0cc8f8961229ac9187b42b4de10000")
+    cv := hx("0f000084080400805a747c5d88fa9bd2e55ab085a61015b7211f824cd484145a" + "b3ff52f1fda8477b0b7abc90db78e2d33a5c141a078653fa6bef780c5ea248ee" + "aaa785c4f394cab6d30bbe8d4859ee511f602957b15411ac027671459e46445c" + "9ea58c181e818e95b8c3fb0bf3278409d3be152a3da5043e063dda65cdf5aea2" + "0d53dfacd42f74f3")
+    fin := hx("140000209b9b141d906337fbd2cbdce71df4deda4ab42c309572cb7fffee5454" + "b78f0718")
+
+    // the published ECDHE side: client x25519 private + server public
+    // must yield the published shared secret
+    csk := hx("49af42ba7f7994852d713ef2784bcbcaa7911de26adc5642cb634540e7ea5005")
+    spk := hx("c9828876112095fe66762bdbf7c672e156d6cc253b833df1dd69b1b04e751f0f")
+    shared := x25519.scalarmult(csk, spk)
+    heq(shared, "8bd4054fb55b9d63fdfbacf9f04b9f0d35e6d63f537563efd46272900f89492d", "ecdhe")
+
+    // Transcript-Hash(CH..SH) matches the published hash input
+    let m1: [][]byte = nil
+    m1 = push(m1, ch)
+    m1 = push(m1, sh)
+    th1 := thash(m1)
+    heq(th1, "860c06edc07858ee8e78f0e7428c58edd6b43f2ca3e6e95f02ed063cf0e1cad8", "thash ch..sh")
+
+    // early -> handshake -> traffic secrets
+    [ks, e] = tls.ks_begin(sha256.new, 32)
+    testing.expect(e == nil, "ks_begin")
+    heq(ks.early, "33ad0a1c607ec03b09e6cd9893680ce210adf300aa1f2660e1b22e10f170f92a", "early")
+    e = ks.handshake(shared, th1)
+    testing.expect(e == nil, "ks handshake")
+    heq(ks.hs, "1dc826e93606aa6fdc0aadc12f741b01046aa6b99f691ed221a9f0ca043fbeac", "handshake secret")
+    heq(ks.c_hs, "b3eddb126e067f35a780b3abf45e2d8f3b1a950738f52e9600746a0e27a55a21", "c hs traffic")
+    heq(ks.s_hs, "b67b7d690cc16c4e75e54213cb2d37b4e9c912bcded9105d42befd59d391ad38", "s hs traffic")
+
+    // server handshake-epoch key+iv
+    [kiv, e2] = ks.key_iv(tls.SUITE_AES128_GCM, ks.s_hs)
+    testing.expect(e2 == nil, "key_iv hs")
+    heq(kiv.key, "3fce516009c21727d0f2e4e86ee403bc", "s hs key")
+    heq(kiv.iv, "5d313eb2671276ee13000b30", "s hs iv")
+
+    // server Finished: HMAC(finished_key(s_hs), hash(CH..CV))
+    let m2: [][]byte = nil
+    m2 = push(m2, ch)
+    m2 = push(m2, sh)
+    m2 = push(m2, ee)
+    m2 = push(m2, cert)
+    m2 = push(m2, cv)
+    th2 := thash(m2)
+    [fk, e3] = ks.finished_key(ks.s_hs)
+    testing.expect(e3 == nil, "finished_key")
+    [vd, e4] = tls.hmac_sum(sha256.new, fk, th2)
+    testing.expect(e4 == nil, "hmac")
+    heq(vd, "9b9b141d906337fbd2cbdce71df4deda4ab42c309572cb7fffee5454b78f0718", "server finished")
+
+    // master + app traffic secrets scoped to CH..server Finished
+    let m3: [][]byte = nil
+    m3 = push(m3, ch)
+    m3 = push(m3, sh)
+    m3 = push(m3, ee)
+    m3 = push(m3, cert)
+    m3 = push(m3, cv)
+    m3 = push(m3, fin)
+    th3 := thash(m3)
+    e = ks.app(th3)
+    testing.expect(e == nil, "ks app")
+    heq(ks.master, "18df06843d13a08bf2a449844c5f8a478001bc4d4c627984d5a41da8d0402919", "master")
+    heq(ks.c_ap, "9e40646ce79a7f9dc05af8889bce6552875afa0b06df0087f792ebb7c17504a5", "c ap traffic")
+    heq(ks.s_ap, "a11af9f05531f856ad47116b45a950328204b4f44bfb6b3a4b4f1f3fcb631643", "s ap traffic")
+
+    // application-epoch key+iv, both directions
+    [kiva, e5] = ks.key_iv(tls.SUITE_AES128_GCM, ks.s_ap)
+    testing.expect(e5 == nil, "key_iv s_ap")
+    heq(kiva.key, "9f02283b6c9c07efc26bb9f2ac92e356", "s ap key")
+    heq(kiva.iv, "cf782b88dd83549aadf1e984", "s ap iv")
+    [kivb, e6] = ks.key_iv(tls.SUITE_AES128_GCM, ks.c_ap)
+    testing.expect(e6 == nil, "key_iv c_ap")
+    heq(kivb.key, "17422dda596ed5d9acd890e3c63f5051", "c ap key")
+    heq(kivb.iv, "5b78923dee08579033e523d9", "c ap iv")
+
+    // client Finished: HMAC(finished_key(c_hs), hash(CH..server Fin))
+    [fkc, e7] = ks.finished_key(ks.c_hs)
+    testing.expect(e7 == nil, "finished_key c")
+    [vdc, e8] = tls.hmac_sum(sha256.new, fkc, th3)
+    testing.expect(e8 == nil, "hmac c")
+    heq(vdc, "a8ec436d677634ae525ac1fcebe11a039ec17694fac6e98527b642f2edd5ce61", "client finished")
+}
+
+fn test_record() {
+    // the trace's client application_data record, opened through the
+    // record layer's nonce/AEAD/strip path: 50 bytes of 0..49 payload
+    // then inner type 23. This is the wire-format gate — nonce =
+    // iv ^ seq (seq 0), aad = the 5-byte header verbatim.
+    key := hx("17422dda596ed5d9acd890e3c63f5051")
+    iv := hx("5b78923dee08579033e523d9")
+    rec := hx("170303004" + "3a23f7054b62c94d0affafe8228ba55cbefacea42f914aa66bcab3f2b" + "9819a8a5b46b395bd54a9a20441e2b62974e1f5a6292a2977014bd1e3de" + "ae63aeebb21694915e4")
+    nnc := tls.nonce_of(iv, 0)
+    [pt, e] = tls.aead_open(tls.AEAD_AES128, key, nnc, rec[0:5], rec[5:len(rec)])
+    testing.expect(e == nil, "aead_open: " + errors.msg(e))
+    in2 := tls.strip_inner(pt)
+    testing.expect_eq(in2.ty, tls.CT_APPDATA, "inner type")
+    testing.expect_eq(len(in2.pl), 50, "inner payload len")
+    i := 0
+    ok := true
+    for i < 50 {
+        if in2.pl[i] != i {
+            ok = false
+        }
+        i = i + 1
+    }
+    testing.expect(ok, "inner payload bytes")
+
+    // the record seal/open round-trip under the same epoch
+    inner := tls.bcat(in2.pl, mkslice(byte, 1))
+    inner[len(inner) - 1] = tls.CT_APPDATA
+    aad := mkslice(byte, 5)
+    aad[0] = 23
+    aad[1] = 3
+    aad[2] = 3
+    [ct, e2] = tls.aead_seal(tls.AEAD_AES128, key, tls.nonce_of(iv, 0), aad, inner)
+    testing.expect(e2 == nil, "aead_seal")
+    [pt2, e3] = tls.aead_open(tls.AEAD_AES128, key, tls.nonce_of(iv, 0), aad, ct)
+    testing.expect(e3 == nil, "aead_open rt")
+    testing.expect(tls.bequal(pt2, inner), "seal/open round-trip")
+
+    // wrong nonce/tamper must reject — the record layer's only
+    // integrity verdict
+    bad := tls.bclone(ct)
+    bad[0] = bad[0] ^ 1
+    [ptb, e4] = tls.aead_open(tls.AEAD_AES128, key, tls.nonce_of(iv, 0), aad, bad)
+    testing.expect(e4 != nil && ptb == nil, "tampered tag rejects")
+}

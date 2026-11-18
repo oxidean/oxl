@@ -1,0 +1,383 @@
+package tls
+
+// std/net/tls — TLS 1.3 client. Contract:
+// docs/specs/2026-11-11-tls-x509/items/tls13-wire.md + tls-api.md.
+// Client-only; no TLS<=1.2, mTLS, resumption/PSK, or revocation.
+// `dial*`/`client` perform the full handshake before returning; the
+// returned Conn is io plumbing — read yields decrypted app data,
+// post-handshake chatter (NST, KeyUpdate, stray CertificateRequest)
+// is consumed inside it.
+import "std/io"
+
+import "std/net"
+
+import "std/errors"
+
+import "std/hash"
+
+import "std/crypto/x509"
+
+import "std/crypto/rand"
+
+import "std/crypto/sha256"
+
+import "std/slices"
+
+/// err_proto — handshake/record shape violation (an alert was sent).
+fn err_proto() -> err {
+    return errors.new("tls: protocol error")
+}
+
+/// err_alert — the peer sent a fatal alert; the alert name rides in
+/// the message text.
+fn err_alert() -> err {
+    return errors.new("tls: alert received")
+}
+
+/// err_eof — TCP closed mid-record or without close_notify.
+/// Distinguished from io.eof (orderly close_notify): truncation is
+/// never silent.
+fn err_eof() -> err {
+    return errors.new("tls: unexpected eof")
+}
+
+// err_keys — local key-schedule/AEAD failure.
+fn err_keys() -> err {
+    return errors.new("tls: key schedule error")
+}
+
+/// Config is the client handshake's input. Deliberately absent:
+/// insecure_skip_verify — `verify` says *what* trust means instead.
+struct Config {
+    server_name: str, // verification name — dial() fills from host.
+    // Empty + nil verify is rejected at client().
+    roots: x509.Roots, // Roots{cas: nil} ⇒ lazy system store at
+    // first real verification
+    alpn: []str, // empty ⇒ no ALPN extension
+    verify: Verifier, // nil ⇒ x509.verify + match_hostname; non-nil
+    // replaces BOTH (tests/private PKI pinning)
+}
+
+/// Verifier is the full-override certificate hook — an interface so
+/// "no override" can spell `verify: nil`. Replaces chain AND hostname
+/// verification; check returns nil (accept) or the rejection err.
+interface Verifier { check(leaf: x509.Cert, untrusted: []x509.Cert) -> err }
+
+/// default_cfg is the sane starting point — roots lazy-loads the
+/// system store at handshake time; server_name/verify/alpn empty.
+fn default_cfg() -> Config {
+    return Config{server_name: "", roots: x509.Roots{cas: nil}, alpn: nil, verify: nil}
+}
+
+// ---- session state ------------------------------------------------------
+
+// Session is the heap state box every copy of a Conn shares —
+// traffic keys+secrets per direction, seq counters, reassembly
+// windows, transcript, and the verified peer leaf. Fields are plain
+// values; the box's own handle is what Conn copies alias.
+struct Session {
+    suite: int, // negotiated suite (SUITE_*); 0 pre-SH
+    aead: int,
+    hlen: int,
+    hf: fn() -> hash.Hash,
+    th: hash.Hash, // running handshake transcript
+    ch1: []byte, // ClientHello#1 — HRR message_hash resynthesis
+    // record layer — ren/wen mark "epoch armed" (keys installed)
+    rkey: []byte,
+    riv: []byte,
+    rseq: int,
+    ren: int,
+    wkey: []byte,
+    wiv: []byte,
+    wseq: int,
+    wen: int,
+    rsecret: []byte, // current inbound traffic secret (KeyUpdate)
+    wsecret: []byte, // current outbound traffic secret
+    c_hs: []byte, // client hs traffic — post-handshake Finished
+    ks: KeySched,
+    hsbuf: []byte, // decrypted handshake reassembly window
+    appbuf: []byte, // decrypted app data awaiting read()
+    ccs: int, // plaintext CCS tolerated once per §D.4
+    notify: int, // close_notify received
+    wclosed: int, // close_notify sent
+    // handshake working state
+    random: []byte, // client random we sent
+    session_id: []byte, // legacy_session_id we sent (echo check)
+    xsk: []byte, // x25519 private share (32B)
+    xpk: []byte, // x25519 public share
+    psk2: []byte, // p256 private share (32B)
+    ppk: []byte, // p256 public share (SEC1, 65B)
+    group: int, // negotiated group
+    gsk: []byte, // private share for the negotiated group
+    gsk_pub: []byte, // public share for a HRR-demanded p384
+    hrr: int, // HRR already seen
+    cookie: []byte, // HRR cookie to echo in CH2
+    hver: int, // plaintext-epoch record version: first CH writes
+    // 0x0301 (middlebox allowance), everything after is 0x0303
+    cr_seen: int, // CertificateRequest arrived mid-flight
+    cr_ctx: []byte, // its certificate_request_context
+    alpn: str, // negotiated ALPN ("" = none)
+    leaf: x509.Cert,
+    has_leaf: int,
+    deadline: int, // unix-ms receive budget; 0 = disarmed
+    hs_tmo: int, // handshake-flight budget (from dial/client)
+    capin: []byte, // test hook: raw inbound wire bytes
+    capout: []byte, // test hook: raw outbound wire bytes
+}
+
+// Conn is a TLS client connection — io.Reader/Writer/Closer. Copies
+// share the heap Session (own field alias), so a boxed-as-Reader copy
+// and the original see the same keys, seqs, and buffers. `st`/`g` is
+// the net.Conn-style close latch.
+struct Conn { inner: net.Conn, st: shared, g: int, s: own Session }
+
+fn mkconn(inner: net.Conn, s: own Session) -> own Conn {
+    c := new(Conn)
+    c.inner = inner
+    c.st = rt_latch_alloc()
+    c.g = sget(c.st)
+    c.s = s
+    return c
+}
+
+extern fn rt_latch_alloc() -> shared
+
+extern fn rt_latch_free(s: shared)
+
+// dead latch shared by error-path conns — mirrors net.oxl's idiom.
+let dead_st = mkshared(0)
+
+fn badconn() -> Conn {
+    return Conn{inner: net.Conn{fd: -1, st: dead_st, g: 0}, st: dead_st, g: 0, s: nil}
+}
+
+// ---- deterministic test hook ---------------------------------------------
+// The X6 replay fixture pins the client side: when armed, crand fills
+// from a sha256("oxl tls test hook" || counter) keystream instead of
+// the OS CSPRNG, so ClientHello bytes — random, session id, and both
+// ECDHE shares — are stable run-to-run and the captured server flight
+// stays transcript-valid. Shared cells keep the hook usable across
+// scope tasks; it arms only through fixture_hook() so production paths
+// can never reach it.
+let hook_on = mkshared(0)
+
+let hook_ctr = mkshared(0)
+
+/// fixture_hook arms the deterministic-csrand + wire-capture fixture
+/// hook. Exported for the tests; a name this loud is intentional.
+fn fixture_hook() {
+    sset(hook_on, 1)
+    sset(hook_ctr, 0)
+}
+
+// WireDump is the captured raw wire bytes for the fixture recorder.
+struct WireDump { inb: []byte, outb: []byte }
+
+/// fixture_wiredump returns the captured raw wire bytes — the capture
+/// tool records a fixture through it.
+fn fixture_wiredump(c: ref Conn) -> WireDump {
+    if c.s == nil {
+        return WireDump{inb: nil, outb: nil}
+    }
+    return WireDump{inb: c.s.capin, outb: c.s.capout}
+}
+
+// hk_stream expands n deterministic bytes starting at keystream block
+// `base`; blocks are sha256(seed || u64be(ctr)).
+fn hk_stream(b: []byte, base: int) {
+    seed := "oxl tls test hook" as []byte
+    n := len(b)
+    i := 0
+    for i < n {
+        blk := base + i / 32
+        w := mkwr()
+        w.put(seed)
+        j := 7
+        for j >= 0 {
+            w.u8(blk / pow256b(j) % 256)
+            j = j - 1
+        }
+        h := sha256.sum256(w.b)
+        b[i] = h[i % 32]
+        i = i + 1
+    }
+}
+
+fn pow256b(k: int) -> int {
+    p := 1
+    for k > 0 {
+        p = p * 256
+        k = k - 1
+    }
+    return p
+}
+
+// crand fills b with OS entropy, or the deterministic keystream when
+// the test hook is armed — every ClientHello draw rides this so the
+// fixture pins the whole CH.
+fn crand(b: []byte) -> err {
+    if sget(hook_on) != 0 {
+        need := (len(b) + 31) / 32
+        if need < 1 {
+            need = 1
+        }
+        base := sadd(hook_ctr, need)
+        hk_stream(b, base)
+        return nil
+    }
+    return rand.fill(b)
+}
+
+// ---- public entry points -------------------------------------------------
+
+/// dial is dial_timeout with net.dial's 30s budget. server_name
+/// defaults to host verbatim (IP literals included — the iPAddress
+/// SAN check needs it); an explicit cfg.server_name wins.
+fn dial(host: str, port: int, cfg: Config) -> [Conn, err] {
+    return dial_timeout(host, port, 30000, cfg)
+}
+
+/// dial_timeout opens a TCP conn then handshakes on it. tmo_ms bounds
+/// the connect and doubles as the handshake-flight receive budget.
+/// Handshake failure closes the inner socket before the err returns.
+fn dial_timeout(host: str, port: int, tmo_ms: int, cfg: Config) -> [Conn, err] {
+    [c, e] = net.dial_timeout(host, port, tmo_ms)
+    if e != nil {
+        return badconn(), e
+    }
+    if len(cfg.server_name) == 0 {
+        cfg.server_name = host
+    }
+    [tc, e2] = client_tmo(c, cfg, tmo_ms)
+    if e2 != nil {
+        c.close()
+        return badconn(), e2
+    }
+    return tc, nil
+}
+
+/// client handshakes over an existing conn — the wrap API (proxy
+/// CONNECT, tests). server_name empty + verify nil is err_name: a
+/// caller who means "no name check" says so with a Verifier.
+fn client(c: net.Conn, cfg: Config) -> [Conn, err] {
+    return client_tmo(c, cfg, 30000)
+}
+
+fn client_tmo(c: net.Conn, cfg: Config, tmo_ms: int) -> [Conn, err] {
+    if len(cfg.server_name) == 0 && cfg.verify == nil {
+        return badconn(), errors.wrap("tls: server_name empty and no verifier", x509.err_name())
+    }
+    tc := mkconn(c, new(Session{suite: 0, aead: 0, hlen: 0, hf: sha256.new, th: nil, ch1: nil, rkey: nil, riv: nil, rseq: 0, ren: 0, wkey: nil, wiv: nil, wseq: 0, wen: 0, rsecret: nil, wsecret: nil, c_hs: nil, ks: KeySched{hf: sha256.new, hlen: 0, early: nil, hs: nil, master: nil, c_hs: nil, s_hs: nil, c_ap: nil, s_ap: nil}, hsbuf: mkslice(byte, 0), appbuf: mkslice(byte, 0), ccs: 0, notify: 0, wclosed: 0, random: nil, session_id: nil, xsk: nil, xpk: nil, psk2: nil, ppk: nil, group: 0, gsk: nil, gsk_pub: nil, hrr: 0, cookie: nil, hver: 0, cr_seen: 0, cr_ctx: nil, alpn: "", leaf: x509.Cert{raw: nil, version: 0, serial: nil, issuer: "", subject: "", issuer_der: nil, subject_der: nil, not_before: 0, not_after: 0, dns_names: nil, ip_addrs: nil, is_ca: 0, max_path: -1, ku: -1, eku: nil, sig_alg: 0, spki_alg: 0, spki: nil, skid: nil, akid: nil, sig: nil, tbs: nil}, has_leaf: 0, deadline: 0, hs_tmo: tmo_ms, capin: nil, capout: nil}))
+    e := hs_client(tc, cfg)
+    if e != nil {
+        tc.close()
+        return badconn(), e
+    }
+    return Conn{inner: tc.inner, st: tc.st, g: tc.g, s: tc.s}, nil
+}
+
+// ---- io plumbing ----------------------------------------------------------
+
+/// read yields decrypted application data; close_notify arrives as
+/// io.eof(). NST/KeyUpdate/stray CertificateRequest are consumed
+/// inside — callers see only app-data semantics.
+fn (c mut Conn) read(b: []byte) -> [int, err] {
+    if c.s == nil {
+        return 0, errors.new("tls: read on closed conn")
+    }
+    s := c.s
+    for len(s.appbuf) == 0 {
+        if s.notify != 0 {
+            return 0, io.eof()
+        }
+        e := rec_pump(c)
+        if e != nil {
+            return 0, e
+        }
+        if s.notify != 0 {
+            return 0, io.eof()
+        }
+    }
+    n := len(b)
+    if n > len(s.appbuf) {
+        n = len(s.appbuf)
+    }
+    i := 0
+    for i < n {
+        b[i] = s.appbuf[i]
+        i = i + 1
+    }
+    s.appbuf = s.appbuf[n:len(s.appbuf)]
+    return n, nil
+}
+
+/// write slices b into <=16KiB records; may write short.
+fn (c mut Conn) write(b: []byte) -> [int, err] {
+    if c.s == nil {
+        return 0, errors.new("tls: write on closed conn")
+    }
+    if c.s.wen == 0 {
+        return 0, errors.new("tls: write before handshake")
+    }
+    n := len(b)
+    if n > 16384 {
+        n = 16384
+    }
+    e := rec_write(c, 23, b[0:n])
+    if e != nil {
+        return 0, e
+    }
+    return n, nil
+}
+
+/// close sends close_notify best-effort, then closes the inner
+/// socket — a wedged peer can't hold the fd. Double-close safe.
+fn (c mut Conn) close() -> err {
+    if c.inner.fd < 0 {
+        return nil
+    }
+    if scas(c.st, c.g, c.g + 1) != c.g {
+        return nil
+    }
+    if c.s != nil && c.s.wen != 0 && c.s.wclosed == 0 {
+        send_alert(c, 1, 0)
+    }
+    c.inner.close()
+    c.inner.fd = -1
+    rt_latch_free(c.st)
+    return nil
+}
+
+/// rawfd exposes the inner socket — set_*timo keeps working.
+fn (c ref Conn) rawfd() -> int {
+    return c.inner.rawfd()
+}
+
+/// peer returns a snapshot copy of the verified leaf — every own
+/// field cloned, so mutating it touches neither the conn's stored
+/// cert nor later peer() calls.
+fn (c ref Conn) peer() -> x509.Cert {
+    if c.s == nil || c.s.has_leaf == 0 {
+        // no handshake (badconn) or no verified leaf — the zero Cert
+        return x509.Cert{raw: nil, version: 0, serial: nil, issuer: "", subject: "", issuer_der: nil, subject_der: nil, not_before: 0, not_after: 0, dns_names: nil, ip_addrs: nil, is_ca: 0, max_path: -1, ku: -1, eku: nil, sig_alg: 0, spki_alg: 0, spki: nil, skid: nil, akid: nil, sig: nil, tbs: nil}
+    }
+    l := c.s.leaf
+    return x509.Cert{raw: slices.clone(l.raw), version: l.version, serial: slices.clone(l.serial), issuer: l.issuer, subject: l.subject, issuer_der: slices.clone(l.issuer_der), subject_der: slices.clone(l.subject_der), not_before: l.not_before, not_after: l.not_after, dns_names: slices.clone(l.dns_names), ip_addrs: slices.clone(l.ip_addrs), is_ca: l.is_ca, max_path: l.max_path, ku: l.ku, eku: slices.clone(l.eku), sig_alg: l.sig_alg, spki_alg: l.spki_alg, spki: slices.clone(l.spki), skid: slices.clone(l.skid), akid: slices.clone(l.akid), sig: slices.clone(l.sig), tbs: slices.clone(l.tbs)}
+}
+
+/// asreader/aswriter/ascloser/asreadwriter — net.Conn parity.
+fn (c mut Conn) asreader() -> io.Reader {
+    return c
+}
+
+fn (c mut Conn) aswriter() -> io.Writer {
+    return c
+}
+
+fn (c mut Conn) ascloser() -> io.Closer {
+    return c
+}
+
+fn (c mut Conn) asreadwriter() -> io.ReadWriter {
+    return c
+}

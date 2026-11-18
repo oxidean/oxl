@@ -24,6 +24,9 @@ fn fill(b: []byte) -> err {
 
 /// bytes returns n random bytes — the [v, err] contract.
 fn bytes(n: int) -> [own []byte, err] {
+    if n < 0 {
+        return nil, errors.new("crypto/rand: negative size")
+    }
     b := mkslice(byte, n)
     e := fill(b)
     if e != nil {

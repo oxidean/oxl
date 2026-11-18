@@ -4126,10 +4126,19 @@ int64_t rt_csrand(RtSlice b) {
     uint8_t *p = (uint8_t *)b.ptr;
     int64_t left = b.len;
 #ifdef _WIN32
-    /* CNG system-preferred RNG — the only flag the client fill needs */
-    if (BCryptGenRandom(NULL, p, (ULONG)left,
-                        BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0)
-        return RT_GLE();
+    /* CNG system-preferred RNG — the only flag the client fill needs.
+     * NTSTATUS is not a GetLastError code: return it negated verbatim
+     * (RT_GLE() would report a stale unrelated win32 error), and fill
+     * in ULONG-sized chunks so a >4 GiB request can't wrap cbBuffer. */
+    while (left > 0) {
+        ULONG chunk = left > 0xFFFFFFFFLL ? 0xFFFFFFFFUL : (ULONG)left;
+        NTSTATUS st = BCryptGenRandom(NULL, p, chunk,
+                                      BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+        if (st != 0)
+            return -((int64_t)st);
+        p += chunk;
+        left -= chunk;
+    }
     return 0;
 #elif defined(__linux__) || defined(__ANDROID__)
     while (left > 0) {
@@ -4138,6 +4147,7 @@ int64_t rt_csrand(RtSlice b) {
             if (errno == EINTR) continue;
             return -(int64_t)errno;
         }
+        if (r == 0) return -5; /* EIO — getrandom can't legally short-fill */
         p += r;
         left -= r;
     }

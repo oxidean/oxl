@@ -34,6 +34,9 @@ fn extract(hf: fn() -> hash.Hash, salt: []byte, ikm: []byte) -> own []byte {
 fn expand(hf: fn() -> hash.Hash, prk: []byte, info: []byte, length: int) -> [own []byte, err] {
     hz := hf()
     hlen := len(hz.sum(nil))
+    if length < 0 {
+        return nil, errors.new("hkdf: negative expand length")
+    }
     if length > 255 * hlen {
         return nil, errors.new("hkdf: expand length exceeds 255*HashLen")
     }

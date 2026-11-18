@@ -76,6 +76,17 @@ export function install(api) {
     // UTF-8 byte length, matching rt.c's rt_strlen — s.length counts
     // UTF-16 code units and diverges on any non-ASCII or astral char
     rt_strlen: (s) => BigInt(typeof s === 'string' ? new TextEncoder().encode(s).length : 0),
+    // WebCrypto fill — chunked under the 65,536-byte getRandomValues
+    // quota; the err contract carries a failure as -EIO like rt.c
+    rt_csrand: (b) => {
+      try {
+        for (let i = 0; i < b.len; i += 65536)
+          crypto.getRandomValues(b.a.subarray(b.off + i, b.off + Math.min(i + 65536, b.len)))
+        return 0n
+      } catch (e) {
+        return -5n
+      }
+    },
     // blocking-capable surfaces with no browser equivalent — trap
     rt_proc_run: trap21,
     rt_proc_output: trap21,

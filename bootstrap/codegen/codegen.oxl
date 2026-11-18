@@ -2488,6 +2488,12 @@ fn gxbin(g: mut G, op: str, l: ref parser.Node, r: ref parser.Node, e: ref parse
         // it (stdlib fnv relies on the wrap; seed gxbin mirrors)
         return "((int64_t)((uint64_t)(" + lv + ") * (uint64_t)(" + rv + ")))"
     }
+    if (op == "+" || op == "-") && ltk == check.k_int() {
+        // int + and - carry the same mod-2^64 wrap contract — the
+        // unsigned detour keeps -O2 off the signed-overflow UB (the
+        // sha512 schedule and state adds rely on the congruence)
+        return "((int64_t)((uint64_t)(" + lv + ") " + op + " (uint64_t)(" + rv + ")))"
+    }
     return "(" + lv + " " + op + " " + rv + ")"
 }
 

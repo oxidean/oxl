@@ -300,7 +300,7 @@ export function install(api) {
     rt_csrand: (b) => {
       try {
         for (let i = 0; i < b.len; i += 65536)
-          crypto.randomFillSync(b.a, b.off + i, Math.min(65536, b.len - i))
+          crypto.randomFillSync(b.a.subarray(b.off + i, b.off + i + Math.min(65536, b.len - i)))
         return 0n
       } catch (e) {
         return neg_errno(e)

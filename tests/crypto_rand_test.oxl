@@ -45,6 +45,34 @@ fn test_csrand() {
     view := buf[0:8]
     testing.expect(rand.fill(view) == nil, "fill(8)")
     testing.expect(buf[8] == 170, "fill wrote past len")
+    // a nonzero-offset view: every byte inside must be written and the
+    // sentinels on both sides must stay — a fill that skips views or
+    // overshoots them fails one of the three checks
+    buf2 := mkslice(byte, 40)
+    i = 0
+    for i < 40 {
+        buf2[i] = 170
+        i = i + 1
+    }
+    v2 := buf2[4:36]
+    testing.expect(rand.fill(v2) == nil, "fill(view)")
+    i = 0
+    for i < 4 {
+        testing.expect(buf2[i] == 170, "fill under-ran the view")
+        testing.expect(buf2[36 + i] == 170, "fill over-ran the view")
+        i = i + 1
+    }
+    // all 32 view bytes still the sentinel means nothing was written —
+    // 2^-256 for a real draw, deterministic for a skip-the-view bug
+    sentinel := 1
+    i = 0
+    for i < 32 {
+        if v2[i] != 170 {
+            sentinel = 0
+        }
+        i = i + 1
+    }
+    testing.expect(sentinel == 0, "fill skipped the view bytes")
     // bytes(0) is the empty draw
     [b0, e3] = rand.bytes(0)
     testing.expect(e3 == nil && len(b0) == 0, "bytes(0)")

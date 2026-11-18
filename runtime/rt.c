@@ -4118,6 +4118,7 @@ OxlStr rt_timestr(void) {
 #ifdef OXL_CRYPTO
 #if defined(_WIN32)
 #include <bcrypt.h>
+#include <winternl.h>
 #elif defined(__linux__) || defined(__ANDROID__)
 #include <sys/random.h>
 #endif
@@ -4127,15 +4128,16 @@ int64_t rt_csrand(RtSlice b) {
     int64_t left = b.len;
 #ifdef _WIN32
     /* CNG system-preferred RNG — the only flag the client fill needs.
-     * NTSTATUS is not a GetLastError code: return it negated verbatim
-     * (RT_GLE() would report a stale unrelated win32 error), and fill
-     * in ULONG-sized chunks so a >4 GiB request can't wrap cbBuffer. */
+     * NTSTATUS is not a GetLastError code and failure values are
+     * negative: translate to the Win32 domain (RtlNtStatusToDosError)
+     * and tag it so rt_errstr FormatMessages the right text — a bare
+     * -st would flip the sign and read as success-tagged garbage. */
     while (left > 0) {
         ULONG chunk = left > 0xFFFFFFFFLL ? 0xFFFFFFFFUL : (ULONG)left;
         NTSTATUS st = BCryptGenRandom(NULL, p, chunk,
                                       BCRYPT_USE_SYSTEM_PREFERRED_RNG);
         if (st != 0)
-            return -((int64_t)st);
+            return -((int64_t)RtlNtStatusToDosError(st) | RT_GLE_TAG);
         p += chunk;
         left -= chunk;
     }
@@ -4164,8 +4166,9 @@ int64_t rt_csrand(RtSlice b) {
         ssize_t r = read(fd, p, (size_t)left);
         if (r < 0) {
             if (errno == EINTR) continue;
+            int e = errno;
             close(fd);
-            return -(int64_t)errno;
+            return -(int64_t)e;
         }
         if (r == 0) { /* short read before EOF would be an urandom bug */
             close(fd);

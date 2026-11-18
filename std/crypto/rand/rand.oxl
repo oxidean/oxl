@@ -27,6 +27,11 @@ fn bytes(n: int) -> [own []byte, err] {
     if n < 0 {
         return nil, errors.new("crypto/rand: negative size")
     }
+    // mkslice aligns the byte count before allocating — cap well under
+    // the overflow point instead of letting a huge n wrap the size
+    if n > 4611686018427387904 {
+        return nil, errors.new("crypto/rand: size too large")
+    }
     b := mkslice(byte, n)
     e := fill(b)
     if e != nil {

@@ -17,7 +17,9 @@ import "std/errors"
 
 /// extract runs the extract step: prk = HMAC-Hash(salt, ikm).
 /// An empty salt means a hashlen block of zeros (RFC 5869 §2.2).
-fn extract(hf: fn() -> hash.Hash, salt: []byte, ikm: []byte) -> own []byte {
+/// The factory's Hash must honor io.Writer — a short write without an
+/// error silently truncates, so hkdf checks both halves of [n, err].
+fn extract(hf: fn() -> hash.Hash, salt: []byte, ikm: []byte) -> [own []byte, err] {
     if len(salt) == 0 {
         // HashLen zeros — RFC 5869 §2.2's default salt
         hz := hf()
@@ -25,7 +27,10 @@ fn extract(hf: fn() -> hash.Hash, salt: []byte, ikm: []byte) -> own []byte {
     }
     hm := hmac.new(hf, salt)
     [wn, we] = hm.write(ikm)
-    return hm.sum(nil)
+    if we != nil || wn != len(ikm) {
+        return nil, errors.new("hkdf: hash write failed")
+    }
+    return hm.sum(nil), nil
 }
 
 /// expand runs the expand step: okm = T(1) | T(2) | ... truncated to
@@ -40,16 +45,27 @@ fn expand(hf: fn() -> hash.Hash, prk: []byte, info: []byte, length: int) -> [own
     if length > 255 * hlen {
         return nil, errors.new("hkdf: expand length exceeds 255*HashLen")
     }
+    // RFC 5869 §2.3: the PRK must be at least HashLen — a shorter one
+    // would zero-pad into predictable key material
+    if len(prk) < hlen {
+        return nil, errors.new("hkdf: prk shorter than HashLen")
+    }
     okm := mkslice(byte, 0)
     prev := mkslice(byte, 0)
+    // one HMAC for all rounds — the key is the same prk every round, so
+    // reset() restores the keyed pads without re-allocating them
+    hm := hmac.new(hf, prk)
     i := 1
     for len(okm) < length {
-        hm := hmac.new(hf, prk)
+        hm.reset()
         [w1, e1] = hm.write(prev)
         [w2, e2] = hm.write(info)
         cb := mkslice(byte, 1)
         cb[0] = i
         [w3, e3] = hm.write(cb)
+        if e1 != nil || w1 != len(prev) || e2 != nil || w2 != len(info) || e3 != nil || w3 != 1 {
+            return nil, errors.new("hkdf: hash write failed")
+        }
         t := hm.sum(nil)
         // append up to hlen bytes — the last round may overshoot
         j := 0

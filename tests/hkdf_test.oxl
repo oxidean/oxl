@@ -31,21 +31,24 @@ fn test_hkdf() {
         ikm1[i] = 11
         i = i + 1
     }
-    prk1 := hkdf.extract(sha256.new, range(0, 13), ikm1)
+    [prk1, pe1] = hkdf.extract(sha256.new, range(0, 13), ikm1)
+    testing.expect(pe1 == nil, "hkdf case1 extract err")
     testing.expect(hex.encode(prk1) == "077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5", "hkdf case1 prk")
     [okm1, e1] = hkdf.expand(sha256.new, prk1, range(240, 10), 42)
     testing.expect(e1 == nil, "hkdf case1 expand err")
     testing.expect(hex.encode(okm1) == "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865", "hkdf case1 okm")
 
     // case 2: 80-byte IKM/salt/info, L=82 — three expand rounds
-    prk2 := hkdf.extract(sha256.new, range(96, 80), range(0, 80))
+    [prk2, pe2] = hkdf.extract(sha256.new, range(96, 80), range(0, 80))
+    testing.expect(pe2 == nil, "hkdf case2 extract err")
     testing.expect(hex.encode(prk2) == "06a6b88c5853361a06104c9ceb35b45cef760014904671014a193f40c15fc244", "hkdf case2 prk")
     [okm2, e2] = hkdf.expand(sha256.new, prk2, range(176, 80), 82)
     testing.expect(e2 == nil, "hkdf case2 expand err")
     testing.expect(hex.encode(okm2) == "b11e398dc80327a1c8e7f78c596a49344f012eda2d4efad8a050cc4c19afa97c59045a99cac7827271cb41c65e590e09da3275600c2f09b8367793a9aca3db71cc30c58179ec3e87c14c01d5c1f3434f1d87", "hkdf case2 okm")
 
     // case 3: empty salt (HashLen zeros) + empty info, L=42
-    prk3 := hkdf.extract(sha256.new, mkslice(byte, 0), ikm1)
+    [prk3, pe3] = hkdf.extract(sha256.new, mkslice(byte, 0), ikm1)
+    testing.expect(pe3 == nil, "hkdf case3 extract err")
     testing.expect(hex.encode(prk3) == "19ef24a32c717b167f33a91d6f648bdf96596776afdb6377ac434c1c293ccb04", "hkdf case3 prk")
     [okm3, e3] = hkdf.expand(sha256.new, prk3, mkslice(byte, 0), 42)
     testing.expect(e3 == nil, "hkdf case3 expand err")
@@ -56,4 +59,12 @@ fn test_hkdf() {
     testing.expect(e4 == nil && len(okm4) == 8160, "hkdf ceiling ok")
     [_okm5, e5] = hkdf.expand(sha256.new, prk1, mkslice(byte, 0), 8161)
     testing.expect(e5 != nil, "hkdf over-ceiling accepted")
+
+    // PRK under HashLen is rejected before any key material comes out
+    [_okm6, e6] = hkdf.expand(sha256.new, mkslice(byte, 20), mkslice(byte, 0), 32)
+    testing.expect(e6 != nil, "hkdf short prk accepted")
+    [_okm7, e7] = hkdf.expand(sha256.new, mkslice(byte, 0), mkslice(byte, 0), 32)
+    testing.expect(e7 != nil, "hkdf empty prk accepted")
+    [_okm8, e8] = hkdf.expand(sha256.new, prk1, mkslice(byte, 0), -1)
+    testing.expect(e8 != nil, "hkdf negative length accepted")
 }

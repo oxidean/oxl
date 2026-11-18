@@ -585,7 +585,10 @@ fn emit_and_cc(csrc: str, out: str, entry: str) -> int {
     }
     // -DOXL_CRYPTO compiles rt_csrand; Windows links bcrypt for it —
     // the ws2_32/net pairing (POSIX needs no extra lib)
-    if strings.contains(csrc, "rt_csrand") {
+    // the needle is split so the driver's own source can't self-match:
+    // emitted data for the literal is rt_str_lit("rt_csrand") — only a
+    // real call site emits rt_csrand( verbatim
+    if strings.contains(csrc, "rt_csrand" + "(") {
         args = push(args, "-DOXL_CRYPTO")
         if rt_is_windows() != 0 {
             args = push(args, "-lbcrypt")

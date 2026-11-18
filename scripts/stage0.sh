@@ -78,7 +78,8 @@ build() {
     fi
     # OXL_CRYPTO mirrors emit_and_cc's rt_csrand scan — bcrypt only
     # on Windows (the ws2_32/net pairing)
-    if grep -q 'rt_csrand' "$SNAP"; then
+    # match an emitted call site, not the driver's own scan literal
+    if grep -q 'rt_csrand(' "$SNAP"; then
         args+=(-DOXL_CRYPTO)
         if [ -n "$CRYPTO_LIB" ]; then
             args+=("$CRYPTO_LIB")

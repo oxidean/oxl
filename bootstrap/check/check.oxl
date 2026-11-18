@@ -343,6 +343,9 @@ struct LL { names: own SList, next: own LL }
 // select/match arm end-states awaiting the fall-through merge
 struct ArmSt { mv: own LL, ft: int, next: own ArmSt }
 
+// select-arm borrow end-states awaiting the fall-through merge
+struct BArmSt { st: own LL, next: own BArmSt }
+
 // per-file import aliases (qualifier -> stem) and selective names
 struct ModEnt { alias: str, stem: str, ver: str, next: own ModEnt }
 
@@ -465,7 +468,6 @@ struct Ck {
     dpos: int, // pending diag offset — set at expr/stmt entry, read by diag()
     et: int, // borrow-taint of the most recently checked expr's value (borrn idx or -1)
     ptaint: int, // pending taint a node helper leaves for expr() to publish as et
-    litaint: int, // accumulated taint across a struct/enum literal's field inits
     borrn: []str, // interned borrow-source names behind et/ptaint/env borr idxs
     meth_alias: own SList, // `T.m` methods whose iface return aliases the receiver borrow
 }
@@ -796,6 +798,12 @@ fn taint_may_d(ck: ref Ck, t: int, d: int) -> int {
     }
     if k == k_struct() {
         i := ck.tyv[t].i
+        if i < 0 && len(ck.tyv[t].name) > 0 && collections.map_has(ck.structs, ck.tyv[t].name) {
+            [si, serr] = collections.map_get(ck.structs, ck.tyv[t].name)
+            if serr == nil {
+                i = si
+            }
+        }
         if i < 0 {
             return 0
         }
@@ -810,6 +818,12 @@ fn taint_may_d(ck: ref Ck, t: int, d: int) -> int {
     }
     if k == k_enum() {
         i := ck.tyv[t].i
+        if i < 0 && len(ck.tyv[t].name) > 0 && collections.map_has(ck.enums, ck.tyv[t].name) {
+            [ei2, eerr] = collections.map_get(ck.enums, ck.tyv[t].name)
+            if eerr == nil {
+                i = ei2
+            }
+        }
         if i < 0 {
             return 0
         }
@@ -881,14 +895,15 @@ fn storage_src(ck: mut Ck, e: ref parser.Node, ty: int, env: ref Env) -> int {
 
 // root binding an assignment target writes through — `s.f = v` and
 // `s[i] = v` taint `s` (whole-value over-approximation, like lit fields)
-fn taint_root(n: ref parser.Node) -> str {
-    match n {
+fn taint_root(nd: ref parser.Node) -> str {
+    r := match nd {
         parser.Node.Name{n} => n
         parser.Node.Field{obj} => taint_root(obj)
         parser.Node.Index{obj} => taint_root(obj)
         parser.Node.Slice{obj} => taint_root(obj)
         _ => ""
     }
+    return r
 }
 
 fn borr_save(e: ref Env) -> own LL {
@@ -1363,6 +1378,284 @@ fn stmts_mentions(items: ref parser.NList, rn: str) -> int {
     l := items
     for l != nil {
         if ret_mentions(l.v, rn) == 1 {
+            return 1
+        }
+        l = l.next
+    }
+    return 0
+}
+
+// ---------- receiver-alias dataflow (meth_alias pre-scan) ----------
+// `let r = b; return r` hides the receiver behind a local — track
+// bindings whose initializer mentions the receiver or an existing
+// alias, to a fixpoint, then ask ret_mentions about each alias.
+fn alias_mentions(n: ref parser.Node, rn: str, al: ref SList) -> int {
+    if mentions(n, rn) == 1 {
+        return 1
+    }
+    l := al
+    for l != nil {
+        if l.v != rn && mentions(n, l.v) == 1 {
+            return 1
+        }
+        l = l.next
+    }
+    return 0
+}
+
+fn alias_add(acc: own SList, rn: str, al: ref SList, n: str) -> own SList {
+    if len(n) == 0 || n == "_" || n == rn || sl_has(al, n) || sl_has(acc, n) {
+        return acc
+    }
+    return scons(n, acc)
+}
+
+fn expr_alias_binds(n: ref parser.Node, rn: str, al: ref SList, acc: own SList) -> own SList {
+    if n == nil {
+        return acc
+    }
+    match n {
+        parser.Node.Call{f, args} => {
+            acc = expr_alias_binds(f, rn, al, acc)
+            l := args
+            for l != nil {
+                acc = expr_alias_binds(l.v, rn, al, acc)
+                l = l.next
+            }
+            return acc
+        }
+        parser.Node.Field{obj} => {
+            return expr_alias_binds(obj, rn, al, acc)
+        }
+        parser.Node.Un{e} => {
+            return expr_alias_binds(e, rn, al, acc)
+        }
+        parser.Node.Bin{l, r} => {
+            acc = expr_alias_binds(l, rn, al, acc)
+            return expr_alias_binds(r, rn, al, acc)
+        }
+        parser.Node.As{e} => {
+            return expr_alias_binds(e, rn, al, acc)
+        }
+        parser.Node.Index{obj, idx} => {
+            acc = expr_alias_binds(obj, rn, al, acc)
+            return expr_alias_binds(idx, rn, al, acc)
+        }
+        parser.Node.Slice{obj, lo, hi} => {
+            acc = expr_alias_binds(obj, rn, al, acc)
+            if lo != nil {
+                acc = expr_alias_binds(lo, rn, al, acc)
+            }
+            if hi != nil {
+                acc = expr_alias_binds(hi, rn, al, acc)
+            }
+            return acc
+        }
+        parser.Node.Lit{obj, fields} => {
+            acc = expr_alias_binds(obj, rn, al, acc)
+            fl := fields
+            for fl != nil {
+                match fl.v {
+                    parser.Node.NamedField{val} => {
+                        acc = expr_alias_binds(val, rn, al, acc)
+                    }
+                    _ => {
+                    }
+                }
+                fl = fl.next
+            }
+            return acc
+        }
+        parser.Node.Match{e, arms} => {
+            acc = expr_alias_binds(e, rn, al, acc)
+            am := arms
+            for am != nil {
+                match am.v {
+                    parser.Node.MArm{pat, body} => {
+                        match pat {
+                            parser.Node.PatBind{name} => {
+                                if alias_mentions(e, rn, al) == 1 {
+                                    acc = alias_add(acc, rn, al, name)
+                                }
+                            }
+                            _ => {
+                            }
+                        }
+                        match body {
+                            parser.Node.List{items} => {
+                                acc = stmts_alias_binds(items, rn, al, acc)
+                            }
+                            _ => {
+                                acc = expr_alias_binds(body, rn, al, acc)
+                            }
+                        }
+                    }
+                    _ => {
+                    }
+                }
+                am = am.next
+            }
+            return acc
+        }
+        _ => {
+            return acc
+        }
+    }
+}
+
+fn node_alias_binds(b: ref parser.Node, rn: str, al: ref SList, acc: own SList) -> own SList {
+    if b == nil {
+        return acc
+    }
+    match b {
+        parser.Node.List{items} => {
+            return stmts_alias_binds(items, rn, al, acc)
+        }
+        _ => {
+            return stmt_alias_binds(b, rn, al, acc)
+        }
+    }
+}
+
+fn stmts_alias_binds(items: ref parser.NList, rn: str, al: ref SList, acc: own SList) -> own SList {
+    l := items
+    for l != nil {
+        acc = stmt_alias_binds(l.v, rn, al, acc)
+        l = l.next
+    }
+    return acc
+}
+
+fn stmt_alias_binds(s: ref parser.Node, rn: str, al: ref SList, acc: own SList) -> own SList {
+    if s == nil {
+        return acc
+    }
+    match s {
+        parser.Node.List{items} => {
+            return stmts_alias_binds(items, rn, al, acc)
+        }
+        parser.Node.Scope{body} => {
+            return node_alias_binds(body, rn, al, acc)
+        }
+        parser.Node.Unsafe{body} => {
+            return node_alias_binds(body, rn, al, acc)
+        }
+        parser.Node.Let{name, init} => {
+            acc = expr_alias_binds(init, rn, al, acc)
+            if init != nil && alias_mentions(init, rn, al) == 1 {
+                acc = alias_add(acc, rn, al, name)
+            }
+            return acc
+        }
+        parser.Node.Bind{name, init} => {
+            acc = expr_alias_binds(init, rn, al, acc)
+            if init != nil && alias_mentions(init, rn, al) == 1 {
+                acc = alias_add(acc, rn, al, name)
+            }
+            return acc
+        }
+        parser.Node.Let2{names, call} => {
+            acc = expr_alias_binds(call, rn, al, acc)
+            if call != nil && alias_mentions(call, rn, al) == 1 {
+                i := find(names, ",")
+                an := names
+                bn := ""
+                if i >= 0 {
+                    an = substr(names, 0, i)
+                    bn = substr(names, i + 1, len(names))
+                }
+                acc = alias_add(acc, rn, al, an)
+                acc = alias_add(acc, rn, al, bn)
+            }
+            return acc
+        }
+        parser.Node.Assign{target, val} => {
+            acc = expr_alias_binds(target, rn, al, acc)
+            acc = expr_alias_binds(val, rn, al, acc)
+            if val != nil && alias_mentions(val, rn, al) == 1 {
+                acc = alias_add(acc, rn, al, taint_root(target))
+            }
+            return acc
+        }
+        parser.Node.ExprStmt{e} => {
+            return expr_alias_binds(e, rn, al, acc)
+        }
+        parser.Node.Defer{call} => {
+            return expr_alias_binds(call, rn, al, acc)
+        }
+        parser.Node.Ret{vals} => {
+            vl := vals
+            for vl != nil {
+                acc = expr_alias_binds(vl.v, rn, al, acc)
+                vl = vl.next
+            }
+            return acc
+        }
+        parser.Node.If{cond, then, els} => {
+            acc = expr_alias_binds(cond, rn, al, acc)
+            acc = node_alias_binds(then, rn, al, acc)
+            return node_alias_binds(els, rn, al, acc)
+        }
+        parser.Node.For{cond, body} => {
+            acc = expr_alias_binds(cond, rn, al, acc)
+            return node_alias_binds(body, rn, al, acc)
+        }
+        parser.Node.Select{arms} => {
+            al2 := arms
+            for al2 != nil {
+                match al2.v {
+                    parser.Node.SArm{ch, ms, body} => {
+                        acc = expr_alias_binds(ch, rn, al, acc)
+                        acc = expr_alias_binds(ms, rn, al, acc)
+                        acc = node_alias_binds(body, rn, al, acc)
+                    }
+                    _ => {
+                    }
+                }
+                al2 = al2.next
+            }
+            return acc
+        }
+        parser.Node.Spawn{e} => {
+            return expr_alias_binds(e, rn, al, acc)
+        }
+        parser.Node.SpawnBlocking{e} => {
+            return expr_alias_binds(e, rn, al, acc)
+        }
+        parser.Node.Go{e} => {
+            return expr_alias_binds(e, rn, al, acc)
+        }
+        parser.Node.GoIn{sc, e} => {
+            acc = expr_alias_binds(sc, rn, al, acc)
+            return expr_alias_binds(e, rn, al, acc)
+        }
+        _ => {
+            return acc
+        }
+    }
+}
+
+fn meth_alias_body(body: ref parser.Node, rn: str) -> int {
+    let al: own SList = nil
+    for true {
+        add := node_alias_binds(body, rn, al, nil)
+        if add == nil {
+            break
+        }
+        l := add
+        for l != nil {
+            if !sl_has(al, l.v) {
+                al = scons(l.v, al)
+            }
+            l = l.next
+        }
+    }
+    if ret_mentions(body, rn) == 1 {
+        return 1
+    }
+    l := al
+    for l != nil {
+        if ret_mentions(body, l.v) == 1 {
             return 1
         }
         l = l.next
@@ -3334,7 +3627,7 @@ fn reg_sigs(ck: mut Ck, its: []It) {
                                 [fi2, e2] = collections.map_get(ck.fns, qn2)
                                 if e2 == nil && ck.fnsv[fi2].retk != 0 && ck.fnsv[fi2].params != nil {
                                     pk := ck.tyv[ck.fnsv[fi2].params.v].k
-                                    if (pk == k_mut() || pk == k_ref()) && taint_may(ck, ck.fnsv[fi2].ret1) == 1 && ret_mentions(body, name) == 1 {
+                                    if (pk == k_mut() || pk == k_ref()) && taint_may(ck, ck.fnsv[fi2].ret1) == 1 && meth_alias_body(body, name) == 1 {
                                         ck.meth_alias = scons(qn2, ck.meth_alias)
                                     }
                                 }
@@ -3551,7 +3844,8 @@ fn field_expr(ck: mut Ck, obj: ref parser.Node, name: str, fhi: int, env: mut En
 }
 
 // every `{name: expr}` literal field — shared by struct and enum paths
-fn lit_fields(ck: mut Ck, path: str, want: ref FList, fields: ref parser.NList, env: mut Env) {
+fn lit_fields(ck: mut Ck, path: str, want: ref FList, fields: ref parser.NList, env: mut Env) -> int {
+    lt := -1
     fl := fields
     for fl != nil {
         match fl.v {
@@ -3563,8 +3857,8 @@ fn lit_fields(ck: mut Ck, path: str, want: ref FList, fields: ref parser.NList, 
                     gt := expr(ck, val, env)
                     assignable(ck, wt, gt)
                     move_for(ck, val, wt, env)
-                    if ck.et >= 0 && ck.litaint < 0 {
-                        ck.litaint = ck.et
+                    if ck.et >= 0 && lt < 0 {
+                        lt = ck.et
                     }
                 }
             }
@@ -3594,10 +3888,10 @@ fn lit_fields(ck: mut Ck, path: str, want: ref FList, fields: ref parser.NList, 
         }
         w = w.next
     }
+    return lt
 }
 
 fn lit_expr(ck: mut Ck, obj: ref parser.Node, fields: ref parser.NList, env: mut Env) -> int {
-    ck.litaint = -1
     name := callee_name(obj)
     path := resolve_named(ck, name)
     rec_use(ck, parser.nlo(obj), parser.nhi(obj), path)
@@ -3622,10 +3916,9 @@ fn lit_expr(ck: mut Ck, obj: ref parser.Node, fields: ref parser.NList, env: mut
             if given != flen(want) {
                 diag(ck, "type", "`" + path + "` takes " + itoa(flen(want)) + " payload field(s), found " + itoa(given))
             } else {
-                lit_fields(ck, path, want, fields, env)
+                ck.ptaint = lit_fields(ck, path, want, fields, env)
             }
         }
-        ck.ptaint = ck.litaint
         return tn(ck, k_enum(), en)
     }
     if !collections.map_has(ck.structs, path) {
@@ -3636,8 +3929,7 @@ fn lit_expr(ck: mut Ck, obj: ref parser.Node, fields: ref parser.NList, env: mut
     if err != nil {
         return t_unk(ck)
     }
-    lit_fields(ck, path, ck.structsv[si].fields, fields, env)
-    ck.ptaint = ck.litaint
+    ck.ptaint = lit_fields(ck, path, ck.structsv[si].fields, fields, env)
     return tn(ck, k_struct(), path)
 }
 
@@ -3894,7 +4186,7 @@ fn pat_lit(ck: mut Ck, v: ref parser.Node, st: int, env: mut Env, sk: int, saw: 
 
 // alo/ahi are the arm's span — payload binds take the arm's span as
 // their declaration, matching the seed's env.set(arm.span) behaviour
-fn pat_variant(ck: mut Ck, path: str, binds: ref parser.NList, en: str, covered: mut SListBox, alo: int, ahi: int, env: mut Env) {
+fn pat_variant(ck: mut Ck, path: str, binds: ref parser.NList, en: str, covered: mut SListBox, alo: int, ahi: int, staint: int, env: mut Env) {
     qpath := resolve_named(ck, path)
     vei := enum_variant(ck, qpath)
     if vei < 0 {
@@ -3939,6 +4231,9 @@ fn pat_variant(ck: mut Ck, path: str, binds: ref parser.NList, en: str, covered:
                 parser.Node.Name{n} => {
                     if n != "_" {
                         env_set(env, n, wl.v.t, alo, ahi)
+                        if staint >= 0 && taint_may(ck, wl.v.t) == 1 {
+                            env_taint_set(env, n, staint)
+                        }
                     }
                 }
                 _ => {
@@ -3959,6 +4254,9 @@ fn pat_variant(ck: mut Ck, path: str, binds: ref parser.NList, en: str, covered:
                         diag(ck, "check", "`" + qpath + "` has no field `" + n + "`")
                     } else {
                         env_set(env, n, ft, alo, ahi)
+                        if staint >= 0 && taint_may(ck, ft) == 1 {
+                            env_taint_set(env, n, staint)
+                        }
                     }
                 }
             }
@@ -3974,6 +4272,7 @@ struct SListBox { l: own SList }
 
 fn match_expr(ck: mut Ck, scrut: ref parser.Node, arms: ref parser.NList, env: mut Env) -> int {
     st := expr(ck, scrut, env)
+    staint := ck.et
     sk := ck.tyv[st].k
     en := ""
     if sk == k_enum() {
@@ -4001,11 +4300,13 @@ fn match_expr(ck: mut Ck, scrut: ref parser.Node, arms: ref parser.NList, env: m
     mtaint := -1
     // arms are alternative paths — merge `moved` like if/else
     pre := moved_save(env)
+    bpre := borr_save(env)
     let armst: own ArmSt = nil
     let btail: own SList = nil
     a := arms
     for a != nil {
         moved_restore(env, ll_clone(pre))
+        borr_restore(env, ll_clone(bpre))
         match a.v {
             parser.Node.MArm{pat, body, lo, hi} => {
                 env_push(env)
@@ -4019,6 +4320,9 @@ fn match_expr(ck: mut Ck, scrut: ref parser.Node, arms: ref parser.NList, env: m
                     match pat {
                         parser.Node.PatBind{name} => {
                             env_set(env, name, st, lo, hi)
+                            if staint >= 0 && taint_may(ck, st) == 1 {
+                                env_taint_set(env, name, staint)
+                            }
                         }
                         _ => {
                         }
@@ -4038,7 +4342,7 @@ fn match_expr(ck: mut Ck, scrut: ref parser.Node, arms: ref parser.NList, env: m
                 if pk == 34 {
                     match pat {
                         parser.Node.Pat{path, binds} => {
-                            pat_variant(ck, path, binds, en, cov, lo, hi, env)
+                            pat_variant(ck, path, binds, en, cov, lo, hi, staint, env)
                         }
                         _ => {
                         }
@@ -4185,13 +4489,21 @@ fn call(ck: mut Ck, f: ref parser.Node, args: ref parser.NList, env: mut Env) ->
                 if given != wlen {
                     diag(ck, "type", "`" + name + "` takes " + itoa(wlen) + " payload field(s), found " + itoa(given))
                 } else {
+                    vt := -1
                     wl := want
                     al := args
                     for al != nil && wl != nil {
                         gt := expr(ck, al.v, env)
+                        at := ck.et
                         assignable(ck, wl.v.t, gt)
+                        if vt < 0 && at >= 0 && taint_may(ck, wl.v.t) == 1 {
+                            vt = at
+                        }
                         wl = wl.next
                         al = al.next
+                    }
+                    if vt >= 0 {
+                        ck.ptaint = vt
                     }
                 }
             }
@@ -4247,6 +4559,9 @@ fn call(ck: mut Ck, f: ref parser.Node, args: ref parser.NList, env: mut Env) ->
                             // hands the same borrow onward
                             if otaint >= 0 && (mt.rk == 1 || mt.rk == 2) && taint_may(ck, mt.r1) == 1 {
                                 ck.ptaint = otaint
+                            }
+                            if ck.in_spawn != 0 && otaint >= 0 {
+                                diag(ck, "check", "`spawn` arg carries a borrow of local `" + taint_src(ck, otaint) + "` — it escapes into the task")
                             }
                             return rt
                         }
@@ -4430,7 +4745,12 @@ fn call(ck: mut Ck, f: ref parser.Node, args: ref parser.NList, env: mut Env) ->
                     }
                 }
                 t := expr(ck, a, env)
-                return ti(ck, k_own(), t)
+                nt := ck.et
+                rt := ti(ck, k_own(), t)
+                if nt >= 0 && taint_may(ck, rt) == 1 {
+                    ck.ptaint = nt
+                }
+                return rt
             }
             diag(ck, "type", "`new` needs a struct name or value")
             return t_unk(ck)
@@ -4752,6 +5072,9 @@ fn call(ck: mut Ck, f: ref parser.Node, args: ref parser.NList, env: mut Env) ->
         al := args
         rg := -1
         fg := -1
+        rt0 := -1
+        fat := -1
+        atain := -1
         if recv != nil && wl != nil {
             // receiver slot: `*x`/`&x` adapt — `&` needs an lvalue
             want := subst_ty(ck, wl.v, bind)
@@ -4759,7 +5082,7 @@ fn call(ck: mut Ck, f: ref parser.Node, args: ref parser.NList, env: mut Env) ->
             ck.in_spawn = 0
             got := expr(ck, recv, env)
             ck.in_spawn = sp
-            rt0 := ck.et
+            rt0 = ck.et
             wk2 := ck.tyv[want].k
             rg = got
             gk2 := ck.tyv[got].k
@@ -4789,6 +5112,10 @@ fn call(ck: mut Ck, f: ref parser.Node, args: ref parser.NList, env: mut Env) ->
             assignable(ck, want, gt)
             if fg < 0 {
                 fg = gt
+                fat = at
+            }
+            if atain < 0 && at >= 0 {
+                atain = at
             }
             move_for(ck, al.v, want, env)
             if sp != 0 {
@@ -4810,19 +5137,31 @@ fn call(ck: mut Ck, f: ref parser.Node, args: ref parser.NList, env: mut Env) ->
         // dot-call node, `srecv` the method-sugar receiver (args[0]).
         // meth_alias (sig-time scan) keeps owned `into_*` variants clean:
         // only methods whose `return` mentions the receiver borrow it.
-        if (recv != nil || srecv != nil) && sig.retk != 0 && sig.params != nil && sl_has(ck.meth_alias, qn) {
-            ryk := ck.tyv[sig.params.v].k
-            if ryk == k_mut() || ryk == k_ref() {
-                rnode := recv
-                rty := rg
-                if rnode == nil {
-                    rnode = srecv
-                    rty = fg
+        // Receiver *contents* taint separately: a value that already
+        // carries a borrow (br.r = buf.asreader()) stays borrow-carrying
+        // through owned conversions like into_reader.
+        if (recv != nil || srecv != nil) && sig.retk != 0 && taint_may(ck, sig.ret1) == 1 {
+            rtain := rt0
+            if recv == nil {
+                rtain = fat
+            }
+            if sig.params != nil && sl_has(ck.meth_alias, qn) {
+                ryk := ck.tyv[sig.params.v].k
+                if ryk == k_mut() || ryk == k_ref() {
+                    rnode := recv
+                    rty := rg
+                    if rnode == nil {
+                        rnode = srecv
+                        rty = fg
+                    }
+                    bs := storage_src(ck, rnode, rty, env)
+                    if bs >= 0 {
+                        ck.ptaint = bs
+                    }
                 }
-                bs := storage_src(ck, rnode, rty, env)
-                if bs >= 0 && taint_may(ck, sig.ret1) == 1 {
-                    ck.ptaint = bs
-                }
+            }
+            if ck.ptaint < 0 && rtain >= 0 {
+                ck.ptaint = rtain
             }
         }
         if sig.retk == 0 {
@@ -4831,6 +5170,12 @@ fn call(ck: mut Ck, f: ref parser.Node, args: ref parser.NList, env: mut Env) ->
         r1 := sig.ret1
         if sig.typarams != nil {
             r1 = subst_ty(ck, r1, bind)
+        }
+        // a call result that can retain a borrowed argument stays
+        // borrow-carrying — bufio.newreader(buf.asreader()) must not
+        // launder the local buffer through into_reader
+        if ck.ptaint < 0 && atain >= 0 && taint_may(ck, r1) == 1 {
+            ck.ptaint = atain
         }
         if sig.retk == 1 {
             return r1
@@ -5004,7 +5349,11 @@ fn stmt(ck: mut Ck, s: ref parser.Node, env: mut Env) {
                 if vtaint >= 0 {
                     rt2 := taint_root(target)
                     if len(rt2) > 0 {
-                        env_taint_set(env, rt2, vtaint)
+                        if scope_of(env, rt2) < 0 && env_get(ck, env, rt2) >= 0 {
+                            diag(ck, "check", "assignment to `" + rt2 + "` escapes a borrow of local `" + taint_src(ck, vtaint) + "` — it dangles when the scope ends")
+                        } else {
+                            env_taint_set(env, rt2, vtaint)
+                        }
                     }
                 }
             } else {
@@ -5887,8 +6236,11 @@ fn sel_stmt(ck: mut Ck, arms: ref parser.NList, env: mut Env) {
     }
     has_else := false
     tmo := 0
+    bpre := borr_save(env)
+    let bst: own BArmSt = nil
     l := arms
     for l != nil {
+        borr_restore(env, ll_clone(bpre))
         env_push(env)
         match l.v {
             parser.Node.SArm{kind, ch, bind, ms, body} => {
@@ -5957,7 +6309,16 @@ fn sel_stmt(ck: mut Ck, arms: ref parser.NList, env: mut Env) {
             }
         }
         env_pop(env)
+        bc := new(BArmSt)
+        bc.st = borr_save(env)
+        bc.next = bst
+        bst = bc
         l = l.next
+    }
+    borr_restore(env, bpre)
+    for bst != nil {
+        borr_union(env, bst.st)
+        bst = bst.next
     }
     if has_else && tmo > 0 {
         diag(ck, "check", "`else` makes `timeout` unreachable — drop one")

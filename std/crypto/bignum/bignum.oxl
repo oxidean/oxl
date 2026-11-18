@@ -10,8 +10,10 @@ package bignum
 // is public only because the language has no internal-package rule;
 // std/crypto/rsa (X3) and std/crypto/nistec (X4) consume it.
 //
-// Divide by zero traps (contract violation, same posture as
-// encoding/binary's bounds need); every other entry point is total.
+// Contract traps — call-site obligations, same posture as
+// encoding/binary's bounds need: divmod/divmod_small on a zero
+// divisor, sub with a < b, from_int with v < 0, and to_be_bytes
+// when a does not fit k bytes. Every other entry point is total.
 import "std/errors"
 
 import "std/slices"

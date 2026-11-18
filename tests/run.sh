@@ -416,13 +416,15 @@ for t in test_hkdf; do
 done
 
 echo "== oxl test: bignum+rsa (x3) =="
-out=$("$OXL" test tests/bignum_test.oxl)
+out=$("$OXL" test tests/bignum_test.oxl) || { printf '%s
+' "$out" >&2; exit 1; }
 printf '%s
 ' "$out" >&2
 for t in test_modmul test_modexp test_modinv; do
     grep -q "$t ... ok" <<<"$out" || { echo "FAIL bignum: $out"; exit 1; }
 done
-out=$("$OXL" test tests/rsa_test.oxl)
+out=$("$OXL" test tests/rsa_test.oxl) || { printf '%s
+' "$out" >&2; exit 1; }
 printf '%s
 ' "$out" >&2
 for t in test_rsav15 test_rsapss; do

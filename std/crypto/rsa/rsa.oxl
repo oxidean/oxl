@@ -41,20 +41,23 @@ fn der_tlv(der: []byte, off: int) -> [TLV, err] {
         if nb == 0 {
             return z, errors.new("rsa: indefinite der length")
         }
-        if nb > 8 || off + nb > len(der) {
+        if nb > 4 || off + nb > len(der) {
             return z, errors.new("rsa: bad der length")
+        }
+        if der[off] == 0 {
+            return z, errors.new("rsa: non-minimal der length")
         }
         i := 0
         for i < nb {
             ln = ln * 256 + der[off + i]
             i = i + 1
         }
-        if ln < 0 || ln < 128 {
-            return z, errors.new("rsa: non-minimal or overflowing der length")
+        if ln < 128 {
+            return z, errors.new("rsa: non-minimal der length")
         }
         off = off + nb
     }
-    if off + ln > len(der) {
+    if ln > len(der) - off {
         return z, errors.new("rsa: der length overflows input")
     }
     return TLV{tag: tag, off: off, len: ln}, nil
@@ -119,10 +122,32 @@ fn parse_pub_key(der: []byte) -> [PubKey, err] {
     }
     n := bignum.from_be_bytes(der[nw.off:nw.off + nw.len])
     e := bignum.from_be_bytes(der[ew.off:ew.off + ew.len])
-    if bignum.is_zero(n) || bignum.is_zero(e) {
-        return z, errors.new("rsa: zero modulus or exponent")
+    ce := check_pub(n, e)
+    if ce != nil {
+        return z, ce
     }
     return PubKey{n: n, e: e}, nil
+}
+
+// check_pub bounds key parameters before they reach modexp — a
+// verifier treats key material as untrusted wire input: e = 1
+// makes verify a no-op (any "signature" is the publicly
+// computable EM), an even e is not a valid RSA exponent, and
+// unbounded bit sizes are a cpu-hang DoS (modexp costs
+// O(bitlen(e)) modmuls over bitlen(n) limbs). The odd-e >= 3 rule
+// matches RFC 8017's parameter range; the 64-bit exponent and
+// 8192-bit modulus ceilings match common-verifier practice.
+fn check_pub(n: []int, e: []int) -> err {
+    if bignum.is_zero(n) || bignum.is_zero(e) {
+        return errors.new("rsa: zero modulus or exponent")
+    }
+    if e[0] % 2 == 0 || bignum.cmp(e, bignum.from_int(3)) < 0 {
+        return errors.new("rsa: public exponent out of range")
+    }
+    if bignum.bitlen(e) > 64 || bignum.cmp(e, n) >= 0 || bignum.bitlen(n) > 8192 {
+        return errors.new("rsa: key parameters out of range")
+    }
+    return nil
 }
 
 // digest runs hf over msg — Hash.sum(nil) is the one-shot form
@@ -251,6 +276,7 @@ fn mgf1(hf: fn() -> hash.Hash, seed: []byte, outlen: int) -> own []byte {
         binary.put_be_u32(cb, 0, ctr)
         [w2, e2] = h.write(cb)
         d := h.sum(nil)
+        assert(len(d) > 0)
         i := 0
         for got < outlen && i < len(d) {
             out[got] = d[i]
@@ -268,8 +294,9 @@ fn mgf1(hf: fn() -> hash.Hash, seed: []byte, outlen: int) -> own []byte {
 /// content — hashed here with hf (sha256.new, sha512.new384,
 /// sha512.new — the DigestInfo table's only entries).
 fn verify_v15(pk: PubKey, hf: fn() -> hash.Hash, msg: []byte, sig: []byte) -> err {
-    if bignum.is_zero(pk.n) || bignum.is_zero(pk.e) {
-        return errors.new("rsa: empty key")
+    ce := check_pub(pk.n, pk.e)
+    if ce != nil {
+        return ce
     }
     k := (bignum.bitlen(pk.n) + 7) / 8
     if len(sig) != k {
@@ -306,19 +333,24 @@ fn verify_v15(pk: PubKey, hf: fn() -> hash.Hash, msg: []byte, sig: []byte) -> er
     if em[ps_end] != 0 {
         return errors.new("rsa: missing v1.5 separator")
     }
+    // constant-fold compares — no early exit on first mismatch
+    diff := 0
     i = 0
     for i < plen {
-        if em[ps_end + 1 + i] != pbuf[i] {
-            return errors.new("rsa: digestinfo prefix mismatch")
-        }
+        diff = diff | em[ps_end + 1 + i] ^ pbuf[i]
         i = i + 1
     }
+    if diff != 0 {
+        return errors.new("rsa: digestinfo prefix mismatch")
+    }
+    diff = 0
     i = 0
     for i < hlen {
-        if em[k - hlen + i] != mhash[i] {
-            return errors.new("rsa: digest mismatch")
-        }
+        diff = diff | em[k - hlen + i] ^ mhash[i]
         i = i + 1
+    }
+    if diff != 0 {
+        return errors.new("rsa: digest mismatch")
     }
     return nil
 }
@@ -330,8 +362,9 @@ fn verify_v15(pk: PubKey, hf: fn() -> hash.Hash, msg: []byte, sig: []byte) -> er
 /// CertificateVerify caller passes the hash length); saltlen < 0
 /// accepts whatever the signer encoded — x509's generic path.
 fn verify_pss(pk: PubKey, hf: fn() -> hash.Hash, msg: []byte, sig: []byte, saltlen: int) -> err {
-    if bignum.is_zero(pk.n) || bignum.is_zero(pk.e) {
-        return errors.new("rsa: empty key")
+    ce := check_pub(pk.n, pk.e)
+    if ce != nil {
+        return ce
     }
     k := (bignum.bitlen(pk.n) + 7) / 8
     if len(sig) != k {
@@ -394,12 +427,15 @@ fn verify_pss(pk: PubKey, hf: fn() -> hash.Hash, msg: []byte, sig: []byte, saltl
     [w2, e2] = h2.write(mhash)
     [w3, e3] = h2.write(salt)
     hp := h2.sum(nil)
+    // constant-fold compare — no early exit on first mismatch
+    diff := 0
     i = 0
     for i < hlen {
-        if em[mlen + i] != hp[i] {
-            return errors.new("rsa: pss hash mismatch")
-        }
+        diff = diff | em[mlen + i] ^ hp[i]
         i = i + 1
+    }
+    if diff != 0 {
+        return errors.new("rsa: pss hash mismatch")
     }
     return nil
 }

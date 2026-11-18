@@ -23,6 +23,13 @@ import "std/testing"
 import "std/time"
 
 // fixture loads a hex file under tests/fixtures/rsa/
+// hx decodes a hex literal — DER fragment helper
+fn hx(s: str) -> own []byte {
+    [b, e] = hex.decode(s)
+    testing.expect(e == nil, "hex decode")
+    return b
+}
+
 fn fixture(name: str) -> own []byte {
     s := strings.trim(os.readfile_("tests/fixtures/rsa/" + name))
     testing.expect(len(s) > 0, "fixture missing " + name)
@@ -75,6 +82,17 @@ fn test_rsav15() {
     e = rsa.verify_v15(pk, sha256.new, msg, bad2[0:100])
     testing.expect(e != nil, "v15 short signature accepted")
 
+    // s >= n rejects — a signature integer at or above the modulus
+    // is not a valid RSA representative (all-ff is always >= n)
+    huge := mkslice(byte, len(bad2))
+    i := 0
+    for i < len(huge) {
+        huge[i] = 255
+        i = i + 1
+    }
+    e = rsa.verify_v15(pk, sha256.new, msg, huge)
+    testing.expect(e != nil, "v15 s >= n accepted")
+
     // wrong message rejects
     e = rsa.verify_v15(pk, sha256.new, fixture("pub4096.hex"), fixture("sig_v15_sha256.hex"))
     testing.expect(e != nil, "v15 wrong-message accepted")
@@ -82,6 +100,21 @@ fn test_rsav15() {
     // garbage DER is a parse error, not a trap
     [_z, pe] = rsa.parse_pub_key(fixture("msg.hex"))
     testing.expect(pe != nil, "garbage key parsed")
+
+    // parameter validation: e = 1 would make verify a universal
+    // forgery, even e is invalid, e >= n is out of range, and
+    // oversized exponents are a cpu-hang DoS — all reject at parse
+    [_z2, pe2] = rsa.parse_pub_key(hx("300602010b020101"))
+    testing.expect(pe2 != nil, "e=1 key parsed")
+    [_z3, pe3] = rsa.parse_pub_key(hx("3006020111020104"))
+    testing.expect(pe3 != nil, "even-e key parsed")
+    [_z4, pe4] = rsa.parse_pub_key(hx("3006020103020105"))
+    testing.expect(pe4 != nil, "e >= n key parsed")
+    [_z5, pe5] = rsa.parse_pub_key(hx("300e0201110209010000000000000001"))
+    testing.expect(pe5 != nil, "65-bit-e key parsed")
+    // non-minimal DER length (leading-zero long form) rejects
+    [_z6, pe6] = rsa.parse_pub_key(hx("3082000602010b020101"))
+    testing.expect(pe6 != nil, "non-minimal der length parsed")
 }
 
 fn test_rsapss() {

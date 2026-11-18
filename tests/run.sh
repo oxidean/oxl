@@ -1526,7 +1526,7 @@ cgen() {  # cgen <src> <name> — emit C via codegen.oxl, compile it
     grep -q 'rt_csrand(' "$cgen_dir/$2.c" && { cdef="-DOXL_CRYPTO"; clib="$CRYPTO_LIBS"; }
     "$CC" -O2 $THREAD_FLAG -Iruntime $def $net $mdef $cdef "$cgen_dir/$2.c" runtime/rt.c $lib $mlib $clib $NET_LIBS -o "$cgen_dir/$2$EXE" || { echo "FAIL codegen cc $1"; exit 1; }
 }
-for f in examples/hello.oxl examples/features.oxl tests/match.oxl tests/chanbuf.oxl tests/methods.oxl tests/pairfwd.oxl; do
+for f in examples/hello.oxl examples/features.oxl tests/match.oxl tests/chanbuf.oxl tests/methods.oxl tests/pairfwd.oxl tests/iface_susp.oxl tests/iface_susp_shim.oxl tests/iface_susp_pair.oxl tests/iface_susp_nested.oxl tests/iface_susp_rewrap.oxl tests/iface_susp_prop.oxl; do
     n=$(basename "$f" .oxl)
     cgen "$f" "$n"
     got=$("$cgen_dir/$n$EXE")
@@ -2180,6 +2180,16 @@ out=$("$OXL" run tests/js_ident.oxl)
 out=$("$OXL" run tests/susp_ownarg.oxl)
 [ "$(tail -1 <<<"$out")" = "susp ownarg ok" ] || { echo "FAIL susp_ownarg: $out"; exit 1; }
 
+echo "== susp iface vtable (descriptor ABI) =="
+# susp-declared iface methods dispatch through RtSuspDesc slots
+# (make/poll/res_off) — sync impls ride ready-shim frames, pair rets
+# read through res_off, rewraps forward the inner pair's descriptor,
+# and susp reaches callers by declaration through the fixpoint
+for t in iface_susp iface_susp_shim iface_susp_pair iface_susp_nested iface_susp_rewrap iface_susp_prop; do
+    out=$("$OXL" run tests/$t.oxl)
+    [ "$(tail -1 <<<"$out")" = "${t//_/ } ok" ] || { echo "FAIL $t: $out"; exit 1; }
+done
+
 echo "== g1 gui: mock backend + cancel gate =="
 out=$("$OXL" run tests/gui_mock.oxl)
 [ "$(tail -1 <<<"$out")" = "done" ] || { echo "FAIL gui_mock: $out"; exit 1; }
@@ -2786,7 +2796,7 @@ if command -v node >/dev/null 2>&1; then
     # each file's last-line success marker is grepped — an err-path
     # regression that prints + exits 0 (gui_dom's `run err:` shape)
     # can't pass silently
-    for f in conc_ping conc_scale select select_fair chan_own chanbuf chanbuf_close scope_exit orphan_join defer_order pairfwd match methods fnval d5_qual stdmods_test susp_closure closure_mcall closure_fnfield closure_shadow zero_str susp_ownarg gui_mock gui_lifecycle gui_overflow gui_select gui_stress gui_cancel gui_dom gui_delay_stop js_ident; do
+    for f in conc_ping conc_scale select select_fair chan_own chanbuf chanbuf_close scope_exit orphan_join defer_order pairfwd match methods fnval d5_qual stdmods_test susp_closure closure_mcall closure_fnfield closure_shadow zero_str susp_ownarg iface_susp iface_susp_shim iface_susp_pair iface_susp_nested iface_susp_rewrap iface_susp_prop gui_mock gui_lifecycle gui_overflow gui_select gui_stress gui_cancel gui_dom gui_delay_stop js_ident; do
         case "$f" in
             conc_ping)      marker='bounces=' ;;
             conc_scale)     marker='done' ;;
@@ -2819,6 +2829,12 @@ if command -v node >/dev/null 2>&1; then
             gui_delay_stop) marker='delay stop ok' ;;
             js_ident)       marker='js ident ok' ;;
             susp_ownarg)    marker='susp ownarg ok' ;;
+            iface_susp)         marker='iface susp ok' ;;
+            iface_susp_shim)    marker='iface susp shim ok' ;;
+            iface_susp_pair)    marker='iface susp pair ok' ;;
+            iface_susp_nested)  marker='iface susp nested ok' ;;
+            iface_susp_rewrap)  marker='iface susp rewrap ok' ;;
+            iface_susp_prop)    marker='iface susp prop ok' ;;
         esac
         out=$(with_timeout 60 "$SELFOXL" run --target js "tests/$f.oxl" 2>&1) || { echo "FAIL js lane $f: $out"; exit 1; }
         grep -q "$marker" <<<"$out" || { echo "FAIL js lane $f marker '$marker': $out"; exit 1; }

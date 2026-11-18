@@ -1,0 +1,14 @@
+package main
+
+interface Waiter { wait() }
+
+struct S { n: int }
+
+fn (s S) wait() {
+    sleep(1)
+}
+
+fn main() {
+    s := S{n: 0}
+    s.wait()
+}

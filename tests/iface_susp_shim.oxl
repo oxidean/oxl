@@ -1,0 +1,42 @@
+package main
+
+// a sync impl may satisfy a susp-declared iface method — its vtab
+// slot wraps a ready-shim frame: poll runs the plain fn once, stores
+// the result, and reports READY, so susp callers see one ABI.
+interface Port { susp ping(), susp send(s: str) -> int }
+
+struct Fast { n: int }
+
+fn (f mut Fast) ping() {
+    f.n = f.n + 1
+}
+
+fn (f mut Fast) send(s: str) -> int {
+    return f.n + len(s)
+}
+
+// susp impls dispatch the same slot shape — no shim needed
+struct Slow { n: int }
+
+fn (s mut Slow) ping() {
+    sleep(1)
+    s.n = s.n + 1
+}
+
+fn (s mut Slow) send(x: str) -> int {
+    sleep(1)
+    return s.n + len(x)
+}
+
+fn use(w: Port) -> int {
+    w.ping()
+    return w.send("abcd")
+}
+
+fn main() {
+    f := Fast{n: 2}
+    s := Slow{n: 3}
+    println(itoa(use(f)))
+    println(itoa(use(s)))
+    println("iface susp shim ok")
+}

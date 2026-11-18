@@ -126,14 +126,25 @@ fn bearer_auth(token: str) -> Header {
 /// a redirect loop can't spin forever
 let CLIENT_REDIRECTS = 10
 
-/// proxy_from_env reads the proxy environment for host — HTTP_PROXY
-/// then http_proxy; NO_PROXY/no_proxy is a comma-separated suffix
-/// list (".internal.example" or "example.com" both match subdomains).
-/// "" means connect directly.
-fn proxy_from_env(host: str) -> str {
-    p := os.getenv("HTTP_PROXY")
-    if len(p) == 0 {
-        p = os.getenv("http_proxy")
+/// proxy_from_env reads the proxy environment for host — curl's
+/// convention: plain http consults HTTP_PROXY then http_proxy; a
+/// secure URL consults https_proxy then HTTPS_PROXY only (an
+/// HTTP_PROXY setting never covers https — CONNECT-less forwarding
+/// would be cleartext, so going direct is honest). NO_PROXY/no_proxy
+/// is a comma-separated suffix list (".internal.example" or
+/// "example.com" both match subdomains). "" means connect directly.
+fn proxy_from_env(host: str, secure: int) -> str {
+    p := ""
+    if secure != 0 {
+        p = os.getenv("https_proxy")
+        if len(p) == 0 {
+            p = os.getenv("HTTPS_PROXY")
+        }
+    } else {
+        p = os.getenv("HTTP_PROXY")
+        if len(p) == 0 {
+            p = os.getenv("http_proxy")
+        }
     }
     if len(p) == 0 {
         return ""
@@ -809,7 +820,7 @@ fn (cl ref Client) do_once(req: Request) -> [Response, err] {
     // is an HTTPS concern).
     pxy := req.proxy
     if len(pxy) == 0 {
-        pxy = proxy_from_env(u.host)
+        pxy = proxy_from_env(u.host, u.secure)
     }
     target_host := u.host
     target_port := u.port

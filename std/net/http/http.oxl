@@ -378,8 +378,9 @@ fn serve(port: int, h: Handler) {
 struct Url { host: str, port: int, path: str, secure: int }
 
 /// `[http|https]://host[:port][/path]` — IPv4 or host names net.dial
-/// accepts. Anything else (other schemes, userinfo) is an err, not a
-/// silent misparsed request
+/// accepts. Other schemes are an err, not a silent misparsed request.
+/// userinfo is not special-cased: `https://u@h/` parses host="u@h"
+/// and fails downstream at dial/hostname-verify
 fn parse_url(url: str) -> [Url, err] {
     bad := Url{host: "", port: 0, path: "", secure: 0}
     u := url

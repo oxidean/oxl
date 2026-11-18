@@ -55,6 +55,13 @@ fn live_port() -> int {
     return atoi(os.getenv("OXL_HTTPS_TEST_PORT"))
 }
 
+// the harness prints `name ... ok` for an early return, which reads
+// identically to a real pass — emit a greppable skip marker so lane
+// output shows which lanes actually exercised the live path
+fn live_skip() {
+    println("https live skip: OXL_HTTPS_TEST_PORT unset")
+}
+
 fn live_cfg() -> tls.Config {
     cfg := tls.default_cfg()
     cafile := os.getenv("OXL_HTTPS_TEST_CA")
@@ -72,6 +79,7 @@ fn live_url(port: int) -> str {
 fn test_https_get() {
     port := live_port()
     if port == 0 {
+        live_skip()
         return // openssl interop lane offline
     }
     cl := http.Client{tmo: 15000, tlscfg: live_cfg()}
@@ -89,6 +97,7 @@ fn test_https_get() {
 fn test_https_bad_cert() {
     port := live_port()
     if port == 0 {
+        live_skip()
         return // openssl interop lane offline
     }
     cfg := live_cfg()
@@ -108,6 +117,7 @@ fn test_https_bad_cert() {
 fn test_https_wrong_name() {
     port := live_port()
     if port == 0 {
+        live_skip()
         return // openssl interop lane offline
     }
     cfg := live_cfg()
@@ -117,4 +127,28 @@ fn test_https_wrong_name() {
     testing.expect(e != nil, "wrong name must fail")
     testing.expect(errors.is(e, x509.err_name()), "verdict is err_name")
     testing.expect_eq(r.status, 0, "no response on trust failure")
+}
+
+fn test_https_redirect_noleak() {
+    // a TLS 302 down to cleartext is a scheme hop — same_origin's
+    // secure term must strip authorization/cookie before the request
+    // reaches the plain-HTTP capture endpoint
+    rport := atoi(os.getenv("OXL_HTTPS_TEST_REDIR_PORT"))
+    capfile := os.getenv("OXL_HTTPS_TEST_CAPTURE_FILE")
+    if rport == 0 || len(capfile) == 0 {
+        live_skip()
+        return
+    }
+    rq := http.request_get("https://127.0.0.1:" + itoa(rport) + "/")
+    rq.headers = push(rq.headers, http.bearer_auth("sekrit-token"))
+    cl := http.Client{tmo: 15000, tlscfg: live_cfg()}
+    [r, e] = cl.do(rq)
+    if e != nil {
+        testing.expect(false, "https redirect: " + errors.msg(e))
+        return
+    }
+    testing.expect_eq(r.status, 200, "redirect followed to capture")
+    got := os.readfile_(capfile)
+    testing.expect(!strings.contains(got, "authorization") && !strings.contains(got, "Authorization"), "authorization header stripped on scheme hop")
+    testing.expect(!strings.contains(got, "sekrit-token"), "bearer token absent from downgrade hop")
 }

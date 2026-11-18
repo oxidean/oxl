@@ -174,10 +174,10 @@ struct Client { tmo: int, tlscfg: tls.Config }
 new_client(tmo) -> Client        // tlscfg = tls.default_cfg()
 ```
 
-A secure URL dials `tls.dial_timeout(host, port, cl.tmo, cl.tlscfg)`;
-the client's budget bounds the TCP connect and doubles as the
-handshake-flight receive timeout. Two defaults are applied per
-request, never to the caller's Config: `server_name` fills from the
+A secure URL dials `tls.dial_timeout(host, port, cl.tmo, cfg)` where
+`cfg` is a per-request copy of `cl.tlscfg`; the client's budget bounds
+the TCP connect and doubles as the handshake-flight receive timeout.
+Two defaults are applied per request, never to the caller's Config: `server_name` fills from the
 URL host when empty (IP literals included — the iPAddress SAN check
 needs them) and `alpn` fills to `["http/1.1"]` when empty. The
 `host:` header appends `:port` only when the port differs from the

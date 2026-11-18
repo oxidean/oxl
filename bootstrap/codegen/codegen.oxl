@@ -179,6 +179,7 @@ struct G {
     fnv: own check.SList, // named fns needing zero-env wrappers
     fdecls: []str, // collected "cty vN;" frame fields
     sdecls: []str, // "RtScope scN;" frame fields
+    vdecls: []str, // "const RtSuspDesc *vsdN;" susp-vtab descriptor fields
     states: []int, // resume labels used in this frame
     loops: []GLab, // (continue, break) label stack
     sopen: []int, // sdecls indices of scopes open at this emission point
@@ -186,6 +187,7 @@ struct G {
     scopen: int,
     cln: int,
     staten: int,
+    vsdn: int,
     labeln: int,
     hoistn: int,
     retk: int, // current fn ret kind (2 = [T, err])
@@ -2007,6 +2009,9 @@ fn g_call_susp(g: mut G, e: ref parser.Node) -> str {
                 return qn
             }
             cp := gcall_plan(g, f, args)
+            if cp.k == 2 && check.sl_has(g.ck.susp, cp.w + "." + cp.mname) {
+                return "vtab"
+            }
             if cp.k != 1 || !check.sl_has(g.ck.susp, cp.q) {
                 return ""
             }
@@ -3175,6 +3180,41 @@ fn gav_decl(g: mut G, args: ref parser.NList, fi: int, bind: ref collections.Map
     return head
 }
 
+// arg fills against an explicit IList signature — susp-vtab calls
+// conv through the iface-declared params (no callee decl to read);
+// hoist 2 marks the own->mut/ref borrows like gav_decl's susp arm
+fn gav_ps(g: mut G, args: ref parser.NList, ps: ref check.IList) -> own GAv {
+    let head: own GAv = nil
+    let tail: own GAv = nil
+    il := ps
+    al := args
+    for al != nil {
+        v := gx(g, al.v)
+        apre := ""
+        apost := ""
+        if il != nil {
+            o := garg_c(g, al.v, v, il.v, nil, 2)
+            v = o.v
+            apre = o.pre
+            apost = o.post
+            il = il.next
+        }
+        c := new(GAv)
+        c.v = v
+        c.pre = apre
+        c.post = apost
+        if head == nil {
+            head = c
+            tail = c
+        } else {
+            tail.next = c
+            tail = tail.next
+        }
+        al = al.next
+    }
+    return head
+}
+
 // destructor thunk symbol for a `chan own T` payload; registers the
 // underlying type (and every own field reachable from it) so
 // gemit_drops writes each o_drop_<n> once. Non-struct payloads get the
@@ -4204,6 +4244,10 @@ fn gsusp_ret(g: mut G, code: str) {
 // PENDING/CANCEL, bind the result on READY (seed fsusp_call)
 // dk: 0 void, 1 frame-field(da), 2 assign-target(da), 3 pair(da,db; ""=blank)
 fn gfsusp_call(g: mut G, call: ref parser.Node, name: str, dk: int, da: str, db: str) {
+    if name == "vtab" {
+        gfsusp_vcall(g, call, dk, da, db)
+        return
+    }
     cn := cname(name)
     frty := "o_frm_" + cn
     // re-plan for the base qn + decl-aware arg fills (recv adapts,
@@ -4275,6 +4319,86 @@ fn gfsusp_call(g: mut G, call: ref parser.Node, name: str, dk: int, da: str, db:
     }
     wln(g, "      free(fr->child);")
     wln(g, "    }")
+}
+
+// suspend point for a susp iface-method call: the vtab slot carries
+// an RtSuspDesc — stash it in the frame (the receiver temp may not
+// outlive the suspension), make the child via desc->make, poll via
+// desc->poll, and read the result through res_off on READY
+fn gfsusp_vcall(g: mut G, call: ref parser.Node, dk: int, da: str, db: str) {
+    match call {
+        parser.Node.Call{f, args} => {
+            cp := gcall_plan(g, f, args)
+            if cp.k != 2 {
+                return
+            }
+            let argvs: own GAv = gav_ps(g, args, cp.ps)
+            bo := gav_borrows(argvs)
+            n := g.vsdn
+            g.vsdn = g.vsdn + 1
+            g.vdecls = push(g.vdecls, "const RtSuspDesc *vsd" + itoa(n) + ";")
+            ov := ""
+            match f {
+                parser.Node.Field{obj} => {
+                    ov = gx(g, obj)
+                }
+                _ => {
+                }
+            }
+            // make's signature is the iface-declared param list with
+            // the erased data ptr first — the plain slot call's shape
+            sig := "void*"
+            il := cp.ps
+            for il != nil {
+                sig = sig + ", " + gcty(g, il.v)
+                il = il.next
+            }
+            argl := ""
+            av := argvs
+            for av != nil {
+                argl = argl + ", " + av.v
+                av = av.next
+            }
+            if len(bo.pre) > 0 {
+                wln(g, "    " + bo.pre)
+            }
+            k := g.staten
+            g.staten = g.staten + 1
+            g.states = push(g.states, k)
+            wln(g, "    { RtIface _iv = " + ov + ";")
+            wln(g, "      fr->vsd" + itoa(n) + " = (const RtSuspDesc *)_iv.vtab[" + itoa(cp.midx) + "];")
+            wln(g, "      { RtFrame *_c = ((RtFrame *(*)(" + sig + "))fr->vsd" + itoa(n) + "->make)(_iv.data" + argl + ");")
+            wln(g, "        fr->child = _c; fr->state = " + itoa(k) + ";")
+            wln(g, "      }")
+            wln(g, "    s" + itoa(k) + ": ;")
+            wln(g, "      _p = fr->vsd" + itoa(n) + "->poll(fr->child, task);")
+            wln(g, "      if (_p != RT_READY) { fr->cur_scope = tls_scope; tls_scope = saved; return _p; }")
+            if len(bo.post) > 0 {
+                wln(g, "      " + bo.post)
+            }
+            if dk == 1 {
+                wln(g, "      fr->" + da + " = *(" + gcty(g, cp.r1) + " *)((char *)fr->child + fr->vsd" + itoa(n) + "->res_off);")
+            }
+            if dk == 2 {
+                wln(g, "      " + da + " = *(" + gcty(g, cp.r1) + " *)((char *)fr->child + fr->vsd" + itoa(n) + "->res_off);")
+            }
+            if dk == 3 {
+                vrt := "struct o_vret_" + cname(cp.w) + "_" + cname(cp.mname)
+                wln(g, "      { " + vrt + " _r = *(" + vrt + " *)((char *)fr->child + fr->vsd" + itoa(n) + "->res_off);")
+                if len(da) > 0 {
+                    wln(g, "        fr->" + da + " = _r.val;")
+                }
+                if len(db) > 0 {
+                    wln(g, "        fr->" + db + " = _r.err;")
+                }
+                wln(g, "      }")
+            }
+            wln(g, "      free(fr->child);")
+            wln(g, "    }")
+        }
+        _ => {
+        }
+    }
 }
 
 // leaf suspends: recv/send/sleep park on the chan/timer wait queue
@@ -5042,8 +5166,10 @@ fn gframe(g: mut G, qn: str, recv: ref parser.Node, params: ref parser.NList, re
     check.env_push(g.fsl)
     g.fdecls = mkslice(str, 0)
     g.sdecls = mkslice(str, 0)
+    g.vdecls = mkslice(str, 0)
     g.states = mkslice(int, 0)
     g.staten = 1
+    g.vsdn = 0
     g.loops = mkslice(GLab, 0)
     g.sopen = mkslice(int, 0)
     g.defers = nil
@@ -5109,8 +5235,14 @@ fn gframe(g: mut G, qn: str, recv: ref parser.Node, params: ref parser.NList, re
         sdj = sdj + g.sdecls[i] + " "
         i = i + 1
     }
+    vdj := ""
+    i = 0
+    for i < len(g.vdecls) {
+        vdj = vdj + g.vdecls[i] + " "
+        i = i + 1
+    }
     ce := cname(qn)
-    g.fhead = push(g.fhead, "struct o_frm_" + ce + " { RtScope *cur_scope; int state; RtFrame *child; RtDefer *_dmark;" + res + pfields + " " + fdj + " " + sdj + "};\nint o_poll_" + ce + "(RtFrame *_f, RtTask *task);\n")
+    g.fhead = push(g.fhead, "struct o_frm_" + ce + " { RtScope *cur_scope; int state; RtFrame *child; RtDefer *_dmark;" + res + pfields + " " + fdj + " " + sdj + " " + vdj + "};\nint o_poll_" + ce + "(RtFrame *_f, RtTask *task);\n")
     g.fbody = push(g.fbody, "int o_poll_" + ce + "(RtFrame *_f, RtTask *task) {\n    struct o_frm_" + ce + " *fr = (struct o_frm_" + ce + " *)_f;\n    RtScope *saved = tls_scope;\n    tls_scope = fr->cur_scope;\n    int _p;\n    switch (fr->state) { " + cases + " default: tls_scope = saved; return RT_READY; }\n    s0: ;\n" + bodytxt + "    fr->cur_scope = tls_scope; tls_scope = saved; return RT_READY;\n}\n")
     g.inframe = 0
 }
@@ -5456,6 +5588,45 @@ fn gseed_vtab_insts(g: mut G) -> int {
     return progress
 }
 
+// "p_<decl-name> = <v>;" fills for a fn's recv + params as vout text —
+// the vsm make fns can't reuse gspawn_args (it emits via wln)
+fn gvsm_fills(g: mut G, fname: str, dst: str, rcvexpr: str) -> str {
+    fi := gfn_item(g, fname)
+    if fi < 0 || check.nk(g.its[fi].node) != 24 {
+        return ""
+    }
+    out := ""
+    match g.its[fi].node {
+        parser.Node.Fn{recv, params} => {
+            k := 0
+            if recv != nil {
+                match recv {
+                    parser.Node.Param{name} => {
+                        out = out + "    " + dst + "->p_" + name + " = " + rcvexpr + ";\n"
+                    }
+                    _ => {
+                    }
+                }
+            }
+            pl := params
+            for pl != nil {
+                match pl.v {
+                    parser.Node.Param{name} => {
+                        out = out + "    " + dst + "->p_" + name + " = a" + itoa(k) + ";\n"
+                        k = k + 1
+                    }
+                    _ => {
+                    }
+                }
+                pl = pl.next
+            }
+        }
+        _ => {
+        }
+    }
+    return out
+}
+
 // concrete vtabs + receiver-normalizing thunks for every (iface, impl)
 // pair a conversion site produced (seed emit_vtabs)
 fn gemvtab_one(g: mut G, vu: ref GVU) {
@@ -5486,76 +5657,220 @@ fn gemvtab_one(g: mut G, vu: ref GVU) {
                 il = il.next
                 k = k + 1
             }
-            g.vout = push(g.vout, "static " + ret_c + " " + tname + "(void* _d" + psig + ") {")
-            if len(impl) > 6 && substr(impl, 0, 6) == "iface:" {
-                // iface->iface rewrap: forward through the source
-                // pair's vtab (seed same-impl arm)
-                w2 := substr(impl, 6, len(impl))
-                j := gimidx(g, w2, m.n)
-                vsig := "void*"
-                il = m.params
-                for il != nil {
-                    vsig = vsig + ", " + gcty(g, il.v)
-                    il = il.next
+            slot := tname
+            if m.susp == 1 {
+                // susp-declared slot: an RtSuspDesc, not a thunk —
+                // susp impls point at their poll driver, sync impls
+                // get a ready-shim, iface rewraps forward the inner
+                // pair's desc
+                dtag := cname(w) + "_" + gvtkey(impl) + "_" + itoa(i)
+                msig := "void*"
+                il2 := m.params
+                for il2 != nil {
+                    msig = msig + ", " + gcty(g, il2.v)
+                    il2 = il2.next
                 }
-                if m.retk == 0 {
-                    g.vout = push(g.vout, "    RtIface *_iv = (RtIface*)_d;\n    ((void (*)(" + vsig + "))_iv->vtab[" + itoa(j) + "])(_iv->data" + argl + ");\n}\n")
-                }
+                rty := ""
                 if m.retk == 1 {
-                    g.vout = push(g.vout, "    RtIface *_iv = (RtIface*)_d;\n    return ((" + ret_c + " (*)(" + vsig + "))_iv->vtab[" + itoa(j) + "])(_iv->data" + argl + ");\n}\n")
+                    rty = gcty(g, m.ret1)
                 }
                 if m.retk == 2 {
-                    src := "struct o_vret_" + cname(w2) + "_" + cname(m.n)
-                    g.vout = push(g.vout, "    RtIface *_iv = (RtIface*)_d;\n    " + src + " _r = ((" + src + " (*)(" + vsig + "))_iv->vtab[" + itoa(j) + "])(_iv->data" + argl + ");\n    return (" + ret_c + "){ _r.val, _r.err };\n}\n")
+                    rty = "struct o_vret_" + cname(w) + "_" + cname(m.n)
                 }
-            } else {
-                // concrete impl — normalize the erased receiver to
-                // the method's declared receiver ty
-                fname := impl + "." + m.n
-                cn := "struct o_s_" + cname(impl)
-                if collections.map_has(g.ck.enums, impl) {
-                    cn = "struct o_en_" + cname(impl)
-                }
-                callee := "o_f_" + cname(fname)
-                let bind: own collections.Map = nil
-                mret := m.retk
-                mfi := gfn(g, fname)
-                if mfi >= 0 {
-                    mret = g.ck.fnsv[mfi].retk
-                    if g.ck.fnsv[mfi].typarams != nil {
+                if len(impl) > 6 && substr(impl, 0, 6) == "iface:" {
+                    w2 := substr(impl, 6, len(impl))
+                    j := gimidx(g, w2, m.n)
+                    wf := "struct o_wf_" + dtag
+                    res := ""
+                    roff := "0"
+                    if m.retk != 0 {
+                        res = " " + rty + " result;"
+                        roff = "offsetof(" + wf + ", result)"
+                    }
+                    g.vout = push(g.vout, wf + " { RtFrame _h; RtFrame *inner; const RtSuspDesc *isd;" + res + " };\n")
+                    g.vout = push(g.vout, "static RtFrame *o_wmk_" + dtag + "(void *_d" + psig + ") {\n    " + wf + " *_w = (" + wf + " *)malloc(sizeof(" + wf + "));\n    RtIface *_iv = (RtIface*)_d;\n    _w->isd = (const RtSuspDesc *)_iv->vtab[" + itoa(j) + "];\n    _w->inner = ((RtFrame *(*)(" + msig + "))_w->isd->make)(_iv->data" + argl + ");\n    ((RtFrame *)_w)->cur_scope = tls_scope; ((RtFrame *)_w)->state = 0;\n    return (RtFrame *)_w;\n}\n")
+                    pf := "static int o_wp_" + dtag + "(RtFrame *_f, RtTask *task) {\n    " + wf + " *_w = (" + wf + " *)_f;\n    int _p = _w->isd->poll(_w->inner, task);\n"
+                    if m.retk != 0 {
+                        pf = pf + "    if (_p == RT_READY) { _w->result = *(" + rty + " *)((char *)_w->inner + _w->isd->res_off); free(_w->inner); }\n"
+                    } else {
+                        pf = pf + "    if (_p == RT_READY) { free(_w->inner); }\n"
+                    }
+                    pf = pf + "    return _p;\n}\n"
+                    g.vout = push(g.vout, pf)
+                    g.vout = push(g.vout, "static const RtSuspDesc o_vsd_" + dtag + " = { o_wp_" + dtag + ", (void *)o_wmk_" + dtag + ", " + roff + " };\n")
+                    slot = "&o_vsd_" + dtag
+                } else {
+                    fname := impl + "." + m.n
+                    cn := "struct o_s_" + cname(impl)
+                    if collections.map_has(g.ck.enums, impl) {
+                        cn = "struct o_en_" + cname(impl)
+                    }
+                    mfi := gfn(g, fname)
+                    let bind: own collections.Map = nil
+                    ftag := fname
+                    if mfi >= 0 && g.ck.fnsv[mfi].typarams != nil {
                         bind = gvtab_bind(g, mfi, m)
                         if bind != nil {
-                            callee = "o_f_" + cname(ginst_name(g, fname, g.ck.fnsv[mfi].typarams, bind))
+                            ftag = ginst_name(g, fname, g.ck.fnsv[mfi].typarams, bind)
                         }
                     }
-                }
-                recv := "((" + cn + "*)_d)"
-                if mfi >= 0 && g.ck.fnsv[mfi].params != nil {
-                    rty := g.ck.fnsv[mfi].params.v
-                    if bind != nil {
-                        rty = check.subst_ty(g.ck, rty, bind)
+                    // erased-recv normalization — same shape the
+                    // o_vtt_ thunk would apply to _d
+                    recv := "((" + cn + "*)_d)"
+                    rcty := cn + "*"
+                    if mfi >= 0 && g.ck.fnsv[mfi].params != nil {
+                        rty0 := g.ck.fnsv[mfi].params.v
+                        if bind != nil {
+                            rty0 = check.subst_ty(g.ck, rty0, bind)
+                        }
+                        rk0 := tyk(g, rty0)
+                        if rk0 == check.k_struct() || rk0 == check.k_enum() {
+                            recv = "(*(" + cn + "*)_d)"
+                            rcty = cn
+                        }
                     }
-                    rk0 := tyk(g, rty)
-                    if rk0 == check.k_struct() || rk0 == check.k_enum() {
-                        recv = "(*(" + cn + "*)_d)"
+                    if check.sl_has(g.ck.susp, fname) {
+                        // susp impl — make fills a real o_frm_, the
+                        // desc points straight at its poll driver
+                        fcn := cname(ftag)
+                        frty := "struct o_frm_" + fcn
+                        roff := "0"
+                        if mfi >= 0 && g.ck.fnsv[mfi].retk != 0 {
+                            roff = "offsetof(" + frty + ", result)"
+                        }
+                        mk := "static RtFrame *o_vsm_" + dtag + "(void *_d" + psig + ") {\n    " + frty + " *_c = (" + frty + " *)malloc(sizeof(" + frty + "));\n    ((RtFrame *)_c)->cur_scope = tls_scope; ((RtFrame *)_c)->state = 0;\n"
+                        mk = mk + gvsm_fills(g, fname, "_c", recv)
+                        mk = mk + "    return (RtFrame *)_c;\n}\n"
+                        g.vout = push(g.vout, mk)
+                        g.vout = push(g.vout, "static const RtSuspDesc o_vsd_" + dtag + " = { o_poll_" + fcn + ", (void *)o_vsm_" + dtag + ", " + roff + " };\n")
+                    } else {
+                        // sync impl — ready-shim frame: its poll runs
+                        // the plain fn once, stores the result at
+                        // res_off, and returns RT_READY
+                        sh := "struct o_shf_" + dtag
+                        res := ""
+                        roff := "0"
+                        if m.retk != 0 {
+                            res = " " + rty + " result;"
+                            roff = "offsetof(" + sh + ", result)"
+                        }
+                        decl := sh + " { RtFrame _h;" + res + " " + rcty + " p_r;"
+                        il3 := m.params
+                        k3 := 0
+                        for il3 != nil {
+                            decl = decl + " " + gcty(g, il3.v) + " p_a" + itoa(k3) + ";"
+                            il3 = il3.next
+                            k3 = k3 + 1
+                        }
+                        decl = decl + " };\n"
+                        g.vout = push(g.vout, decl)
+                        mk := "static RtFrame *o_shm_" + dtag + "(void *_d" + psig + ") {\n    " + sh + " *_c = (" + sh + " *)malloc(sizeof(" + sh + "));\n    ((RtFrame *)_c)->cur_scope = tls_scope; ((RtFrame *)_c)->state = 0;\n    _c->p_r = " + recv + ";\n"
+                        il3 = m.params
+                        k3 = 0
+                        for il3 != nil {
+                            mk = mk + "    _c->p_a" + itoa(k3) + " = a" + itoa(k3) + ";\n"
+                            il3 = il3.next
+                            k3 = k3 + 1
+                        }
+                        mk = mk + "    return (RtFrame *)_c;\n}\n"
+                        g.vout = push(g.vout, mk)
+                        callee := "o_f_" + cname(ftag)
+                        cargs := "_c->p_r"
+                        il3 = m.params
+                        k3 = 0
+                        for il3 != nil {
+                            cargs = cargs + ", _c->p_a" + itoa(k3)
+                            il3 = il3.next
+                            k3 = k3 + 1
+                        }
+                        body := "static int o_shp_" + dtag + "(RtFrame *_f, RtTask *task) {\n    " + sh + " *_c = (" + sh + " *)_f;\n"
+                        if m.retk == 0 {
+                            body = body + "    " + callee + "(" + cargs + ");\n"
+                        }
+                        if m.retk == 1 {
+                            body = body + "    _c->result = " + callee + "(" + cargs + ");\n"
+                        }
+                        if m.retk == 2 {
+                            body = body + "    { struct o_ret_" + cname(ftag) + " _r = " + callee + "(" + cargs + ");\n      _c->result = (" + rty + "){ _r.val, _r.err }; }\n"
+                        }
+                        body = body + "    return RT_READY;\n}\n"
+                        g.vout = push(g.vout, body)
+                        g.vout = push(g.vout, "static const RtSuspDesc o_vsd_" + dtag + " = { o_shp_" + dtag + ", (void *)o_shm_" + dtag + ", " + roff + " };\n")
                     }
+                    slot = "&o_vsd_" + dtag
                 }
-                cargs := recv + argl
-                if mret == 0 {
-                    g.vout = push(g.vout, "    " + callee + "(" + cargs + ");\n}\n")
-                }
-                if mret == 1 {
-                    g.vout = push(g.vout, "    return " + callee + "(" + cargs + ");\n}\n")
-                }
-                if mret == 2 {
-                    rtag := substr(callee, 4, len(callee))
-                    g.vout = push(g.vout, "    struct o_ret_" + rtag + " _r = " + callee + "(" + cargs + ");\n    return (" + ret_c + "){ _r.val, _r.err };\n}\n")
+            } else {
+                g.vout = push(g.vout, "static " + ret_c + " " + tname + "(void* _d" + psig + ") {")
+                if len(impl) > 6 && substr(impl, 0, 6) == "iface:" {
+                    // iface->iface rewrap: forward through the source
+                    // pair's vtab (seed same-impl arm)
+                    w2 := substr(impl, 6, len(impl))
+                    j := gimidx(g, w2, m.n)
+                    vsig := "void*"
+                    il = m.params
+                    for il != nil {
+                        vsig = vsig + ", " + gcty(g, il.v)
+                        il = il.next
+                    }
+                    if m.retk == 0 {
+                        g.vout = push(g.vout, "    RtIface *_iv = (RtIface*)_d;\n    ((void (*)(" + vsig + "))_iv->vtab[" + itoa(j) + "])(_iv->data" + argl + ");\n}\n")
+                    }
+                    if m.retk == 1 {
+                        g.vout = push(g.vout, "    RtIface *_iv = (RtIface*)_d;\n    return ((" + ret_c + " (*)(" + vsig + "))_iv->vtab[" + itoa(j) + "])(_iv->data" + argl + ");\n}\n")
+                    }
+                    if m.retk == 2 {
+                        src := "struct o_vret_" + cname(w2) + "_" + cname(m.n)
+                        g.vout = push(g.vout, "    RtIface *_iv = (RtIface*)_d;\n    " + src + " _r = ((" + src + " (*)(" + vsig + "))_iv->vtab[" + itoa(j) + "])(_iv->data" + argl + ");\n    return (" + ret_c + "){ _r.val, _r.err };\n}\n")
+                    }
+                } else {
+                    // concrete impl — normalize the erased receiver to
+                    // the method's declared receiver ty
+                    fname := impl + "." + m.n
+                    cn := "struct o_s_" + cname(impl)
+                    if collections.map_has(g.ck.enums, impl) {
+                        cn = "struct o_en_" + cname(impl)
+                    }
+                    callee := "o_f_" + cname(fname)
+                    let bind: own collections.Map = nil
+                    mret := m.retk
+                    mfi := gfn(g, fname)
+                    if mfi >= 0 {
+                        mret = g.ck.fnsv[mfi].retk
+                        if g.ck.fnsv[mfi].typarams != nil {
+                            bind = gvtab_bind(g, mfi, m)
+                            if bind != nil {
+                                callee = "o_f_" + cname(ginst_name(g, fname, g.ck.fnsv[mfi].typarams, bind))
+                            }
+                        }
+                    }
+                    recv := "((" + cn + "*)_d)"
+                    if mfi >= 0 && g.ck.fnsv[mfi].params != nil {
+                        rty := g.ck.fnsv[mfi].params.v
+                        if bind != nil {
+                            rty = check.subst_ty(g.ck, rty, bind)
+                        }
+                        rk0 := tyk(g, rty)
+                        if rk0 == check.k_struct() || rk0 == check.k_enum() {
+                            recv = "(*(" + cn + "*)_d)"
+                        }
+                    }
+                    cargs := recv + argl
+                    if mret == 0 {
+                        g.vout = push(g.vout, "    " + callee + "(" + cargs + ");\n}\n")
+                    }
+                    if mret == 1 {
+                        g.vout = push(g.vout, "    return " + callee + "(" + cargs + ");\n}\n")
+                    }
+                    if mret == 2 {
+                        rtag := substr(callee, 4, len(callee))
+                        g.vout = push(g.vout, "    struct o_ret_" + rtag + " _r = " + callee + "(" + cargs + ");\n    return (" + ret_c + "){ _r.val, _r.err };\n}\n")
+                    }
                 }
             }
             if len(slots) > 0 {
                 slots = slots + ", "
             }
-            slots = slots + "(void*)" + tname
+            slots = slots + "(void*)" + slot
             ml = ml.next
             i = i + 1
         }
@@ -6039,6 +6354,7 @@ fn emit(r: own check.CkRes, testm: int) -> str {
     g.fnv = nil
     g.fdecls = mkslice(str, 0)
     g.sdecls = mkslice(str, 0)
+    g.vdecls = mkslice(str, 0)
     g.states = mkslice(int, 0)
     g.loops = mkslice(GLab, 0)
     g.sopen = mkslice(int, 0)

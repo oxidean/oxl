@@ -179,6 +179,16 @@ EOF
 diag=$("$OXL" build "$scratch/badchar.oxl" -o "$scratch/badchar$EXE" 2>&1 || true)
 grep -q "char literal" <<<"$diag" || { echo "FAIL charlit diag: $diag"; exit 1; }
 
+# a missing `:` between params used to parse as extra untyped params —
+# the separator is required so the signature fails loudly (#149)
+cat > "$scratch/badparam.oxl" <<'EOF'
+package main
+fn id(r io.Reader) -> int { return 0 }
+fn main() {}
+EOF
+diag=$("$OXL" build "$scratch/badparam.oxl" -o "$scratch/badparam$EXE" 2>&1 || true)
+grep -q "parameter list" <<<"$diag" || { echo "FAIL param-sep diag: $diag"; exit 1; }
+
 echo "== oxl test: util (s3) =="
 out=$("$OXL" test tests/util_test.oxl)
 printf '%s

@@ -7689,7 +7689,15 @@ struct o_s_parser_NList* o_f_parser_p_params(struct o_s_parser_PCur* c) {
     ty = o_f_parser_p_ty(c);
     }
     items = o_f_parser_ncons(o_f_parser_b((struct o_en_parser_Node){ .tag = 6, .u.v6 = (struct o_s_parser_Node_Param){ .f_name = name, .f_ty = ty, .f_lo = pm, .f_hi = c->f_phi } }), items);
-    o_f_parser_eat(c, rt_str_lit(","));
+    if ((!o_f_parser_eat(c, rt_str_lit(",")))) {
+    if ((!o_f_parser_at(c, rt_str_lit(")")))) {
+    if ((c->f_hush == 0LL)) {
+    rt_println_str(rt_str_lit("parse: expected `,` or `)` in parameter list"));
+    }
+    c->f_lex_err = 1LL;
+    }
+    break;
+    }
     }
     o_f_parser_eat(c, rt_str_lit(")"));
     rt_defer_drain_to(_dmark);

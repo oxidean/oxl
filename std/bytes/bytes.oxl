@@ -166,3 +166,33 @@ fn (b mut Buffer) aswriter() -> io.Writer {
 fn (b mut Buffer) asreadwriter() -> io.ReadWriter {
     return b
 }
+
+/// into_reader moves this Buffer to the heap and boxes it as an
+/// io.Reader — safe to return or store where `asreader`'s borrow
+/// would dangle. The receiver is consumed: don't use it afterwards.
+fn (b mut Buffer) into_reader() -> io.Reader {
+    h := new(Buffer)
+    h.buf = new(b.buf)
+    h.rd = b.rd
+    return h
+}
+
+/// into_writer moves this Buffer to the heap and boxes it as an
+/// io.Writer — safe to return or store where `aswriter`'s borrow
+/// would dangle. The receiver is consumed: don't use it afterwards.
+fn (b mut Buffer) into_writer() -> io.Writer {
+    h := new(Buffer)
+    h.buf = new(b.buf)
+    h.rd = b.rd
+    return h
+}
+
+/// into_readwriter moves this Buffer to the heap and boxes it as an
+/// io.ReadWriter — safe to return or store. The receiver is consumed:
+/// don't use it afterwards.
+fn (b mut Buffer) into_readwriter() -> io.ReadWriter {
+    h := new(Buffer)
+    h.buf = new(b.buf)
+    h.rd = b.rd
+    return h
+}

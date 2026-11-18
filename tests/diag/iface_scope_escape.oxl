@@ -1,0 +1,17 @@
+package main
+
+import "std/bytes"
+
+import "std/io"
+
+fn leak() -> io.Reader {
+    h := new(bytes.Buffer)
+    r := h.asreader()
+    scope {
+        buf := bytes.newbuffer()
+        r = buf.asreader()
+    }
+    return r
+}
+
+fn main() {}

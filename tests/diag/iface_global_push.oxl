@@ -1,0 +1,15 @@
+package main
+
+import "std/bytes"
+
+import "std/io"
+
+let g: []io.Reader = mkslice(io.Reader, 0)
+
+fn store() {
+    buf := bytes.newbuffer()
+    [wb, web] = buf.write("x" as []byte)
+    push(g, buf.asreader())
+}
+
+fn main() {}

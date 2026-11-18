@@ -343,6 +343,20 @@ struct LL { names: own SList, next: own LL }
 // select/match arm end-states awaiting the fall-through merge
 struct ArmSt { mv: own LL, ft: int, next: own ArmSt }
 
+// select-arm borrow end-states awaiting the fall-through merge
+struct BArmSt { st: own LL, sr: own SalIAS, next: own BArmSt }
+
+// break/continue borrow snapshots for the innermost loop
+struct SnapL { s: own LL, sr: own SalIAS, next: own SnapL }
+
+struct LoopSt { brk: own SnapL, cont: own SnapL, next: own LoopSt }
+
+// slice-backing alias edge: `b := a` / `b = a` / `b := a[lo:hi]` share
+// backing, so a borrow written through `a[i]` is readable through `b`.
+// (member name, group id, scope idx, scope gen) — live while the
+// recorded scope instance is still the one `scope_of` resolves to.
+struct SalIAS { m: str, g: int, sc: int, gen: int, next: own SalIAS }
+
 // per-file import aliases (qualifier -> stem) and selective names
 struct ModEnt { alias: str, stem: str, ver: str, next: own ModEnt }
 
@@ -401,14 +415,17 @@ struct Scope {
     m: own collections.Map,
     moved: own SList,
     ds: own collections.Map,
+    borr: own SList, // "name|idx" — bindings holding borrow-carrying values (iface boxes of mut/ref receivers)
+    gen: int, // scope-instance id — alias edges key on it so a popped+repushed scope can't resurrect stale members
 }
 
-struct Env { scopes: []Scope }
+struct Env { scopes: []Scope, ngen: int }
 
 struct Loader { items: []It }
 
 struct Ck {
     tyv: []T, // interned type records
+    tyhs: []int, // ty_has_slice memo — slot t*16+d: -1 unknown, 0/1 result
     fns: own collections.Map, // name -> idx into fnsv
     fnsv: []FnSig,
     structs: own collections.Map, // name -> idx into structsv
@@ -462,6 +479,14 @@ struct Ck {
     declsv: []DeclEnt,
     over: own OverEnt, // unsaved-buffer overrides (LSP only; nil in CLI use)
     dpos: int, // pending diag offset — set at expr/stmt entry, read by diag()
+    et: int, // borrow-taint of the most recently checked expr's value (borrn idx or -1)
+    ptaint: int, // pending taint a node helper leaves for expr() to publish as et
+    borrn: []str, // interned borrow-source names behind et/ptaint/env borr idxs
+    meth_alias: own SList, // `T.m` methods whose iface return aliases the receiver borrow
+    loops: own LoopSt, // innermost loop break/continue taint snapshots
+    srep: own SalIAS, // slice-backing alias edges (newest first)
+    sgid: int, // next slice-backing group id
+    param_gens: own SList, // scope gens (as str) that hold closure params — fn params are scope 0, closure params a pushed scope
 }
 
 // E1/LSP index: a use-site record mapping (file, [lo,hi)) to the decl it
@@ -482,17 +507,59 @@ struct UseRec {
 struct DeclEnt { sig: str, file: str, lo: int, hi: int, name: str, kind: int }
 
 fn env_new() -> own Env {
-    e := Env{scopes: mkslice(Scope, 0)}
-    e.scopes = push(e.scopes, Scope{m: collections.map_new(), moved: nil, ds: collections.map_new()})
+    e := Env{scopes: mkslice(Scope, 0), ngen: 0}
+    e.ngen = e.ngen + 1
+    e.scopes = push(e.scopes, Scope{m: collections.map_new(), moved: nil, ds: collections.map_new(), borr: nil, gen: e.ngen})
     return new(e)
 }
 
 fn env_push(e: mut Env) {
-    e.scopes = push(e.scopes, Scope{m: collections.map_new(), moved: nil, ds: collections.map_new()})
+    e.ngen = e.ngen + 1
+    e.scopes = push(e.scopes, Scope{m: collections.map_new(), moved: nil, ds: collections.map_new(), borr: nil, gen: e.ngen})
+}
+
+fn borr_entry_idx(e: str) -> int {
+    p := find(e, "|")
+    if p < 0 {
+        return -1
+    }
+    return atoi(substr(e, p + 1, len(e)))
 }
 
 fn env_pop(e: mut Env) {
     e.scopes = e.scopes[0:len(e.scopes) - 1]
+}
+
+// checker pop: diagnose borrow-carrying bindings in surviving scopes
+// whose borrow source died with the popped scope, then pop
+fn env_pop_ck(ck: mut Ck, e: mut Env) {
+    top := len(e.scopes) - 1
+    if top > 0 {
+        i := 0
+        for i < top {
+            l := e.scopes[i].borr
+            for l != nil {
+                bi := borr_entry_idx(l.v)
+                if bi >= 0 && bi < len(ck.borrn) {
+                    srcs := taint_srcs(ck, bi)
+                    hit := ""
+                    for srcs != nil {
+                        if src_gen(srcs.v) == e.scopes[top].gen {
+                            hit = src_name(srcs.v)
+                            break
+                        }
+                        srcs = srcs.next
+                    }
+                    if len(hit) > 0 {
+                        diag(ck, "check", "`" + taint_name(l.v) + "` retains a borrow of local `" + hit + "` past its scope")
+                    }
+                }
+                l = l.next
+            }
+            i = i + 1
+        }
+    }
+    env_pop(e)
 }
 
 fn env_set(e: mut Env, n: str, t: int, lo: int, hi: int) {
@@ -500,6 +567,7 @@ fn env_set(e: mut Env, n: str, t: int, lo: int, hi: int) {
     collections.map_set(e.scopes[i].m, n, t)
     // a (re)binding starts un-moved — clears any stale mark on shadow
     e.scopes[i].moved = sl_del(e.scopes[i].moved, n)
+    e.scopes[i].borr = borr_del(e.scopes[i].borr, n)
     // binding-site span for hover/goto on locals (E1 port)
     collections.map_set(e.scopes[i].ds, n, lo * 4294967296 + hi)
 }
@@ -688,6 +756,1747 @@ fn moved_union(e: mut Env, other: ref LL) {
     }
 }
 
+// ---------- borrow-taint tracking (iface escape) ----------
+// A `mut`/`ref` receiver method returning an iface (or a composite that
+// may hold one) boxes a borrow of the receiver's storage. When that
+// storage is a function-local binding the iface dangles at scope exit —
+// the hole `ret_sig`/`in_spawn` close for declared ref/mut returns and
+// spawn args, which iface coercion erases. Taint flows: call_kind marks
+// borrow-boxing calls, expr() publishes it as ck.et, helpers propagate
+// through field/lit/as/index/slice/match, bindings record it in
+// Scope.borr, and escape points (return/spawn/send/global/closure)
+// reject it. Interprocedural cases (a fn returning a borrow it got from
+// a param) stay open — the summary work is tracked separately.
+fn borr_intern(ck: mut Ck, s: str) -> int {
+    i := 0
+    for i < len(ck.borrn) {
+        if ck.borrn[i] == s {
+            return i
+        }
+        i = i + 1
+    }
+    ck.borrn = push(ck.borrn, s)
+    return len(ck.borrn) - 1
+}
+
+// Scope.borr entries are "name|idx" — idx into ck.borrn
+fn borr_get(l: ref SList, n: str) -> int {
+    p := l
+    pre := n + "|"
+    for p != nil {
+        if len(p.v) > len(pre) && substr(p.v, 0, len(pre)) == pre {
+            return atoi(substr(p.v, len(pre), len(p.v)))
+        }
+        p = p.next
+    }
+    return -1
+}
+
+fn borr_del(l: own SList, n: str) -> own SList {
+    pre := n + "|"
+    let out: own SList = nil
+    p := l
+    for p != nil {
+        if !(len(p.v) > len(pre) && substr(p.v, 0, len(pre)) == pre) {
+            c := new(SList)
+            c.v = p.v
+            c.next = out
+            out = c
+        }
+        p = p.next
+    }
+    return out
+}
+
+fn env_taint(e: ref Env, n: str) -> int {
+    i := scope_of(e, n)
+    if i < 0 {
+        return -1
+    }
+    return borr_get(e.scopes[i].borr, n)
+}
+
+fn env_taint_set(e: mut Env, n: str, idx: int) {
+    i := scope_of(e, n)
+    if i < 0 {
+        return
+    }
+    e.scopes[i].borr = borr_del(e.scopes[i].borr, n)
+    e.scopes[i].borr = scons(n + "|" + itoa(idx), e.scopes[i].borr)
+}
+
+fn env_taint_clear(e: mut Env, n: str) {
+    i := scope_of(e, n)
+    if i < 0 {
+        return
+    }
+    e.scopes[i].borr = borr_del(e.scopes[i].borr, n)
+}
+
+// may a value of type `t` carry a borrow of local storage? Deep enough
+// to keep `[Resp, err]`-style returns clean: a struct only counts when
+// one of its fields can hold an iface/borrow. `d` caps recursion on
+// self-referential types (own Box[Node] cycles) — assume carry there.
+fn taint_may_d(ck: ref Ck, t: int, d: int) -> int {
+    if t < 0 {
+        return 0
+    }
+    if d > 8 {
+        return 1
+    }
+    k := ck.tyv[t].k
+    if k == k_iface() || k == k_mut() || k == k_ref() {
+        return 1
+    }
+    if k == k_own() || k == k_slice() {
+        i := ck.tyv[t].i
+        if i < 0 {
+            return 0
+        }
+        return taint_may_d(ck, i, d + 1)
+    }
+    if k == k_struct() {
+        i := ck.tyv[t].i
+        if i < 0 && len(ck.tyv[t].name) > 0 && collections.map_has(ck.structs, ck.tyv[t].name) {
+            [si, serr] = collections.map_get(ck.structs, ck.tyv[t].name)
+            if serr == nil {
+                i = si
+            }
+        }
+        if i < 0 {
+            return 0
+        }
+        fl := ck.structsv[i].fields
+        for fl != nil {
+            if taint_may_d(ck, fl.v.t, d + 1) == 1 {
+                return 1
+            }
+            fl = fl.next
+        }
+        return 0
+    }
+    if k == k_enum() {
+        i := ck.tyv[t].i
+        if i < 0 && len(ck.tyv[t].name) > 0 && collections.map_has(ck.enums, ck.tyv[t].name) {
+            [ei2, eerr] = collections.map_get(ck.enums, ck.tyv[t].name)
+            if eerr == nil {
+                i = ei2
+            }
+        }
+        if i < 0 {
+            return 0
+        }
+        vl := ck.enumsv[i].vars
+        for vl != nil {
+            fl := vl.v.fields
+            for fl != nil {
+                if taint_may_d(ck, fl.v.t, d + 1) == 1 {
+                    return 1
+                }
+                fl = fl.next
+            }
+            vl = vl.next
+        }
+        return 0
+    }
+    if k == k_var() {
+        return 1
+    }
+    return 0
+}
+
+fn taint_may(ck: ref Ck, t: int) -> int {
+    return taint_may_d(ck, t, 0)
+}
+
+// where does the storage a `mut`/`ref` receiver borrows actually live?
+// local value bindings die with the fn (taint them); own/heap, foreign
+// borrows, slice backing, and pointees outlive or belong to someone
+// else (-1). `ty` is the receiver expr's type; node walks cover fields.
+fn storage_src(ck: mut Ck, e: ref parser.Node, ty: int, env: ref Env) -> int {
+    if ty >= 0 {
+        tk := ck.tyv[ty].k
+        if tk == k_own() || tk == k_ref() || tk == k_mut() || tk == k_iface() || tk == k_var() || tk == k_fn() || tk == k_chan() || tk == k_shared() || tk == k_scope() || tk == k_err() || tk == k_unk() {
+            return -1
+        }
+    }
+    match e {
+        parser.Node.Name{n} => {
+            vt := env_get(ck, env, n)
+            if vt >= 0 {
+                vk := ck.tyv[vt].k
+                if vk == k_own() || vk == k_ref() || vk == k_mut() || vk == k_iface() || vk == k_var() || vk == k_fn() || vk == k_chan() || vk == k_shared() || vk == k_scope() {
+                    return -1
+                }
+            }
+            sc := scope_of(env, n)
+            if sc >= 0 {
+                // `name@gen` — the declaring scope's instance id rides
+                // with the source so a shadowing same-named binding in
+                // another scope is never mistaken for the storage owner
+                return borr_intern(ck, n + "@" + itoa(env.scopes[sc].gen))
+            }
+            return -1
+        }
+        parser.Node.Field{obj} => {
+            return storage_src(ck, obj, -1, env)
+        }
+        parser.Node.Index{obj} => {
+            return storage_src_root(ck, e, env)
+        }
+        parser.Node.Slice{obj} => {
+            return storage_src_root(ck, e, env)
+        }
+        parser.Node.Un{op, e} => {
+            return -1
+        }
+        _ => {
+            return borr_intern(ck, "<temporary>")
+        }
+    }
+}
+
+// borrow source for a receiver living inside a root binding's backing
+// (index/slice elements, `s[i].asreader()`): a local backing dies with
+// the fn so it mints `root@gen`; params (fn scope 0 or a recorded
+// closure-param scope) and globals outlive the call, so -1.
+fn storage_src_root(ck: mut Ck, e: ref parser.Node, env: ref Env) -> int {
+    rn := taint_root(e)
+    if len(rn) > 0 {
+        sc := scope_of(env, rn)
+        if sc > 0 && is_param_binding(ck, env, rn) == 0 {
+            return borr_intern(ck, rn + "@" + itoa(env.scopes[sc].gen))
+        }
+    }
+    return -1
+}
+
+// root binding an assignment target writes through — `s.f = v` and
+// `s[i] = v` taint `s` (whole-value over-approximation, like lit fields)
+fn taint_root(nd: ref parser.Node) -> str {
+    r := match nd {
+        parser.Node.Name{n} => n
+        parser.Node.Field{obj} => taint_root(obj)
+        parser.Node.Index{obj} => taint_root(obj)
+        parser.Node.Slice{obj} => taint_root(obj)
+        _ => ""
+    }
+    return r
+}
+
+// ---------- slice-backing alias groups ----------
+// `b := a` copies the slice header, not the backing — a borrow stored
+// through `a[i]` is readable through `b[i]`. Edges record which binding
+// groups share storage so element writes taint every live member.
+fn salcons(m: str, g: int, sc: int, gen: int, l: own SalIAS) -> own SalIAS {
+    c := new(SalIAS)
+    c.m = m
+    c.g = g
+    c.sc = sc
+    c.gen = gen
+    c.next = l
+    return c
+}
+
+fn ty_slice_k(ck: ref Ck, t: int) -> int {
+    if t < 0 {
+        return 0
+    }
+    k := ck.tyv[t].k
+    if k == k_slice() {
+        return 1
+    }
+    if k == k_own() || k == k_ref() || k == k_mut() {
+        i := ck.tyv[t].i
+        if i >= 0 && ck.tyv[i].k == k_slice() {
+            return 1
+        }
+    }
+    return 0
+}
+
+// deep copy — branch joins snapshot/restore the edge list like borr.
+// Iterative: the recursive form paid a borrow push + frame per edge,
+// and srep runs ~10^3 edges deep on the driver itself — 52M nested
+// calls per build. Two passes (reverse, then frev-style flip) keep
+// the original order without recursion.
+fn sal_clone(l: ref SalIAS) -> own SalIAS {
+    let rev: own SalIAS = nil
+    for l != nil {
+        c := new(SalIAS)
+        c.m = l.m
+        c.g = l.g
+        c.sc = l.sc
+        c.gen = l.gen
+        c.next = rev
+        rev = c
+        l = l.next
+    }
+    let out: own SalIAS = nil
+    for rev != nil {
+        n := rev.next
+        rev.next = out
+        out = rev
+        rev = n
+    }
+    return out
+}
+
+fn sal_edge_live(l: ref SalIAS, m: str, g: int, sc: int, gen: int) -> int {
+    for l != nil {
+        if l.m == m && l.g == g && l.sc == sc && l.gen == gen {
+            return 1
+        }
+        l = l.next
+    }
+    return 0
+}
+
+// union `extra`'s edges into `head` (dedup on the full tuple) — the
+// branch-join for slice memberships: a binding keeps every backing it
+// could denote on any incoming path
+fn sal_absorb_to(head: own SalIAS, extra: ref SalIAS) -> own SalIAS {
+    e := extra
+    for e != nil {
+        if sal_edge_live(head, e.m, e.g, e.sc, e.gen) == 0 {
+            head = salcons(e.m, e.g, e.sc, e.gen, head)
+        }
+        e = e.next
+    }
+    return head
+}
+
+fn sal_count(l: ref SalIAS) -> int {
+    n := 0
+    for l != nil {
+        n = n + 1
+        l = l.next
+    }
+    return n
+}
+
+// fixed-point test for the sal side: every edge in `nh` is already a
+// live member of `head` — count comparison alone can pass while live
+// membership still changes under sal_live_only filtering
+fn sal_covered(nh: ref SalIAS, head: ref SalIAS) -> int {
+    l := nh
+    for l != nil {
+        if sal_edge_live(head, l.m, l.g, l.sc, l.gen) == 0 {
+            return 0
+        }
+        l = l.next
+    }
+    return 1
+}
+
+// drop edges whose scope generation is gone — loop fixed-points re-run
+// bodies that mint fresh edges for short-lived bindings; without this
+// filter the join state grows every pass and never converges
+fn sal_live_only(e: ref Env, l: ref SalIAS) -> own SalIAS {
+    let out: own SalIAS = nil
+    for l != nil {
+        if l.sc < len(e.scopes) && e.scopes[l.sc].gen == l.gen {
+            out = salcons(l.m, l.g, l.sc, l.gen, out)
+        }
+        l = l.next
+    }
+    return out
+}
+
+// every live group id `n` currently belongs to — a binding may hold
+// several after a branch join (`if f { a = c }` leaves a in both
+// groups). No minting: reads never create backing identity.
+fn sal_groups(ck: ref Ck, env: ref Env, n: str) -> own IList {
+    sc := scope_of(env, n)
+    if sc < 0 {
+        return nil
+    }
+    gen := env.scopes[sc].gen
+    let out: own IList = nil
+    l := ck.srep
+    for l != nil {
+        if l.m == n && l.sc == sc && l.gen == gen {
+            seen := false
+            q := out
+            for q != nil {
+                if q.v == l.g {
+                    seen = true
+                }
+                q = q.next
+            }
+            if !seen {
+                out = icons(l.g, out)
+            }
+        }
+        l = l.next
+    }
+    return out
+}
+
+// `n` must have at least one group — mint a fresh backing id when it
+// has none (slice writes/aliases need an identity to join later)
+fn sal_ensure(ck: mut Ck, env: ref Env, n: str) -> own IList {
+    gs := sal_groups(ck, env, n)
+    if gs != nil {
+        return gs
+    }
+    sc := scope_of(env, n)
+    if sc < 0 {
+        return nil
+    }
+    ck.sgid = ck.sgid + 1
+    ck.srep = salcons(n, ck.sgid, sc, env.scopes[sc].gen, ck.srep)
+    return icons(ck.sgid, nil)
+}
+
+// drop `n`'s membership edges in its current scope — a rebind replaces
+// the backing on this path (`b = mkslice(..)` must not stay in `a`'s
+// group); branch joins re-add the other paths' edges via sal_absorb_to
+fn sal_del_name(ck: mut Ck, env: ref Env, n: str) {
+    sc := scope_of(env, n)
+    if sc < 0 {
+        return
+    }
+    gen := env.scopes[sc].gen
+    let keep: own SalIAS = nil
+    l := ck.srep
+    for l != nil {
+        if l.m != n || l.sc != sc || l.gen != gen {
+            keep = salcons(l.m, l.g, l.sc, l.gen, keep)
+        }
+        l = l.next
+    }
+    ck.srep = keep
+}
+
+// may a value of type `t` contain a slice (directly or through
+// aggregate fields)? mirrors taint_may_d's depth cap
+// memoized entry — the raw walk re-visits shared type DAGs
+// (parser.Node & friends) once per (type, remaining depth); without
+// the cache a single query is exponential in type depth
+fn ty_has_slice_d(ck: mut Ck, t: int, d: int) -> int {
+    if t < 0 {
+        return 0
+    }
+    if d > 8 {
+        return 1
+    }
+    i := t * 16 + d
+    if i < len(ck.tyhs) {
+        v := ck.tyhs[i]
+        if v >= 0 {
+            return v
+        }
+    }
+    r := ty_has_slice_r(ck, t, d)
+    if i < len(ck.tyhs) {
+        ck.tyhs[i] = r
+    }
+    return r
+}
+
+fn ty_has_slice_r(ck: mut Ck, t: int, d: int) -> int {
+    k := ck.tyv[t].k
+    if k == k_slice() {
+        return 1
+    }
+    if k == k_own() || k == k_ref() || k == k_mut() {
+        return ty_has_slice_d(ck, ck.tyv[t].i, d + 1)
+    }
+    if k == k_iface() || k == k_var() {
+        return 1
+    }
+    if k == k_struct() || k == k_enum() {
+        i := ck.tyv[t].i
+        if i < 0 && len(ck.tyv[t].name) > 0 {
+            if k == k_struct() && collections.map_has(ck.structs, ck.tyv[t].name) {
+                [si, serr] = collections.map_get(ck.structs, ck.tyv[t].name)
+                if serr == nil {
+                    i = si
+                }
+            }
+            if k == k_enum() && collections.map_has(ck.enums, ck.tyv[t].name) {
+                [ei, eerr] = collections.map_get(ck.enums, ck.tyv[t].name)
+                if eerr == nil {
+                    i = ei
+                }
+            }
+        }
+        if i < 0 {
+            return 0
+        }
+        if k == k_struct() {
+            fl := ck.structsv[i].fields
+            for fl != nil {
+                if ty_has_slice_d(ck, fl.v.t, d + 1) == 1 {
+                    return 1
+                }
+                fl = fl.next
+            }
+            return 0
+        }
+        vl := ck.enumsv[i].vars
+        for vl != nil {
+            fl := vl.v.fields
+            for fl != nil {
+                if ty_has_slice_d(ck, fl.v.t, d + 1) == 1 {
+                    return 1
+                }
+                fl = fl.next
+            }
+            vl = vl.next
+        }
+        return 0
+    }
+    return 0
+}
+
+fn ty_has_slice(ck: mut Ck, t: int) -> int {
+    return ty_has_slice_d(ck, t, 0)
+}
+
+// root binding an expr's value storage traces to through field
+// selects only — Index breaks the chain (an element's own backing
+// isn't the container's)
+fn sal_root_clean(e: ref parser.Node) -> str {
+    r := match e {
+        parser.Node.Name{n} => n
+        parser.Node.Field{obj} => sal_root_clean(obj)
+        _ => ""
+    }
+    return r
+}
+
+// groups the value of expr `e` may share backing with. Names and
+// field-chains propagate their root's memberships (aggregate copies
+// carry the contained slice headers); slice exprs propagate the
+// sliced root's; literals union their fields'. Index/call results
+// have untracked or fresh backing — nil.
+fn sal_expr_groups(ck: mut Ck, env: ref Env, e: ref parser.Node) -> own IList {
+    if e == nil {
+        return nil
+    }
+    match e {
+        parser.Node.Name{n} => {
+            gs := sal_groups(ck, env, n)
+            if gs == nil {
+                nt := env_get(ck, env, n)
+                if nt >= 0 && ty_slice_k(ck, nt) == 1 {
+                    gs = sal_ensure(ck, env, n)
+                }
+            }
+            return gs
+        }
+        parser.Node.Slice{obj} => {
+            rn := taint_root(obj)
+            if len(rn) == 0 {
+                return nil
+            }
+            gs := sal_groups(ck, env, rn)
+            if gs == nil {
+                rt := env_get(ck, env, rn)
+                if rt >= 0 && ty_slice_k(ck, rt) == 1 {
+                    gs = sal_ensure(ck, env, rn)
+                }
+            }
+            return gs
+        }
+        parser.Node.Field{obj} => {
+            rn := sal_root_clean(obj)
+            if len(rn) == 0 {
+                return nil
+            }
+            return sal_groups(ck, env, rn)
+        }
+        parser.Node.Lit{fields} => {
+            let out: own IList = nil
+            fl := fields
+            for fl != nil {
+                fv := fl.v
+                match fv {
+                    parser.Node.NamedField{val} => {
+                        fv = val
+                    }
+                    _ => {
+                    }
+                }
+                fg := sal_expr_groups(ck, env, fv)
+                gl := fg
+                for gl != nil {
+                    seen := false
+                    q := out
+                    for q != nil {
+                        if q.v == gl.v {
+                            seen = true
+                        }
+                        q = q.next
+                    }
+                    if !seen {
+                        out = icons(gl.v, out)
+                    }
+                    gl = gl.next
+                }
+                fl = fl.next
+            }
+            return out
+        }
+        parser.Node.Call{f, args} => {
+            // `push(s, v)` may reuse s's spare capacity — the result can
+            // share the input backing, so propagate its groups
+            if callee_name(f) == "push" && args != nil && scope_of(env, "push") < 0 {
+                return sal_expr_groups(ck, env, args.v)
+            }
+            return nil
+        }
+        _ => {
+            return nil
+        }
+    }
+    return nil
+}
+
+// groups `init` gives the freshly bound `name` — Name/Slice/Field/
+// Lit propagate the backing their value shares; calls and other
+// producers mint a fresh backing when the result is itself a slice
+fn sal_init_groups(ck: mut Ck, env: ref Env, init: ref parser.Node, t: int) -> own IList {
+    if ty_has_slice(ck, t) != 1 {
+        return nil
+    }
+    gs := sal_expr_groups(ck, env, init)
+    if gs != nil {
+        return gs
+    }
+    if ty_slice_k(ck, t) == 1 {
+        ck.sgid = ck.sgid + 1
+        return icons(ck.sgid, nil)
+    }
+    return nil
+}
+
+// record `name` (just bound to `init`'s value) into every backing
+// group its value shares — slices directly, aggregates through their
+// slice-carrying fields. Rebinds drop the name's old memberships after
+// resolving `init` (a self-slice or `push` still shares the pre-rebind
+// backing); branch joins restore the paths that kept them.
+fn sal_bind(ck: mut Ck, env: ref Env, name: str, t: int, init: ref parser.Node) {
+    if init == nil || ty_has_slice(ck, t) != 1 {
+        sal_del_name(ck, env, name)
+        return
+    }
+    // compute groups before dropping the old edge: `a = a[lo:hi]` and
+    // `a = push(a, v)` still share the pre-rebind backing
+    gs := sal_init_groups(ck, env, init, t)
+    sal_del_name(ck, env, name)
+    sc := scope_of(env, name)
+    if sc < 0 {
+        return
+    }
+    gen := env.scopes[sc].gen
+    for gs != nil {
+        ck.srep = salcons(name, gs.v, sc, gen, ck.srep)
+        gs = gs.next
+    }
+}
+
+// `h.items = a` stores `a`'s slice headers inside `h` — the root
+// binding gains every group the stored value may share
+fn sal_field_store(ck: mut Ck, env: ref Env, target: ref parser.Node, val: ref parser.Node, vt: int) {
+    match target {
+        parser.Node.Field{obj} => {
+            rn := sal_root_clean(obj)
+            if len(rn) == 0 {
+                return
+            }
+            if scope_of(env, rn) < 0 || ty_has_slice(ck, vt) != 1 {
+                return
+            }
+            gs := sal_init_groups(ck, env, val, vt)
+            sc := scope_of(env, rn)
+            gen := env.scopes[sc].gen
+            for gs != nil {
+                if sal_edge_live(ck.srep, rn, gs.v, sc, gen) == 0 {
+                    ck.srep = salcons(rn, gs.v, sc, gen, ck.srep)
+                }
+                gs = gs.next
+            }
+        }
+        _ => {
+        }
+    }
+}
+
+// taint every live member of group `g` — a write through one alias is
+// visible through all of them, including aggregates holding the
+// backing in a field
+fn sal_taint_all(ck: mut Ck, env: mut Env, g: int, idx: int) {
+    l := ck.srep
+    for l != nil {
+        if l.g == g {
+            sc := scope_of(env, l.m)
+            if sc == l.sc && sc >= 0 && env.scopes[sc].gen == l.gen {
+                env_taint_merge(ck, env, l.m, idx)
+            }
+        }
+        l = l.next
+    }
+}
+
+// `root[i] = v` writes shared backing — taint every group `root` may
+// denote (post-join a name can sit in several)
+fn sal_taint_name(ck: mut Ck, env: mut Env, n: str, idx: int) {
+    gs := sal_groups(ck, env, n)
+    if gs == nil {
+        nt := env_get(ck, env, n)
+        if nt < 0 || ty_slice_k(ck, nt) != 1 {
+            return
+        }
+        gs = sal_ensure(ck, env, n)
+    }
+    for gs != nil {
+        sal_taint_all(ck, env, gs.v, idx)
+        gs = gs.next
+    }
+}
+
+fn borr_save(e: ref Env) -> own LL {
+    let out: own LL = nil
+    i := len(e.scopes) - 1
+    for i >= 0 {
+        c := new(LL)
+        c.names = sl_clone(e.scopes[i].borr)
+        c.next = out
+        out = c
+        i = i - 1
+    }
+    return out
+}
+
+fn borr_restore(e: mut Env, s: own LL) {
+    i := 0
+    for i < len(e.scopes) && s != nil {
+        e.scopes[i].borr = s.names
+        s = s.next
+        i = i + 1
+    }
+}
+
+// merge `name|idx` into one scope's borr list — branch/select joins keep
+// every borrow source either side carried, not just the first name seen
+fn borr_merge_entry(ck: mut Ck, l: ref SList, n: str, idx: int) -> own SList {
+    pre := n + "|"
+    mi := idx
+    found := 0
+    p := l
+    for p != nil {
+        if len(p.v) > len(pre) && substr(p.v, 0, len(pre)) == pre {
+            old := atoi(substr(p.v, len(pre), len(p.v)))
+            mi = taint_merge(ck, old, idx)
+            found = 1
+        }
+        p = p.next
+    }
+    let out: own SList = nil
+    p = l
+    for p != nil {
+        if !(len(p.v) > len(pre) && substr(p.v, 0, len(pre)) == pre) {
+            out = scons(p.v, out)
+        }
+        p = p.next
+    }
+    return scons(n + "|" + itoa(mi), out)
+}
+
+fn borr_union(ck: mut Ck, e: mut Env, other: ref LL) {
+    i := 0
+    o := other
+    for i < len(e.scopes) && o != nil {
+        l := o.names
+        for l != nil {
+            bi := borr_entry_idx(l.v)
+            if bi >= 0 {
+                e.scopes[i].borr = borr_merge_entry(ck, e.scopes[i].borr, taint_name(l.v), bi)
+            }
+            l = l.next
+        }
+        o = o.next
+        i = i + 1
+    }
+}
+
+// a taint idx may name several borrow sources — `borrn` entries are
+// "|"-joined component lists so one et slot carries a literal's whole
+// source set (lit_fields/match/call-args merge via taint_merge)
+fn taint_comps(ck: ref Ck, idx: int) -> own SList {
+    if idx < 0 || idx >= len(ck.borrn) {
+        return nil
+    }
+    s := ck.borrn[idx]
+    let out: own SList = nil
+    st := 0
+    i := 0
+    for i <= len(s) {
+        if i == len(s) || byteat(s, i) == 124 {
+            out = scons(substr(s, st, i), out)
+            st = i + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn taint_srcs(ck: ref Ck, idx: int) -> own SList {
+    return taint_comps(ck, idx)
+}
+
+fn taint_has_comp(ck: ref Ck, a: int, comp: str) -> int {
+    if a < 0 || a >= len(ck.borrn) {
+        return 0
+    }
+    na := ck.borrn[a]
+    st := 0
+    i := 0
+    for i <= len(na) {
+        if i == len(na) || byteat(na, i) == 124 {
+            if substr(na, st, i) == comp {
+                return 1
+            }
+            st = i + 1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// every "|" component of nb already present in taint a
+fn taint_covers(ck: ref Ck, a: int, nb: str) -> int {
+    st := 0
+    i := 0
+    for i <= len(nb) {
+        if i == len(nb) || byteat(nb, i) == 124 {
+            if taint_has_comp(ck, a, substr(nb, st, i)) == 0 {
+                return 0
+            }
+            st = i + 1
+        }
+        i = i + 1
+    }
+    return 1
+}
+
+// union two taint idxs into one (may-analysis: a value may carry any
+// of the sources either side contributed)
+fn taint_merge(ck: mut Ck, a: int, b: int) -> int {
+    if a < 0 {
+        return b
+    }
+    if b < 0 || a == b {
+        return a
+    }
+    na := ck.borrn[a]
+    nb := ck.borrn[b]
+    if na == nb || taint_covers(ck, a, nb) == 1 {
+        return a
+    }
+    return borr_intern(ck, na + "|" + nb)
+}
+
+// add a source to a binding that may already carry others (backing
+// writes, arm merges) — unlike env_taint_set this never drops sources
+fn env_taint_merge(ck: mut Ck, e: mut Env, n: str, idx: int) {
+    i := scope_of(e, n)
+    if i < 0 {
+        return
+    }
+    pre := n + "|"
+    l := e.scopes[i].borr
+    for l != nil {
+        if len(l.v) > len(pre) && substr(l.v, 0, len(pre)) == pre {
+            old := atoi(substr(l.v, len(pre), len(l.v)))
+            e.scopes[i].borr = borr_del(e.scopes[i].borr, n)
+            e.scopes[i].borr = scons(n + "|" + itoa(taint_merge(ck, old, idx)), e.scopes[i].borr)
+            return
+        }
+        l = l.next
+    }
+    e.scopes[i].borr = scons(n + "|" + itoa(idx), e.scopes[i].borr)
+}
+
+// "name|idx" -> name (borr_union dedupes on the binding, not the src)
+fn taint_name(entry: str) -> str {
+    i := find(entry, "|")
+    if i < 0 {
+        return entry
+    }
+    return substr(entry, 0, i)
+}
+
+fn taint_src(ck: ref Ck, idx: int) -> str {
+    if idx < 0 || idx >= len(ck.borrn) {
+        return "?"
+    }
+    s := ck.borrn[idx]
+    p := find(s, "|")
+    if p >= 0 {
+        s = substr(s, 0, p)
+    }
+    return src_name(s)
+}
+
+// any `|` component of idx's source set is a `<temporary>` borrow —
+// minted for receivers with no binding (call results, literals); the
+// temp dies when the statement ends, so a binding taking it on dangles
+// immediately rather than at scope pop
+fn taint_has_temp(ck: ref Ck, idx: int) -> int {
+    if idx < 0 || idx >= len(ck.borrn) {
+        return 0
+    }
+    if find(ck.borrn[idx], "<temporary>") >= 0 {
+        return 1
+    }
+    return 0
+}
+
+// is `n`'s binding a fn or closure parameter? Fn params occupy scope 0
+// (their bodies start at scope 1); closure params live in a pushed
+// scope whose gen is recorded in ck.param_gens.
+fn is_param_binding(ck: ref Ck, e: ref Env, n: str) -> int {
+    sc := scope_of(e, n)
+    if sc == 0 {
+        return 1
+    }
+    if sc < 0 {
+        return 0
+    }
+    if sl_has(ck.param_gens, itoa(e.scopes[sc].gen)) {
+        return 1
+    }
+    return 0
+}
+
+// borrow-source ids are `name@gen`: gen is the declaring scope's
+// instance stamp (Scope.gen) so shadowed same-named bindings can't be
+// mistaken for each other's storage. -1 for non-scope sources.
+fn src_gen(s: str) -> int {
+    p := find(s, "@")
+    if p < 0 {
+        return -1
+    }
+    g := atoi(substr(s, p + 1, len(s)))
+    if g <= 0 {
+        return -1
+    }
+    return g
+}
+
+// bare binding name from a `name@gen` source id (diagnostic text)
+fn src_name(s: str) -> str {
+    p := find(s, "@")
+    if p < 0 {
+        return s
+    }
+    return substr(s, 0, p)
+}
+
+// ---------- receiver-alias pre-scan ----------
+// A mut/ref receiver method returning an iface aliases the receiver's
+// storage only when a `return` expr mentions the receiver name —
+// `return b` boxes `&b` (asreader), `return h` heap-copies (into_*).
+// The scan runs at sig registration so call sites checked before the
+// method body still see the bit. Over-approximation is deliberate:
+// any mention marks the method aliasing.
+fn mentions(n: ref parser.Node, rn: str) -> int {
+    if n == nil {
+        return 0
+    }
+    match n {
+        parser.Node.Name{n} => {
+            if n == rn {
+                return 1
+            }
+            return 0
+        }
+        parser.Node.Call{f, args} => {
+            if mentions(f, rn) == 1 {
+                return 1
+            }
+            al := args
+            for al != nil {
+                if mentions(al.v, rn) == 1 {
+                    return 1
+                }
+                al = al.next
+            }
+            return 0
+        }
+        parser.Node.Field{obj} => {
+            return mentions(obj, rn)
+        }
+        parser.Node.Un{e} => {
+            return mentions(e, rn)
+        }
+        parser.Node.Bin{l, r} => {
+            if mentions(l, rn) == 1 {
+                return 1
+            }
+            return mentions(r, rn)
+        }
+        parser.Node.As{e} => {
+            return mentions(e, rn)
+        }
+        parser.Node.Index{obj, idx} => {
+            if mentions(obj, rn) == 1 {
+                return 1
+            }
+            return mentions(idx, rn)
+        }
+        parser.Node.Slice{obj, lo, hi} => {
+            if mentions(obj, rn) == 1 {
+                return 1
+            }
+            if lo != nil && mentions(lo, rn) == 1 {
+                return 1
+            }
+            if hi != nil {
+                return mentions(hi, rn)
+            }
+            return 0
+        }
+        parser.Node.Lit{obj, fields} => {
+            if mentions(obj, rn) == 1 {
+                return 1
+            }
+            fl := fields
+            for fl != nil {
+                match fl.v {
+                    parser.Node.NamedField{val} => {
+                        if mentions(val, rn) == 1 {
+                            return 1
+                        }
+                    }
+                    _ => {
+                    }
+                }
+                fl = fl.next
+            }
+            return 0
+        }
+        parser.Node.Match{e, arms} => {
+            if mentions(e, rn) == 1 {
+                return 1
+            }
+            am := arms
+            for am != nil {
+                match am.v {
+                    parser.Node.MArm{body} => {
+                        if mentions(body, rn) == 1 {
+                            return 1
+                        }
+                    }
+                    _ => {
+                    }
+                }
+                am = am.next
+            }
+            return 0
+        }
+        parser.Node.List{items} => {
+            l := items
+            for l != nil {
+                if mentions(l.v, rn) == 1 {
+                    return 1
+                }
+                l = l.next
+            }
+            return 0
+        }
+        parser.Node.Ret{vals} => {
+            vl := vals
+            for vl != nil {
+                if mentions(vl.v, rn) == 1 {
+                    return 1
+                }
+                vl = vl.next
+            }
+            return 0
+        }
+        parser.Node.ExprStmt{e} => {
+            return mentions(e, rn)
+        }
+        parser.Node.Assign{target, val} => {
+            if mentions(target, rn) == 1 {
+                return 1
+            }
+            return mentions(val, rn)
+        }
+        parser.Node.Let{init} => {
+            return mentions(init, rn)
+        }
+        parser.Node.Let2{call} => {
+            return mentions(call, rn)
+        }
+        parser.Node.Bind{init} => {
+            return mentions(init, rn)
+        }
+        parser.Node.Defer{call} => {
+            return mentions(call, rn)
+        }
+        parser.Node.If{cond, then, els} => {
+            if mentions(cond, rn) == 1 {
+                return 1
+            }
+            if mentions(then, rn) == 1 {
+                return 1
+            }
+            return mentions(els, rn)
+        }
+        parser.Node.For{cond, body} => {
+            if mentions(cond, rn) == 1 {
+                return 1
+            }
+            return mentions(body, rn)
+        }
+        parser.Node.Scope{body} => {
+            return mentions(body, rn)
+        }
+        parser.Node.Unsafe{body} => {
+            return mentions(body, rn)
+        }
+        parser.Node.Spawn{e} => {
+            return mentions(e, rn)
+        }
+        parser.Node.SpawnBlocking{e} => {
+            return mentions(e, rn)
+        }
+        parser.Node.Go{e} => {
+            return mentions(e, rn)
+        }
+        parser.Node.GoIn{sc, e} => {
+            if mentions(sc, rn) == 1 {
+                return 1
+            }
+            return mentions(e, rn)
+        }
+        parser.Node.Select{arms} => {
+            al := arms
+            for al != nil {
+                match al.v {
+                    parser.Node.SArm{ch, ms, body} => {
+                        if ch != nil && mentions(ch, rn) == 1 {
+                            return 1
+                        }
+                        if ms != nil && mentions(ms, rn) == 1 {
+                            return 1
+                        }
+                        if mentions(body, rn) == 1 {
+                            return 1
+                        }
+                    }
+                    _ => {
+                    }
+                }
+                al = al.next
+            }
+            return 0
+        }
+        parser.Node.Closure{params, body} => {
+            // closure params shadow the receiver name — its body's
+            // mentions resolve locally, not to the receiver
+            return 0
+        }
+        _ => {
+            return 0
+        }
+    }
+}
+
+// does an expr subtree contain a `return` handing back an rn-derived
+// value? Only Match arm blocks can hide stmts inside exprs — closures
+// have their own returns and are skipped.
+fn expr_has_ret(n: ref parser.Node, rn: str) -> int {
+    if n == nil {
+        return 0
+    }
+    match n {
+        parser.Node.Match{e, arms} => {
+            if expr_has_ret(e, rn) == 1 {
+                return 1
+            }
+            am := arms
+            for am != nil {
+                match am.v {
+                    parser.Node.MArm{body} => {
+                        if ret_mentions(body, rn) == 1 {
+                            return 1
+                        }
+                    }
+                    _ => {
+                    }
+                }
+                am = am.next
+            }
+            return 0
+        }
+        parser.Node.Call{f, args} => {
+            if expr_has_ret(f, rn) == 1 {
+                return 1
+            }
+            al := args
+            for al != nil {
+                if expr_has_ret(al.v, rn) == 1 {
+                    return 1
+                }
+                al = al.next
+            }
+            return 0
+        }
+        parser.Node.Field{obj} => {
+            return expr_has_ret(obj, rn)
+        }
+        parser.Node.Un{e} => {
+            return expr_has_ret(e, rn)
+        }
+        parser.Node.Bin{l, r} => {
+            if expr_has_ret(l, rn) == 1 {
+                return 1
+            }
+            return expr_has_ret(r, rn)
+        }
+        parser.Node.As{e} => {
+            return expr_has_ret(e, rn)
+        }
+        parser.Node.Index{obj, idx} => {
+            if expr_has_ret(obj, rn) == 1 {
+                return 1
+            }
+            return expr_has_ret(idx, rn)
+        }
+        parser.Node.Slice{obj, lo, hi} => {
+            if expr_has_ret(obj, rn) == 1 {
+                return 1
+            }
+            if lo != nil && expr_has_ret(lo, rn) == 1 {
+                return 1
+            }
+            if hi != nil {
+                return expr_has_ret(hi, rn)
+            }
+            return 0
+        }
+        parser.Node.Lit{obj, fields} => {
+            if expr_has_ret(obj, rn) == 1 {
+                return 1
+            }
+            fl := fields
+            for fl != nil {
+                match fl.v {
+                    parser.Node.NamedField{val} => {
+                        if expr_has_ret(val, rn) == 1 {
+                            return 1
+                        }
+                    }
+                    _ => {
+                    }
+                }
+                fl = fl.next
+            }
+            return 0
+        }
+        _ => {
+            return 0
+        }
+    }
+}
+
+// does a `return` under this stmt subtree hand back an rn-derived value?
+fn ret_mentions(n: ref parser.Node, rn: str) -> int {
+    if n == nil {
+        return 0
+    }
+    match n {
+        parser.Node.Ret{vals} => {
+            vl := vals
+            for vl != nil {
+                if mentions(vl.v, rn) == 1 {
+                    return 1
+                }
+                vl = vl.next
+            }
+            return 0
+        }
+        parser.Node.List{items} => {
+            return stmts_mentions(items, rn)
+        }
+        parser.Node.If{cond, then, els} => {
+            if expr_has_ret(cond, rn) == 1 {
+                return 1
+            }
+            if ret_mentions(then, rn) == 1 {
+                return 1
+            }
+            return ret_mentions(els, rn)
+        }
+        parser.Node.For{cond, body} => {
+            if expr_has_ret(cond, rn) == 1 {
+                return 1
+            }
+            return ret_mentions(body, rn)
+        }
+        parser.Node.Scope{body} => {
+            return ret_mentions(body, rn)
+        }
+        parser.Node.Unsafe{body} => {
+            return ret_mentions(body, rn)
+        }
+        parser.Node.Select{arms} => {
+            al := arms
+            for al != nil {
+                match al.v {
+                    parser.Node.SArm{ch, ms, body} => {
+                        if ch != nil && expr_has_ret(ch, rn) == 1 {
+                            return 1
+                        }
+                        if ms != nil && expr_has_ret(ms, rn) == 1 {
+                            return 1
+                        }
+                        if ret_mentions(body, rn) == 1 {
+                            return 1
+                        }
+                    }
+                    _ => {
+                    }
+                }
+                al = al.next
+            }
+            return 0
+        }
+        parser.Node.ExprStmt{e} => {
+            return expr_has_ret(e, rn)
+        }
+        parser.Node.Assign{target, val} => {
+            if expr_has_ret(target, rn) == 1 {
+                return 1
+            }
+            return expr_has_ret(val, rn)
+        }
+        parser.Node.Let{init} => {
+            return expr_has_ret(init, rn)
+        }
+        parser.Node.Let2{call} => {
+            return expr_has_ret(call, rn)
+        }
+        parser.Node.Bind{init} => {
+            return expr_has_ret(init, rn)
+        }
+        parser.Node.Defer{call} => {
+            return expr_has_ret(call, rn)
+        }
+        parser.Node.Spawn{e} => {
+            return expr_has_ret(e, rn)
+        }
+        parser.Node.SpawnBlocking{e} => {
+            return expr_has_ret(e, rn)
+        }
+        parser.Node.Go{e} => {
+            return expr_has_ret(e, rn)
+        }
+        parser.Node.GoIn{sc, e} => {
+            if expr_has_ret(sc, rn) == 1 {
+                return 1
+            }
+            return expr_has_ret(e, rn)
+        }
+        _ => {
+            return expr_has_ret(n, rn)
+        }
+    }
+}
+
+fn stmts_mentions(items: ref parser.NList, rn: str) -> int {
+    l := items
+    for l != nil {
+        if ret_mentions(l.v, rn) == 1 {
+            return 1
+        }
+        l = l.next
+    }
+    return 0
+}
+
+// ---------- receiver-alias dataflow (meth_alias pre-scan) ----------
+// `let r = b; return r` hides the receiver behind a local — track
+// bindings whose initializer mentions the receiver or an existing
+// alias, to a fixpoint, then ask ret_mentions about each alias.
+fn alias_mentions(n: ref parser.Node, rn: str, al: ref SList) -> int {
+    if mentions(n, rn) == 1 {
+        return 1
+    }
+    l := al
+    for l != nil {
+        if l.v != rn && mentions(n, l.v) == 1 {
+            return 1
+        }
+        l = l.next
+    }
+    return 0
+}
+
+fn alias_add(acc: own SList, rn: str, al: ref SList, n: str) -> own SList {
+    if len(n) == 0 || n == "_" || n == rn || sl_has(al, n) || sl_has(acc, n) {
+        return acc
+    }
+    return scons(n, acc)
+}
+
+fn expr_alias_binds(n: ref parser.Node, rn: str, al: ref SList, acc: own SList) -> own SList {
+    if n == nil {
+        return acc
+    }
+    match n {
+        parser.Node.Call{f, args} => {
+            acc = expr_alias_binds(f, rn, al, acc)
+            l := args
+            for l != nil {
+                acc = expr_alias_binds(l.v, rn, al, acc)
+                l = l.next
+            }
+            return acc
+        }
+        parser.Node.Field{obj} => {
+            return expr_alias_binds(obj, rn, al, acc)
+        }
+        parser.Node.Un{e} => {
+            return expr_alias_binds(e, rn, al, acc)
+        }
+        parser.Node.Bin{l, r} => {
+            acc = expr_alias_binds(l, rn, al, acc)
+            return expr_alias_binds(r, rn, al, acc)
+        }
+        parser.Node.As{e} => {
+            return expr_alias_binds(e, rn, al, acc)
+        }
+        parser.Node.Index{obj, idx} => {
+            acc = expr_alias_binds(obj, rn, al, acc)
+            return expr_alias_binds(idx, rn, al, acc)
+        }
+        parser.Node.Slice{obj, lo, hi} => {
+            acc = expr_alias_binds(obj, rn, al, acc)
+            if lo != nil {
+                acc = expr_alias_binds(lo, rn, al, acc)
+            }
+            if hi != nil {
+                acc = expr_alias_binds(hi, rn, al, acc)
+            }
+            return acc
+        }
+        parser.Node.Lit{obj, fields} => {
+            acc = expr_alias_binds(obj, rn, al, acc)
+            fl := fields
+            for fl != nil {
+                match fl.v {
+                    parser.Node.NamedField{val} => {
+                        acc = expr_alias_binds(val, rn, al, acc)
+                    }
+                    _ => {
+                    }
+                }
+                fl = fl.next
+            }
+            return acc
+        }
+        parser.Node.Match{e, arms} => {
+            acc = expr_alias_binds(e, rn, al, acc)
+            am := arms
+            for am != nil {
+                match am.v {
+                    parser.Node.MArm{pat, body} => {
+                        match pat {
+                            parser.Node.PatBind{name} => {
+                                if expr_borrows(e, rn, al) == 1 {
+                                    acc = alias_add(acc, rn, al, name)
+                                }
+                            }
+                            _ => {
+                            }
+                        }
+                        match body {
+                            parser.Node.List{items} => {
+                                acc = stmts_alias_binds(items, rn, al, acc)
+                            }
+                            _ => {
+                                acc = expr_alias_binds(body, rn, al, acc)
+                            }
+                        }
+                    }
+                    _ => {
+                    }
+                }
+                am = am.next
+            }
+            return acc
+        }
+        _ => {
+            return acc
+        }
+    }
+}
+
+fn node_alias_binds(b: ref parser.Node, rn: str, al: ref SList, acc: own SList) -> own SList {
+    if b == nil {
+        return acc
+    }
+    match b {
+        parser.Node.List{items} => {
+            return stmts_alias_binds(items, rn, al, acc)
+        }
+        _ => {
+            return stmt_alias_binds(b, rn, al, acc)
+        }
+    }
+}
+
+fn stmts_alias_binds(items: ref parser.NList, rn: str, al: ref SList, acc: own SList) -> own SList {
+    l := items
+    for l != nil {
+        acc = stmt_alias_binds(l.v, rn, al, acc)
+        l = l.next
+    }
+    return acc
+}
+
+fn stmt_alias_binds(s: ref parser.Node, rn: str, al: ref SList, acc: own SList) -> own SList {
+    if s == nil {
+        return acc
+    }
+    match s {
+        parser.Node.List{items} => {
+            return stmts_alias_binds(items, rn, al, acc)
+        }
+        parser.Node.Scope{body} => {
+            return node_alias_binds(body, rn, al, acc)
+        }
+        parser.Node.Unsafe{body} => {
+            return node_alias_binds(body, rn, al, acc)
+        }
+        parser.Node.Let{name, init} => {
+            acc = expr_alias_binds(init, rn, al, acc)
+            if init != nil && expr_borrows(init, rn, al) == 1 {
+                acc = alias_add(acc, rn, al, name)
+            }
+            return acc
+        }
+        parser.Node.Bind{name, init} => {
+            acc = expr_alias_binds(init, rn, al, acc)
+            if init != nil && expr_borrows(init, rn, al) == 1 {
+                acc = alias_add(acc, rn, al, name)
+            }
+            return acc
+        }
+        parser.Node.Let2{names, call} => {
+            acc = expr_alias_binds(call, rn, al, acc)
+            if call != nil && expr_borrows(call, rn, al) == 1 {
+                i := find(names, ",")
+                an := names
+                bn := ""
+                if i >= 0 {
+                    an = substr(names, 0, i)
+                    bn = substr(names, i + 1, len(names))
+                }
+                acc = alias_add(acc, rn, al, an)
+                acc = alias_add(acc, rn, al, bn)
+            }
+            return acc
+        }
+        parser.Node.Assign{target, val} => {
+            acc = expr_alias_binds(target, rn, al, acc)
+            acc = expr_alias_binds(val, rn, al, acc)
+            if val != nil && expr_borrows(val, rn, al) == 1 {
+                acc = alias_add(acc, rn, al, taint_root(target))
+            }
+            return acc
+        }
+        parser.Node.ExprStmt{e} => {
+            return expr_alias_binds(e, rn, al, acc)
+        }
+        parser.Node.Defer{call} => {
+            return expr_alias_binds(call, rn, al, acc)
+        }
+        parser.Node.Ret{vals} => {
+            vl := vals
+            for vl != nil {
+                acc = expr_alias_binds(vl.v, rn, al, acc)
+                vl = vl.next
+            }
+            return acc
+        }
+        parser.Node.If{cond, then, els} => {
+            acc = expr_alias_binds(cond, rn, al, acc)
+            acc = node_alias_binds(then, rn, al, acc)
+            return node_alias_binds(els, rn, al, acc)
+        }
+        parser.Node.For{cond, body} => {
+            acc = expr_alias_binds(cond, rn, al, acc)
+            return node_alias_binds(body, rn, al, acc)
+        }
+        parser.Node.Select{arms} => {
+            al2 := arms
+            for al2 != nil {
+                match al2.v {
+                    parser.Node.SArm{ch, ms, body} => {
+                        acc = expr_alias_binds(ch, rn, al, acc)
+                        acc = expr_alias_binds(ms, rn, al, acc)
+                        acc = node_alias_binds(body, rn, al, acc)
+                    }
+                    _ => {
+                    }
+                }
+                al2 = al2.next
+            }
+            return acc
+        }
+        parser.Node.Spawn{e} => {
+            return expr_alias_binds(e, rn, al, acc)
+        }
+        parser.Node.SpawnBlocking{e} => {
+            return expr_alias_binds(e, rn, al, acc)
+        }
+        parser.Node.Go{e} => {
+            return expr_alias_binds(e, rn, al, acc)
+        }
+        parser.Node.GoIn{sc, e} => {
+            acc = expr_alias_binds(sc, rn, al, acc)
+            return expr_alias_binds(e, rn, al, acc)
+        }
+        _ => {
+            return acc
+        }
+    }
+}
+
+// does `e`'s value potentially carry a borrow of `rn`'s storage (or a
+// tracked alias's)? The plain mention scan can't tell `h.buf =
+// new(b.buf)` (a copy into a fresh heap object) or `h.rd = b.rd` (a
+// field's value copy) from a real borrow — both wrongly flagged the
+// owned `into_*` variants as receiver-aliasing. What borrows: the
+// receiver/alias name itself (the mut view), a call mentioning it
+// (as*/store methods and passthroughs — except `new`, which
+// heap-copies), a sub-slice of it (shared backing), and literals built
+// from such pieces.
+fn expr_borrows(e: ref parser.Node, rn: str, al: ref SList) -> int {
+    if e == nil {
+        return 0
+    }
+    match e {
+        parser.Node.Name{n} => {
+            if n == rn || sl_has(al, n) {
+                return 1
+            }
+            return 0
+        }
+        parser.Node.Field{obj} => {
+            // a field read of the receiver is a value copy — fields
+            // don't borrow their own struct. A field of a tracked
+            // alias may be the slot a borrow was stored into, so
+            // aliases stay conservative.
+            match obj {
+                parser.Node.Name{n} => {
+                    if n == rn {
+                        return 0
+                    }
+                }
+                _ => {
+                }
+            }
+            return expr_borrows(obj, rn, al)
+        }
+        parser.Node.Index{obj} => {
+            match obj {
+                parser.Node.Name{n} => {
+                    if n == rn {
+                        return 0
+                    }
+                }
+                _ => {
+                }
+            }
+            return expr_borrows(obj, rn, al)
+        }
+        parser.Node.Slice{obj} => {
+            return expr_borrows(obj, rn, al)
+        }
+        parser.Node.Un{e} => {
+            // value operators (!, -) produce copies, never a borrow
+            return 0
+        }
+        parser.Node.Bin{l, r} => {
+            return 0
+        }
+        parser.Node.As{e} => {
+            // a conversion preserves the value — `b as []T` keeps the
+            // backing, `b as io.Reader` boxes the mut view
+            return expr_borrows(e, rn, al)
+        }
+        parser.Node.Call{f, args} => {
+            match f {
+                parser.Node.Name{n} => {
+                    if n == "new" {
+                        return 0
+                    }
+                }
+                _ => {
+                }
+            }
+            return alias_mentions(e, rn, al)
+        }
+        parser.Node.Lit{obj, fields} => {
+            fl := fields
+            for fl != nil {
+                match fl.v {
+                    parser.Node.NamedField{val} => {
+                        if expr_borrows(val, rn, al) == 1 {
+                            return 1
+                        }
+                    }
+                    _ => {
+                    }
+                }
+                fl = fl.next
+            }
+            return expr_borrows(obj, rn, al)
+        }
+        _ => {
+            return alias_mentions(e, rn, al)
+        }
+    }
+}
+
+fn meth_alias_body(body: ref parser.Node, rn: str) -> int {
+    let al: own SList = nil
+    for true {
+        add := node_alias_binds(body, rn, al, nil)
+        if add == nil {
+            break
+        }
+        l := add
+        for l != nil {
+            if !sl_has(al, l.v) {
+                al = scons(l.v, al)
+            }
+            l = l.next
+        }
+    }
+    if ret_mentions(body, rn) == 1 {
+        return 1
+    }
+    l := al
+    for l != nil {
+        if ret_mentions(body, l.v) == 1 {
+            return 1
+        }
+        l = l.next
+    }
+    return 0
+}
+
 // does control reach the end of this block? A trailing return/break/
 // continue can't have its moves observed at the join
 fn falls_through(items: ref parser.NList) -> bool {
@@ -784,6 +2593,91 @@ fn moved_clear_all(e: mut Env) {
         e.scopes[i].moved = nil
         i = i + 1
     }
+}
+
+fn borr_clear_all(e: mut Env) {
+    i := 0
+    for i < len(e.scopes) {
+        e.scopes[i].borr = nil
+        i = i + 1
+    }
+}
+
+fn sncons(s: own LL, l: own SnapL) -> own SnapL {
+    c := new(SnapL)
+    c.s = s
+    c.next = l
+    return c
+}
+
+fn loop_push(ck: mut Ck) {
+    t := new(LoopSt)
+    t.next = ck.loops
+    ck.loops = t
+}
+
+fn loop_pop(ck: mut Ck) -> own LoopSt {
+    t := ck.loops
+    if t == nil {
+        return nil
+    }
+    ck.loops = t.next
+    return t
+}
+
+fn for_body(ck: mut Ck, body: ref parser.Node, env: mut Env) -> own LoopSt {
+    ck.loop_depth = ck.loop_depth + 1
+    loop_push(ck)
+    block_node(ck, body, env)
+    lp := loop_pop(ck)
+    ck.loop_depth = ck.loop_depth - 1
+    return lp
+}
+
+fn ll_taint_count(l: ref LL) -> int {
+    n := 0
+    for l != nil {
+        n = n + sl_len(l.names)
+        l = l.next
+    }
+    return n
+}
+
+// fixed-point test: every borrow entry in `nh` — binding name and its
+// full merged source set — is already carried by the same scope's entry
+// in `head`. Counts alone miss source-set growth under borr_union.
+fn ll_covered(ck: ref Ck, nh: ref LL, head: ref LL) -> int {
+    a := nh
+    b := head
+    for a != nil {
+        l := a.names
+        for l != nil {
+            bi := borr_entry_idx(l.v)
+            hb := -1
+            if b != nil {
+                hb = borr_get(b.names, taint_name(l.v))
+            }
+            if bi >= 0 && bi < len(ck.borrn) && (hb < 0 || hb >= len(ck.borrn) || taint_covers(ck, hb, ck.borrn[bi]) == 0) {
+                return 0
+            }
+            l = l.next
+        }
+        a = a.next
+        if b != nil {
+            b = b.next
+        }
+    }
+    return 1
+}
+
+fn env_bind_count(e: ref Env) -> int {
+    n := 0
+    i := 0
+    for i < len(e.scopes) {
+        n = n + collections.map_len(e.scopes[i].m)
+        i = i + 1
+    }
+    return n
 }
 
 // `for` post-pass: any binding newly marked inside the body would be
@@ -1314,14 +3208,34 @@ fn call_iface(ck: mut Ck, ps: ref IList, retk: int, ret1: int, args: ref parser.
     if nl_len(args) != ilen(ps) {
         diag(ck, "check", "method takes " + itoa(ilen(ps)) + " args, got " + itoa(nl_len(args)))
     }
+    atain := -1
     wl := ps
     al := args
     for al != nil && wl != nil {
+        sp := ck.in_spawn
+        ck.in_spawn = 0
         gt := expr(ck, al.v, env)
+        at := ck.et
+        ck.in_spawn = sp
         assignable(ck, wl.v, gt)
         move_for(ck, al.v, wl.v, env)
+        if at >= 0 {
+            atain = taint_merge(ck, atain, at)
+        }
+        if sp != 0 {
+            wk3 := ck.tyv[wl.v].k
+            if wk3 == k_slice() || wk3 == k_ref() || wk3 == k_mut() {
+                diag(ck, "check", "`spawn` arg of `[]T`/`ref`/`mut` escapes into the task — the backing dies with the scope; pass `own` or a value")
+            }
+            if at >= 0 {
+                diag(ck, "check", "`spawn` arg carries a borrow of local `" + taint_src(ck, at) + "` — it escapes into the task")
+            }
+        }
         wl = wl.next
         al = al.next
+    }
+    if retk != 0 && ret1 >= 0 && taint_may(ck, ret1) == 1 && atain >= 0 {
+        ck.ptaint = atain
     }
     if retk == 0 {
         return t_void(ck)
@@ -1516,6 +3430,11 @@ fn diag(ck: mut Ck, kind: str, msg: str) {
 // ---------- ty handles ----------
 fn tm(ck: mut Ck, k: int, i: int, args: own IList, r: int, name: str) -> int {
     ck.tyv = push(ck.tyv, T{k: k, i: i, args: args, r: r, name: name})
+    j := 0
+    for j < 16 {
+        ck.tyhs = push(ck.tyhs, -1)
+        j = j + 1
+    }
     return len(ck.tyv) - 1
 }
 
@@ -2651,6 +4570,29 @@ fn reg_sigs(ck: mut Ck, its: []It) {
         match its[i].node {
             parser.Node.Fn{ex, name, recv, typarams, params, ret, body, lo, hi} => {
                 reg_fn(ck, its[i].mod, ex, name, recv, typarams, params, ret, lo, hi)
+                // iface-returning mut/ref methods whose `return` mentions
+                // the receiver alias its borrow — flag for call-site taint
+                // (issue #138). Runs at sig time so callers checked before
+                // the method body still see the bit.
+                if recv != nil && body != nil {
+                    fnm := name
+                    match recv {
+                        parser.Node.Param{name} => {
+                            qn2 := fn_qname(ck, its[i].mod, recv, fnm)
+                            if collections.map_has(ck.fns, qn2) {
+                                [fi2, e2] = collections.map_get(ck.fns, qn2)
+                                if e2 == nil && ck.fnsv[fi2].retk != 0 && ck.fnsv[fi2].params != nil {
+                                    pk := ck.tyv[ck.fnsv[fi2].params.v].k
+                                    if (pk == k_mut() || pk == k_ref()) && taint_may(ck, ck.fnsv[fi2].ret1) == 1 && meth_alias_body(body, name) == 1 {
+                                        ck.meth_alias = scons(qn2, ck.meth_alias)
+                                    }
+                                }
+                            }
+                        }
+                        _ => {
+                        }
+                    }
+                }
             }
             parser.Node.Let{name, ty, init, lo, hi} => {
                 reg_global(ck, name, ty, init, lo, hi)
@@ -2681,7 +4623,9 @@ fn is_susp_builtin(n: str) -> bool {
 
 // ---------- expressions ----------
 fn expr(ck: mut Ck, e: ref parser.Node, env: mut Env) -> int {
+    ck.ptaint = -1
     if e == nil {
+        ck.et = -1
         return t_unk(ck)
     }
     elo := parser.nlo(e)
@@ -2706,6 +4650,19 @@ fn expr(ck: mut Ck, e: ref parser.Node, env: mut Env) -> int {
         parser.Node.Ty{f0} => tylit_bad(ck)
         _ => t_unk(ck)
     }
+    // borrow-taint of this value: node helpers leave it in ptaint;
+    // plain names resolve through the binding's borr entry
+    if ck.ptaint < 0 {
+        match e {
+            parser.Node.Name{n} => {
+                ck.ptaint = env_taint(env, n)
+            }
+            _ => {
+            }
+        }
+    }
+    ck.et = ck.ptaint
+    ck.ptaint = -1
     return t
 }
 
@@ -2804,6 +4761,7 @@ fn field_expr(ck: mut Ck, obj: ref parser.Node, name: str, fhi: int, env: mut En
         return ident(ck, base + "." + name, fhi - len(name), fhi, env)
     }
     t := expr(ck, obj, env)
+    otaint := ck.et
     sn := ""
     tk2 := ck.tyv[t].k
     if tk2 == k_struct() {
@@ -2835,11 +4793,15 @@ fn field_expr(ck: mut Ck, obj: ref parser.Node, name: str, fhi: int, env: mut En
     }
     mlo := fhi - len(name)
     rec_use(ck, mlo, mlo + len(name), sn + "." + name)
+    if otaint >= 0 && taint_may(ck, ft) == 1 {
+        ck.ptaint = otaint
+    }
     return ft
 }
 
 // every `{name: expr}` literal field — shared by struct and enum paths
-fn lit_fields(ck: mut Ck, path: str, want: ref FList, fields: ref parser.NList, env: mut Env) {
+fn lit_fields(ck: mut Ck, path: str, want: ref FList, fields: ref parser.NList, env: mut Env) -> int {
+    lt := -1
     fl := fields
     for fl != nil {
         match fl.v {
@@ -2851,6 +4813,9 @@ fn lit_fields(ck: mut Ck, path: str, want: ref FList, fields: ref parser.NList, 
                     gt := expr(ck, val, env)
                     assignable(ck, wt, gt)
                     move_for(ck, val, wt, env)
+                    if ck.et >= 0 {
+                        lt = taint_merge(ck, lt, ck.et)
+                    }
                 }
             }
             _ => {
@@ -2879,6 +4844,7 @@ fn lit_fields(ck: mut Ck, path: str, want: ref FList, fields: ref parser.NList, 
         }
         w = w.next
     }
+    return lt
 }
 
 fn lit_expr(ck: mut Ck, obj: ref parser.Node, fields: ref parser.NList, env: mut Env) -> int {
@@ -2906,7 +4872,7 @@ fn lit_expr(ck: mut Ck, obj: ref parser.Node, fields: ref parser.NList, env: mut
             if given != flen(want) {
                 diag(ck, "type", "`" + path + "` takes " + itoa(flen(want)) + " payload field(s), found " + itoa(given))
             } else {
-                lit_fields(ck, path, want, fields, env)
+                ck.ptaint = lit_fields(ck, path, want, fields, env)
             }
         }
         return tn(ck, k_enum(), en)
@@ -2919,12 +4885,13 @@ fn lit_expr(ck: mut Ck, obj: ref parser.Node, fields: ref parser.NList, env: mut
     if err != nil {
         return t_unk(ck)
     }
-    lit_fields(ck, path, ck.structsv[si].fields, fields, env)
+    ck.ptaint = lit_fields(ck, path, ck.structsv[si].fields, fields, env)
     return tn(ck, k_struct(), path)
 }
 
 fn as_expr(ck: mut Ck, inner: ref parser.Node, ty: ref parser.Node, env: mut Env) -> int {
     ot := expr(ck, inner, env)
+    itaint := ck.et
     match ty {
         parser.Node.Ty{f0, lo, hi} => {
             if bare_ty_name(f0) {
@@ -2935,6 +4902,9 @@ fn as_expr(ck: mut Ck, inner: ref parser.Node, ty: ref parser.Node, env: mut Env
         }
     }
     wt := ty_parse(ck, ty_str(ty))
+    if itaint >= 0 && taint_may(ck, wt) == 1 {
+        ck.ptaint = itaint
+    }
     ok := ck.tyv[ot].k
     oname := ""
     if ok == k_enum() {
@@ -2982,16 +4952,25 @@ fn as_expr(ck: mut Ck, inner: ref parser.Node, ty: ref parser.Node, env: mut Env
 
 fn index_expr(ck: mut Ck, obj: ref parser.Node, idx: ref parser.Node, env: mut Env) -> int {
     ot := expr(ck, obj, env)
+    otaint := ck.et
     it := expr(ck, idx, env)
     assignable(ck, t_int(ck), it)
     ok := ck.tyv[ot].k
     if ok == k_slice() {
-        return ck.tyv[ot].i
+        rt := ck.tyv[ot].i
+        if otaint >= 0 && taint_may(ck, rt) == 1 {
+            ck.ptaint = otaint
+        }
+        return rt
     }
     if ok == k_own() || ok == k_ref() || ok == k_mut() {
         inner := ck.tyv[ot].i
         if inner >= 0 && ck.tyv[inner].k == k_slice() {
-            return ck.tyv[inner].i
+            rt2 := ck.tyv[inner].i
+            if otaint >= 0 && taint_may(ck, rt2) == 1 {
+                ck.ptaint = otaint
+            }
+            return rt2
         }
     }
     if ok != k_unk() {
@@ -3002,6 +4981,7 @@ fn index_expr(ck: mut Ck, obj: ref parser.Node, idx: ref parser.Node, env: mut E
 
 fn slice_expr(ck: mut Ck, obj: ref parser.Node, lo: ref parser.Node, hi: ref parser.Node, env: mut Env) -> int {
     ot := expr(ck, obj, env)
+    otaint := ck.et
     if lo != nil {
         assignable(ck, t_int(ck), expr(ck, lo, env))
     }
@@ -3010,11 +4990,17 @@ fn slice_expr(ck: mut Ck, obj: ref parser.Node, lo: ref parser.Node, hi: ref par
     }
     ok := ck.tyv[ot].k
     if ok == k_slice() {
+        if otaint >= 0 && taint_may(ck, ot) == 1 {
+            ck.ptaint = otaint
+        }
         return ot
     }
     if ok == k_own() || ok == k_ref() || ok == k_mut() {
         inner := ck.tyv[ot].i
         if inner >= 0 && ck.tyv[inner].k == k_slice() {
+            if otaint >= 0 && taint_may(ck, inner) == 1 {
+                ck.ptaint = otaint
+            }
             return inner
         }
     }
@@ -3156,7 +5142,7 @@ fn pat_lit(ck: mut Ck, v: ref parser.Node, st: int, env: mut Env, sk: int, saw: 
 
 // alo/ahi are the arm's span — payload binds take the arm's span as
 // their declaration, matching the seed's env.set(arm.span) behaviour
-fn pat_variant(ck: mut Ck, path: str, binds: ref parser.NList, en: str, covered: mut SListBox, alo: int, ahi: int, env: mut Env) {
+fn pat_variant(ck: mut Ck, path: str, binds: ref parser.NList, en: str, covered: mut SListBox, alo: int, ahi: int, staint: int, env: mut Env) {
     qpath := resolve_named(ck, path)
     vei := enum_variant(ck, qpath)
     if vei < 0 {
@@ -3201,6 +5187,9 @@ fn pat_variant(ck: mut Ck, path: str, binds: ref parser.NList, en: str, covered:
                 parser.Node.Name{n} => {
                     if n != "_" {
                         env_set(env, n, wl.v.t, alo, ahi)
+                        if staint >= 0 && taint_may(ck, wl.v.t) == 1 {
+                            env_taint_set(env, n, staint)
+                        }
                     }
                 }
                 _ => {
@@ -3221,6 +5210,9 @@ fn pat_variant(ck: mut Ck, path: str, binds: ref parser.NList, en: str, covered:
                         diag(ck, "check", "`" + qpath + "` has no field `" + n + "`")
                     } else {
                         env_set(env, n, ft, alo, ahi)
+                        if staint >= 0 && taint_may(ck, ft) == 1 {
+                            env_taint_set(env, n, staint)
+                        }
                     }
                 }
             }
@@ -3236,6 +5228,7 @@ struct SListBox { l: own SList }
 
 fn match_expr(ck: mut Ck, scrut: ref parser.Node, arms: ref parser.NList, env: mut Env) -> int {
     st := expr(ck, scrut, env)
+    staint := ck.et
     sk := ck.tyv[st].k
     en := ""
     if sk == k_enum() {
@@ -3260,12 +5253,19 @@ fn match_expr(ck: mut Ck, scrut: ref parser.Node, arms: ref parser.NList, env: m
     result := -1
     n_expr := 0
     n_block := 0
+    mtaint := -1
     // arms are alternative paths — merge `moved` like if/else
     pre := moved_save(env)
+    bpre := borr_save(env)
+    spre := sal_clone(ck.srep)
     let armst: own ArmSt = nil
+    let btail: own SList = nil
+    let sjoin: own SalIAS = nil
     a := arms
     for a != nil {
         moved_restore(env, ll_clone(pre))
+        borr_restore(env, ll_clone(bpre))
+        ck.srep = sal_clone(spre)
         match a.v {
             parser.Node.MArm{pat, body, lo, hi} => {
                 env_push(env)
@@ -3279,6 +5279,10 @@ fn match_expr(ck: mut Ck, scrut: ref parser.Node, arms: ref parser.NList, env: m
                     match pat {
                         parser.Node.PatBind{name} => {
                             env_set(env, name, st, lo, hi)
+                            if staint >= 0 && taint_may(ck, st) == 1 {
+                                env_taint_set(env, name, staint)
+                            }
+                            sal_bind(ck, env, name, st, scrut)
                         }
                         _ => {
                         }
@@ -3298,7 +5302,7 @@ fn match_expr(ck: mut Ck, scrut: ref parser.Node, arms: ref parser.NList, env: m
                 if pk == 34 {
                     match pat {
                         parser.Node.Pat{path, binds} => {
-                            pat_variant(ck, path, binds, en, cov, lo, hi, env)
+                            pat_variant(ck, path, binds, en, cov, lo, hi, staint, env)
                         }
                         _ => {
                         }
@@ -3316,19 +5320,63 @@ fn match_expr(ck: mut Ck, scrut: ref parser.Node, arms: ref parser.NList, env: m
                 } else {
                     n_expr = n_expr + 1
                     bt := expr(ck, body, env)
+                    // the arm's value may carry a borrow of a binding the
+                    // arm itself introduced (PatBind copies a value scrutinee
+                    // into arm scope) — it dies at env_pop_ck, so the match
+                    // result would dangle in the enclosing scope
+                    if ck.et >= 0 {
+                        mtaint = taint_merge(ck, mtaint, ck.et)
+                        tops := len(env.scopes) - 1
+                        srcs := taint_srcs(ck, ck.et)
+                        for srcs != nil {
+                            if src_gen(srcs.v) == env.scopes[tops].gen {
+                                diag(ck, "check", "match arm result escapes a borrow of arm-local `" + src_name(srcs.v) + "` — it dangles when the arm scope ends")
+                            }
+                            srcs = srcs.next
+                        }
+                    }
                     if result < 0 {
                         result = bt
                     } else {
                         assignable(ck, result, bt)
                     }
                 }
-                env_pop(env)
+                sjoin = sal_absorb_to(sjoin, ck.srep)
+                env_pop_ck(ck, env)
+                // taint is may-analysis across arms — collect every
+                // binding any arm left borrow-carrying, re-apply after
+                bi := 0
+                for bi < len(env.scopes) {
+                    bl2 := env.scopes[bi].borr
+                    for bl2 != nil {
+                        if !sl_has(btail, bl2.v) {
+                            btail = scons(bl2.v, btail)
+                        }
+                        bl2 = bl2.next
+                    }
+                    bi = bi + 1
+                }
             }
             _ => {
             }
         }
         a = a.next
     }
+    bl3 := btail
+    for bl3 != nil {
+        nm := taint_name(bl3.v)
+        di2 := find(bl3.v, "|")
+        if di2 >= 0 {
+            env_taint_merge(ck, env, nm, atoi(substr(bl3.v, di2 + 1, len(bl3.v))))
+        }
+        bl3 = bl3.next
+    }
+    if sjoin != nil {
+        ck.srep = sjoin
+    } else {
+        ck.srep = sal_clone(spre)
+    }
+    spre = nil
     if n_expr > 0 && n_block > 0 {
         diag(ck, "check", "match arms must be all expressions or all blocks — not mixed")
     }
@@ -3357,6 +5405,7 @@ fn match_expr(ck: mut Ck, scrut: ref parser.Node, arms: ref parser.NList, env: m
         }
     }
     if n_expr > 0 {
+        ck.ptaint = mtaint
         if result < 0 {
             return t_void(ck)
         }
@@ -3419,13 +5468,21 @@ fn call(ck: mut Ck, f: ref parser.Node, args: ref parser.NList, env: mut Env) ->
                 if given != wlen {
                     diag(ck, "type", "`" + name + "` takes " + itoa(wlen) + " payload field(s), found " + itoa(given))
                 } else {
+                    vt := -1
                     wl := want
                     al := args
                     for al != nil && wl != nil {
                         gt := expr(ck, al.v, env)
+                        at := ck.et
                         assignable(ck, wl.v.t, gt)
+                        if at >= 0 && taint_may(ck, wl.v.t) == 1 {
+                            vt = taint_merge(ck, vt, at)
+                        }
                         wl = wl.next
                         al = al.next
+                    }
+                    if vt >= 0 {
+                        ck.ptaint = vt
                     }
                 }
             }
@@ -3450,11 +5507,13 @@ fn call(ck: mut Ck, f: ref parser.Node, args: ref parser.NList, env: mut Env) ->
         // generic constraint vtab-dispatches; a bare `m(x,..)` that isn't
         // a fn retries as a method on args[0]'s ty
         let recv: ref parser.Node = nil
+        let srecv: ref parser.Node = nil
         if !collections.map_has(ck.fns, qn) {
             if nk(f) == 9 {
                 match f {
                     parser.Node.Field{obj, name} => {
                         ot := expr(ck, obj, env)
+                        otaint := ck.et
                         if ck.tyv[ot].k == k_unk() {
                             return t_unk(ck)
                         }
@@ -3474,7 +5533,16 @@ fn call(ck: mut Ck, f: ref parser.Node, args: ref parser.NList, env: mut Env) ->
                         if mt.k == 2 {
                             ms := member_span(f)
                             rec_use(ck, ms.lo, ms.hi, mt.q)
-                            return call_iface(ck, mt.ps, mt.rk, mt.r1, args, env)
+                            rt := call_iface(ck, mt.ps, mt.rk, mt.r1, args, env)
+                            // a vtable call on a borrow-carrying receiver
+                            // hands the same borrow onward
+                            if otaint >= 0 && (mt.rk == 1 || mt.rk == 2) && taint_may(ck, mt.r1) == 1 {
+                                ck.ptaint = otaint
+                            }
+                            if ck.in_spawn != 0 && otaint >= 0 {
+                                diag(ck, "check", "`spawn` arg carries a borrow of local `" + taint_src(ck, otaint) + "` — it escapes into the task")
+                            }
+                            return rt
                         }
                         if mt.k == 1 {
                             recv = obj
@@ -3498,6 +5566,7 @@ fn call(ck: mut Ck, f: ref parser.Node, args: ref parser.NList, env: mut Env) ->
                 mt := method_target(ck, t0, name)
                 if mt.k == 1 {
                     qn = mt.q
+                    srecv = args.v
                 }
             }
         }
@@ -3573,10 +5642,14 @@ fn call(ck: mut Ck, f: ref parser.Node, args: ref parser.NList, env: mut Env) ->
                     diag(ck, "type", "expected `chan`, found `" + ty_name(ck, ct) + "`")
                 }
                 vt := expr(ck, args.next.v, env)
+                vat := ck.et
                 if ct >= 0 && ck.tyv[ct].k == k_chan() && ck.tyv[ct].i >= 0 {
                     assignable(ck, ck.tyv[ct].i, vt)
                 } else if !is_word(ck, vt) {
                     diag(ck, "own", "channels carry word-sized owned values (v0), not `" + ty_name(ck, vt) + "`")
+                }
+                if vat >= 0 {
+                    diag(ck, "check", "`" + qn + "` escapes a borrow of local `" + taint_src(ck, vat) + "` into the channel — it dangles when the scope ends")
                 }
                 // try_send statically always moves — a `false` result
                 // drops the payload by disuse (v0 semantics)
@@ -3651,7 +5724,12 @@ fn call(ck: mut Ck, f: ref parser.Node, args: ref parser.NList, env: mut Env) ->
                     }
                 }
                 t := expr(ck, a, env)
-                return ti(ck, k_own(), t)
+                nt := ck.et
+                rt := ti(ck, k_own(), t)
+                if nt >= 0 && taint_may(ck, rt) == 1 {
+                    ck.ptaint = nt
+                }
+                return rt
             }
             diag(ck, "type", "`new` needs a struct name or value")
             return t_unk(ck)
@@ -3732,10 +5810,36 @@ fn call(ck: mut Ck, f: ref parser.Node, args: ref parser.NList, env: mut Env) ->
                 return t_unk(ck)
             }
             st := expr(ck, args.v, env)
+            stat := ck.et
             if ck.tyv[st].k == k_slice() {
-                if args.next != nil {
+                if args.next != nil && args.next.next == nil {
                     vt := expr(ck, args.next.v, env)
+                    vat := ck.et
                     assignable(ck, ck.tyv[st].i, vt)
+                    // the result slice carries the pushed value's borrow;
+                    // spare-capacity pushes also write it into the input
+                    // backing every live alias can still observe
+                    pt := -1
+                    if vat >= 0 && taint_may(ck, ck.tyv[st].i) == 1 {
+                        pt = vat
+                        rn := taint_root(args.v)
+                        if len(rn) > 0 {
+                            rgt := env_get(ck, env, rn)
+                            if scope_of(env, rn) < 0 && rgt >= 0 {
+                                diag(ck, "check", "`push` into `" + rn + "` escapes a borrow of local `" + taint_src(ck, vat) + "` — it dangles when the scope ends")
+                            } else if is_param_binding(ck, env, rn) == 1 {
+                                diag(ck, "check", "`push` into `" + rn + "` stores a borrow of local `" + taint_src(ck, vat) + "` in borrowed storage — it can outlive this scope")
+                            } else {
+                                sal_taint_name(ck, env, rn, vat)
+                            }
+                        }
+                    }
+                    if stat >= 0 && taint_may(ck, st) == 1 {
+                        pt = taint_merge(ck, pt, stat)
+                    }
+                    if pt >= 0 {
+                        ck.ptaint = pt
+                    }
                 } else {
                     diag(ck, "check", "`push` takes (slice, value)")
                 }
@@ -3963,6 +6067,11 @@ fn call(ck: mut Ck, f: ref parser.Node, args: ref parser.NList, env: mut Env) ->
         }
         wl := sig.params
         al := args
+        rg := -1
+        fg := -1
+        rt0 := -1
+        fat := -1
+        atain := -1
         if recv != nil && wl != nil {
             // receiver slot: `*x`/`&x` adapt — `&` needs an lvalue
             want := subst_ty(ck, wl.v, bind)
@@ -3970,7 +6079,9 @@ fn call(ck: mut Ck, f: ref parser.Node, args: ref parser.NList, env: mut Env) ->
             ck.in_spawn = 0
             got := expr(ck, recv, env)
             ck.in_spawn = sp
+            rt0 = ck.et
             wk2 := ck.tyv[want].k
+            rg = got
             gk2 := ck.tyv[got].k
             if (wk2 == k_own() || wk2 == k_ref() || wk2 == k_mut()) && (gk2 == k_struct() || gk2 == k_enum()) && !is_lvalue(recv) {
                 diag(ck, "type", "pointer receiver on an rvalue — bind it first")
@@ -3978,8 +6089,13 @@ fn call(ck: mut Ck, f: ref parser.Node, args: ref parser.NList, env: mut Env) ->
             got = recv_adapt_ty(ck, want, got)
             assignable(ck, want, got)
             move_for(ck, recv, want, env)
-            if sp != 0 && (wk2 == k_slice() || wk2 == k_ref() || wk2 == k_mut()) {
-                diag(ck, "check", "`spawn` arg of `[]T`/`ref`/`mut` escapes into the task — the backing dies with the scope; pass `own` or a value")
+            if sp != 0 {
+                if wk2 == k_slice() || wk2 == k_ref() || wk2 == k_mut() {
+                    diag(ck, "check", "`spawn` arg of `[]T`/`ref`/`mut` escapes into the task — the backing dies with the scope; pass `own` or a value")
+                }
+                if rt0 >= 0 {
+                    diag(ck, "check", "`spawn` arg carries a borrow of local `" + taint_src(ck, rt0) + "` — it escapes into the task")
+                }
             }
             wl = wl.next
         }
@@ -3988,17 +6104,62 @@ fn call(ck: mut Ck, f: ref parser.Node, args: ref parser.NList, env: mut Env) ->
             sp := ck.in_spawn
             ck.in_spawn = 0
             gt := expr(ck, al.v, env)
+            at := ck.et
             ck.in_spawn = sp
             assignable(ck, want, gt)
+            if fg < 0 {
+                fg = gt
+                fat = at
+            }
+            if at >= 0 {
+                atain = taint_merge(ck, atain, at)
+            }
             move_for(ck, al.v, want, env)
             if sp != 0 {
                 wk3 := ck.tyv[want].k
                 if wk3 == k_slice() || wk3 == k_ref() || wk3 == k_mut() {
                     diag(ck, "check", "`spawn` arg of `[]T`/`ref`/`mut` escapes into the task — the backing dies with the scope; pass `own` or a value")
                 }
+                if at >= 0 {
+                    diag(ck, "check", "`spawn` arg carries a borrow of local `" + taint_src(ck, at) + "` — it escapes into the task")
+                }
             }
             wl = wl.next
             al = al.next
+        }
+        // a mut/ref receiver method returning an iface (or composite
+        // that may hold one) boxes a borrow of the receiver's storage —
+        // taint the call when that storage is a function-local binding.
+        // sig.params head is the receiver slot for methods; `recv` is the
+        // dot-call node, `srecv` the method-sugar receiver (args[0]).
+        // meth_alias (sig-time scan) keeps owned `into_*` variants clean:
+        // only methods whose `return` mentions the receiver borrow it.
+        // Receiver *contents* taint separately: a value that already
+        // carries a borrow (br.r = buf.asreader()) stays borrow-carrying
+        // through owned conversions like into_reader.
+        if (recv != nil || srecv != nil) && sig.retk != 0 && taint_may(ck, sig.ret1) == 1 {
+            rtain := rt0
+            if recv == nil {
+                rtain = fat
+            }
+            if sig.params != nil && sl_has(ck.meth_alias, qn) {
+                ryk := ck.tyv[sig.params.v].k
+                if ryk == k_mut() || ryk == k_ref() {
+                    rnode := recv
+                    rty := rg
+                    if rnode == nil {
+                        rnode = srecv
+                        rty = fg
+                    }
+                    bs := storage_src(ck, rnode, rty, env)
+                    if bs >= 0 {
+                        ck.ptaint = bs
+                    }
+                }
+            }
+            if ck.ptaint < 0 && rtain >= 0 {
+                ck.ptaint = rtain
+            }
         }
         if sig.retk == 0 {
             return t_void(ck)
@@ -4006,6 +6167,12 @@ fn call(ck: mut Ck, f: ref parser.Node, args: ref parser.NList, env: mut Env) ->
         r1 := sig.ret1
         if sig.typarams != nil {
             r1 = subst_ty(ck, r1, bind)
+        }
+        // a call result that can retain a borrowed argument stays
+        // borrow-carrying — bufio.newreader(buf.asreader()) must not
+        // launder the local buffer through into_reader
+        if ck.ptaint < 0 && atain >= 0 && taint_may(ck, r1) == 1 {
+            ck.ptaint = atain
         }
         if sig.retk == 1 {
             return r1
@@ -4030,22 +6197,33 @@ fn call_fnvalue(ck: mut Ck, ps: ref IList, r: int, args: ref parser.NList, env: 
     if nl_len(args) != ilen(ps) {
         diag(ck, "check", "fn value takes " + itoa(ilen(ps)) + " args, got " + itoa(nl_len(args)))
     }
+    atain := -1
     wl := ps
     al := args
     for al != nil && wl != nil {
         sp := ck.in_spawn
         ck.in_spawn = 0
         gt := expr(ck, al.v, env)
+        at := ck.et
         ck.in_spawn = sp
         assignable(ck, wl.v, gt)
+        if at >= 0 {
+            atain = taint_merge(ck, atain, at)
+        }
         if sp != 0 {
             wk4 := ck.tyv[wl.v].k
             if wk4 == k_slice() || wk4 == k_ref() || wk4 == k_mut() {
                 diag(ck, "check", "`spawn` arg of `[]T`/`ref`/`mut` escapes into the task — the backing dies with the scope; pass `own` or a value")
             }
+            if at >= 0 {
+                diag(ck, "check", "`spawn` arg carries a borrow of local `" + taint_src(ck, at) + "` — it escapes into the task")
+            }
         }
         wl = wl.next
         al = al.next
+    }
+    if r >= 0 && taint_may(ck, r) == 1 && atain >= 0 {
+        ck.ptaint = atain
     }
     return r
 }
@@ -4070,7 +6248,7 @@ fn block(ck: mut Ck, items: ref parser.NList, env: mut Env) {
         stmt(ck, l.v, env)
         l = l.next
     }
-    env_pop(env)
+    env_pop_ck(ck, env)
 }
 
 fn block_node(ck: mut Ck, body: ref parser.Node, env: mut Env) {
@@ -4099,6 +6277,7 @@ fn stmt(ck: mut Ck, s: ref parser.Node, env: mut Env) {
                 diag(ck, "check", "`let` requires a type or an initializer")
             }
             it := expr(ck, init, env)
+            bs := ck.et
             t := it
             if ty != nil {
                 want := ty_parse(ck, ty_str(ty))
@@ -4106,10 +6285,18 @@ fn stmt(ck: mut Ck, s: ref parser.Node, env: mut Env) {
                 t = want
             }
             env_set(env, name, t, lo, hi)
+            if bs >= 0 {
+                if taint_has_temp(ck, bs) == 1 {
+                    diag(ck, "check", "`" + name + "` binds a borrow of a temporary — it dangles at the end of this statement")
+                }
+                env_taint_set(env, name, bs)
+            }
+            sal_bind(ck, env, name, t, init)
         }
         parser.Node.Let2{names, call, lo, hi} => {
             ck.in_let2 = 1
             expr(ck, call, env)
+            bs := ck.et
             ck.in_let2 = 0
             val_ty := t_unk(ck)
             if call_retk(ck, call, env) == 2 {
@@ -4126,6 +6313,13 @@ fn stmt(ck: mut Ck, s: ref parser.Node, env: mut Env) {
             }
             if an != "_" {
                 env_set(env, an, val_ty, lo, hi)
+                if bs >= 0 {
+                    if taint_has_temp(ck, bs) == 1 {
+                        diag(ck, "check", "`" + an + "` binds a borrow of a temporary — it dangles at the end of this statement")
+                    }
+                    env_taint_set(env, an, bs)
+                }
+                sal_bind(ck, env, an, val_ty, call)
             }
             if bn == "_" {
                 diag(ck, "check", "cannot discard `err` — handle it or pass it up")
@@ -4158,13 +6352,56 @@ fn stmt(ck: mut Ck, s: ref parser.Node, env: mut Env) {
                 }
             }
             vt := expr(ck, val, env)
+            vtaint := ck.et
             assignable(ck, tt, vt)
             // `x = y` re-initializes (aliasing walks like `s = s.next`
             // stay legal); `s.f = y`/`s[i] = y` hand the value away
             if len(idn) == 0 {
                 move_for(ck, val, tt, env)
+                sal_field_store(ck, env, target, val, vt)
+                if vtaint >= 0 {
+                    rt2 := taint_root(target)
+                    if len(rt2) > 0 {
+                        rt := env_get(ck, env, rt2)
+                        rk := -1
+                        if rt >= 0 {
+                            rk = ck.tyv[rt].k
+                        }
+                        if scope_of(env, rt2) < 0 && rt >= 0 {
+                            diag(ck, "check", "assignment to `" + rt2 + "` escapes a borrow of local `" + taint_src(ck, vtaint) + "` — it dangles when the scope ends")
+                        } else if rk == k_mut() || rk == k_ref() || is_param_binding(ck, env, rt2) == 1 && (rk == k_slice() || rk == k_own()) {
+                            diag(ck, "check", "assignment to `" + rt2 + "` stores a borrow of local `" + taint_src(ck, vtaint) + "` in borrowed storage — it can outlive this scope")
+                        } else {
+                            env_taint_merge(ck, env, rt2, vtaint)
+                        }
+                    }
+                    // `a[i] = v` writes the shared backing — every live
+                    // member of every group `a` may denote carries the taint
+                    match target {
+                        parser.Node.Index{obj} => {
+                            rn := taint_root(obj)
+                            if len(rn) > 0 {
+                                sal_taint_name(ck, env, rn, vtaint)
+                            }
+                        }
+                        _ => {
+                        }
+                    }
+                }
             } else {
                 clear_moved(env, idn)
+                if scope_of(env, idn) < 0 && ck.cur_fn != "" && vtaint >= 0 {
+                    diag(ck, "check", "assignment to `" + idn + "` escapes a borrow of local `" + taint_src(ck, vtaint) + "` — it dangles when the scope ends")
+                }
+                if vtaint >= 0 {
+                    if taint_has_temp(ck, vtaint) == 1 {
+                        diag(ck, "check", "assignment to `" + idn + "` binds a borrow of a temporary — it dangles at the end of this statement")
+                    }
+                    env_taint_set(env, idn, vtaint)
+                } else {
+                    env_taint_clear(env, idn)
+                }
+                sal_bind(ck, env, idn, tt, val)
             }
         }
         parser.Node.ExprStmt{e} => {
@@ -4185,6 +6422,9 @@ fn stmt(ck: mut Ck, s: ref parser.Node, env: mut Env) {
                     t0 := t_void(ck)
                     if n0 == 1 {
                         t0 = expr(ck, vals.v, env)
+                        if ck.et >= 0 {
+                            diag(ck, "check", "`return` escapes a borrow of local `" + taint_src(ck, ck.et) + "` — the boxed value dangles when the closure's scope ends")
+                        }
                     }
                     if ck.cl_ret < 0 {
                         ck.cl_ret = t0
@@ -4204,17 +6444,27 @@ fn stmt(ck: mut Ck, s: ref parser.Node, env: mut Env) {
                     diag(ck, "check", "expected one return value")
                 } else {
                     t := expr(ck, vals.v, env)
+                    if ck.et >= 0 {
+                        diag(ck, "check", "`return` escapes a borrow of local `" + taint_src(ck, ck.et) + "` — the boxed value dangles when this scope ends; heap-allocate the receiver or use an `into_*` owned variant")
+                    }
                     assignable(ck, ck.ret1, t)
                 }
             } else if n == 2 {
                 t := expr(ck, vals.v, env)
+                if ck.et >= 0 {
+                    diag(ck, "check", "`return` escapes a borrow of local `" + taint_src(ck, ck.et) + "` — the boxed value dangles when this scope ends; heap-allocate the receiver or use an `into_*` owned variant")
+                }
                 assignable(ck, ck.ret1, t)
                 e2 := expr(ck, vals.next.v, env)
                 assignable(ck, t_err(ck), e2)
             } else if n == 1 {
                 ck.in_let2 = 1
                 expr(ck, vals.v, env)
+                bs := ck.et
                 ck.in_let2 = 0
+                if bs >= 0 {
+                    diag(ck, "check", "`return` escapes a borrow of local `" + taint_src(ck, bs) + "` — the boxed value dangles when this scope ends; heap-allocate the receiver or use an `into_*` owned variant")
+                }
                 if call_retk(ck, vals.v, env) == 2 {
                     rt1 := call_ret1(ck, vals.v, env)
                     if rt1 >= 0 {
@@ -4232,10 +6482,17 @@ fn stmt(ck: mut Ck, s: ref parser.Node, env: mut Env) {
             assignable(ck, t_bool(ck), t)
             // a move on either branch is possible after the join — union
             // the exits; only exits that can reach the join contribute
+            spre := sal_clone(ck.srep)
             pre := moved_save(env)
+            bpre := borr_save(env)
             block_node(ck, then, env)
+            sthen := sal_clone(ck.srep)
             thmv := moved_save(env)
+            bth := borr_save(env)
             moved_restore(env, pre)
+            borr_restore(env, bpre)
+            ck.srep = sal_clone(spre)
+            spre = nil
             tft := node_ft(then)
             eft := els == nil
             if els != nil {
@@ -4248,8 +6505,15 @@ fn stmt(ck: mut Ck, s: ref parser.Node, env: mut Env) {
             }
             if els != nil && !eft && tft {
                 moved_restore(env, thmv)
+                borr_restore(env, bth)
+                ck.srep = sthen
             } else if tft && (els == nil || eft) {
                 moved_union(env, thmv)
+                borr_union(ck, env, bth)
+                ck.srep = sal_absorb_to(ck.srep, sthen)
+                sthen = nil
+            } else {
+                sthen = nil
             }
         }
         parser.Node.For{cond, body} => {
@@ -4257,22 +6521,100 @@ fn stmt(ck: mut Ck, s: ref parser.Node, env: mut Env) {
             // unless re-assigned there — flag newly-moved bindings, then
             // restore the pre-loop state (check.rs: Stmt::For)
             pre := moved_save(env)
+            bpre := borr_save(env)
             t := expr(ck, cond, env)
             assignable(ck, t_bool(ck), t)
-            ck.loop_depth = ck.loop_depth + 1
-            block_node(ck, body, env)
-            ck.loop_depth = ck.loop_depth - 1
-            for_moved_check(ck, env, pre)
+            head := ll_clone(bpre)
+            ck.srep = sal_live_only(env, ck.srep)
+            shead := sal_clone(ck.srep)
+            iter := 0
+            lim := env_bind_count(env) + 16
+            let lp: own LoopSt = nil
+            let post: own LL = nil
+            for iter < lim {
+                if iter > 0 {
+                    borr_restore(env, ll_clone(head))
+                    moved_restore(env, ll_clone(pre))
+                    ck.srep = sal_clone(shead)
+                }
+                npass := ck.nerr
+                lp = for_body(ck, body, env)
+                post = borr_save(env)
+                spost := sal_clone(ck.srep)
+                if iter == 0 {
+                    for_moved_check(ck, env, pre)
+                }
+                // next-iteration head: previous head + fallthrough + continues
+                borr_restore(env, ll_clone(head))
+                borr_union(ck, env, post)
+                cl := lp.cont
+                for cl != nil {
+                    borr_union(ck, env, cl.s)
+                    cl = cl.next
+                }
+                nh := borr_save(env)
+                // slice memberships join the same way — head + post + continues
+                ck.srep = sal_clone(shead)
+                ck.srep = sal_absorb_to(ck.srep, spost)
+                spost = nil
+                cl2 := lp.cont
+                for cl2 != nil {
+                    ck.srep = sal_absorb_to(ck.srep, cl2.sr)
+                    cl2 = cl2.next
+                }
+                snh := sal_live_only(env, ck.srep)
+                conv := ck.nerr != npass || ll_covered(ck, nh, head) == 1 && sal_covered(snh, shead) == 1
+                shead = nil
+                shead = snh
+                if conv {
+                    break
+                }
+                head = nh
+                iter = iter + 1
+            }
             moved_restore(env, pre)
+            // after-loop may-state: loop-head membership + break exits
+            // (shead already unions pre, every iteration's fallthrough
+            // and continue states)
+            ck.srep = sal_clone(shead)
+            shead = nil
+            if lp != nil {
+                bl := lp.brk
+                for bl != nil {
+                    ck.srep = sal_absorb_to(ck.srep, bl.sr)
+                    bl = bl.next
+                }
+            }
+            ck.srep = sal_live_only(env, ck.srep)
+            // after-loop may-state: zero-iteration entry + fallthrough + break exits
+            borr_restore(env, ll_clone(bpre))
+            if post != nil {
+                borr_union(ck, env, post)
+            }
+            if lp != nil {
+                bl2 := lp.brk
+                for bl2 != nil {
+                    borr_union(ck, env, bl2.s)
+                    bl2 = bl2.next
+                }
+            }
         }
         parser.Node.Break => {
             if ck.loop_depth == 0 {
                 diag(ck, "check", "break/continue outside loop")
+            } else if ck.loops != nil {
+                sn := sncons(borr_save(env), ck.loops.brk)
+                sn.sr = sal_clone(ck.srep)
+                ck.loops.brk = sn
             }
         }
         parser.Node.Continue => {
             if ck.loop_depth == 0 {
                 diag(ck, "check", "break/continue outside loop")
+            } else if ck.loops != nil {
+                sn := sncons(borr_save(env), ck.loops.cont)
+                sn.sr = sal_clone(ck.srep)
+                ck.loops.cont = sn
             }
         }
         parser.Node.Scope{body} => {
@@ -4292,8 +6634,16 @@ fn stmt(ck: mut Ck, s: ref parser.Node, env: mut Env) {
         }
         parser.Node.Bind{name, init, lo, hi} => {
             t := expr(ck, init, env)
+            bs := ck.et
             // decl span is the name token itself — `lo` is its offset
             env_set(env, name, t, lo, lo + len(name))
+            if bs >= 0 {
+                if taint_has_temp(ck, bs) == 1 {
+                    diag(ck, "check", "`" + name + "` binds a borrow of a temporary — it dangles at the end of this statement")
+                }
+                env_taint_set(env, name, bs)
+            }
+            sal_bind(ck, env, name, t, init)
             // decl-name occurrence: queries on `name` would otherwise
             // fall through to the enclosing fn's decl record
             rec_local(ck, lo, lo + len(name), name, t, env)
@@ -4614,6 +6964,10 @@ fn closure_expr(ck: mut Ck, params: ref parser.NList, body: ref parser.Node, env
                 if cvk == k_ref() || cvk == k_mut() {
                     diag(ck, "check", "closure captures `" + cn + "` (`" + ty_name(ck, cvt) + "`) — borrowed refs may not be stored in heap objects (v0)")
                 }
+                cit := env_taint(env, cm)
+                if cit >= 0 {
+                    diag(ck, "check", "closure captures `" + cn + "` carrying a borrow of local `" + taint_src(ck, cit) + "` — the heap env outlives the borrow's scope")
+                }
                 break
             }
             cld := last_dot(cm)
@@ -4629,6 +6983,7 @@ fn closure_expr(ck: mut Ck, params: ref parser.NList, body: ref parser.Node, env
     ck.in_cl = 1
     ck.cl_ret = -1
     env_push(env)
+    ck.param_gens = scons(itoa(env.scopes[len(env.scopes) - 1].gen), ck.param_gens)
     pl = params
     wl := ps
     for pl != nil && wl != nil {
@@ -4695,7 +7050,7 @@ fn closure_expr(ck: mut Ck, params: ref parser.NList, body: ref parser.Node, env
     cc.next = ck.clcks
     ck.clcks = cc
     block_node(ck, body, env)
-    env_pop(env)
+    env_pop_ck(ck, env)
     r := ck.cl_ret
     ck.in_cl = s_in
     ck.cl_ret = s_ret
@@ -5003,8 +7358,13 @@ fn sel_stmt(ck: mut Ck, arms: ref parser.NList, env: mut Env) {
     }
     has_else := false
     tmo := 0
+    bpre := borr_save(env)
+    spre := sal_clone(ck.srep)
+    let bst: own BArmSt = nil
     l := arms
     for l != nil {
+        borr_restore(env, ll_clone(bpre))
+        ck.srep = sal_clone(spre)
         env_push(env)
         match l.v {
             parser.Node.SArm{kind, ch, bind, ms, body} => {
@@ -5072,8 +7432,21 @@ fn sel_stmt(ck: mut Ck, arms: ref parser.NList, env: mut Env) {
             _ => {
             }
         }
-        env_pop(env)
+        env_pop_ck(ck, env)
+        bc := new(BArmSt)
+        bc.st = borr_save(env)
+        bc.sr = sal_clone(ck.srep)
+        bc.next = bst
+        bst = bc
         l = l.next
+    }
+    spre = nil
+    borr_clear_all(env)
+    ck.srep = nil
+    for bst != nil {
+        borr_union(ck, env, bst.st)
+        ck.srep = sal_absorb_to(ck.srep, bst.sr)
+        bst = bst.next
     }
     if has_else && tmo > 0 {
         diag(ck, "check", "`else` makes `timeout` unreachable — drop one")
@@ -5597,6 +7970,7 @@ fn check_fn(ck: mut Ck, mod: str, name: str, recv: ref parser.Node, params: ref 
         }
     }
     ck.loop_depth = 0
+    ck.loops = nil
     env := env_new()
     if collections.map_has(ck.fns, qn) {
         [fi, err] = collections.map_get(ck.fns, qn)
@@ -7770,6 +10144,7 @@ struct CkRes { ck: own Ck, items: []It }
 fn ck_new() -> own Ck {
     ck := new(Ck)
     ck.tyv = mkslice(T, 0)
+    ck.tyhs = mkslice(int, 0)
     ck.fns = collections.map_new()
     ck.fnsv = mkslice(FnSig, 0)
     ck.structs = collections.map_new()
@@ -7799,6 +10174,9 @@ fn ck_new() -> own Ck {
     ck.cl_ret = -1
     ck.clcks = nil
     ck.loop_depth = 0
+    ck.loops = nil
+    ck.srep = nil
+    ck.sgid = 0
     ck.nerr = 0
     ck.usev = mkslice(UseRec, 0)
     ck.decls = collections.map_new()

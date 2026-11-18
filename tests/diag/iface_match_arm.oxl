@@ -1,0 +1,17 @@
+package main
+
+import "std/bytes"
+
+import "std/io"
+
+fn leak() -> int {
+    buf := bytes.newbuffer()
+    [wb, web] = buf.write("x" as []byte)
+    r := match buf {
+        b => b.asreader()
+    }
+    [rb, rerr] = r.read(mkslice(byte, 1))
+    return rb
+}
+
+fn main() {}

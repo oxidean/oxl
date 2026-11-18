@@ -1,0 +1,37 @@
+package main
+
+import "std/bytes"
+
+import "std/io"
+
+fn leak() -> io.Reader {
+    h := new(bytes.Buffer)
+    hr := h.asreader()
+    buf := bytes.newbuffer()
+    r := buf.asreader()
+    a0 := hr
+    a1 := hr
+    a2 := hr
+    a3 := hr
+    a4 := hr
+    a5 := hr
+    a6 := hr
+    a7 := hr
+    a8 := hr
+    i := 0
+    for i < 9 {
+        a0 = a1
+        a1 = a2
+        a2 = a3
+        a3 = a4
+        a4 = a5
+        a5 = a6
+        a6 = a7
+        a7 = a8
+        a8 = r
+        i = i + 1
+    }
+    return a0
+}
+
+fn main() {}

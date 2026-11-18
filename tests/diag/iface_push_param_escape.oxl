@@ -1,0 +1,13 @@
+package main
+
+import "std/bytes"
+
+import "std/io"
+
+fn fill(items: []io.Reader) -> []io.Reader {
+    buf := bytes.newbuffer()
+    [wb, web] = buf.write("x" as []byte)
+    return push(items, buf.asreader())
+}
+
+fn main() {}

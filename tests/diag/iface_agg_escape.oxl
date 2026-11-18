@@ -1,0 +1,18 @@
+package main
+
+import "std/bytes"
+
+import "std/io"
+
+struct Holder { items: []io.Reader }
+
+fn leak() -> Holder {
+    a := mkslice(io.Reader, 1)
+    h := Holder{items: a}
+    buf := bytes.newbuffer()
+    [wb, web] = buf.write("x" as []byte)
+    a[0] = buf.asreader()
+    return h
+}
+
+fn main() {}

@@ -158,6 +158,141 @@ printf '%s
 for t in test_bytes test_strconv test_fmt test_errs test_fill_keeps_err_bytes test_flush_keeps_unwritten test_fill_nop_progress test_stdstreams test_io_files test_err_chain; do
     grep -q "$t ... ok" <<<"$out" || { echo "FAIL io: $out"; exit 1; }
 done
+# iface-boxed borrow escapes (issue #138): `as*` borrows must not leave
+# their scope, while heap-backed receivers and `into_*` owned variants
+# stay legal
+cat > "$scratch/ifaceescape.oxl" <<'EOF'
+package main
+
+import "std/bufio"
+import "std/bytes"
+import "std/io"
+
+fn via_into() -> io.Reader {
+    h := new(bytes.Buffer)
+    [wn, we] = h.write("owned" as []byte)
+    return h.into_reader()
+}
+
+fn via_heap() -> io.Reader {
+    h := new(bytes.Buffer)
+    [wn, we] = h.write("heap" as []byte)
+    return h.asreader()
+}
+
+fn scoped() -> int {
+    buf := bytes.newbuffer()
+    [wn, we] = buf.write("scoped" as []byte)
+    r := buf.asreader()
+    b := mkslice(byte, 16)
+    [n, err] = r.read(b)
+    return n
+}
+
+// every select arm replaces the borrow with a heap-backed reader —
+// the join must not retain the pre-select taint
+fn select_clear() -> io.Reader {
+    buf := bytes.newbuffer()
+    h := new(bytes.Buffer)
+    [wh, weh] = h.write("sel" as []byte)
+    r := buf.asreader()
+    c := mkchan(1)
+    select {
+        v := recv(c) => {
+            r = h.asreader()
+        }
+        timeout(0) => {
+            r = h.asreader()
+        }
+    }
+    return r
+}
+
+// slice aliases share backing — a borrow written through `a` is
+// readable through `b`, but in-scope use stays legal
+fn alias_scoped() -> int {
+    a := mkslice(io.Reader, 1)
+    b := a
+    buf := bytes.newbuffer()
+    [wa, wea] = buf.write("alias" as []byte)
+    a[0] = buf.asreader()
+    r := b[0]
+    bb := mkslice(byte, 16)
+    [n, err] = r.read(bb)
+    return n
+}
+
+// rebinding `b` drops its membership in `a`'s backing group — writes
+// through `a` must not taint the fresh slice `b` now denotes
+fn alias_rebind() -> io.Reader {
+    a := mkslice(io.Reader, 1)
+    b := a
+    b = mkslice(io.Reader, 1)
+    buf := bytes.newbuffer()
+    [wb, web] = buf.write("x" as []byte)
+    a[0] = buf.asreader()
+    return b[0]
+}
+
+// an owned `into_*` conversion on a value-local receiver is the
+// documented remediation — it must not itself be flagged as a borrow
+fn value_into() -> io.Reader {
+    b := bytes.newbuffer()
+    [wv, wev] = b.write("vinto" as []byte)
+    return b.into_reader()
+}
+
+// a shadowing same-named binding in an inner scope is not the borrow's
+// storage owner — popping it must not condemn `r`
+fn shadow_scoped() -> int {
+    buf := bytes.newbuffer()
+    [ws, wes] = buf.write("shadow" as []byte)
+    r := buf.asreader()
+    if true {
+        buf := 42
+        println("inner:" + itoa(buf))
+    }
+    b := mkslice(byte, 16)
+    [n, err] = r.read(b)
+    return n
+}
+
+fn main() {
+    b := mkslice(byte, 16)
+    r := via_into()
+    [n, err] = r.read(b)
+    println("into:" + substr(b as str, 0, n))
+    r2 := via_heap()
+    [n2, err2] = r2.read(b)
+    println("heap:" + substr(b as str, 0, n2))
+    h2 := new(bytes.Buffer)
+    bw := bufio.newwriter(h2.aswriter())
+    [wn3, we3] = bw.write("bufio" as []byte)
+    w := bw.into_writer()
+    [nw, we2] = w.write("direct" as []byte)
+    println("bufio:" + itoa(nw))
+    println("sink:" + h2.str())
+    println("scoped:" + itoa(scoped()))
+    r3 := select_clear()
+    [n3, err3] = r3.read(b)
+    println("select:" + substr(b as str, 0, n3))
+    println("alias:" + itoa(alias_scoped()))
+    println("shadow:" + itoa(shadow_scoped()))
+    rv := value_into()
+    [nv, ev] = rv.read(b)
+    println("vinto:" + substr(b as str, 0, nv))
+}
+EOF
+out=$("$OXL" run "$scratch/ifaceescape.oxl")
+grep -q "into:owned" <<<"$out" || { echo "FAIL ifaceescape into: $out"; exit 1; }
+grep -q "heap:heap" <<<"$out" || { echo "FAIL ifaceescape heap: $out"; exit 1; }
+grep -q "scoped:6" <<<"$out" || { echo "FAIL ifaceescape scoped: $out"; exit 1; }
+grep -q "bufio:6" <<<"$out" || { echo "FAIL ifaceescape bufio: $out"; exit 1; }
+grep -q "sink:bufiodirect" <<<"$out" || { echo "FAIL ifaceescape sink: $out"; exit 1; }
+grep -q "select:sel" <<<"$out" || { echo "FAIL ifaceescape select: $out"; exit 1; }
+grep -q "alias:5" <<<"$out" || { echo "FAIL ifaceescape alias: $out"; exit 1; }
+grep -q "shadow:6" <<<"$out" || { echo "FAIL ifaceescape shadow: $out"; exit 1; }
+grep -q "vinto:vinto" <<<"$out" || { echo "FAIL ifaceescape vinto: $out"; exit 1; }
 # char literals decode to their scalar (scratch, not corpus — fmt
 # normalizes 'a' to 97 in formatted files)
 cat > "$scratch/charlit.oxl" <<'EOF'

@@ -1,0 +1,14 @@
+package main
+
+import "std/bytes"
+
+import "std/io"
+
+struct Holder { r: io.Reader }
+
+fn store(h: mut Holder) {
+    buf := bytes.newbuffer()
+    h.r = buf.asreader()
+}
+
+fn main() {}

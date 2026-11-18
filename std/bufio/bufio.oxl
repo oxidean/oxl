@@ -168,16 +168,55 @@ fn (b mut Reader) asreader() -> io.Reader {
     return b
 }
 
-/// Writer buffers an io.Writer — flush() pushes the window.
-struct Writer { w: io.Writer, buf: []byte }
+/// into_reader moves this Reader to the heap and boxes it as an
+/// io.Reader — safe to return or store where `asreader`'s borrow
+/// would dangle. The receiver is consumed: don't use it afterwards.
+fn (b mut Reader) into_reader() -> io.Reader {
+    h := new(Reader)
+    h.r = b.r
+    h.buf = new(b.buf)
+    h.ri = b.ri
+    h.wi = b.wi
+    h.stuck = b.stuck
+    return h
+}
+
+/// Writer buffers an io.Writer — flush() pushes the window. A writer
+/// produced by into_writer is direct: writes pass through after the
+/// pending window drains, so an io.Writer caller never needs flush().
+struct Writer { w: io.Writer, buf: []byte, direct: int, werr: err }
 
 /// newwriter — default 4096 window.
 fn newwriter(w: io.Writer) -> Writer {
-    return Writer{w: w, buf: mkslice(byte, 0)}
+    return Writer{w: w, buf: mkslice(byte, 0), direct: 0, werr: nil}
 }
 
 /// write buffers p — big writes flush first then pass through; [n, err].
 fn (b mut Writer) write(p: []byte) -> [int, err] {
+    if b.werr != nil {
+        return 0, b.werr
+    }
+    if b.direct == 1 {
+        e := b.flush()
+        if e != nil {
+            b.werr = e
+            return 0, e
+        }
+        off := 0
+        for off < len(p) {
+            [n, we] = b.w.write(p[off:])
+            if we != nil {
+                b.werr = we
+                return off, we
+            }
+            if n <= 0 {
+                b.werr = errors.new("bufio: short write")
+                return off, b.werr
+            }
+            off = off + n
+        }
+        return len(p), nil
+    }
     if len(b.buf) + len(p) > 4096 {
         e := b.flush()
         if e != nil {
@@ -199,6 +238,9 @@ fn (b mut Writer) write(p: []byte) -> [int, err] {
 /// only the unwritten suffix stays buffered — a retry can't duplicate
 /// the prefix the writer already consumed.
 fn (b mut Writer) flush() -> err {
+    if b.werr != nil {
+        return b.werr
+    }
     off := 0
     for off < len(b.buf) {
         [n, e] = b.w.write(b.buf[off:])
@@ -228,4 +270,22 @@ fn (b mut Writer) flush() -> err {
 /// drains them (`&bw`).
 fn (b mut Writer) aswriter() -> io.Writer {
     return b
+}
+
+/// into_writer moves this Writer to the heap and boxes it as an
+/// io.Writer — safe to return or store where `aswriter`'s borrow
+/// would dangle. The returned writer is direct: accepted bytes reach
+/// the sink during write, with no flush the caller can't reach. The
+/// receiver is consumed: don't use it afterwards.
+fn (b mut Writer) into_writer() -> io.Writer {
+    h := new(Writer)
+    h.w = b.w
+    h.buf = new(b.buf)
+    h.direct = 1
+    h.werr = nil
+    fe := h.flush()
+    if fe != nil {
+        h.werr = fe
+    }
+    return h
 }

@@ -1,0 +1,17 @@
+package main
+
+import "std/bytes"
+
+import "std/io"
+
+fn helper() -> io.Reader {
+    buf := bytes.newbuffer()
+    [wn, we] = buf.write("hello" as []byte)
+    return buf.asreader()
+}
+
+fn main() {
+    r := helper()
+    b := mkslice(byte, 4)
+    [n, err] = r.read(b)
+}

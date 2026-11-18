@@ -1,0 +1,21 @@
+package main
+
+import "std/bytes"
+
+import "std/io"
+
+fn leak() -> io.Reader {
+    buf := bytes.newbuffer()
+    h := new(bytes.Buffer)
+    r := buf.asreader()
+    c := mkchan(1)
+    select {
+        v := recv(c) => {}
+        timeout(0) => {
+            r = h.asreader()
+        }
+    }
+    return r
+}
+
+fn main() {}

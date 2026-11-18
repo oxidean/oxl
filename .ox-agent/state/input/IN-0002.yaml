@@ -7,6 +7,8 @@ options:
     - B interim + A milestone (recommended)
     - A now — descriptor-slot ABI as next milestone
     - B only — sync-iface contract is the design
-status: pending
+status: cancelled
 created_by: cli
+answered_by: devin
 created_at: "2026-11-18T21:23:02Z"
+answered_at: "2026-11-18T21:30:44Z"

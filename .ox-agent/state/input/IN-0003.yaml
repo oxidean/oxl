@@ -1,0 +1,12 @@
+schema_version: 1
+request_id: IN-0003
+work_item_id: WI-0020
+kind: decision
+question: 'WI-0020 (issue #135) suspendable-vtable route — post prior-art update. The gap is exactly Rust''s dyn-async problem; fix = descriptor-slot ABI: vtab[i] holds {make,poll} for susp-declared iface methods, call sites use boxed child frames, susp becomes part of the signature (D3 demotes to a signature-mismatch check), sync impls get ready-shim frames (async_trait analog). Cost: one alloc per susp-iface call; direct susp calls keep zero-alloc inline frames; RtFrame protocol preserved for the LLVM spec. Sub-decisions: (2) susp marker syntax on iface methods — first susp surface syntax, sets precedent for fn-values [rec: susp keyword]; (5) spawn w.m() under A [rec: excluded v1]. Pick the route.'
+options:
+    - A now — descriptor-slot ABI in one run (recommended)
+    - B interim + A milestone — sync-iface contract docs land first
+    - B only — sync-iface contract is the design
+status: pending
+created_by: cli
+created_at: "2026-11-18T21:30:44Z"

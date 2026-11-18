@@ -84,6 +84,83 @@ is never boxed into it. And the `mt.k == 2` (`call_iface`) path returns
 before `add_edge`, so suspendability could not propagate through
 vtable calls even without the guard.
 
+## Prior art (2026-11-18) — how Go and Rust answer this
+
+**Go: hide suspension by owning the stack.** No async functions, no
+suspend ABI. Every call — direct or through an interface — is an
+ordinary indirect call; suspension is a runtime property invisible at
+the call site. A blocking channel op, mutex, or net read calls
+`gopark`, switching the M:N (GMP) scheduler to another goroutine; the
+callee's state lives on its ordinary growable stack and netpoller wires
+fd readiness to resumption. `w.Write(b)` on an `io.Writer` whose impl
+blocks Just Works — the vtable has zero suspend awareness because
+nothing about the call is special. The cost is enormous and invisible:
+segmented/growable stacks, a cooperative+preemptive scheduler,
+per-goroutine stack maps for the GC — a multi-year runtime investment
+oxl should not replicate. Both emit lanes (C, JS) target environments
+without growable stacks; a Go-shaped model would need stackful
+coroutines (ucontext/asm) per lane.
+
+**Rust: expose suspension as a poll-ABI on a state machine.**
+`async fn` desugars to a compiler-generated state machine returning
+`impl Future`; the contract is `poll(&mut self, cx) -> Poll<T>`
+(`Ready`/`Pending`) driven by an external executor, wakers handle
+re-enqueue, futures are cold. Rust hit exactly the #135 wall: `async
+fn` in traits was uncallable via `dyn` for years — each impl's future
+type differs in size/layout, so a vtable cannot return it. The
+ecosystem's answer (`async_trait`) is uniform boxing: the slot returns
+`Pin<Box<dyn Future>>` and the suspension plumbing rides through the
+*future's own* vtable (its `poll`), not the trait's. Sync impls get a
+trivially-Ready wrapper future. Native `async fn` in traits (Rust 1.75)
+remains static-dispatch only; `dyn` async is still unstable for exactly
+this reason.
+
+**oxl is already Rust-shaped.** The mapping is nearly literal:
+
+| oxl | Rust |
+|---|---|
+| `o_poll_<fn>(fr, t)` + `RtFrame{cur_scope, state}` | `Future::poll` + generated state machine |
+| `RtTask` + worker pool | the executor |
+| `RT_PENDING` + wait-queue re-enqueue | `Pending` + waker (`t` is the `cx`; no waker object needed) |
+| `fr.child` + `case K:` resume | the parent state machine's *inline* child future — unboxed, statically typed |
+
+The missing piece is exactly `Pin<Box<dyn Future>>`: a vtable slot
+carrying a **pollable descriptor instead of a fn pointer**.
+
+Rejected alternative: the JS lane could emit native `async`/`await`
+and let the engine own suspension — but the C lane has no equivalent,
+and lane parity argues for the manual poll driver everywhere.
+
+## Concrete A design (descriptor slot)
+
+For a `susp`-declared iface method, `vtab[i]` holds
+`{RtFrame* (*make)(void* data, args…), RtPoll poll}` instead of a bare
+fn pointer:
+
+- `make` — per-impl shim with the signature's real param list.
+  Allocates the concrete `o_frm_<n>`, fills `p_` slots, returns it
+  erased as `RtFrame*`. Solves "call site doesn't know the frame
+  layout" the way `Box<dyn Future>` does.
+- Call site — emits the same suspend-point machinery as
+  `gfsusp_call`/`jfsusp_call` today, except `fr->child` becomes
+  `{RtFrame* f; RtPoll p}` and the poll line goes through `p` instead
+  of `o_poll_<cn>`.
+- Sync impls — an auto-shim `make` allocates a minimal frame whose
+  `poll` runs the body once and returns `RT_READY` — the `async_trait`
+  ready-wrapper. Structural satisfaction preserved.
+- `susp` — part of the iface method signature: the *declaration* fixes
+  the calling convention, not the impl (Rust precedent: `async` is part
+  of the fn type). The D3 guard becomes an ordinary signature-mismatch
+  check.
+- Cost — one heap alloc per susp-iface call + indirect polls —
+  identical to `async_trait`'s box. Direct susp calls keep the
+  zero-alloc inline child frame.
+- Earlier open questions resolve: the slot is descriptor-typed *per
+  signature* (no per-method bit — declared susp-ness decides); nested
+  indirect suspension is free (child frames chain); `spawn w.m()`
+  excluded for v1 (Rust likewise requires materializing the future
+  before spawning).
+
 ## Refined options (extends the A/B fork)
 
 | # | route | scope | notes |
@@ -94,20 +171,27 @@ vtable calls even without the guard.
 | D | Blocking-drive shim thunk | medium | Thunk spawns impl frame as child task + blocking-join. Semantic downgrade (suspend→block, worker pinning) — weakest |
 | E | Uniform susp ABI (marker-free A) | medium | Every slot a frame factory; per-call malloc on *all* iface dispatch — taxes io.Writer hot paths for zero API gain |
 
-**Recommendation: B now, A as the milestone fix** (descriptor variant).
-The descriptor keeps `RtFrame`'s header and the `poll(RtFrame*,
-RtTask*)` protocol the LLVM spec pins — lowest blast radius. Avoid D
-and E.
+**Recommendation: A — descriptor slot — implemented in one run.**
+Prior art confirms the shape: the gap is precisely `Pin<Box<dyn
+Future>>`, and descriptor-in-slot is its oxl analog. The descriptor
+keeps `RtFrame`'s header and the `poll(RtFrame*, RtTask*)` protocol the
+LLVM spec pins — lowest blast radius. B's spawn+handle pattern is still
+worth a doc line as today's workaround, but need not gate the
+milestone. Avoid D and E.
 
 ## Open questions for the maintainer
 
-1. Descriptor-in-slot vs extending `RtFrame` with a `poll` field
-   (touches the protocol LLVM pins as contract — descriptor preferred).
+1. ~~Descriptor-in-slot vs extending `RtFrame` with a `poll` field~~ —
+   resolved by the concrete design: descriptor-in-slot (the LLVM spec
+   pins `RtFrame`'s header as contract).
 2. Marker syntax: new `susp` keyword on iface method decls sets
-   precedent for fn-values later (`fn susp …` types?).
-3. Satisfaction rule: shim frames for non-susp impls (recommended) or
-   exact susp-match only.
+   precedent for fn-values later (`fn susp …` types?). [rec: `susp`
+   keyword — mirrors Rust `async` being part of the fn type]
+3. ~~Satisfaction rule~~ — resolved: shim frames for non-susp impls
+   (the `async_trait` ready-wrapper analog; structural satisfaction
+   preserved).
 4. Is the spawn+handle pattern the documented interim for v0.2, and
-   does std want a `task`/joiner helper?
-5. `spawn w.m()` under A — supported via factory + `rt_task_new_in`
-   (same machinery) or excluded for v1.
+   does std want a `task`/joiner helper? (Still worth a doc line even
+   under A-now.)
+5. `spawn w.m()` under A — [rec: excluded for v1; Rust likewise
+   requires materializing the future before spawning].

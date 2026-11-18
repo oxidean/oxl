@@ -4129,15 +4129,15 @@ int64_t rt_csrand(RtSlice b) {
 #ifdef _WIN32
     /* CNG system-preferred RNG — the only flag the client fill needs.
      * NTSTATUS is not a GetLastError code and failure values are
-     * negative: translate to the Win32 domain (RtlNtStatusToDosError)
-     * and tag it so rt_errstr FormatMessages the right text — a bare
-     * -st would flip the sign and read as success-tagged garbage. */
+     * negative: report CNG failures as -EIO in the errno domain
+     * rt_errstr decodes — a bare -st would flip the sign and read as
+     * success-tagged garbage. */
     while (left > 0) {
         ULONG chunk = left > 0xFFFFFFFFLL ? 0xFFFFFFFFUL : (ULONG)left;
         NTSTATUS st = BCryptGenRandom(NULL, p, chunk,
                                       BCRYPT_USE_SYSTEM_PREFERRED_RNG);
         if (st != 0)
-            return -((int64_t)RtlNtStatusToDosError(st) | RT_GLE_TAG);
+            return -(int64_t)EIO;
         p += chunk;
         left -= chunk;
     }

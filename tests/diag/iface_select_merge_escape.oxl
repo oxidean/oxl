@@ -1,0 +1,27 @@
+package main
+
+import "std/bytes"
+
+fn leak() {
+    h := new(bytes.Buffer)
+    r := h.asreader()
+    scope {
+        b1 := bytes.newbuffer()
+        scope {
+            b2 := bytes.newbuffer()
+            c1 := mkchan(1)
+            c2 := mkchan(1)
+            select {
+                v1 := recv(c1) => {
+                    r = b2.asreader()
+                }
+                v2 := recv(c2) => {
+                    r = b1.asreader()
+                }
+            }
+        }
+        r = h.asreader()
+    }
+}
+
+fn main() {}

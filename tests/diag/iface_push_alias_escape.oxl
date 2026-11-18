@@ -1,0 +1,23 @@
+package main
+
+import "std/bytes"
+
+import "std/io"
+
+fn leak() -> io.Reader {
+    h := new(bytes.Buffer)
+    hr := h.asreader()
+    a := mkslice(io.Reader, 0)
+    a = push(a, hr)
+    a = push(a, hr)
+    a = push(a, hr)
+    a = push(a, hr)
+    a = push(a, hr)
+    b := a[0:5]
+    a = a[0:3]
+    buf := bytes.newbuffer()
+    c := push(a, buf.asreader())
+    return b[3]
+}
+
+fn main() {}

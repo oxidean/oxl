@@ -1994,6 +1994,8 @@ fn dnrev(l: own parser.NList) -> own parser.NList {
 // susp callee name: bare leaf builtin or qualified oxl fn ("" = not susp)
 // does this call park? returns the EMIT name — builtin leaf, oxl fn
 // base, or the mangled inst for generic susp callees (seed call_is_susp)
+// A vtab-slot callee returns "!vtab" — `!` can't appear in a resolved
+// fn name, so a real fn named `vtab` can't be mistaken for a desc call
 fn g_call_susp(g: mut G, e: ref parser.Node) -> str {
     if e == nil || check.nk(e) != 8 {
         return ""
@@ -2010,7 +2012,7 @@ fn g_call_susp(g: mut G, e: ref parser.Node) -> str {
             }
             cp := gcall_plan(g, f, args)
             if cp.k == 2 && check.sl_has(g.ck.susp, cp.w + "." + cp.mname) {
-                return "vtab"
+                return "!vtab"
             }
             if cp.k != 1 || !check.sl_has(g.ck.susp, cp.q) {
                 return ""
@@ -2411,7 +2413,7 @@ fn gxsusp(g: mut G, e: ref parser.Node, sn: str) -> str {
             if check.is_susp_builtin(sn) {
                 gfsusp_leaf(g, sn, args, 1, fd, "")
             } else {
-                gfsusp_call(g, e, sn, 1, fd, "")
+                gfsusp_call(g, e, sn, 1, fd, "", rt)
             }
         }
         _ => {
@@ -4243,9 +4245,9 @@ fn gsusp_ret(g: mut G, code: str) {
 // suspend point for an oxl-fn call: alloc child frame, poll it, propagate
 // PENDING/CANCEL, bind the result on READY (seed fsusp_call)
 // dk: 0 void, 1 frame-field(da), 2 assign-target(da), 3 pair(da,db; ""=blank)
-fn gfsusp_call(g: mut G, call: ref parser.Node, name: str, dk: int, da: str, db: str) {
-    if name == "vtab" {
-        gfsusp_vcall(g, call, dk, da, db)
+fn gfsusp_call(g: mut G, call: ref parser.Node, name: str, dk: int, da: str, db: str, dt: int) {
+    if name == "!vtab" {
+        gfsusp_vcall(g, call, dk, da, db, dt)
         return
     }
     cn := cname(name)
@@ -4289,7 +4291,7 @@ fn gfsusp_call(g: mut G, call: ref parser.Node, name: str, dk: int, da: str, db:
         wln(g, "    " + bo.pre)
     }
     wln(g, "    { struct " + frty + " *_c = (struct " + frty + " *)malloc(sizeof(struct " + frty + "));")
-    wln(g, "      ((RtFrame *)_c)->cur_scope = tls_scope; ((RtFrame *)_c)->state = 0;")
+    wln(g, "      ((RtFrame *)_c)->cur_scope = tls_scope; ((RtFrame *)_c)->state = 0; ((RtFrame *)_c)->child = NULL;")
     gspawn_args(g, bname, "_c", argvs)
     k := g.staten
     g.staten = g.staten + 1
@@ -4301,23 +4303,29 @@ fn gfsusp_call(g: mut G, call: ref parser.Node, name: str, dk: int, da: str, db:
     if len(bo.post) > 0 {
         wln(g, "      " + bo.post)
     }
+    // dt is the destination ty — the raw child result must run the
+    // same conversion the plain call/store path does (concrete impl
+    // ret -> RtIface box) or an iface-typed dest gets invalid C
     if dk == 1 {
-        wln(g, "      fr->" + da + " = ((struct " + frty + " *)fr->child)->result;")
+        wln(g, "      fr->" + da + " = " + gconv_v(g, call, "((struct " + frty + " *)fr->child)->result", dt) + ";")
     }
     if dk == 2 {
-        wln(g, "      " + da + " = ((struct " + frty + " *)fr->child)->result;")
+        wln(g, "      " + da + " = " + gconv_v(g, call, "((struct " + frty + " *)fr->child)->result", dt) + ";")
     }
     if dk == 3 {
         wln(g, "      { struct o_ret_" + cn + " _r = ((struct " + frty + " *)fr->child)->result;")
         if len(da) > 0 {
-            wln(g, "        fr->" + da + " = _r.val;")
+            wln(g, "        fr->" + da + " = " + gconv_v(g, call, "_r.val", dt) + ";")
         }
         if len(db) > 0 {
             wln(g, "        fr->" + db + " = _r.err;")
         }
         wln(g, "      }")
     }
+    // the child chain is owned through fr->child — task_release_frame
+    // frees whatever is still linked if this poll never returns READY
     wln(g, "      free(fr->child);")
+    wln(g, "      fr->child = NULL;")
     wln(g, "    }")
 }
 
@@ -4325,7 +4333,7 @@ fn gfsusp_call(g: mut G, call: ref parser.Node, name: str, dk: int, da: str, db:
 // an RtSuspDesc — stash it in the frame (the receiver temp may not
 // outlive the suspension), make the child via desc->make, poll via
 // desc->poll, and read the result through res_off on READY
-fn gfsusp_vcall(g: mut G, call: ref parser.Node, dk: int, da: str, db: str) {
+fn gfsusp_vcall(g: mut G, call: ref parser.Node, dk: int, da: str, db: str, dt: int) {
     match call {
         parser.Node.Call{f, args} => {
             cp := gcall_plan(g, f, args)
@@ -4376,17 +4384,24 @@ fn gfsusp_vcall(g: mut G, call: ref parser.Node, dk: int, da: str, db: str) {
             if len(bo.post) > 0 {
                 wln(g, "      " + bo.post)
             }
+            // res_off points at the IMPL's result storage — memcpy out
+            // rather than deref through the iface-declared type: the
+            // child's o_ret_<impl> / scalar slot is layout-identical
+            // but a different C type, so a typed deref is an
+            // effective-type violation
             if dk == 1 {
-                wln(g, "      fr->" + da + " = *(" + gcty(g, cp.r1) + " *)((char *)fr->child + fr->vsd" + itoa(n) + "->res_off);")
+                wln(g, "      { " + gcty(g, cp.r1) + " _rv; memcpy(&_rv, (char *)fr->child + fr->vsd" + itoa(n) + "->res_off, sizeof _rv);")
+                wln(g, "        fr->" + da + " = " + gconv_v(g, call, "_rv", dt) + "; }")
             }
             if dk == 2 {
-                wln(g, "      " + da + " = *(" + gcty(g, cp.r1) + " *)((char *)fr->child + fr->vsd" + itoa(n) + "->res_off);")
+                wln(g, "      { " + gcty(g, cp.r1) + " _rv; memcpy(&_rv, (char *)fr->child + fr->vsd" + itoa(n) + "->res_off, sizeof _rv);")
+                wln(g, "        " + da + " = " + gconv_v(g, call, "_rv", dt) + "; }")
             }
             if dk == 3 {
                 vrt := "struct o_vret_" + cname(cp.w) + "_" + cname(cp.mname)
-                wln(g, "      { " + vrt + " _r = *(" + vrt + " *)((char *)fr->child + fr->vsd" + itoa(n) + "->res_off);")
+                wln(g, "      { " + vrt + " _r; memcpy(&_r, (char *)fr->child + fr->vsd" + itoa(n) + "->res_off, sizeof _r);")
                 if len(da) > 0 {
-                    wln(g, "        fr->" + da + " = _r.val;")
+                    wln(g, "        fr->" + da + " = " + gconv_v(g, call, "_r.val", dt) + ";")
                 }
                 if len(db) > 0 {
                     wln(g, "        fr->" + db + " = _r.err;")
@@ -4394,6 +4409,7 @@ fn gfsusp_vcall(g: mut G, call: ref parser.Node, dk: int, da: str, db: str) {
                 wln(g, "      }")
             }
             wln(g, "      free(fr->child);")
+            wln(g, "      fr->child = NULL;")
             wln(g, "    }")
         }
         _ => {
@@ -4473,8 +4489,9 @@ fn gfsusp_leaf(g: mut G, name: str, args: ref parser.NList, dk: int, da: str, db
     }
 }
 
-// dispatch a stmt-level susp call: leaf builtin or oxl frame call
-fn gfsusp_go(g: mut G, call: ref parser.Node, dk: int, da: str, db: str) {
+// dispatch a stmt-level susp call: leaf builtin or oxl frame call —
+// dt is the destination ty the result lands in (-1 when none)
+fn gfsusp_go(g: mut G, call: ref parser.Node, dk: int, da: str, db: str, dt: int) {
     sn := g_call_susp(g, call)
     if len(sn) == 0 {
         return
@@ -4484,7 +4501,7 @@ fn gfsusp_go(g: mut G, call: ref parser.Node, dk: int, da: str, db: str) {
             if check.is_susp_builtin(sn) {
                 gfsusp_leaf(g, sn, args, dk, da, db)
             } else {
-                gfsusp_call(g, call, sn, dk, da, db)
+                gfsusp_call(g, call, sn, dk, da, db, dt)
             }
         }
         _ => {
@@ -4569,7 +4586,7 @@ fn gfmatch(g: mut G, scrut: ref parser.Node, arms: ref parser.NList) {
 // an expr in stmt position inside a frame (ExprStmt / match arm body)
 fn gfstmt_expr(g: mut G, e: ref parser.Node) {
     if check.nk(e) == 8 && len(g_call_susp(g, e)) > 0 {
-        gfsusp_go(g, e, 0, "", "")
+        gfsusp_go(g, e, 0, "", "", -1)
         return
     }
     if check.nk(e) == 32 {
@@ -4742,7 +4759,7 @@ fn gfstmt(g: mut G, s: ref parser.Node) {
                 // bare `let` in a susp fn: typed zero for the slot
                 wln(g, "    fr->" + fd + " = (" + ct + "){0};")
             } else if len(g_call_susp(g, init)) > 0 {
-                gfsusp_go(g, init, 1, fd, "")
+                gfsusp_go(g, init, 1, fd, "", t)
             } else {
                 v := gx(g, init)
                 v = gconv_v(g, init, v, t)
@@ -4754,7 +4771,7 @@ fn gfstmt(g: mut G, s: ref parser.Node) {
             fd := gfslot(g, name, gcty(g, t))
             check.env_bind(g.env, name, t)
             if len(g_call_susp(g, init)) > 0 {
-                gfsusp_go(g, init, 1, fd, "")
+                gfsusp_go(g, init, 1, fd, "", t)
             } else {
                 v := gx(g, init)
                 v = gconv_v(g, init, v, t)
@@ -4803,7 +4820,7 @@ fn gfstmt(g: mut G, s: ref parser.Node) {
                         if check.is_susp_builtin(sn) {
                             gfsusp_leaf(g, sn, args, 3, fa, fb)
                         } else {
-                            gfsusp_call(g, call, sn, 3, fa, fb)
+                            gfsusp_call(g, call, sn, 3, fa, fb, vt)
                         }
                     }
                     _ => {
@@ -4832,7 +4849,7 @@ fn gfstmt(g: mut G, s: ref parser.Node) {
                         if check.is_susp_builtin(sn) {
                             gfsusp_leaf(g, sn, args, 2, tc, "")
                         } else {
-                            gfsusp_call(g, val, sn, 2, tc, "")
+                            gfsusp_call(g, val, sn, 2, tc, "", xty(g, target))
                         }
                     }
                     _ => {
@@ -4866,7 +4883,7 @@ fn gfstmt(g: mut G, s: ref parser.Node) {
                     g.hoistn = g.hoistn + 1
                     gfscope_drain(g, 0)
                     gdefers(g)
-                    gfsusp_call(g, vals.v, sn, 3, pa, pe)
+                    gfsusp_call(g, vals.v, sn, 3, pa, pe, pr2.vt)
                     cv2 := gconv_v(g, vals.v, "fr->" + pa, g.cret)
                     wln(g, "    fr->result = (struct o_ret_" + cname(g.cur) + "){ " + cv2 + ", fr->" + pe + " };")
                     gsusp_ret(g, "RT_READY")
@@ -5687,13 +5704,17 @@ fn gemvtab_one(g: mut G, vu: ref GVU) {
                         res = " " + rty + " result;"
                         roff = "offsetof(" + wf + ", result)"
                     }
-                    g.vout = push(g.vout, wf + " { RtFrame _h; RtFrame *inner; const RtSuspDesc *isd;" + res + " };\n")
-                    g.vout = push(g.vout, "static RtFrame *o_wmk_" + dtag + "(void *_d" + psig + ") {\n    " + wf + " *_w = (" + wf + " *)malloc(sizeof(" + wf + "));\n    RtIface *_iv = (RtIface*)_d;\n    _w->isd = (const RtSuspDesc *)_iv->vtab[" + itoa(j) + "];\n    _w->inner = ((RtFrame *(*)(" + msig + "))_w->isd->make)(_iv->data" + argl + ");\n    ((RtFrame *)_w)->cur_scope = tls_scope; ((RtFrame *)_w)->state = 0;\n    return (RtFrame *)_w;\n}\n")
-                    pf := "static int o_wp_" + dtag + "(RtFrame *_f, RtTask *task) {\n    " + wf + " *_w = (" + wf + " *)_f;\n    int _p = _w->isd->poll(_w->inner, task);\n"
+                    g.vout = push(g.vout, wf + " { RtFrame _h; const RtSuspDesc *isd;" + res + " };\n")
+                    g.vout = push(g.vout, "static RtFrame *o_wmk_" + dtag + "(void *_d" + psig + ") {\n    " + wf + " *_w = (" + wf + " *)malloc(sizeof(" + wf + "));\n    RtIface *_iv = (RtIface*)_d;\n    _w->isd = (const RtSuspDesc *)_iv->vtab[" + itoa(j) + "];\n    ((RtFrame *)_w)->child = ((RtFrame *(*)(" + msig + "))_w->isd->make)(_iv->data" + argl + ");\n    ((RtFrame *)_w)->cur_scope = tls_scope; ((RtFrame *)_w)->state = 0;\n    return (RtFrame *)_w;\n}\n")
+                    pf := "static int o_wp_" + dtag + "(RtFrame *_f, RtTask *task) {\n    " + wf + " *_w = (" + wf + " *)_f;\n    RtFrame *_in = ((RtFrame *)_w)->child;\n    int _p = _w->isd->poll(_in, task);\n"
                     if m.retk != 0 {
-                        pf = pf + "    if (_p == RT_READY) { _w->result = *(" + rty + " *)((char *)_w->inner + _w->isd->res_off); free(_w->inner); }\n"
+                        // memcpy out: the inner frame's result slot is
+                        // the impl's pair struct (o_ret_<impl>), not the
+                        // iface-declared o_vret_ — same layout, different
+                        // C type, so a typed deref violates effective type
+                        pf = pf + "    if (_p == RT_READY) { memcpy(&_w->result, (char *)_in + _w->isd->res_off, sizeof _w->result); free(_in); ((RtFrame *)_w)->child = NULL; }\n"
                     } else {
-                        pf = pf + "    if (_p == RT_READY) { free(_w->inner); }\n"
+                        pf = pf + "    if (_p == RT_READY) { free(_in); ((RtFrame *)_w)->child = NULL; }\n"
                     }
                     pf = pf + "    return _p;\n}\n"
                     g.vout = push(g.vout, pf)
@@ -5738,7 +5759,7 @@ fn gemvtab_one(g: mut G, vu: ref GVU) {
                         if mfi >= 0 && g.ck.fnsv[mfi].retk != 0 {
                             roff = "offsetof(" + frty + ", result)"
                         }
-                        mk := "static RtFrame *o_vsm_" + dtag + "(void *_d" + psig + ") {\n    " + frty + " *_c = (" + frty + " *)malloc(sizeof(" + frty + "));\n    ((RtFrame *)_c)->cur_scope = tls_scope; ((RtFrame *)_c)->state = 0;\n"
+                        mk := "static RtFrame *o_vsm_" + dtag + "(void *_d" + psig + ") {\n    " + frty + " *_c = (" + frty + " *)malloc(sizeof(" + frty + "));\n    ((RtFrame *)_c)->cur_scope = tls_scope; ((RtFrame *)_c)->state = 0; ((RtFrame *)_c)->child = NULL;\n"
                         mk = mk + gvsm_fills(g, fname, "_c", recv)
                         mk = mk + "    return (RtFrame *)_c;\n}\n"
                         g.vout = push(g.vout, mk)
@@ -5764,7 +5785,7 @@ fn gemvtab_one(g: mut G, vu: ref GVU) {
                         }
                         decl = decl + " };\n"
                         g.vout = push(g.vout, decl)
-                        mk := "static RtFrame *o_shm_" + dtag + "(void *_d" + psig + ") {\n    " + sh + " *_c = (" + sh + " *)malloc(sizeof(" + sh + "));\n    ((RtFrame *)_c)->cur_scope = tls_scope; ((RtFrame *)_c)->state = 0;\n    _c->p_r = " + recv + ";\n"
+                        mk := "static RtFrame *o_shm_" + dtag + "(void *_d" + psig + ") {\n    " + sh + " *_c = (" + sh + " *)malloc(sizeof(" + sh + "));\n    ((RtFrame *)_c)->cur_scope = tls_scope; ((RtFrame *)_c)->state = 0; ((RtFrame *)_c)->child = NULL;\n    _c->p_r = " + recv + ";\n"
                         il3 = m.params
                         k3 = 0
                         for il3 != nil {

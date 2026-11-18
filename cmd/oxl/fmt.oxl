@@ -1216,10 +1216,10 @@ fn fp_item(p: mut FPar) -> own FItem {
         let methods: own MSL = nil
         for !feat_p(p, "}") && !fat_eof(p) {
             t := fcurt(p)
-            // `susp` + ident marks the next method suspendable (the
+            // `susp` + name marks the next method suspendable (the
             // contextual rule `susp(` = a method named susp)
             msusp := 0
-            if t.txt == "susp" && t.kind == 1 && fpeekt(p).kind == 1 {
+            if t.txt == "susp" && t.kind == 1 && (fpeekt(p).kind == 1 || fpeekt(p).kind == 2) {
                 fbump(p)
                 msusp = 1
                 t = fcurt(p)
@@ -1246,6 +1246,12 @@ fn fp_item(p: mut FPar) -> own FItem {
                     m.susp = msusp
                     methods = mscons(m, methods)
                 } else {
+                    if msusp == 1 {
+                        // `susp eq` must fail the same way the parser
+                        // rejects it — not silently rewrite to `eq`
+                        ferr(p, t.lo, "parse", "`susp` must precede a method signature")
+                        return nil
+                    }
                     ops = sscons(t.txt, ops)
                     fbump(p)
                 }

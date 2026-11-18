@@ -1308,9 +1308,12 @@ fn p_item(c: mut PCur) -> own Node {
                 methods = ncons(b(Node.Method{name: mname, susp: msusp, params: mparams, ret: mret, lo: mm, hi: c.phi}), methods)
             } else {
                 if msusp == 1 {
-                    // the mark only applies to method names — `susp eq`
-                    // surfaces as an unparsed fragment
-                    methods = ncons(b(Node.Skip{text: "susp " + mname}), methods)
+                    // the mark binds only to a method signature —
+                    // `susp eq` can't degrade to an op constraint
+                    if c.hush == 0 {
+                        println("parse: `susp` must precede a method signature — `susp " + mname + "` isn't one")
+                    }
+                    c.lex_err = 1
                 }
                 ops = ncons(b(Node.Name{n: mname, lo: mm, hi: c.phi}), ops)
             }

@@ -102,6 +102,7 @@ static inline long oxl_pid(void) { return (long)getpid(); }
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 typedef struct {
     const char *p;
@@ -132,6 +133,12 @@ typedef struct RtTask RtTask;
 typedef struct RtFrame {
     struct RtScope *cur_scope; /* innermost live scope at last suspend */
     int state;                 /* resume counter: 0 = entry */
+    /* owned inner frame of an inline susp call (plain call child or
+       susp-vtab descriptor make) — emitted code keeps it NULL outside
+       a live suspension; task_release_frame frees whatever is still
+       linked when the task settles without re-entering the poll
+       (cancel-while-parked, trap, RT_CANCEL exit) */
+    struct RtFrame *child;
 } RtFrame;
 typedef int (*RtPoll)(RtFrame *, RtTask *);
 /* suspendable-vtable call descriptor: a susp iface method's vtab slot

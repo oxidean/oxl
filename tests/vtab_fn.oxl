@@ -1,0 +1,14 @@
+package main
+
+// a fn literally named `vtab` must not collide with the susp
+// codegen's descriptor-dispatch sentinel — its susp call parks on a
+// plain child frame like any other callee
+fn vtab() -> int {
+    sleep(1)
+    return 42
+}
+
+fn main() {
+    println(itoa(vtab()))
+    println("vtab fn ok")
+}

@@ -1,0 +1,53 @@
+package main
+
+// cancel-while-parked: a task suspended inside a descriptor child
+// frame is force-woken by scancel; the poll that resumes returns
+// RT_CANCEL with fr->child still linked, and a cancel between wake
+// and poll skips the poll entirely — task_release_frame frees the
+// linked child chain either way. The second worker parks two frames
+// deep (vtab child suspending on another vtab child).
+interface Src { susp take() -> int }
+
+interface Mid { susp deep() -> int }
+
+struct Q { n: int }
+
+fn (q mut Q) take() -> int {
+    c := mkchan()
+    v := recv(c)
+    return v
+}
+
+struct M { n: int }
+
+fn (m mut M) deep() -> int {
+    q := Q{n: m.n}
+    return relay(q)
+}
+
+fn relay(s: Src) -> int {
+    return s.take()
+}
+
+fn worker(s: Src) {
+    v := s.take()
+    println(itoa(v))
+}
+
+fn worker2(m: Mid) {
+    v := m.deep()
+    println(itoa(v))
+}
+
+fn main() {
+    q := Q{n: 1}
+    m := M{n: 2}
+    sc := mkscope()
+    goin(sc, worker(q))
+    goin(sc, worker2(m))
+    msleep(80)
+    scancel(sc)
+    rc := sjoin(sc)
+    println(itoa(rc))
+    println("iface susp cancel ok")
+}

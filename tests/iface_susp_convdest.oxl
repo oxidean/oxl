@@ -1,0 +1,39 @@
+package main
+
+// descriptor result conversion: a susp iface method whose declared
+// ret is a concrete type must still box into the destination's iface
+// type — the READY-path store runs the same conversion the plain
+// (non-susp) call path does
+interface Reader { read() -> int }
+
+interface Maker { susp make() -> Item }
+
+struct Item { n: int }
+
+struct F { k: int }
+
+fn (i Item) read() -> int {
+    return i.n
+}
+
+fn (f mut F) make() -> Item {
+    sleep(1)
+    return Item{n: f.k}
+}
+
+fn drive(m: Maker) -> int {
+    let r: Reader = m.make()
+    return r.read()
+}
+
+fn drive2(m: Maker) -> int {
+    r := m.make()
+    return r.read()
+}
+
+fn main() {
+    f := F{k: 7}
+    println(itoa(drive(f)))
+    println(itoa(drive2(f)))
+    println("iface susp convdest ok")
+}

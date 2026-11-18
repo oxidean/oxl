@@ -469,7 +469,7 @@ struct Ck {
     ret1: int,
     in_let2: int,
     in_spawn: int, // inside `spawn`/`goin` callee — no calls edge (seed in_spawn)
-    vtab_spawn: []int, // Field-node lo offsets already diag'd by the vtab susp spawn gate — goin's generic gate suppresses its dup
+    vtab_spawn: []str, // "file|lo" keys already diag'd by the vtab susp spawn gate — goin's generic gate suppresses its dup
     in_infer: int, // generic ty-param inference pass — expr() re-runs for real checking, so index records stay off
     in_cl: int, // inside `{ |..| }` — ret feeds cl_ret
     cl_ret: int, // inferred closure return ty (-1 none)
@@ -5549,7 +5549,7 @@ fn call(ck: mut Ck, f: ref parser.Node, args: ref parser.NList, env: mut Env) ->
                                 add_edge(ck, mt.q)
                             } else if sl_has(ck.susp, mt.q) {
                                 diag(ck, "check", "`spawn`/`goin` on a vtable susp call isn't supported yet — wrap the call in a susp fn and spawn that")
-                                ck.vtab_spawn = push(ck.vtab_spawn, parser.nlo(f))
+                                ck.vtab_spawn = push(ck.vtab_spawn, ck.cur_file + "|" + itoa(parser.nlo(f)))
                             }
                             rt := call_iface(ck, mt.ps, mt.rk, mt.r1, args, env)
                             // a vtable call on a borrow-carrying receiver
@@ -7875,10 +7875,13 @@ fn walk_block(ck: mut Ck, items: ref parser.NList) {
                         parser.Node.Call{f} => {
                             n := resolve_named(ck, callee_name(f))
                             ok = len(n) > 0 && sl_has(ck.susp, n)
-                            flo := parser.nlo(f)
+                            // the vtab spawn gate keys on (file, lo) —
+                            // a bare lo would suppress a legit goin diag
+                            // in another file sharing the byte offset
+                            fk := ck.cur_file + "|" + itoa(parser.nlo(f))
                             vi := 0
                             for vi < len(ck.vtab_spawn) {
-                                if ck.vtab_spawn[vi] == flo {
+                                if ck.vtab_spawn[vi] == fk {
                                     seen = true
                                 }
                                 vi = vi + 1

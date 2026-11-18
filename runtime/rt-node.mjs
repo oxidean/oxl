@@ -140,7 +140,7 @@ export function install(api) {
         [-22]: 'invalid argument', [-24]: 'too many open files',
         [-28]: 'no space left on device', [-32]: 'broken pipe',
       }
-      return s_of_js(table[code] || `error ${code}`)
+      return s_of_js(table[code] ?? table[-code] ?? `error ${code}`)
     },
 
     /* ---------- fs ---------- */

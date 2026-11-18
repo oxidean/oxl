@@ -1,0 +1,135 @@
+package main
+
+// X4: std/crypto/nistec — P-256 and P-384 SEC1 decode + ECDH
+// (known-answer, cross-computed vectors) and ECDSA verify
+// (known-answer + tamper/wrong-hash/out-of-range rejects). Perf
+// gate: ECDSA-P256 verify < 150 ms/op, asserted at a pathological
+// 10x bound so slower CI legs don't flake.
+import "std/crypto/nistec"
+
+import "std/crypto/sha256"
+
+import "std/crypto/sha512"
+
+import "std/encoding/hex"
+
+import "std/testing"
+
+import "std/time"
+
+// hx decodes a hex literal — fixture helper
+fn hx(s: str) -> own []byte {
+    [b, e] = hex.decode(s)
+    testing.expect(e == nil, "hex decode")
+    return b
+}
+
+fn test_ecdh_p256() {
+    c := nistec.p256()
+    ask := hx("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcd")
+    bsk := hx("fedcba9876543210fedcba9876543210fedcba9876543210fedcba98765432")
+    [apub, e1] = nistec.pub_from_priv(c, ask)
+    testing.expect(e1 == nil, "p256 alice pub err")
+    testing.expect_streq(hex.encode(apub), "0409448789809fde6cd4cb7349e4398e1aef44be2450c82c435abf07dc96d0f87fd2b7710a034245b61b5b548f87ecd67ba1bf35c5824b23e37481593c41e5bec2", "p256 alice pub")
+    [bpub, e2] = nistec.pub_from_priv(c, bsk)
+    testing.expect(e2 == nil, "p256 bob pub err")
+    testing.expect_streq(hex.encode(bpub), "04a17d7a9c3692db94349d4c47e2eadff7336c26ff3d17cd3cb489aed9e35ba8bea19710b054f03944ad23c71a648fb96920f9bb1494ed74b5232f215a88ec2afa", "p256 bob pub")
+
+    [sa, e3] = nistec.ecdh(c, ask, bpub)
+    testing.expect(e3 == nil, "p256 ecdh alice err")
+    testing.expect_streq(hex.encode(sa), "46c230886a8eed332ac45861212b40266841c481d8d557cc7ee72393dffb7fd7", "p256 shared")
+    [sb, e4] = nistec.ecdh(c, bsk, apub)
+    testing.expect(e4 == nil, "p256 ecdh bob err")
+    testing.expect_streq(hex.encode(sb), hex.encode(sa), "p256 ecdh symmetry")
+
+    // decode rejects: wrong shape, off-curve point, coordinate >= p
+    [_z, e5] = nistec.ecdh(c, ask, apub[0:33])
+    testing.expect(e5 != nil, "p256 truncated point accepted")
+    bad := mkslice(byte, len(apub))
+    i := 0
+    for i < len(apub) {
+        bad[i] = apub[i]
+        i = i + 1
+    }
+    bad[64] = bad[64] ^ 1
+    [_z2, e6] = nistec.ecdh(c, ask, bad)
+    testing.expect(e6 != nil, "p256 off-curve point accepted")
+}
+
+fn test_ecdh_p384() {
+    c := nistec.p384()
+    ask := hx("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+    bsk := hx("fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210")
+    [apub, e1] = nistec.pub_from_priv(c, ask)
+    testing.expect(e1 == nil, "p384 alice pub err")
+    testing.expect_streq(hex.encode(apub), "045c86a47f40f6edcd68ca1e3d112522dc8ac91ce4c10b743ad3e8e2538f30be488d50037a01b940ddc6df8d7465ae1626789e5cd6244c79a83bb7d3a3e7138eb9d1f216aafd215b9debc8950d86cc401a11ebc929d03e3aae321f375608aa3143", "p384 alice pub")
+    [bpub, e2] = nistec.pub_from_priv(c, bsk)
+    testing.expect(e2 == nil, "p384 bob pub err")
+    testing.expect_streq(hex.encode(bpub), "048b40a2bbce88083e8b8f35219c6b5e35782995ea3fa4ce48b6c7bb0ce65b808dc74a24531e60e080c95c3321ba2228a1e5aedeb6d5234e00d257a4f6cb95a47feade17e88ad881c35c65a1b83af5d3c14f973699132a58b6f5009405f96fc7fc", "p384 bob pub")
+
+    [sa, e3] = nistec.ecdh(c, ask, bpub)
+    testing.expect(e3 == nil, "p384 ecdh alice err")
+    testing.expect_streq(hex.encode(sa), "e72bae28e29aaba0785f13aac57c73c6547c014f121927b1e54b5fb22ab0234f944459054f9ab1e68a446106d98eaf7f", "p384 shared")
+    [sb, e4] = nistec.ecdh(c, bsk, apub)
+    testing.expect(e4 == nil, "p384 ecdh bob err")
+    testing.expect_streq(hex.encode(sb), hex.encode(sa), "p384 ecdh symmetry")
+
+    [_z, e5] = nistec.ecdh(c, ask, apub[0:49])
+    testing.expect(e5 != nil, "p384 truncated point accepted")
+}
+
+fn test_ecdsa() {
+    msg := hx("6f786c20746c732078342065636473612074657374206d6573736167650a")
+
+    // P-256/SHA-256 known-answer (fixed nonce, cross-computed)
+    c := nistec.p256()
+    pub := hx("041fa34bac6b777620eee5233ab7efb5ab204f25dd403f7f2f13b38a90443fc7c5e63b9ee7411a3412a4a34e2121a17cfe8c845ee008e16e0b2478178a5fde2c6f")
+    r := hx("2f57acb3042c65c3103172415c42f3ba15c3412a5dd85baa6e7b50933f61547b")
+    s := hx("959a9569665125de1102705376736d35bf27eab61c8470d24278e35825991f05")
+    e := nistec.ecdsa_verify(c, pub, sha256.new, msg, r, s)
+    testing.expect(e == nil, "ecdsa p256 verify")
+
+    // tamper rejects: s flip, r flip, wrong message, wrong hash,
+    // out-of-range r/s
+    s2 := hx("959a9569665125de1102705376736d35bf27eab61c8470d24278e35825991f05")
+    s2[10] = s2[10] ^ 1
+    e = nistec.ecdsa_verify(c, pub, sha256.new, msg, r, s2)
+    testing.expect(e != nil, "ecdsa s tamper accepted")
+    r2 := hx("2f57acb3042c65c3103172415c42f3ba15c3412a5dd85baa6e7b50933f61547b")
+    r2[3] = r2[3] ^ 1
+    e = nistec.ecdsa_verify(c, pub, sha256.new, msg, r2, s)
+    testing.expect(e != nil, "ecdsa r tamper accepted")
+    e = nistec.ecdsa_verify(c, pub, sha256.new, hx("deadbeef"), r, s)
+    testing.expect(e != nil, "ecdsa wrong message accepted")
+    e = nistec.ecdsa_verify(c, pub, sha512.new, msg, r, s)
+    testing.expect(e != nil, "ecdsa wrong hash accepted")
+    e = nistec.ecdsa_verify(c, pub, sha256.new, msg, hx("00"), s)
+    testing.expect(e != nil, "ecdsa r=0 accepted")
+    e = nistec.ecdsa_verify(c, pub, sha256.new, msg, hx("ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551"), s)
+    testing.expect(e != nil, "ecdsa r=n accepted")
+    // wrong key rejects
+    [_pk, ke] = nistec.pub_from_priv(c, hx("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcd"))
+    testing.expect(ke == nil, "p256 other key err")
+    e = nistec.ecdsa_verify(c, _pk, sha256.new, msg, r, s)
+    testing.expect(e != nil, "ecdsa wrong key accepted")
+
+    // P-384/SHA-384 known-answer
+    c4 := nistec.p384()
+    pub4 := hx("04f65671862ee354e352a3749ce1483e589da2cf25bd0ab0daee5b14e6f63d425061ea30643038fd2bf14cda46fa69b22aebba165391c732c400095827e9a0123d7c2296129ab234fa6a44051bd8db282d20823e199dc136084375b7c4e7cad22c")
+    r4 := hx("6a6f564ac55c120c32673cfadfb88bfcf86195baa5c9dcce522d1bbc1e7f6f4509c34469169bbc7c2d42711e3cacd1de")
+    s4 := hx("fd18a5fc824013667faf2780ed4eb27e8c8722724ab55ab9510d1414ef5d5d6e455a281f115f7acf282d12b8ec69932f")
+    e = nistec.ecdsa_verify(c4, pub4, sha512.new384, msg, r4, s4)
+    testing.expect(e == nil, "ecdsa p384 verify")
+    s4b := hx("fd18a5fc824013667faf2780ed4eb27e8c8722724ab55ab9510d1414ef5d5d6e455a281f115f7acf282d12b8ec69932f")
+    s4b[20] = s4b[20] ^ 1
+    e = nistec.ecdsa_verify(c4, pub4, sha512.new384, msg, r4, s4b)
+    testing.expect(e != nil, "ecdsa p384 s tamper accepted")
+
+    // perf gate: spec bound 150 ms/op, asserted pathological 10x
+    t0 := time.unix_ms()
+    e = nistec.ecdsa_verify(c, pub, sha256.new, msg, r, s)
+    dt := time.unix_ms() - t0
+    testing.expect(e == nil, "ecdsa timed verify")
+    println("ecdsa p256 verify ms=" + itoa(dt))
+    testing.expect(dt < 1500, "ecdsa p256 perf gate")
+}

@@ -234,6 +234,21 @@ fn alias_rebind() -> io.Reader {
     return b[0]
 }
 
+// a shadowing same-named binding in an inner scope is not the borrow's
+// storage owner — popping it must not condemn `r`
+fn shadow_scoped() -> int {
+    buf := bytes.newbuffer()
+    [ws, wes] = buf.write("shadow" as []byte)
+    r := buf.asreader()
+    if true {
+        buf := 42
+        println("inner:" + itoa(buf))
+    }
+    b := mkslice(byte, 16)
+    [n, err] = r.read(b)
+    return n
+}
+
 fn main() {
     b := mkslice(byte, 16)
     r := via_into()
@@ -254,6 +269,7 @@ fn main() {
     [n3, err3] = r3.read(b)
     println("select:" + substr(b as str, 0, n3))
     println("alias:" + itoa(alias_scoped()))
+    println("shadow:" + itoa(shadow_scoped()))
 }
 EOF
 out=$("$OXL" run "$scratch/ifaceescape.oxl")
@@ -264,6 +280,7 @@ grep -q "bufio:6" <<<"$out" || { echo "FAIL ifaceescape bufio: $out"; exit 1; }
 grep -q "sink:bufiodirect" <<<"$out" || { echo "FAIL ifaceescape sink: $out"; exit 1; }
 grep -q "select:sel" <<<"$out" || { echo "FAIL ifaceescape select: $out"; exit 1; }
 grep -q "alias:5" <<<"$out" || { echo "FAIL ifaceescape alias: $out"; exit 1; }
+grep -q "shadow:6" <<<"$out" || { echo "FAIL ifaceescape shadow: $out"; exit 1; }
 # char literals decode to their scalar (scratch, not corpus — fmt
 # normalizes 'a' to 97 in formatted files)
 cat > "$scratch/charlit.oxl" <<'EOF'

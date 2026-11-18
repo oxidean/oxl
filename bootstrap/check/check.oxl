@@ -543,8 +543,8 @@ fn env_pop_ck(ck: mut Ck, e: mut Env) {
                     srcs := taint_srcs(ck, bi)
                     hit := ""
                     for srcs != nil {
-                        if collections.map_has(e.scopes[top].m, srcs.v) {
-                            hit = srcs.v
+                        if src_gen(srcs.v) == e.scopes[top].gen {
+                            hit = src_name(srcs.v)
                             break
                         }
                         srcs = srcs.next
@@ -928,8 +928,12 @@ fn storage_src(ck: mut Ck, e: ref parser.Node, ty: int, env: ref Env) -> int {
                     return -1
                 }
             }
-            if scope_of(env, n) >= 0 {
-                return borr_intern(ck, n)
+            sc := scope_of(env, n)
+            if sc >= 0 {
+                // `name@gen` — the declaring scope's instance id rides
+                // with the source so a shadowing same-named binding in
+                // another scope is never mistaken for the storage owner
+                return borr_intern(ck, n + "@" + itoa(env.scopes[sc].gen))
             }
             return -1
         }
@@ -1053,6 +1057,20 @@ fn sal_count(l: ref SalIAS) -> int {
         l = l.next
     }
     return n
+}
+
+// fixed-point test for the sal side: every edge in `nh` is already a
+// live member of `head` — count comparison alone can pass while live
+// membership still changes under sal_live_only filtering
+fn sal_covered(nh: ref SalIAS, head: ref SalIAS) -> int {
+    l := nh
+    for l != nil {
+        if sal_edge_live(head, l.m, l.g, l.sc, l.gen) == 0 {
+            return 0
+        }
+        l = l.next
+    }
+    return 1
 }
 
 // drop edges whose scope generation is gone — loop fixed-points re-run
@@ -1603,9 +1621,33 @@ fn taint_src(ck: ref Ck, idx: int) -> str {
     s := ck.borrn[idx]
     p := find(s, "|")
     if p >= 0 {
-        return substr(s, 0, p)
+        s = substr(s, 0, p)
     }
-    return s
+    return src_name(s)
+}
+
+// borrow-source ids are `name@gen`: gen is the declaring scope's
+// instance stamp (Scope.gen) so shadowed same-named bindings can't be
+// mistaken for each other's storage. -1 for non-scope sources.
+fn src_gen(s: str) -> int {
+    p := find(s, "@")
+    if p < 0 {
+        return -1
+    }
+    g := atoi(substr(s, p + 1, len(s)))
+    if g <= 0 {
+        return -1
+    }
+    return g
+}
+
+// bare binding name from a `name@gen` source id (diagnostic text)
+fn src_name(s: str) -> str {
+    p := find(s, "@")
+    if p < 0 {
+        return s
+    }
+    return substr(s, 0, p)
 }
 
 // ---------- receiver-alias pre-scan ----------
@@ -2455,6 +2497,33 @@ fn ll_taint_count(l: ref LL) -> int {
         l = l.next
     }
     return n
+}
+
+// fixed-point test: every borrow entry in `nh` — binding name and its
+// full merged source set — is already carried by the same scope's entry
+// in `head`. Counts alone miss source-set growth under borr_union.
+fn ll_covered(ck: ref Ck, nh: ref LL, head: ref LL) -> int {
+    a := nh
+    b := head
+    for a != nil {
+        l := a.names
+        for l != nil {
+            bi := borr_entry_idx(l.v)
+            hb := -1
+            if b != nil {
+                hb = borr_get(b.names, taint_name(l.v))
+            }
+            if bi >= 0 && bi < len(ck.borrn) && (hb < 0 || hb >= len(ck.borrn) || taint_covers(ck, hb, ck.borrn[bi]) == 0) {
+                return 0
+            }
+            l = l.next
+        }
+        a = a.next
+        if b != nil {
+            b = b.next
+        }
+    }
+    return 1
 }
 
 fn env_bind_count(e: ref Env) -> int {
@@ -5116,8 +5185,8 @@ fn match_expr(ck: mut Ck, scrut: ref parser.Node, arms: ref parser.NList, env: m
                         tops := len(env.scopes) - 1
                         srcs := taint_srcs(ck, ck.et)
                         for srcs != nil {
-                            if collections.map_has(env.scopes[tops].m, srcs.v) {
-                                diag(ck, "check", "match arm result escapes a borrow of arm-local `" + srcs.v + "` — it dangles when the arm scope ends")
+                            if src_gen(srcs.v) == env.scopes[tops].gen {
+                                diag(ck, "check", "match arm result escapes a borrow of arm-local `" + src_name(srcs.v) + "` — it dangles when the arm scope ends")
                             }
                             srcs = srcs.next
                         }
@@ -5611,7 +5680,11 @@ fn call(ck: mut Ck, f: ref parser.Node, args: ref parser.NList, env: mut Env) ->
                         pt = vat
                         rn := taint_root(args.v)
                         if len(rn) > 0 {
-                            sal_taint_name(ck, env, rn, vat)
+                            if scope_of(env, rn) == 0 {
+                                diag(ck, "check", "`push` into `" + rn + "` stores a borrow of local `" + taint_src(ck, vat) + "` in borrowed storage — it can outlive this scope")
+                            } else {
+                                sal_taint_name(ck, env, rn, vat)
+                            }
                         }
                     }
                     if stat >= 0 && taint_may(ck, st) == 1 {
@@ -6143,7 +6216,7 @@ fn stmt(ck: mut Ck, s: ref parser.Node, env: mut Env) {
                         }
                         if scope_of(env, rt2) < 0 && rt >= 0 {
                             diag(ck, "check", "assignment to `" + rt2 + "` escapes a borrow of local `" + taint_src(ck, vtaint) + "` — it dangles when the scope ends")
-                        } else if rk == k_mut() || rk == k_ref() {
+                        } else if rk == k_mut() || rk == k_ref() || scope_of(env, rt2) == 0 && (rk == k_slice() || rk == k_own()) {
                             diag(ck, "check", "assignment to `" + rt2 + "` stores a borrow of local `" + taint_src(ck, vtaint) + "` in borrowed storage — it can outlive this scope")
                         } else {
                             env_taint_merge(ck, env, rt2, vtaint)
@@ -6334,7 +6407,7 @@ fn stmt(ck: mut Ck, s: ref parser.Node, env: mut Env) {
                     cl2 = cl2.next
                 }
                 snh := sal_live_only(env, ck.srep)
-                conv := ck.nerr != npass || ll_taint_count(nh) <= ll_taint_count(head) && sal_count(snh) <= sal_count(shead)
+                conv := ck.nerr != npass || ll_covered(ck, nh, head) == 1 && sal_covered(snh, shead) == 1
                 shead = nil
                 shead = snh
                 if conv {

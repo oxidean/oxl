@@ -1,0 +1,100 @@
+package main
+
+// X3: std/crypto/bignum — known-answer + Fermat cross-checks over
+// base-2^26 limbs (modmul/modexp/modinv per the spec's test names;
+// divmod and the byte codecs are exercised inside them).
+import "std/crypto/bignum"
+
+import "std/encoding/hex"
+
+import "std/testing"
+
+// hx decodes a hex literal — fixture helper
+fn hx(s: str) -> own []byte {
+    [b, e] = hex.decode(s)
+    testing.expect(e == nil, "hex decode")
+    return b
+}
+
+// bex renders a bignum as minimal big-endian hex (low nibble
+// padding kept — byte granularity, like the vectors)
+fn bex(a: []int) -> str {
+    k := (bignum.bitlen(a) + 7) / 8
+    if k == 0 {
+        k = 1
+    }
+    return hex.encode(bignum.to_be_bytes(a, k))
+}
+
+fn test_modmul() {
+    // (2^64 - 59) modulus — prime; operands fill three 26-bit limbs
+    m := bignum.sub(bignum.from_be_bytes(hx("010000000000000000")), bignum.from_int(59))
+    a := bignum.from_be_bytes(hx("deadbeefcafebabe"))
+    b := bignum.from_be_bytes(hx("1234567890abcdef"))
+    testing.expect_streq(bex(bignum.modmul(a, b, m)), "1d754bbc4a52a188", "modmul 2^64-59")
+
+    // Mersenne prime 2^127 - 1 — five limbs
+    p := bignum.from_be_bytes(hx("7fffffffffffffffffffffffffffffff"))
+    a2 := bignum.from_be_bytes(hx("0123456789abcdeffedcba9876543210"))
+    testing.expect_streq(bex(bignum.modmul(a2, a2, p)), "422b08854c0762069cc018eb7c0ee84c", "modmul p127 square")
+    s := bignum.from_be_bytes(hx("0123456789abcdef00112233445566778899aabbccddeeff"))
+    testing.expect_streq(bex(bignum.modmul(a2, s, p)), "42e1a3ab1a12b729ca3f2262efb7a9b4", "modmul p127 cross")
+
+    // identities: a*1 mod m == a mod m; a*0 == 0
+    testing.expect_streq(bex(bignum.modmul(a2, bignum.from_int(1), p)), bex(bignum.mod(a2, p)), "modmul id")
+    testing.expect(bignum.is_zero(bignum.modmul(a2, bignum.from_int(0), p)), "modmul zero")
+
+    // divmod consistency: a2*s = q*p + r with r the residue above
+    dm := bignum.divmod(bignum.mul(a2, s), p)
+    testing.expect_streq(bex(dm.r), "42e1a3ab1a12b729ca3f2262efb7a9b4", "divmod r")
+    testing.expect(bignum.cmp(bignum.add(bignum.mul(dm.q, p), dm.r), bignum.mul(a2, s)) == 0, "divmod reconstruct")
+}
+
+fn test_modexp() {
+    // 7^20 mod 13 = 3 (hand-checked)
+    testing.expect(bignum.cmp(bignum.modexp(bignum.from_int(7), bignum.from_int(20), bignum.from_int(13)), bignum.from_int(3)) == 0, "modexp small")
+
+    // Fermat: a^(p-1) mod p == 1 for prime p, gcd(a,p)=1 — cross-check
+    // on the 127-bit Mersenne (and a^0 == 1, 0^e == 0 edges)
+    p := bignum.from_be_bytes(hx("7fffffffffffffffffffffffffffffff"))
+    pm1 := bignum.sub(p, bignum.from_int(1))
+    a := bignum.from_be_bytes(hx("0123456789abcdeffedcba9876543210"))
+    testing.expect(bignum.is_one(bignum.modexp(a, pm1, p)), "fermat p127")
+    testing.expect(bignum.is_one(bignum.modexp(a, bignum.from_int(0), p)), "exp zero")
+    testing.expect(bignum.is_zero(bignum.modexp(bignum.from_int(0), bignum.from_int(5), p)), "base zero")
+
+    // RSA-shaped: s^65537 mod n on a ~500-bit modulus (known answer)
+    n := bignum.from_be_bytes(hx("c5cd08dc2f0fe0f0e20b1d4cb5b9d7a1a7ad8b3b9a4e35d0b1e5b0f5b90cbb1d0d5bb60a1be1d6a5b0f7c1b8a0b6c5d4e3f201d2c3b4a5968778695a4b3c2d1e0f"))
+    s := bignum.from_be_bytes(hx("0123456789abcdef00112233445566778899aabbccddeeff"))
+    testing.expect_streq(bex(bignum.modexp(s, bignum.from_int(65537), n)), "711ec45f49bc5add89727762d707e493c2714a76542c7c10b6cc3a63d07ca07e38d62b8f51214f4b780ae3a856646f66c1dc0cfc46f5d7ab16bc625b7ea5c33ada", "modexp rsa-shaped")
+}
+
+fn test_modinv() {
+    // 7^-1 mod 13 = 2 (hand-checked); then a*inv ≡ 1 spot checks
+    [i7, e7] = bignum.modinv(bignum.from_int(7), bignum.from_int(13))
+    testing.expect(e7 == nil, "modinv small err")
+    testing.expect(bignum.cmp(i7, bignum.from_int(2)) == 0, "modinv small")
+
+    // Fermat cross-check: inverse equals a^(p-2) mod p
+    p := bignum.from_be_bytes(hx("7fffffffffffffffffffffffffffffff"))
+    a := bignum.from_be_bytes(hx("0123456789abcdeffedcba9876543210"))
+    [inv, ei] = bignum.modinv(a, p)
+    testing.expect(ei == nil, "modinv err")
+    testing.expect_streq(bex(inv), "08102040810203f90102040810204071", "modinv p127")
+    pm2 := bignum.sub(p, bignum.from_int(2))
+    testing.expect(bignum.cmp(inv, bignum.modexp(a, pm2, p)) == 0, "fermat inverse")
+    testing.expect(bignum.is_one(bignum.modmul(a, inv, p)), "a * a^-1 == 1")
+
+    // composite modulus (2^61-1)(2^85-1), still coprime to x
+    m := bignum.mul(bignum.from_be_bytes(hx("1fffffffffffffff")), bignum.from_be_bytes(hx("1fffffffffffffffffffff")))
+    x := bignum.from_be_bytes(hx("0123456789abcdef0123456789abcdef012345"))
+    [ix, ex] = bignum.modinv(x, m)
+    testing.expect(ex == nil, "modinv composite err")
+    testing.expect(bignum.is_one(bignum.modmul(x, ix, m)), "composite a * a^-1 == 1")
+
+    // rejects: gcd != 1, and m <= 1
+    [_ni, en] = bignum.modinv(p, bignum.mul(p, bignum.from_int(3)))
+    testing.expect(en != nil, "modinv non-invertible accepted")
+    [_n2, e2] = bignum.modinv(bignum.from_int(7), bignum.from_int(1))
+    testing.expect(e2 != nil, "modinv mod 1 accepted")
+}

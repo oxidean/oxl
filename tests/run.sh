@@ -414,6 +414,20 @@ printf '%s
 for t in test_hkdf; do
     grep -q "$t ... ok" <<<"$out" || { echo "FAIL hkdf: $out"; exit 1; }
 done
+
+echo "== oxl test: bignum+rsa (x3) =="
+out=$("$OXL" test tests/bignum_test.oxl)
+printf '%s
+' "$out" >&2
+for t in test_modmul test_modexp test_modinv; do
+    grep -q "$t ... ok" <<<"$out" || { echo "FAIL bignum: $out"; exit 1; }
+done
+out=$("$OXL" test tests/rsa_test.oxl)
+printf '%s
+' "$out" >&2
+for t in test_rsav15 test_rsapss; do
+    grep -q "$t ... ok" <<<"$out" || { echo "FAIL rsa: $out"; exit 1; }
+done
 out=$("$OXL" test tests/net_test.oxl)
 printf '%s
 ' "$out" >&2
@@ -1408,9 +1422,10 @@ printf '%s
 for t in test_path test_filepath test_cmp test_sort test_slices test_maps test_math test_rand test_utf8; do
     grep -q "$t ... ok" <<<"$out" || { echo "FAIL codegen util: $out"; exit 1; }
 done
-# s4 enc/hash/crypto through the self-hosted emitter + cc — exercises
-# [][]str return emission (csv.read_all) and hash/crypto under -test
-for tf in enc hash crypto aesgcm chacha sha512 hkdf crypto_rand; do
+# s4 enc/hash/crypto + x1/x3 crypto through the self-hosted emitter +
+# cc — exercises [][]str return emission (csv.read_all), hash/crypto,
+# and the big-limb arithmetic under -test
+for tf in enc hash crypto aesgcm chacha sha512 hkdf crypto_rand bignum rsa; do
     "$OXL" run bootstrap/cmd/codegen -- --test "tests/${tf}_test.oxl" > "$cgen_dir/$tf.c"
     tfcrypto=""; tfcryptolib=""
     grep -q 'rt_csrand(' "$cgen_dir/$tf.c" && { tfcrypto="-DOXL_CRYPTO"; tfcryptolib="$CRYPTO_LIBS"; }
@@ -1442,6 +1457,12 @@ for t in test_hkdf; do
 done
 for t in test_csrand; do
     grep -q "$t ... ok" "$cgen_dir/crypto_rand.out" || { echo "FAIL codegen crypto_rand $t"; cat "$cgen_dir/crypto_rand.out"; exit 1; }
+done
+for t in test_modmul test_modexp test_modinv; do
+    grep -q "$t ... ok" "$cgen_dir/bignum.out" || { echo "FAIL codegen bignum $t"; cat "$cgen_dir/bignum.out"; exit 1; }
+done
+for t in test_rsav15 test_rsapss; do
+    grep -q "$t ... ok" "$cgen_dir/rsa.out" || { echo "FAIL codegen rsa $t"; cat "$cgen_dir/rsa.out"; exit 1; }
 done
 # s5 regexp through the self-hosted emitter + cc — the NFA engine is
 # the heaviest pure-.oxl package (struct slices, closures, utf8)

@@ -1,0 +1,405 @@
+package rsa
+
+// std/crypto/rsa — RSA signature verification only (X3): DER
+// RSAPublicKey decode, PKCS#1 v1.5 EMSA verify (DigestInfo prefixes
+// for sha256/384/512 — sha1/md5 are absent by design), and
+// RSASSA-PSS verify (MGF1 over the same hash, recovered or pinned
+// salt length, 0xbc trailer). No sign/encrypt/decrypt surface —
+// the TLS client posture needs verify only.
+import "std/crypto/bignum"
+
+import "std/encoding/binary"
+
+import "std/errors"
+
+import "std/hash"
+
+/// PubKey is an RSA public key — modulus n and public exponent e as
+/// bignum limb slices (crypto/bignum's little-endian base-2^26 form).
+struct PubKey { n: []int, e: []int }
+
+// TLV is one decoded DER element — tag byte plus the content
+// window [off, off+len) inside the source. (Multi-returns are
+// [T, err] only, so the triple rides a struct.)
+struct TLV { tag: int, off: int, len: int }
+
+// der_tlv parses one definite-length TLV at off — the minimal DER
+// reader an RSAPublicKey needs (x509 carries the full reader).
+fn der_tlv(der: []byte, off: int) -> [TLV, err] {
+    z := TLV{tag: 0, off: 0, len: 0}
+    if off < 0 || off + 2 > len(der) {
+        return z, errors.new("rsa: truncated der")
+    }
+    tag := der[off]
+    lb := der[off + 1]
+    off = off + 2
+    ln := 0
+    if lb < 128 {
+        ln = lb
+    } else {
+        nb := lb - 128
+        if nb == 0 {
+            return z, errors.new("rsa: indefinite der length")
+        }
+        if nb > 8 || off + nb > len(der) {
+            return z, errors.new("rsa: bad der length")
+        }
+        i := 0
+        for i < nb {
+            ln = ln * 256 + der[off + i]
+            i = i + 1
+        }
+        if ln < 0 || ln < 128 {
+            return z, errors.new("rsa: non-minimal or overflowing der length")
+        }
+        off = off + nb
+    }
+    if off + ln > len(der) {
+        return z, errors.new("rsa: der length overflows input")
+    }
+    return TLV{tag: tag, off: off, len: ln}, nil
+}
+
+// intbytes returns the positive-magnitude window of a DER INTEGER
+// content: first byte under 0x80 (a set bit means negative), then
+// the zero pad bytes stripped. [off, len] or ok=false.
+struct IntWin { off: int, len: int, ok: bool }
+
+fn int_win(der: []byte, t: TLV) -> IntWin {
+    z := IntWin{off: 0, len: 0, ok: false}
+    if t.len == 0 || der[t.off] >= 128 {
+        return z
+    }
+    o := t.off
+    l := t.len
+    for l > 1 && der[o] == 0 {
+        o = o + 1
+        l = l - 1
+    }
+    return IntWin{off: o, len: l, ok: true}
+}
+
+/// parse_pub_key decodes a DER RSAPublicKey — SEQUENCE of INTEGER
+/// modulus and INTEGER publicExponent, the form an x509 SPKI BIT
+/// STRING carries (the AlgorithmIdentifier wrapper belongs to the
+/// x509 layer, not here).
+fn parse_pub_key(der: []byte) -> [PubKey, err] {
+    z := PubKey{n: nil, e: nil}
+    [seq, e1] = der_tlv(der, 0)
+    if e1 != nil {
+        return z, e1
+    }
+    if seq.tag != 48 || seq.off + seq.len != len(der) {
+        return z, errors.new("rsa: key is not a single SEQUENCE")
+    }
+    [itn, e2] = der_tlv(der, seq.off)
+    if e2 != nil {
+        return z, e2
+    }
+    if itn.tag != 2 {
+        return z, errors.new("rsa: modulus is not an INTEGER")
+    }
+    [ite, e3] = der_tlv(der, itn.off + itn.len)
+    if e3 != nil {
+        return z, e3
+    }
+    if ite.tag != 2 {
+        return z, errors.new("rsa: exponent is not an INTEGER")
+    }
+    if ite.off + ite.len != seq.off + seq.len {
+        return z, errors.new("rsa: trailing data in key SEQUENCE")
+    }
+    nw := int_win(der, itn)
+    if !nw.ok {
+        return z, errors.new("rsa: modulus is empty or negative")
+    }
+    ew := int_win(der, ite)
+    if !ew.ok {
+        return z, errors.new("rsa: exponent is empty or negative")
+    }
+    n := bignum.from_be_bytes(der[nw.off:nw.off + nw.len])
+    e := bignum.from_be_bytes(der[ew.off:ew.off + ew.len])
+    if bignum.is_zero(n) || bignum.is_zero(e) {
+        return z, errors.new("rsa: zero modulus or exponent")
+    }
+    return PubKey{n: n, e: e}, nil
+}
+
+// digest runs hf over msg — Hash.sum(nil) is the one-shot form
+fn digest(hf: fn() -> hash.Hash, msg: []byte) -> own []byte {
+    h := hf()
+    [wn, we] = h.write(msg)
+    return h.sum(nil)
+}
+
+// di_prefix writes the DigestInfo prefix for a hlen-byte digest
+// into out (always big enough) and returns its length, or -1 —
+// sha256(32)/sha384(48)/sha512(64) only; sha1/md5/sha224 absent.
+fn di_prefix(hlen: int, out: []byte) -> int {
+    // DER DigestInfo = SEQ{ SEQ{ OID, NULL }, OCTET STRING }
+    if hlen == 32 {
+        // sha256, OID 2.16.840.1.101.3.4.2.1
+        t := mkslice(byte, 19)
+        t[0] = 48
+        t[1] = 49
+        t[2] = 48
+        t[3] = 13
+        t[4] = 6
+        t[5] = 9
+        t[6] = 96
+        t[7] = 134
+        t[8] = 72
+        t[9] = 1
+        t[10] = 101
+        t[11] = 3
+        t[12] = 4
+        t[13] = 2
+        t[14] = 1
+        t[15] = 5
+        t[16] = 0
+        t[17] = 4
+        t[18] = 32
+        i := 0
+        for i < 19 {
+            out[i] = t[i]
+            i = i + 1
+        }
+        return 19
+    }
+    if hlen == 48 {
+        // sha384, OID 2.16.840.1.101.3.4.2.2
+        t := mkslice(byte, 19)
+        t[0] = 48
+        t[1] = 65
+        t[2] = 48
+        t[3] = 13
+        t[4] = 6
+        t[5] = 9
+        t[6] = 96
+        t[7] = 134
+        t[8] = 72
+        t[9] = 1
+        t[10] = 101
+        t[11] = 3
+        t[12] = 4
+        t[13] = 2
+        t[14] = 2
+        t[15] = 5
+        t[16] = 0
+        t[17] = 4
+        t[18] = 48
+        i := 0
+        for i < 19 {
+            out[i] = t[i]
+            i = i + 1
+        }
+        return 19
+    }
+    if hlen == 64 {
+        // sha512, OID 2.16.840.1.101.3.4.2.3
+        t := mkslice(byte, 19)
+        t[0] = 48
+        t[1] = 81
+        t[2] = 48
+        t[3] = 13
+        t[4] = 6
+        t[5] = 9
+        t[6] = 96
+        t[7] = 134
+        t[8] = 72
+        t[9] = 1
+        t[10] = 101
+        t[11] = 3
+        t[12] = 4
+        t[13] = 2
+        t[14] = 3
+        t[15] = 5
+        t[16] = 0
+        t[17] = 4
+        t[18] = 64
+        i := 0
+        for i < 19 {
+            out[i] = t[i]
+            i = i + 1
+        }
+        return 19
+    }
+    return -1
+}
+
+// sp2 is 2^n for 0 <= n <= 8 — top-bit masking of PSS octets
+fn sp2(n: int) -> int {
+    v := 1
+    i := 0
+    for i < n {
+        v = v * 2
+        i = i + 1
+    }
+    return v
+}
+
+// mgf1 — RFC 8017 §B.2.1 mask generation over hf, counter
+// big-endian; the caller's hash is also the MGF hash.
+fn mgf1(hf: fn() -> hash.Hash, seed: []byte, outlen: int) -> own []byte {
+    out := mkslice(byte, outlen)
+    cb := mkslice(byte, 4)
+    got := 0
+    ctr := 0
+    for got < outlen {
+        h := hf()
+        [w1, e1] = h.write(seed)
+        binary.put_be_u32(cb, 0, ctr)
+        [w2, e2] = h.write(cb)
+        d := h.sum(nil)
+        i := 0
+        for got < outlen && i < len(d) {
+            out[got] = d[i]
+            got = got + 1
+            i = i + 1
+        }
+        ctr = ctr + 1
+    }
+    return new(out)
+}
+
+/// verify_v15 checks a PKCS#1 v1.5 signature (RSASSA-PKCS1-v1_5,
+/// RFC 8017 §8.2.2): s^e mod n must decode to
+/// 00 || 01 || FF* || 00 || DigestInfo || H. msg is the signed
+/// content — hashed here with hf (sha256.new, sha512.new384,
+/// sha512.new — the DigestInfo table's only entries).
+fn verify_v15(pk: PubKey, hf: fn() -> hash.Hash, msg: []byte, sig: []byte) -> err {
+    if bignum.is_zero(pk.n) || bignum.is_zero(pk.e) {
+        return errors.new("rsa: empty key")
+    }
+    k := (bignum.bitlen(pk.n) + 7) / 8
+    if len(sig) != k {
+        return errors.new("rsa: signature length != modulus")
+    }
+    s := bignum.from_be_bytes(sig)
+    if bignum.cmp(s, pk.n) >= 0 {
+        return errors.new("rsa: signature >= modulus")
+    }
+    mhash := digest(hf, msg)
+    hlen := len(mhash)
+    pbuf := mkslice(byte, 19)
+    plen := di_prefix(hlen, pbuf)
+    if plen < 0 {
+        return errors.new("rsa: hash outside the v1.5 prefix set")
+    }
+    tl := plen + hlen
+    if k < tl + 11 {
+        return errors.new("rsa: modulus too short for hash")
+    }
+    m := bignum.modexp(s, pk.e, pk.n)
+    em := bignum.to_be_bytes(m, k)
+    if em[0] != 0 || em[1] != 1 {
+        return errors.new("rsa: bad v1.5 header")
+    }
+    ps_end := k - tl - 1
+    i := 2
+    for i < ps_end {
+        if em[i] != 255 {
+            return errors.new("rsa: bad v1.5 padding")
+        }
+        i = i + 1
+    }
+    if em[ps_end] != 0 {
+        return errors.new("rsa: missing v1.5 separator")
+    }
+    i = 0
+    for i < plen {
+        if em[ps_end + 1 + i] != pbuf[i] {
+            return errors.new("rsa: digestinfo prefix mismatch")
+        }
+        i = i + 1
+    }
+    i = 0
+    for i < hlen {
+        if em[k - hlen + i] != mhash[i] {
+            return errors.new("rsa: digest mismatch")
+        }
+        i = i + 1
+    }
+    return nil
+}
+
+/// verify_pss checks a RSASSA-PSS signature (RFC 8017 §8.1.2):
+/// EMSA decode — DB unmask via MGF1 over the same hf, 00* 01 salt
+/// separator, 0xbc trailer, Hash(00*8 || mHash || salt) match.
+/// saltlen >= 0 pins the recovered salt length (the TLS
+/// CertificateVerify caller passes the hash length); saltlen < 0
+/// accepts whatever the signer encoded — x509's generic path.
+fn verify_pss(pk: PubKey, hf: fn() -> hash.Hash, msg: []byte, sig: []byte, saltlen: int) -> err {
+    if bignum.is_zero(pk.n) || bignum.is_zero(pk.e) {
+        return errors.new("rsa: empty key")
+    }
+    k := (bignum.bitlen(pk.n) + 7) / 8
+    if len(sig) != k {
+        return errors.new("rsa: signature length != modulus")
+    }
+    s := bignum.from_be_bytes(sig)
+    if bignum.cmp(s, pk.n) >= 0 {
+        return errors.new("rsa: signature >= modulus")
+    }
+    mhash := digest(hf, msg)
+    hlen := len(mhash)
+    embits := bignum.bitlen(pk.n) - 1
+    emlen := (embits + 7) / 8
+    need := hlen + 2
+    if saltlen > 0 {
+        need = hlen + saltlen + 2
+    }
+    if emlen < need {
+        return errors.new("rsa: modulus too short for hash")
+    }
+    m := bignum.modexp(s, pk.e, pk.n)
+    if bignum.bitlen(m) > 8 * emlen {
+        return errors.new("rsa: encoded message too large")
+    }
+    em := bignum.to_be_bytes(m, emlen)
+    if em[emlen - 1] != 188 {
+        return errors.new("rsa: bad pss trailer")
+    }
+    mlen := emlen - hlen - 1
+    // the leftmost 8*emlen - embits bits of em[0] must be zero —
+    // the RFC's check on maskedDB before unmasking
+    unused := 8 * emlen - embits
+    if unused > 0 && em[0] / sp2(8 - unused) != 0 {
+        return errors.new("rsa: nonzero pss high bits")
+    }
+    dbmask := mgf1(hf, em[mlen:mlen + hlen], mlen)
+    db := mkslice(byte, mlen)
+    i := 0
+    for i < mlen {
+        db[i] = em[i] ^ dbmask[i]
+        i = i + 1
+    }
+    if unused > 0 {
+        db[0] = db[0] % sp2(8 - unused)
+    }
+    i = 0
+    for i < mlen && db[i] == 0 {
+        i = i + 1
+    }
+    if i >= mlen || db[i] != 1 {
+        return errors.new("rsa: bad pss padding")
+    }
+    salt := db[i + 1:mlen]
+    if saltlen >= 0 && len(salt) != saltlen {
+        return errors.new("rsa: pss salt length mismatch")
+    }
+    h2 := hf()
+    zb := mkslice(byte, 8)
+    [w1, e1] = h2.write(zb)
+    [w2, e2] = h2.write(mhash)
+    [w3, e3] = h2.write(salt)
+    hp := h2.sum(nil)
+    i = 0
+    for i < hlen {
+        if em[mlen + i] != hp[i] {
+            return errors.new("rsa: pss hash mismatch")
+        }
+        i = i + 1
+    }
+    return nil
+}

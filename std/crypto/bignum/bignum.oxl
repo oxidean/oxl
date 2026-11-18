@@ -1,0 +1,459 @@
+package bignum
+
+// std/crypto/bignum — unsigned-magnitude arithmetic over i64 limbs,
+// base 2^26 so schoolbook products and column accumulators stay
+// under 2^63 (the language has no u64/i128 — limbs must leave
+// headroom). Numbers are []int little-endian limb slices,
+// normalized: no high zero limbs, zero is the empty slice.
+//
+// This is a crypto-internal building block — the API may churn. It
+// is public only because the language has no internal-package rule;
+// std/crypto/rsa (X3) and std/crypto/nistec (X4) consume it.
+//
+// Divide by zero traps (contract violation, same posture as
+// encoding/binary's bounds need); every other entry point is total.
+import "std/errors"
+
+import "std/slices"
+
+// limb geometry: 26 bits per limb, B = 2^26
+let LB: int = 26
+
+let B: int = 67108864
+
+let P2: own []int = nil
+
+// powers of two 0..26 — no shift operators, so bit work is / * &
+fn p2() -> own []int {
+    if P2 == nil {
+        t := mkslice(int, 27)
+        v := 1
+        i := 0
+        for i < 27 {
+            t[i] = v
+            v = v * 2
+            i = i + 1
+        }
+        P2 = slices.clone(t)
+    }
+    return P2
+}
+
+// nlimbs is the significant-limb count — high zero limbs stripped
+fn nlimbs(a: []int) -> int {
+    n := len(a)
+    for n > 0 && a[n - 1] == 0 {
+        n = n - 1
+    }
+    return n
+}
+
+// ownv returns a normalized owned copy — the return-boundary form.
+// Never nil: coercing a nil own to []int dereferences a null handle;
+// a zero bignum is the allocated empty slice (nlimbs reads len 0).
+fn ownv(a: []int) -> own []int {
+    n := nlimbs(a)
+    return new(a[0:n])
+}
+
+/// is_zero reports whether a is zero.
+fn is_zero(a: []int) -> bool {
+    return nlimbs(a) == 0
+}
+
+/// is_one reports whether a is exactly one.
+fn is_one(a: []int) -> bool {
+    return nlimbs(a) == 1 && a[0] == 1
+}
+
+/// cmp is the magnitude compare: -1/0/1 for a <, ==, > b.
+fn cmp(a: []int, b: []int) -> int {
+    na := nlimbs(a)
+    nb := nlimbs(b)
+    if na != nb {
+        if na < nb {
+            return -1
+        }
+        return 1
+    }
+    i := na
+    for i > 0 {
+        i = i - 1
+        if a[i] != b[i] {
+            if a[i] < b[i] {
+                return -1
+            }
+            return 1
+        }
+    }
+    return 0
+}
+
+/// equal reports whether a and b are the same number.
+fn equal(a: []int, b: []int) -> bool {
+    return cmp(a, b) == 0
+}
+
+/// bitlen is the number of significant bits — floor(log2(a)) + 1.
+fn bitlen(a: []int) -> int {
+    n := nlimbs(a)
+    if n == 0 {
+        return 0
+    }
+    t := a[n - 1]
+    c := 0
+    for t > 1 {
+        t = t / 2
+        c = c + 1
+    }
+    return (n - 1) * LB + c + 1
+}
+
+/// from_int converts a non-negative int — traps on negatives (the
+/// two's-complement bit pattern is NOT read as unsigned here; callers
+/// needing that go through from_be_bytes).
+fn from_int(v: int) -> own []int {
+    assert(v >= 0)
+    r := mkslice(int, 3)
+    r[0] = v % B
+    r[1] = v / B % B
+    r[2] = v / (B * B)
+    return ownv(r)
+}
+
+/// from_be_bytes decodes a big-endian byte string — the RSA/x509
+/// wire form. Each byte lands at a fixed bit position, then one
+/// carry pass normalizes (a limb accumulates under 5 * 2^33, safely
+/// below 2^63).
+fn from_be_bytes(b: []byte) -> own []int {
+    if len(b) == 0 {
+        return ownv(mkslice(int, 0))
+    }
+    n := (len(b) * 8 + LB - 1) / LB
+    r := mkslice(int, n)
+    p := p2()
+    i := 0
+    for i < len(b) {
+        bit := (len(b) - 1 - i) * 8
+        r[bit / LB] = r[bit / LB] + b[i] * p[bit % LB]
+        i = i + 1
+    }
+    c := 0
+    i = 0
+    for i < n {
+        t := r[i] + c
+        r[i] = t % B
+        c = t / B
+        i = i + 1
+    }
+    if c > 0 {
+        // unreachable at n = ceil(8*len/26) — defensive
+        r = push(r, c)
+    }
+    return ownv(r)
+}
+
+/// to_be_bytes encodes a as exactly k big-endian bytes — the I2OSP
+/// form. Traps when a does not fit (callers bounds-check first).
+fn to_be_bytes(a: []int, k: int) -> own []byte {
+    assert(bitlen(a) <= k * 8)
+    r := mkslice(byte, k)
+    p := p2()
+    n := nlimbs(a)
+    i := 0
+    for i < k {
+        bit := (k - 1 - i) * 8
+        li := bit / LB
+        s := bit % LB
+        v := 0
+        if li < n {
+            v = a[li] / p[s]
+            if s > LB - 8 && li + 1 < n {
+                v = v | a[li + 1] * p[LB - s]
+            }
+        }
+        r[i] = v % 256
+        i = i + 1
+    }
+    return new(r)
+}
+
+/// add is a + b.
+fn add(a: []int, b: []int) -> own []int {
+    la := nlimbs(a)
+    lb := nlimbs(b)
+    n := la
+    if lb > n {
+        n = lb
+    }
+    r := mkslice(int, n + 1)
+    c := 0
+    i := 0
+    for i < n {
+        t := c
+        if i < la {
+            t = t + a[i]
+        }
+        if i < lb {
+            t = t + b[i]
+        }
+        if t >= B {
+            t = t - B
+            c = 1
+        } else {
+            c = 0
+        }
+        r[i] = t
+        i = i + 1
+    }
+    r[n] = c
+    return ownv(r)
+}
+
+/// sub is a - b — traps via cmp contract when b > a (magnitudes are
+/// unsigned; a negative result cannot be represented).
+fn sub(a: []int, b: []int) -> own []int {
+    assert(cmp(a, b) >= 0)
+    la := nlimbs(a)
+    lb := nlimbs(b)
+    r := mkslice(int, la)
+    borrow := 0
+    i := 0
+    for i < la {
+        t := a[i] - borrow
+        if i < lb {
+            t = t - b[i]
+        }
+        if t < 0 {
+            t = t + B
+            borrow = 1
+        } else {
+            borrow = 0
+        }
+        r[i] = t
+        i = i + 1
+    }
+    return ownv(r)
+}
+
+/// mul is the schoolbook product a * b. Column sums stay under
+/// 2^52 + 2^27 — every intermediate fits signed i64 with headroom.
+fn mul(a: []int, b: []int) -> own []int {
+    la := nlimbs(a)
+    lb := nlimbs(b)
+    r := mkslice(int, la + lb)
+    if la == 0 || lb == 0 {
+        return ownv(r)
+    }
+    i := 0
+    for i < la {
+        c := 0
+        j := 0
+        for j < lb {
+            t := r[i + j] + a[i] * b[j] + c
+            r[i + j] = t % B
+            c = t / B
+            j = j + 1
+        }
+        r[i + lb] = c
+        i = i + 1
+    }
+    return ownv(r)
+}
+
+// mul_small is a * s for 0 <= s < B — one limb of carry work.
+fn mul_small(a: []int, s: int) -> own []int {
+    la := nlimbs(a)
+    r := mkslice(int, la + 1)
+    c := 0
+    i := 0
+    for i < la {
+        t := a[i] * s + c
+        r[i] = t % B
+        c = t / B
+        i = i + 1
+    }
+    r[la] = c
+    return ownv(r)
+}
+
+// divmod_small is a / d and a % d for 1 <= d < B — scalar long
+// division, high limb down. cur < B^2 so i64 holds it.
+fn divmod_small(a: []int, d: int) -> Div {
+    la := nlimbs(a)
+    q := mkslice(int, la)
+    r := 0
+    i := la
+    for i > 0 {
+        i = i - 1
+        cur := r * B + a[i]
+        q[i] = cur / d
+        r = cur % d
+    }
+    rr := mkslice(int, 0)
+    if r > 0 {
+        rr = push(rr, r)
+    }
+    return Div{q: ownv(q), r: ownv(rr)}
+}
+
+/// Div is the divmod result — multi-returns are [T, err] only in
+/// this language, so quotient and remainder ride a struct.
+struct Div { q: own []int, r: own []int }
+
+/// divmod returns u / v and u % v — Knuth TAOCP 4.3.1 algorithm D
+/// over base-2^26 limbs. Traps on v == 0 (contract violation).
+fn divmod(u: []int, v: []int) -> Div {
+    nv := nlimbs(v)
+    assert(nv > 0)
+    if nv == 1 {
+        dm := divmod_small(u, v[0])
+        return dm
+    }
+    if cmp(u, v) < 0 {
+        return Div{q: ownv(u[0:0]), r: ownv(u)}
+    }
+    lu := nlimbs(u)
+    // normalize so vn's top limb >= B/2 — multiply by a scalar, not
+    // a shift (the language has none); vn keeps exactly nv limbs
+    // since d <= B/(v_top+1)
+    d := B / (v[nv - 1] + 1)
+    un := mul_small(u, d)
+    vn := mul_small(v, d)
+    w := mkslice(int, lu + 1)
+    i := 0
+    for i < len(un) {
+        w[i] = un[i]
+        i = i + 1
+    }
+    m := lu - nv
+    q := mkslice(int, m + 1)
+    j := m + 1
+    for j > 0 {
+        j = j - 1
+        // qhat estimate — num < B^2 fits i64; the test loop brings
+        // qhat within the true digit (Knuth D3)
+        num := w[j + nv] * B + w[j + nv - 1]
+        qhat := num / vn[nv - 1]
+        rhat := num % vn[nv - 1]
+        for qhat >= B || qhat * vn[nv - 2] > rhat * B + w[j + nv - 2] {
+            qhat = qhat - 1
+            rhat = rhat + vn[nv - 1]
+            if rhat >= B {
+                break
+            }
+        }
+        // D4: w[j..j+nv] -= qhat * vn — carry and borrow stay under
+        // B + 1; the transient negative top resolves in add-back
+        carry := 0
+        borrow := 0
+        k := 0
+        for k < nv {
+            p := qhat * vn[k] + carry
+            carry = p / B
+            t := w[j + k] - p % B - borrow
+            if t < 0 {
+                t = t + B
+                borrow = 1
+            } else {
+                borrow = 0
+            }
+            w[j + k] = t
+            k = k + 1
+        }
+        top := w[j + nv] - carry - borrow
+        w[j + nv] = top
+        if top < 0 {
+            // D6: overestimated qhat — rare; add vn back
+            qhat = qhat - 1
+            c2 := 0
+            k = 0
+            for k < nv {
+                t := w[j + k] + vn[k] + c2
+                if t >= B {
+                    t = t - B
+                    c2 = 1
+                } else {
+                    c2 = 0
+                }
+                w[j + k] = t
+                k = k + 1
+            }
+            w[j + nv] = w[j + nv] + c2
+        }
+        q[j] = qhat
+    }
+    rn := divmod_small(w[0:nv], d)
+    return Div{q: ownv(q), r: rn.q}
+}
+
+/// mod is a % m — traps on m == 0.
+fn mod(a: []int, m: []int) -> own []int {
+    dm := divmod(a, m)
+    return dm.r
+}
+
+/// modmul is a * b % m — traps on m == 0.
+fn modmul(a: []int, b: []int, m: []int) -> own []int {
+    p := mul(a, b)
+    dm := divmod(p, m)
+    return dm.r
+}
+
+/// modexp is b^e % m — square-and-multiply over the exponent bits,
+/// most significant first (the RSA verify path: e = 65537 costs 17
+/// modmuls). Traps on m == 0.
+fn modexp(b: []int, e: []int, m: []int) -> own []int {
+    if is_one(m) {
+        return ownv(m[0:0])
+    }
+    base := mod(b, m)
+    r := mod(from_int(1), m)
+    p := p2()
+    bits := bitlen(e)
+    i := bits
+    for i > 0 {
+        i = i - 1
+        r = modmul(r, r, m)
+        if (e[i / LB] & p[i % LB]) != 0 {
+            r = modmul(r, base, m)
+        }
+    }
+    return r
+}
+
+/// modinv returns a^-1 mod m — extended Euclid where the Bezout
+/// coefficients are carried reduced mod m (the invariant is
+/// r_i == a * t_i mod m, so at the gcd the surviving t0 is the
+/// inverse). Errs when a is not invertible mod m or m <= 1.
+fn modinv(a: []int, m: []int) -> [own []int, err] {
+    if nlimbs(m) == 0 || is_one(m) {
+        return nil, errors.new("bignum: modinv needs m > 1")
+    }
+    r0 := ownv(m)
+    r1 := mod(a, m)
+    t0 := from_int(0)
+    t1 := from_int(1)
+    for nlimbs(r1) > 0 {
+        dm := divmod(r0, r1)
+        q := dm.q
+        r := dm.r
+        // t_next = (t0 - q*t1) mod m — every term already < m, so a
+        // single conditional subtract yields the residue
+        qm := modmul(q, t1, m)
+        tn := t0
+        if cmp(t0, qm) >= 0 {
+            tn = sub(t0, qm)
+        } else {
+            tn = sub(m, sub(qm, t0))
+        }
+        r0 = r1
+        t0 = t1
+        r1 = r
+        t1 = tn
+    }
+    if !is_one(r0) {
+        return nil, errors.new("bignum: not invertible")
+    }
+    return t0, nil
+}

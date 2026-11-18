@@ -832,6 +832,12 @@ fn (cl ref Client) do_once(req: Request) -> [Response, err] {
         if pe != nil {
             return bad, errors.new("http: bad proxy url " + pxy)
         }
+        // a TLS-schemed proxy parses now that parse_url accepts
+        // https — but forwarding is cleartext either way, so a
+        // secure proxy scheme is a config error, not a dial target
+        if pu.secure != 0 {
+            return bad, errors.new("http: proxy url must be http")
+        }
         dial_host = pu.host
         dial_port = pu.port
         via_proxy = true

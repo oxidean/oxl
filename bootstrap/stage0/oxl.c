@@ -34148,6 +34148,12 @@ int64_t o_f_emit_and_cc(OxlStr csrc, OxlStr out, OxlStr entry) {
     args = ({ OxlStr _pv = rt_str_lit("-lm"); rt_slice_push(args, sizeof(OxlStr), &_pv); });
     }
     }
+    if (({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_strings_contains }; ((int (*)(void*, OxlStr, OxlStr))_fv.fp)(_fv.env, csrc, rt_str_lit("rt_csrand")); })) {
+    args = ({ OxlStr _pv = rt_str_lit("-DOXL_CRYPTO"); rt_slice_push(args, sizeof(OxlStr), &_pv); });
+    if ((rt_is_windows() != 0LL)) {
+    args = ({ OxlStr _pv = rt_str_lit("-lbcrypt"); rt_slice_push(args, sizeof(OxlStr), &_pv); });
+    }
+    }
     if (needs_sqlite) {
     args = ({ OxlStr _pv = rt_str_lit("-DOXL_SQLITE"); rt_slice_push(args, sizeof(OxlStr), &_pv); });
     OxlStr sq = ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_os_getenv }; ((OxlStr (*)(void*, OxlStr))_fv.fp)(_fv.env, rt_str_lit("LANG_SQLITE_SRC")); });

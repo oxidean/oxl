@@ -5,6 +5,10 @@ package rand
 // drand48's LCG — state = (a·state + c) mod 2^48 — the documented
 // C/POSIX generator, respectable distribution, and multiplication/
 // addition/modulo only. High bits are drawn by division.
+//
+// NON-CRYPTOGRAPHIC: this is a statistical PRNG for simulations and
+// shuffling. Anything security-relevant — keys, nonces, protocol
+// randomness — uses std/crypto/rand instead.
 
 // 2^48 and the drand48 multiplier/increment — `let`, not `const`:
 // top-level const doesn't exist; these are never reassigned.

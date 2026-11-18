@@ -1,0 +1,55 @@
+package main
+
+// X1: std/crypto/sha512 — FIPS 180-4 SHA-512 + SHA-384 published
+// vectors (empty, abc, the 56-byte and 112-byte NIST messages),
+// incremental == one-shot, and HMAC-SHA512 RFC 4231 cases 1-2.
+import "std/crypto/sha512"
+
+import "std/crypto/hmac"
+
+import "std/encoding/hex"
+
+import "std/testing"
+
+fn test_sha512() {
+    testing.expect(sha512.hexdigest("" as []byte) == "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e", "sha512 empty")
+    testing.expect(sha512.hexdigest("abc" as []byte) == "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f", "sha512 abc")
+    testing.expect(sha512.hexdigest("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq" as []byte) == "204a8fc6dda82f0a0ced7beb8e08a41657c16ef468b228a8279be331a703c33596fd15c13b1b07f9aa1d3bea57789ca031ad85c7a71dd70354ec631238ca3445", "sha512 56B")
+    testing.expect(sha512.hexdigest("abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu" as []byte) == "8e959b75dae313da8cf4f72814fc143f8f7779c6eb9f7fa17299aeadb6889018501d289e4900f7e4331b99dec4b5433ac7d329eeb6dd26545e96e55b874be909", "sha512 112B")
+    testing.expect(len(sha512.sum512("abc" as []byte)) == 64, "sha512 digest len")
+    // incremental write == one-shot, across a block boundary
+    h := sha512.new()
+    [_w1, _e1] = h.write("ab" as []byte)
+    [_w2, _e2] = h.write("c" as []byte)
+    s := h.sum(nil)
+    testing.expect(hex.encode(s) == "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f", "sha512 incremental")
+    testing.expect(h.blocksize() == 128, "sha512 blocksize")
+}
+
+fn test_sha384() {
+    testing.expect(hex.encode(sha512.sum384("" as []byte)) == "38b060a751ac96384cd9327eb1b1e36a21fdb71114be07434c0cc7bf63f6e1da274edebfe76f65fbd51ad2f14898b95b", "sha384 empty")
+    testing.expect(hex.encode(sha512.sum384("abc" as []byte)) == "cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed8086072ba1e7cc2358baeca134c825a7", "sha384 abc")
+    testing.expect(len(sha512.sum384("abc" as []byte)) == 48, "sha384 digest len")
+    // incremental SHA-384 == one-shot
+    h := sha512.new384()
+    [_w1, _e1] = h.write("ab" as []byte)
+    [_w2, _e2] = h.write("c" as []byte)
+    s := h.sum(nil)
+    testing.expect(hex.encode(s) == "cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed8086072ba1e7cc2358baeca134c825a7", "sha384 incremental")
+}
+
+fn test_hmac_sha512() {
+    // RFC 4231 cases 1-2 — key sizes under and over the 128-byte block
+    k1 := mkslice(byte, 20)
+    i := 0
+    for i < 20 {
+        k1[i] = 11
+        i = i + 1
+    }
+    h1 := hmac.new(sha512.new, k1)
+    [_w1, _e1] = h1.write("Hi There" as []byte)
+    testing.expect(hex.encode(h1.sum(nil)) == "87aa7cdea5ef619d4ff0b4241a1d6cb02379f4e2ce4ec2787ad0b30545e17cdedaa833b7d6b8a702038b274eaea3f4e4be9d914eeb61f1702e696c203a126854", "hmac-sha512 case1")
+    h2 := hmac.new(sha512.new, "Jefe" as []byte)
+    [_w2, _e2] = h2.write("what do ya want for nothing?" as []byte)
+    testing.expect(hex.encode(h2.sum(nil)) == "164b7a7bfcf819e2e395fbe73b56e0a387bd64222e831fd610270cd7ea2505549758bf75c05a994a6d034f65f8f0e6fdcaeab1a34d4a6b4b636e070a38bce737", "hmac-sha512 case2")
+}

@@ -1,0 +1,33 @@
+package rand
+
+// std/crypto/rand — cryptographically secure randomness drawn from
+// the OS CSPRNG (rt_csrand: getrandom / arc4random_buf /
+// BCryptGenRandom, compiled under -DOXL_CRYPTO). This is NOT
+// math/rand — that generator is a documented non-cryptographic LCG
+// seeded from wall time; anything security-relevant (keys, nonces,
+// protocol randomness) belongs here.
+import "std/errors"
+
+extern fn rt_csrand(b: []byte) -> int
+
+extern fn rt_errstr(code: int) -> str
+
+/// fill draws len(b) random bytes into b — the whole slice or an
+/// err; a short draw is impossible (rt_csrand loops to full).
+fn fill(b: []byte) -> err {
+    rc := rt_csrand(b)
+    if rc != 0 {
+        return errors.new("crypto/rand: " + rt_errstr(0 - rc))
+    }
+    return nil
+}
+
+/// bytes returns n random bytes — the [v, err] contract.
+fn bytes(n: int) -> [own []byte, err] {
+    b := mkslice(byte, n)
+    e := fill(b)
+    if e != nil {
+        return nil, e
+    }
+    return new(b), nil
+}

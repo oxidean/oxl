@@ -13,10 +13,10 @@ case "$OXL" in /*) ;; *) OXL="$PWD/$OXL";; esac
 # explicitly, drop -pthread (pthread APIs come from the rt.h Win32
 # veneer, not a lib), link ws2_32 for the socket shims, and resolve
 # python by whatever name the image gives it
-EXE=""; THREAD_FLAG="-pthread"; NET_LIBS=""; MATH_LIBS="-lm"; PY=python3
+EXE=""; THREAD_FLAG="-pthread"; NET_LIBS=""; MATH_LIBS="-lm"; CRYPTO_LIBS=""; PY=python3
 case "$(uname -s)" in
     MINGW*|MSYS*|CYGWIN*)
-        EXE=".exe"; THREAD_FLAG=""; NET_LIBS="-lws2_32"; MATH_LIBS=""; PY=python ;;
+        EXE=".exe"; THREAD_FLAG=""; NET_LIBS="-lws2_32"; MATH_LIBS=""; CRYPTO_LIBS="-lbcrypt"; PY=python ;;
 esac
 command -v "$PY" >/dev/null 2>&1 || PY=python3
 CC="${LANG_CC:-cc}"
@@ -375,6 +375,7 @@ for t in test_sha256 test_md5 test_hmac; do
     grep -q "$t ... ok" <<<"$out" || { echo "FAIL crypto: $out"; exit 1; }
 done
 
+
 echo "== oxl test: aead (x2) =="
 out=$("$OXL" test tests/aesgcm_test.oxl) || { printf '%s
 ' "$out" >&2; exit 1; }
@@ -389,6 +390,26 @@ printf '%s
 ' "$out" >&2
 for t in test_chacha20 test_poly1305 test_aead; do
     grep -q "$t ... ok" <<<"$out" || { echo "FAIL chacha: $out"; exit 1; }
+done
+
+echo "== oxl test: tls ground (x1) =="
+out=$("$OXL" test tests/crypto_rand_test.oxl)
+printf '%s
+' "$out" >&2
+for t in test_csrand; do
+    grep -q "$t ... ok" <<<"$out" || { echo "FAIL crypto_rand: $out"; exit 1; }
+done
+out=$("$OXL" test tests/sha512_test.oxl)
+printf '%s
+' "$out" >&2
+for t in test_sha512 test_sha384 test_hmac_sha512; do
+    grep -q "$t ... ok" <<<"$out" || { echo "FAIL sha512: $out"; exit 1; }
+done
+out=$("$OXL" test tests/hkdf_test.oxl)
+printf '%s
+' "$out" >&2
+for t in test_hkdf; do
+    grep -q "$t ... ok" <<<"$out" || { echo "FAIL hkdf: $out"; exit 1; }
 done
 out=$("$OXL" test tests/net_test.oxl)
 printf '%s
@@ -1343,7 +1364,11 @@ cgen() {  # cgen <src> <name> — emit C via codegen.oxl, compile it
     # wrappers and -lm links them; the lib follows the sources
     mdef=""; mlib=""
     grep -q 'rt_m_' "$cgen_dir/$2.c" && { mdef="-DOXL_MATH"; mlib="$MATH_LIBS"; }
-    "$CC" -O2 $THREAD_FLAG -Iruntime $def $net $mdef "$cgen_dir/$2.c" runtime/rt.c $lib $mlib $NET_LIBS -o "$cgen_dir/$2$EXE" || { echo "FAIL codegen cc $1"; exit 1; }
+    # OXL_CRYPTO mirrors emit_and_cc's rt_csrand scan — bcrypt links
+    # only on Windows (the ws2_32/net pairing)
+    cdef=""; clib=""
+    grep -q 'rt_csrand' "$cgen_dir/$2.c" && { cdef="-DOXL_CRYPTO"; clib="$CRYPTO_LIBS"; }
+    "$CC" -O2 $THREAD_FLAG -Iruntime $def $net $mdef $cdef "$cgen_dir/$2.c" runtime/rt.c $lib $mlib $clib $NET_LIBS -o "$cgen_dir/$2$EXE" || { echo "FAIL codegen cc $1"; exit 1; }
 }
 for f in examples/hello.oxl examples/features.oxl tests/match.oxl tests/chanbuf.oxl tests/methods.oxl tests/pairfwd.oxl; do
     n=$(basename "$f" .oxl)
@@ -1359,19 +1384,21 @@ want=$("$OXL" run examples/cli/main.oxl -- Jesse)
 [ "$got" = "$want" ] || { echo "FAIL codegen cli: $got"; exit 1; }
 # --test mode: scope-wrapped runner like `oxl test`
 "$OXL" run bootstrap/cmd/codegen -- --test examples/smoke_test.oxl > "$cgen_dir/t.c"
-tnet=""; tmath=""; tmathlib=""
+tnet=""; tmath=""; tmathlib=""; tcrypto=""; tcryptolib=""
 grep -qE 'rt_sock_|rt_bind_any|rt_set_(reuseaddr|rcvtimo|sndtimo)|rt_htons|rt_htonl' "$cgen_dir/t.c" && tnet="-DOXL_NET"
 grep -q 'rt_m_' "$cgen_dir/t.c" && { tmath="-DOXL_MATH"; tmathlib="$MATH_LIBS"; }
-"$CC" -O2 $THREAD_FLAG -Iruntime $tnet $tmath "$cgen_dir/t.c" runtime/rt.c -DOXL_SQLITE $SQLITE_LINK $tmathlib $NET_LIBS -o "$cgen_dir/t$EXE" || { echo "FAIL codegen cc --test"; exit 1; }
+grep -q 'rt_csrand' "$cgen_dir/t.c" && { tcrypto="-DOXL_CRYPTO"; tcryptolib="$CRYPTO_LIBS"; }
+"$CC" -O2 $THREAD_FLAG -Iruntime $tnet $tmath $tcrypto "$cgen_dir/t.c" runtime/rt.c -DOXL_SQLITE $SQLITE_LINK $tmathlib $tcryptolib $NET_LIBS -o "$cgen_dir/t$EXE" || { echo "FAIL codegen cc --test"; exit 1; }
 out=$("$cgen_dir/t$EXE")
 grep -q "test_chan ... ok" <<<"$out" || { echo "FAIL codegen --test: $out"; exit 1; }
 # s3 generics through the self-hosted emitter + cc — the same util
 # coverage as `oxl test` above, exercising generic inst emission and
 # the rt_m_ math-link scan
 "$OXL" run bootstrap/cmd/codegen -- --test tests/util_test.oxl > "$cgen_dir/util.c"
-um=""; umlib=""
+um=""; umlib=""; ucrypto=""; ucryptolib=""
 grep -q 'rt_m_' "$cgen_dir/util.c" && { um="-DOXL_MATH"; umlib="$MATH_LIBS"; }
-"$CC" -O2 $THREAD_FLAG -Iruntime $um "$cgen_dir/util.c" runtime/rt.c $umlib $NET_LIBS -o "$cgen_dir/util$EXE" || { echo "FAIL codegen cc util"; exit 1; }
+grep -q 'rt_csrand' "$cgen_dir/util.c" && { ucrypto="-DOXL_CRYPTO"; ucryptolib="$CRYPTO_LIBS"; }
+"$CC" -O2 $THREAD_FLAG -Iruntime $um $ucrypto "$cgen_dir/util.c" runtime/rt.c $umlib $ucryptolib $NET_LIBS -o "$cgen_dir/util$EXE" || { echo "FAIL codegen cc util"; exit 1; }
 out=$("$cgen_dir/util$EXE")
 printf '%s
 ' "$out" >&2
@@ -1382,7 +1409,9 @@ done
 # [][]str return emission (csv.read_all) and hash/crypto under -test
 for tf in enc hash crypto aesgcm chacha; do
     "$OXL" run bootstrap/cmd/codegen -- --test "tests/${tf}_test.oxl" > "$cgen_dir/$tf.c"
-    "$CC" -O2 $THREAD_FLAG -Iruntime "$cgen_dir/$tf.c" runtime/rt.c $NET_LIBS -o "$cgen_dir/$tf$EXE" || { echo "FAIL codegen cc $tf"; exit 1; }
+    tfcrypto=""; tfcryptolib=""
+    grep -q 'rt_csrand' "$cgen_dir/$tf.c" && { tfcrypto="-DOXL_CRYPTO"; tfcryptolib="$CRYPTO_LIBS"; }
+    "$CC" -O2 $THREAD_FLAG -Iruntime $tfcrypto "$cgen_dir/$tf.c" runtime/rt.c $tfcryptolib $NET_LIBS -o "$cgen_dir/$tf$EXE" || { echo "FAIL codegen cc $tf"; exit 1; }
     "$cgen_dir/$tf$EXE" > "$cgen_dir/$tf.out"
     printf '%s
 ' "$(cat "$cgen_dir/$tf.out")" >&2
@@ -1405,7 +1434,9 @@ done
 # s5 regexp through the self-hosted emitter + cc — the NFA engine is
 # the heaviest pure-.oxl package (struct slices, closures, utf8)
 "$OXL" run bootstrap/cmd/codegen -- --test "tests/regexp_test.oxl" > "$cgen_dir/rx.c"
-"$CC" -O2 $THREAD_FLAG -Iruntime "$cgen_dir/rx.c" runtime/rt.c $NET_LIBS -o "$cgen_dir/rx$EXE" || { echo "FAIL codegen cc regexp"; exit 1; }
+rxcrypto=""; rxcryptolib=""
+grep -q 'rt_csrand' "$cgen_dir/rx.c" && { rxcrypto="-DOXL_CRYPTO"; rxcryptolib="$CRYPTO_LIBS"; }
+"$CC" -O2 $THREAD_FLAG -Iruntime $rxcrypto "$cgen_dir/rx.c" runtime/rt.c $rxcryptolib $NET_LIBS -o "$cgen_dir/rx$EXE" || { echo "FAIL codegen cc regexp"; exit 1; }
 "$cgen_dir/rx$EXE" > "$cgen_dir/rx.out"
 printf '%s
 ' "$(cat "$cgen_dir/rx.out")" >&2
@@ -1438,7 +1469,9 @@ if command -v pkg-config >/dev/null 2>&1 && pkg-config --exists gtk4 2>/dev/null
     "$OXL" run bootstrap/cmd/codegen -- examples/gui-todo/todo.oxl > "$cgen_dir/todo.c"
     todonet=""
     grep -qE 'rt_sock_|rt_bind_any|rt_set_(reuseaddr|rcvtimo|sndtimo)|rt_htons|rt_htonl' "$cgen_dir/todo.c" && todonet="-DOXL_NET"
-    "$CC" -O2 $THREAD_FLAG -Iruntime $todonet "$cgen_dir/todo.c" runtime/rt.c "$cgen_dir/gui_shim.o" $(pkg-config --libs gtk4) $NET_LIBS -o "$cgen_dir/todo$EXE" || { echo "FAIL codegen cc gui"; exit 1; }
+    todocrypto=""; todocryptolib=""
+    grep -q 'rt_csrand' "$cgen_dir/todo.c" && { todocrypto="-DOXL_CRYPTO"; todocryptolib="$CRYPTO_LIBS"; }
+    "$CC" -O2 $THREAD_FLAG -Iruntime $todonet $todocrypto "$cgen_dir/todo.c" runtime/rt.c "$cgen_dir/gui_shim.o" $(pkg-config --libs gtk4) $todocryptolib $NET_LIBS -o "$cgen_dir/todo$EXE" || { echo "FAIL codegen cc gui"; exit 1; }
     if [ -n "${DISPLAY:-}" ]; then
         out=$(with_timeout 30 "$cgen_dir/todo$EXE" --selftest 2>/dev/null)
         grep -q "selftest rows=2" <<<"$out" || { echo "FAIL codegen gui selftest: $out"; exit 1; }

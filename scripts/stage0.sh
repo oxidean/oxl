@@ -20,11 +20,11 @@ OUT="target/oxl"
 
 case "$(uname -s)" in
     MINGW*|MSYS*|CYGWIN*)
-        EXE=".exe"; THREAD_FLAG=""; NET_LIB="-lws2_32"; MATH_LIB=""; GC_FLAG="-Wl,--gc-sections" ;;
+        EXE=".exe"; THREAD_FLAG=""; NET_LIB="-lws2_32"; MATH_LIB=""; CRYPTO_LIB="-lbcrypt"; GC_FLAG="-Wl,--gc-sections" ;;
     Darwin)
-        EXE=""; THREAD_FLAG="-pthread"; NET_LIB=""; MATH_LIB="-lm"; GC_FLAG="-Wl,-dead_strip" ;;
+        EXE=""; THREAD_FLAG="-pthread"; NET_LIB=""; MATH_LIB="-lm"; CRYPTO_LIB=""; GC_FLAG="-Wl,-dead_strip" ;;
     *)
-        EXE=""; THREAD_FLAG="-pthread"; NET_LIB=""; MATH_LIB="-lm"; GC_FLAG="-Wl,--gc-sections" ;;
+        EXE=""; THREAD_FLAG="-pthread"; NET_LIB=""; MATH_LIB="-lm"; CRYPTO_LIB=""; GC_FLAG="-Wl,--gc-sections" ;;
 esac
 
 emit() {
@@ -74,6 +74,14 @@ build() {
         args+=(-DOXL_MATH)
         if [ -n "$MATH_LIB" ]; then
             args+=("$MATH_LIB")
+        fi
+    fi
+    # OXL_CRYPTO mirrors emit_and_cc's rt_csrand scan — bcrypt only
+    # on Windows (the ws2_32/net pairing)
+    if grep -q 'rt_csrand' "$SNAP"; then
+        args+=(-DOXL_CRYPTO)
+        if [ -n "$CRYPTO_LIB" ]; then
+            args+=("$CRYPTO_LIB")
         fi
     fi
     "$CC" "${args[@]}"

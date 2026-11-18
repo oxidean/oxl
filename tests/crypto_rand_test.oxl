@@ -1,0 +1,51 @@
+package main
+
+// X1: std/crypto/rand over rt_csrand — the OS CSPRNG fill. Asserts
+// the contract (full-len fill, err channel, distinct draws), never
+// the values — randomness has no fixed point.
+import "std/crypto/rand"
+
+import "std/testing"
+
+fn test_csrand() {
+    // bytes(n) honors n and returns err==nil
+    [b32, e1] = rand.bytes(32)
+    testing.expect(e1 == nil, "bytes(32) err")
+    testing.expect(len(b32) == 32, "bytes(32) len")
+    // nonzero fill — a 32-byte all-zero draw is a 2^-256 event
+    z := 0
+    i := 0
+    for i < 32 {
+        z = z + b32[i]
+        i = i + 1
+    }
+    testing.expect(z != 0, "bytes(32) all-zero draw")
+    // two draws differ — same-generator independence probe
+    [b32b, e2] = rand.bytes(32)
+    testing.expect(e2 == nil, "bytes(32) second err")
+    same := 1
+    i = 0
+    for i < 32 {
+        if b32[i] != b32b[i] {
+            same = 0
+        }
+        i = i + 1
+    }
+    testing.expect(same == 0, "two draws identical")
+    // fill honors len: a 0-len fill is a no-op success, an 8-len fill
+    // writes exactly its window (byte 8 of a sentinel stays put)
+    empty := mkslice(byte, 0)
+    testing.expect(rand.fill(empty) == nil, "fill(empty)")
+    buf := mkslice(byte, 9)
+    i = 0
+    for i < 9 {
+        buf[i] = 170
+        i = i + 1
+    }
+    view := buf[0:8]
+    testing.expect(rand.fill(view) == nil, "fill(8)")
+    testing.expect(buf[8] == 170, "fill wrote past len")
+    // bytes(0) is the empty draw
+    [b0, e3] = rand.bytes(0)
+    testing.expect(e3 == nil && len(b0) == 0, "bytes(0)")
+}

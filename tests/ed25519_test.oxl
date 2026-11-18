@@ -52,6 +52,10 @@ fn test_ed25519() {
     testing.expect(e != nil, "short sig accepted")
     e = ed25519.verify(hx("edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"), msg, sig2)
     testing.expect(e != nil, "non-canonical y accepted")
+    // non-canonical R in the signature rejects the same way
+    sig4 := hx("edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00")
+    e = ed25519.verify(pk, msg, sig4)
+    testing.expect(e != nil, "non-canonical R accepted")
     // S >= L rejects (S = L exactly)
     sig3 := hx("92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69daedd3f55c1a631258d69cf7a2def9de1400000000000000000000000000000010")
     e = ed25519.verify(pk, msg, sig3)

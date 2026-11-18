@@ -54,6 +54,21 @@ fn test_ecdh_p256() {
     bad[64] = bad[64] ^ 1
     [_z2, e6] = nistec.ecdh(c, ask, bad)
     testing.expect(e6 != nil, "p256 off-curve point accepted")
+    // coordinate == p (non-canonical field element) rejects
+    bigp := mkslice(byte, len(apub))
+    i = 0
+    for i < len(apub) {
+        bigp[i] = apub[i]
+        i = i + 1
+    }
+    px := hx("ffffffff00000001000000000000000000000000ffffffffffffffffffffffff")
+    i = 0
+    for i < 32 {
+        bigp[1 + i] = px[i]
+        i = i + 1
+    }
+    [_z3, e7] = nistec.ecdh(c, ask, bigp)
+    testing.expect(e7 != nil, "p256 coordinate >= p accepted")
 }
 
 fn test_ecdh_p384() {
@@ -107,6 +122,14 @@ fn test_ecdsa() {
     testing.expect(e != nil, "ecdsa r=0 accepted")
     e = nistec.ecdsa_verify(c, pub, sha256.new, msg, hx("ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551"), s)
     testing.expect(e != nil, "ecdsa r=n accepted")
+    e = nistec.ecdsa_verify(c, pub, sha256.new, msg, r, hx("00"))
+    testing.expect(e != nil, "ecdsa s=0 accepted")
+    e = nistec.ecdsa_verify(c, pub, sha256.new, msg, r, hx("ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551"))
+    testing.expect(e != nil, "ecdsa s=n accepted")
+    // DER-padded r/s (leading zero byte) still verifies — x509
+    // signatures arrive INTEGER-encoded
+    e = nistec.ecdsa_verify(c, pub, sha256.new, msg, hx("002f57acb3042c65c3103172415c42f3ba15c3412a5dd85baa6e7b50933f61547b"), hx("00959a9569665125de1102705376736d35bf27eab61c8470d24278e35825991f05"))
+    testing.expect(e == nil, "ecdsa der-padded r/s rejected")
     // wrong key rejects
     [_pk, ke] = nistec.pub_from_priv(c, hx("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcd"))
     testing.expect(ke == nil, "p256 other key err")

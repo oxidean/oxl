@@ -6,9 +6,15 @@ package nistec
 // std/crypto/bignum; point math is Jacobian coordinates so scalar
 // mul costs one modinv total, not one per bit.
 //
-// Verify/ECDH only — no sign, no private-key surface. Nothing here
-// is constant-time; that matches the client-side TLS posture
-// (public keys, public signatures).
+// Verify/ECDH only — no sign. Nothing here is constant-time:
+// scalarmult branches on scalar bits and every field op bottoms
+// out in i64 / and %, whose latency is operand-dependent on
+// mainstream ISAs — strict constant-time is not achievable on the
+// current substrate. For ECDSA verify and peer public keys that's
+// the right posture (public data), but ecdh/pub_from_priv feed a
+// private scalar through the same variable-time path: the TLS
+// ECDHE private share is a real secret, so this is a documented
+// limitation, not a secrets-free surface.
 import "std/crypto/bignum"
 
 import "std/encoding/hex"
@@ -245,7 +251,7 @@ fn point_sec1(c: Curve, b: []byte) -> [Point, err] {
 }
 
 // scalar_of reads a big-endian scalar byte string reduced mod n —
-// errs on a zero residue.
+// callers reject a zero residue (bignum.is_zero) themselves.
 fn scalar_of(c: Curve, sk: []byte) -> []int {
     s := bignum.mod(bignum.from_be_bytes(sk), c.n)
     return s

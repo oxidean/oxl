@@ -8,6 +8,13 @@ package ed25519
 // exports scalarmult only, so this package carries its own.
 //
 // Verify is over public data; nothing here is constant-time.
+//
+// decode does not reject small-order points: an identity or
+// low-order public key can satisfy the cofactorless verification
+// equation for crafted (R, S) — literal RFC 8032 behavior,
+// matching openssl and Go. That acceptance is deliberate; the
+// trust decision on a public key belongs to the x509 path that
+// vouches for it, not to this package.
 import "std/crypto/bignum"
 
 import "std/crypto/sha512"

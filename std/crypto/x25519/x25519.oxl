@@ -10,6 +10,13 @@ package x25519
 // Public surface is scalarmult(sk, pk) only — the field ops stay
 // private by design (std/crypto/ed25519 carries its own copy rather
 // than exporting these).
+//
+// Constant-time posture: the ladder is branch-free over the scalar
+// (fixed 255 iterations, masked cswap), but it is not strictly
+// constant-time — carry/bit math uses / and % (C idiv, operand-
+// dependent latency) and fe_tobytes' conditional subtract is a
+// branch. Callers must pre-validate input lengths: scalarmult
+// asserts len == 32 rather than erroring.
 import "std/slices"
 
 // powers of two — eager table: a lazy fill would publish a shared

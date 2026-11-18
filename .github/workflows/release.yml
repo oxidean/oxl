@@ -206,15 +206,29 @@ jobs:
           # target this exact bump commit. A lookup failure is not an empty
           # result: retry, then refuse to create a possible duplicate.
           resolve_pr() {
-            local out
-            for _ in 1 2 3; do
+            local out any
+            for _ in 1 2 3 4 5 6; do
               # Test gh's status directly — a piped head -1 would mask a
               # lookup failure as "no PR" wherever pipefail isn't set.
-              if out="$(gh pr list --head "$branch" --base main --state open \
+              if ! out="$(gh pr list --head "$branch" --base main --state open \
                   --json number,baseRefName,headRefOid \
                   --jq ".[] | select(.baseRefName==\"main\" and .headRefOid==\"$expected_sha\") | .number")"; then
+                sleep 10
+                continue
+              fi
+              if [ -n "$out" ]; then
                 printf '%s\n' "$out" | head -1
                 return 0
+              fi
+              # Empty pinned output right after a force-push is a stale
+              # headRefOid read, not "no PR" — returning success here sent
+              # callers into gh pr create, which then failed on the
+              # existing PR and killed the release (v0.18.0 jam). Only an
+              # existence probe that comes back empty may fall through to
+              # create; a PR at another SHA keeps retrying.
+              if any="$(gh pr list --head "$branch" --base main --state open \
+                  --json number --jq '.[0].number // ""')"; then
+                [ -z "$any" ] && return 0
               fi
               sleep 10
             done
@@ -242,6 +256,7 @@ jobs:
           state=""
           merged_gate=0
           updates=0
+          reran=""
           # ~50min of polling inside the 60min job timeout — observed CI is
           # ~21.5min but slower legs must not hit "never reached a clean
           # state" while the job still has budget.
@@ -292,6 +307,25 @@ jobs:
               continue
             fi
             if [ "$fails" != "0" ]; then
+              # A failed/cancelled leg whose run is complete can be a
+              # provisioning flake rather than a real failure — observed:
+              # macOS legs queued ~15min then cancelled with zero steps.
+              # Re-run failed jobs once per run; a real failure fails
+              # again and exits on the next poll, a flake re-pends and the
+              # loop waits it out.
+              rerun=0
+              for rid in $(gh pr checks "$pr" --json link,state,bucket \
+                  --jq '.[] | select((.bucket=="fail" or .bucket=="cancel") and .state!="ACTION_REQUIRED") | .link | capture("runs/(?<r>[0-9]+)").r' 2>/dev/null); do
+                case " $reran " in *" $rid "*) continue ;; esac
+                if gh api -X POST "repos/${{ github.repository }}/actions/runs/$rid/rerun-failed-jobs" >/dev/null 2>&1; then
+                  reran="$reran $rid"; rerun=1
+                  echo "bump PR #$pr check on run $rid failed/cancelled — re-ran failed jobs"
+                fi
+              done
+              if [ "$rerun" = "1" ]; then sleep 30; continue; fi
+              # Other legs still in flight settle first — only error once
+              # the check set is terminal and no rerun was accepted.
+              if [ "$pending" != "0" ]; then sleep 20; continue; fi
               echo "::error::bump PR #$pr has a failing check — rerun the release"
               gh pr checks "$pr" || true
               exit 1

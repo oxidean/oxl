@@ -615,12 +615,85 @@ if command -v openssl >/dev/null 2>&1 && openssl version 2>/dev/null | grep -q '
         || { echo "FAIL tls interop badroot"; kill "$isrv" "$hsrv" 2>/dev/null || true; exit 1; }
     tls_interop badname "$iport" tests/tls/ca.pem INTEROP_BADNAME \
         || { echo "FAIL tls interop badname"; kill "$isrv" "$hsrv" 2>/dev/null || true; exit 1; }
+    # x7 https seam — the same s_server through http.Client.request:
+    # env roots carry the CA bundle, server_name defaults to the URL
+    # host (an iPAddress SAN on the fixture cert)
+    hout=$(OXL_HTTPS_TEST_PORT="$iport" OXL_HTTPS_TEST_CA=tests/tls/ca.pem \
+        "$OXL" test tests/https_test.oxl) || {
+        printf '%s\n' "$hout" >&2
+        kill "$isrv" "$hsrv" 2>/dev/null || true
+        exit 1
+    }
+    printf '%s\n' "$hout" >&2
+    for t in test_https_get test_https_bad_cert test_https_wrong_name; do
+        grep -q "$t ... ok" <<<"$hout" || { echo "FAIL https interop $t: $hout"; kill "$isrv" "$hsrv" 2>/dev/null || true; exit 1; }
+    done
+    # https redirect credential-strip — a TLS 302 down to cleartext
+    # must not carry authorization. s_server can't emit redirects and
+    # the oxl TLS server is parked, so the stubs are python+ssl:
+    # redirect_server answers the TLS hop with a 302 to the plain
+    # capture_server, which records the request head for the test
+    if command -v python3 >/dev/null 2>&1 && python3 -c 'import ssl' 2>/dev/null; then
+        rport=$((iport + 2))
+        cport=$((iport + 3))
+        capfile=$(mktemp)
+        python3 tests/tls/redirect_server.py tests/tls/server.pem tests/tls/server-key.pem \
+            "$rport" "http://127.0.0.1:$cport/leak" >/dev/null 2>&1 &
+        rsrv=$!
+        python3 tests/tls/capture_server.py "$cport" "$capfile" >/dev/null 2>&1 &
+        csrv=$!
+        rready=0
+        for i in $(seq 1 50); do
+            kill -0 "$rsrv" 2>/dev/null || break
+            (exec 3<>"/dev/tcp/127.0.0.1/$rport") 2>/dev/null && { exec 3>&- 3<&-; rready=1; break; }
+            sleep 0.1
+        done
+        cready=0
+        for i in $(seq 1 50); do
+            kill -0 "$csrv" 2>/dev/null || break
+            (exec 3<>"/dev/tcp/127.0.0.1/$cport") 2>/dev/null && { exec 3>&- 3<&-; cready=1; break; }
+            sleep 0.1
+        done
+        if [ "$rready" != 1 ] || [ "$cready" != 1 ]; then
+            echo "FAIL https redirect: stubs did not listen" >&2
+            kill "$rsrv" "$csrv" "$isrv" "$hsrv" 2>/dev/null || true
+            exit 1
+        fi
+        rout=$(OXL_HTTPS_TEST_REDIR_PORT="$rport"             OXL_HTTPS_TEST_CAPTURE_FILE="$capfile"             OXL_HTTPS_TEST_CA=tests/tls/ca.pem             "$OXL" test tests/https_test.oxl) || {
+            printf '%s\n' "$rout" >&2
+            kill "$rsrv" "$csrv" "$isrv" "$hsrv" 2>/dev/null || true
+            rm -f "$capfile"
+            exit 1
+        }
+        printf '%s\n' "$rout" >&2
+        grep -q "test_https_redirect_noleak ... ok" <<<"$rout" \
+            || { echo "FAIL https redirect noleak: $rout"; kill "$rsrv" "$csrv" "$isrv" "$hsrv" 2>/dev/null || true; rm -f "$capfile"; exit 1; }
+        kill "$rsrv" "$csrv" 2>/dev/null || true
+        wait "$rsrv" "$csrv" 2>/dev/null || true
+        rm -f "$capfile"
+        echo "  interop: ok hrr badroot badname https redirect-noleak"
+    else
+        echo "  python3+ssl not found — skipping https redirect interop"
+        echo "  interop: ok hrr badroot badname https"
+    fi
     kill "$isrv" "$hsrv" 2>/dev/null || true
     wait "$isrv" "$hsrv" 2>/dev/null || true
-    echo "  interop: ok hrr badroot badname"
 else
     echo "  openssl not found — skipping live interop"
 fi
+
+echo "== oxl test: https (x7) =="
+# parse-level coverage runs everywhere; the live tests see no
+# OXL_HTTPS_TEST_* env here so they skip clean (their markers print
+# ok either way — the real assertions for them are the greps inside
+# the openssl gate above, where the env is set)
+out=$("$OXL" test tests/https_test.oxl) || { printf '%s
+' "$out" >&2; exit 1; }
+printf '%s
+' "$out" >&2
+for t in test_url_https test_https_get test_https_bad_cert test_https_wrong_name test_https_redirect_noleak; do
+    grep -q "$t ... ok" <<<"$out" || { echo "FAIL https: $out"; exit 1; }
+done
 
 echo "== oxl test: compress & archive =="
 out=$("$OXL" test tests/compress_flate.oxl)
@@ -1564,7 +1637,7 @@ done
 # s4 enc/hash/crypto + x1/x3/x4 crypto through the self-hosted emitter +
 # cc — exercises [][]str return emission (csv.read_all), hash/crypto,
 # and the big-limb arithmetic under -test
-for tf in enc hash crypto aesgcm chacha sha512 hkdf crypto_rand bignum rsa x25519 nistec ed25519 x509 tls_keys tls_handshake; do
+for tf in enc hash crypto aesgcm chacha sha512 hkdf crypto_rand bignum rsa x25519 nistec ed25519 x509 tls_keys tls_handshake https; do
     "$OXL" run bootstrap/cmd/codegen -- --test "tests/${tf}_test.oxl" > "$cgen_dir/$tf.c"
     tfcrypto=""; tfcryptolib=""; tfnet=""
     grep -q 'rt_csrand(' "$cgen_dir/$tf.c" && { tfcrypto="-DOXL_CRYPTO"; tfcryptolib="$CRYPTO_LIBS"; }
@@ -1621,6 +1694,9 @@ for t in test_keyschedule test_record; do
 done
 for t in test_handshake test_handshake_hrr test_handshake_cookie test_rawfd_and_adapters; do
     grep -q "$t ... ok" "$cgen_dir/tls_handshake.out" || { echo "FAIL codegen tls_handshake $t"; cat "$cgen_dir/tls_handshake.out"; exit 1; }
+done
+for t in test_url_https test_https_get test_https_bad_cert test_https_wrong_name test_https_redirect_noleak; do
+    grep -q "$t ... ok" "$cgen_dir/https.out" || { echo "FAIL codegen https $t"; cat "$cgen_dir/https.out"; exit 1; }
 done
 # x5 env-root discovery through codegen — the same three
 # configurations as the native lane

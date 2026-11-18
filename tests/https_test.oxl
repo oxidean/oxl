@@ -1,0 +1,172 @@
+package main
+
+// X7: https:// through std/net/http — the Url.secure / Client.tlscfg
+// seam. test_url_https is parse-level and runs in every lane; the
+// live tests need an `openssl s_server` and read
+// OXL_HTTPS_TEST_PORT / OXL_HTTPS_TEST_CA from the environment
+// (run.sh's openssl interop lane sets them) — with no port set they
+// return early, the same skip pattern as x509_env_test.
+import "std/crypto/x509"
+
+import "std/errors"
+
+import "std/net/http"
+
+import "std/net/tls"
+
+import "std/os"
+
+import "std/strings"
+
+import "std/testing"
+
+fn test_url_https() {
+    [u, e] = http.parse_url("https://example.com/a/b?x=1")
+    testing.expect(e == nil, "https url parses")
+    testing.expect_eq(u.secure, 1, "https marks secure")
+    testing.expect_eq(u.port, 443, "https default port")
+    testing.expect_streq(u.host, "example.com", "https host")
+    testing.expect_streq(u.path, "/a/b?x=1", "https path keeps query")
+    // an explicit port beats the scheme default
+    [u2, e2] = http.parse_url("https://example.com:8443")
+    testing.expect(e2 == nil, "https explicit port parses")
+    testing.expect_eq(u2.secure, 1, "explicit-port secure")
+    testing.expect_eq(u2.port, 8443, "explicit port wins")
+    testing.expect_streq(u2.path, "/", "empty path defaults to /")
+    // http and bare forms stay secure=0 on port 80
+    [u3, e3] = http.parse_url("http://example.com/x")
+    testing.expect(e3 == nil, "http parses")
+    testing.expect_eq(u3.secure, 0, "http not secure")
+    testing.expect_eq(u3.port, 80, "http default port")
+    [u4, e4] = http.parse_url("example.com:8080/y")
+    testing.expect(e4 == nil, "bare host:port parses")
+    testing.expect_eq(u4.secure, 0, "bare form not secure")
+    testing.expect_eq(u4.port, 8080, "bare explicit port")
+    // other schemes stay an error, unchanged
+    [u5, e5] = http.parse_url("ftp://example.com/x")
+    testing.expect(e5 != nil, "unknown scheme still rejected")
+    testing.expect_eq(u5.port, 0, "rejected url is the zero Url")
+    // a TLS-schemed proxy is a config error, not a dial target —
+    // both checks fire before any socket opens, so the pins are
+    // unconditional (the port needn't exist)
+    cl := http.new_client(5000)
+    rq := http.request_get("http://127.0.0.1:1/")
+    rq.proxy = "https://127.0.0.1:8443"
+    [_, e6] = cl.do(rq)
+    testing.expect(e6 != nil, "https proxy url rejected")
+    if e6 != nil {
+        testing.expect(strings.contains(errors.msg(e6), "proxy url must be http"), "proxy scheme error is loud")
+    }
+    rq2 := http.request_get("https://example.com/")
+    rq2.proxy = "http://127.0.0.1:1"
+    [_, e7] = cl.do(rq2)
+    testing.expect(e7 != nil, "https-via-proxy rejected")
+    if e7 != nil {
+        testing.expect(strings.contains(errors.msg(e7), "no CONNECT"), "CONNECT-parked error is loud")
+    }
+}
+
+// the interop lane's env: OXL_HTTPS_TEST_PORT is the s_server port
+// (0 = lane offline, live tests skip); OXL_HTTPS_TEST_CA is the CA
+// bundle live_cfg roots the Config at.
+fn live_port() -> int {
+    return atoi(os.getenv("OXL_HTTPS_TEST_PORT"))
+}
+
+// the harness prints `name ... ok` for an early return, which reads
+// identically to a real pass — emit a greppable skip marker so lane
+// output shows which lanes actually exercised the live path
+fn live_skip() {
+    println("https live skip: OXL_HTTPS_TEST_PORT unset")
+}
+
+fn live_cfg() -> tls.Config {
+    cfg := tls.default_cfg()
+    cafile := os.getenv("OXL_HTTPS_TEST_CA")
+    if len(cafile) > 0 {
+        [n, le] = cfg.roots.load_pem(os.readfile_(cafile))
+        testing.expect(le == nil && n > 0, "ca bundle load")
+    }
+    return cfg
+}
+
+fn live_url(port: int) -> str {
+    return "https://127.0.0.1:" + itoa(port) + "/"
+}
+
+fn test_https_get() {
+    port := live_port()
+    if port == 0 {
+        live_skip()
+        return // openssl interop lane offline
+    }
+    cl := http.Client{tmo: 15000, tlscfg: live_cfg()}
+    // server_name defaults to the URL host — the s_server cert
+    // carries an iPAddress SAN for 127.0.0.1
+    [r, e] = cl.get(live_url(port))
+    if e != nil {
+        testing.expect(false, "https get: " + errors.msg(e))
+        return
+    }
+    testing.expect_eq(r.status, 200, "https status")
+    testing.expect(strings.contains(r.body, "s_server"), "s_server -www page")
+}
+
+fn test_https_bad_cert() {
+    port := live_port()
+    if port == 0 {
+        live_skip()
+        return // openssl interop lane offline
+    }
+    cfg := live_cfg()
+    // an unrelated-but-valid CA bundle — the chain can't anchor, so
+    // the trust verdict must surface err_root, not a generic failure
+    roots := x509.Roots{cas: nil}
+    [n, le] = roots.load_pem(os.readfile_("tests/fixtures/x509/roots.pem"))
+    testing.expect(le == nil && n > 0, "unrelated roots load")
+    cfg.roots = roots
+    cl := http.Client{tmo: 15000, tlscfg: cfg}
+    [r, e] = cl.get(live_url(port))
+    testing.expect(e != nil, "untrusted root must fail")
+    testing.expect(errors.is(e, x509.err_root()), "verdict is err_root")
+    testing.expect_eq(r.status, 0, "no response on trust failure")
+}
+
+fn test_https_wrong_name() {
+    port := live_port()
+    if port == 0 {
+        live_skip()
+        return // openssl interop lane offline
+    }
+    cfg := live_cfg()
+    cfg.server_name = "wrong-name.invalid"
+    cl := http.Client{tmo: 15000, tlscfg: cfg}
+    [r, e] = cl.get(live_url(port))
+    testing.expect(e != nil, "wrong name must fail")
+    testing.expect(errors.is(e, x509.err_name()), "verdict is err_name")
+    testing.expect_eq(r.status, 0, "no response on trust failure")
+}
+
+fn test_https_redirect_noleak() {
+    // a TLS 302 down to cleartext is a scheme hop — same_origin's
+    // secure term must strip authorization/cookie before the request
+    // reaches the plain-HTTP capture endpoint
+    rport := atoi(os.getenv("OXL_HTTPS_TEST_REDIR_PORT"))
+    capfile := os.getenv("OXL_HTTPS_TEST_CAPTURE_FILE")
+    if rport == 0 || len(capfile) == 0 {
+        live_skip()
+        return
+    }
+    rq := http.request_get("https://127.0.0.1:" + itoa(rport) + "/")
+    rq.headers = push(rq.headers, http.bearer_auth("sekrit-token"))
+    cl := http.Client{tmo: 15000, tlscfg: live_cfg()}
+    [r, e] = cl.do(rq)
+    if e != nil {
+        testing.expect(false, "https redirect: " + errors.msg(e))
+        return
+    }
+    testing.expect_eq(r.status, 200, "redirect followed to capture")
+    got := os.readfile_(capfile)
+    testing.expect(!strings.contains(got, "authorization") && !strings.contains(got, "Authorization"), "authorization header stripped on scheme hop")
+    testing.expect(!strings.contains(got, "sekrit-token"), "bearer token absent from downgrade hop")
+}

@@ -4,13 +4,13 @@ Status by milestone: X1 shipped `crypto/rand` + hashing, X2 AEAD
 primitives, X3 bignum + RSA verify, X4 P-256/P-384 + Ed25519 +
 X25519, **X5 ships `std/crypto/x509`** — certificate parsing, path
 building, trust anchors, hostname verification, and platform root
-discovery — and **X6 ships `std/net/tls`** — a client-only TLS 1.3
+discovery — **X6 ships `std/net/tls`** — a client-only TLS 1.3
 stack: record layer, the CH→(single) HRR→server-flight→CV→Finished
 state machine, the full HKDF key schedule, X.509 chain + hostname
 verification, NST consume-ignore, KeyUpdate consume+reply+rotate,
-and `dial`/`dial_timeout`/`client` over `net.Conn`. `https://` in
-`net/http` is the remaining milestone (X7); this document grows
-with it.
+and `dial`/`dial_timeout`/`client` over `net.Conn` — and **X7 ships
+`https://` in `std/net/http`** — the `Url.secure` / `Client.tlscfg`
+seam that closes the milestone.
 
 ## `crypto/x509` surface
 
@@ -161,5 +161,73 @@ idempotent.
 
 Explicitly out of scope: TLS <= 1.2, server side, resumption/PSK/
 0-RTT, client certificates (a CertificateRequest is answered with
-an empty Certificate per RFC 8446), OCSP/CRL, and `https://` in
-`net/http` (X7).
+an empty Certificate per RFC 8446), and OCSP/CRL.
+
+## `net/http` seam (X7)
+
+```oxl
+struct Url { host: str, port: int, path: str, secure: int }
+// parse_url: "https://" → secure=1, port 443; "http://" or bare →
+// secure=0, port 80; other schemes stay an err.
+
+struct Client { tmo: int, tlscfg: tls.Config }
+new_client(tmo) -> Client        // tlscfg = tls.default_cfg()
+```
+
+A secure URL dials `tls.dial_timeout(host, port, cl.tmo, cfg)` where
+`cfg` is a per-request copy of `cl.tlscfg`; the client's budget bounds
+the TCP connect and doubles as the handshake-flight receive timeout.
+Two defaults are applied per request, never to the caller's Config: `server_name` fills from the
+URL host when empty (IP literals included — the iPAddress SAN check
+needs them) and `alpn` fills to `["http/1.1"]` when empty. The
+`host:` header appends `:port` only when the port differs from the
+scheme default — no spurious `:443`. Redirect resolution
+(`resolve_location`) is scheme-aware end to end: `https://`
+Locations, scheme-relative `//h/p` on a secure base, and relative
+merges all keep the scheme, and `same_origin` includes `secure` so
+credentials never cross an http→https hop. HTTPS through an HTTP
+proxy needs CONNECT tunneling — parked — so a configured proxy on a
+secure URL errors rather than silently going direct or cleartext.
+`serve` is untouched; a TLS listener is not part of this surface.
+
+## Error taxonomy
+
+`request`/`do` surface failures in three layers, all `err`:
+
+| layer | examples | caller meaning |
+|---|---|---|
+| transport | net dial errors verbatim | host unreachable, refused |
+| protocol | `err_proto`, `err_alert` (alert name in text), `err_eof` | peer not TLS, mid-handshake cut |
+| trust | `err_sig` `err_expired` `err_notyet` `err_ca` `err_eku` `err_path` `err_root` `err_name` `err_alg` `err_der` `err_roots` | the x509 verdict |
+
+Trust errors are never flattened into "handshake failed" — the
+verdict rides in the error text, so a failed `https.get` says
+*which* check lost and `errors.is(e, x509.err_root())` stays
+actionable ("add the CA to `OXL_SSL_CERT_FILE`", "clock is wrong").
+
+## Divergences, posture, non-goals
+
+- **Truncation fails loud.** A TLS peer that closes TCP without
+  `close_notify` surfaces `err_eof` — where permissive HTTP/1.1
+  stacks would deliver the partial body, this client returns the
+  error. Orderly `close_notify` is the only clean end.
+- **Side-channel posture is documented, not claimed.** `.oxl`
+  arithmetic compiles through C with no constant-time discipline —
+  branches on secret material are written, not eliminated. The
+  exposure is narrow for a client (session keys, not long-term
+  identity keys) and the verify-only design ships no signing
+  oracle. A constant-time pass is parked; trigger: first
+  server-side or signing consumer.
+- **Non-goals with their reopen triggers** (each becomes a work
+  item when its trigger fires):
+  - TLS server (`tls.listen`/`accept`) — first serving consumer
+    needing inbound TLS.
+  - TLS 1.2 fallback — first consumer hitting a 1.2-only endpoint.
+  - Session resumption / PSK — measured reconnect cost on a real
+    workload.
+  - Client certs (mTLS) — first consumer needing mutual auth;
+    brings the signing surface back into scope.
+  - Revocation (OCSP/CRL) — first consumer needing revocation
+    proof.
+  - Bundled root list — first consumer on a platform image with
+    no store and no way to set the env override.

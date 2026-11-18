@@ -62,16 +62,18 @@ Milestone map: [docs/specs/2026-11-07-phase-2-plan/](../specs/2026-11-07-phase-2
   `--triple`, shared frame/poll suspension lowering, rt.c under
   clang, IR fixpoint; spec:
   `docs/specs/2026-11-11-llvm-backend/`
+- **X — TLS/x509**: shipped — TLS 1.3 client `std/net/tls`,
+  `std/crypto/x509`, the crypto stack beneath (`crypto/rand`,
+  `sha512`, `hkdf`, AEAD, `bignum`, `rsa`, `x25519`, `nistec`,
+  `ed25519`), and `https://` in `std/net/http`; server side,
+  resumption, mTLS, and revocation stay parked on triggers
+  (`docs/tls.md`); spec: `docs/specs/2026-11-11-tls-x509/`
 - Parked on triggers (each unparks when its trigger fires, then
   takes the normal spec → work-item → PR loop):
   - D4 shape-generics — spec item exists
     (`docs/specs/2026-11-04-0132-v0-2-forward/items/d4-shape-generics.md`);
     trigger: generic-heavy builds show measurable bloat or compile-
     time pain — pure backend optimization, semantics unchanged.
-  - TLS/x509 — spec in flight on `docs/tls-x509-spec`;
-    trigger: first consumer needing authenticated or encrypted
-    transport beyond cleartext `net`; spec must cover the x509
-    trust story, not just a wrapping API.
   - `pin` primitive — spec merged
     (`docs/specs/2026-11-11-pin-primitive/`); trigger: FFI or IO
     needs address-stable values (OS async handles, self-referential

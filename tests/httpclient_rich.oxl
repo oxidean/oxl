@@ -211,7 +211,7 @@ fn main() {
     base := "http://127.0.0.1:" + itoa(PORT)
 
     // -- redirects -------------------------------------------------
-    cl := http.Client{tmo: 30000}
+    cl := http.new_client(30000)
     [r1, e1] = get_retry(cl, base + "/redir")
     ck(e1, "redirect connects")
     if r1.status != 200 || r1.body != "method=GET target=/final" {
@@ -293,7 +293,7 @@ fn main() {
     ck(e9, "gzip")
     expect(r9.body == "hello gzip", "gzip decoded got len " + itoa(len(r9.body)))
     // decompression off delivers the raw bytes with the header visible
-    cl_raw := http.Client{tmo: 30000}
+    cl_raw := http.new_client(30000)
     rq_raw := http.Request{method: "GET", url: base + "/gzip", headers: mkslice(http.Header, 0), body: "", redirects: 0, decompress: false, proxy: "direct"}
     [r10, e10] = get_retry_req(cl_raw, rq_raw)
     ck(e10, "gzip raw")
@@ -301,7 +301,7 @@ fn main() {
     expect(find(r10.header("content-encoding"), "gzip") >= 0, "content-encoding header visible")
 
     // -- proxy -------------------------------------------------------
-    cl_p := http.Client{tmo: 30000}
+    cl_p := http.new_client(30000)
     rq_p := http.request_get("http://example.invalid/hdrcheck")
     rq_p.proxy = "http://127.0.0.1:" + itoa(PORT)
     [r11, e11] = cl_p.do(rq_p)

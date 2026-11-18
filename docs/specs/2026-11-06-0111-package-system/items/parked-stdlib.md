@@ -26,8 +26,6 @@ half. Staying parked: `html/template` (out of R's scope) and
 
 ## Needs machinery the language doesn't have
 
-- `crypto/tls`, `x509`, `crypto/{rsa,ecdsa,ed25519}` — a TLS stack is
-  a project, not a package. `std/crypto` v1 = hash+HMAC (S4).
 - Plugin loading, compiler-self packages (ast/parser/token class),
   `runtime` internals,
   `runtime/pprof` — runtime/codecs introspection doesn't exist.
@@ -58,8 +56,8 @@ half. Staying parked: `html/template` (out of R's scope) and
   core; heap/ring are addable on demand.
 - `log/slog`, `slog` — `std/log` ships first; structured logging
   rides on it later.
-- `crypto/rand`, `math/big`, `time/tzdata`, `syscall` — platform or
-  precision machinery deferred until a real consumer exists.
+- `time/tzdata`, `syscall` — platform machinery deferred until a
+  real consumer exists.
 
 ## Parked pending runtime type descriptors
 

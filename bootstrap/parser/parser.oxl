@@ -1130,7 +1130,18 @@ fn p_params(c: mut PCur) -> own NList {
             ty = p_ty(c)
         }
         items = ncons(b(Node.Param{name: name, ty: ty, lo: pm, hi: c.phi}), items)
-        eat(c, ",")
+        if !eat(c, ",") {
+            // `fn f(a b)` used to parse as two untyped params — require
+            // the separator so a missing `:` fails loudly instead of
+            // silently widening the signature
+            if !at(c, ")") {
+                if c.hush == 0 {
+                    println("parse: expected `,` or `)` in parameter list")
+                }
+                c.lex_err = 1
+            }
+            break
+        }
     }
     eat(c, ")")
     return nrev(items)

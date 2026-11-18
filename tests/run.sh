@@ -285,6 +285,18 @@ EOF
 diag=$("$OXL" build "$scratch/badchar.oxl" -o "$scratch/badchar$EXE" 2>&1 || true)
 grep -q "char literal" <<<"$diag" || { echo "FAIL charlit diag: $diag"; exit 1; }
 
+# a missing `:` between params used to parse as extra untyped params —
+# the separator is required so the signature fails loudly (#149)
+cat > "$scratch/badparam.oxl" <<'EOF'
+package main
+fn id(r io.Reader) -> int { return 0 }
+fn main() {}
+EOF
+if diag=$("$OXL" build "$scratch/badparam.oxl" -o "$scratch/badparam$EXE" 2>&1); then
+    echo "FAIL param-sep: build succeeded: $diag"; exit 1
+fi
+grep -q "parameter list" <<<"$diag" || { echo "FAIL param-sep diag: $diag"; exit 1; }
+
 echo "== oxl test: util (s3) =="
 out=$("$OXL" test tests/util_test.oxl)
 printf '%s
@@ -1169,6 +1181,17 @@ printf 'package main\nimport "file://%s/nosuch/pkg"\n\nfn main() {}\n' "$tv" > "
 printf 'module file://%s/app\noxl 0.3\n' "$tv" > "$tv/app/oxl.mod" && rm -f "$tv/app/oxl.sum"
 ( cd "$tv/app" && OXLMODCACHE="$tv/cache" "$OXL" mod tidy ) > "$tv/tidy5" 2>&1 && { echo "FAIL tidy5 accepted"; cat "$tv/tidy5"; exit 1; }
 grep -q 'no required module provides package' "$tv/tidy5" || { echo "FAIL tidy5 text"; cat "$tv/tidy5"; exit 1; }
+# tidy must not drop requires when a package file fails to parse —
+# the skipped file can't prove its imports are unused (#151)
+printf 'module file://%s/app\noxl 0.3\n\nrequire file://%s/dep v1.0.0\n' "$tv" "$tv" > "$tv/app/oxl.mod"
+printf 'package main\nfn broken(a b) {}\n' > "$tv/app/app/broken.oxl"
+cp "$tv/app/oxl.mod" "$tv/m.save"
+( cd "$tv/app" && OXLMODCACHE="$tv/cache" "$OXL" mod tidy ) > "$tv/tidy5b" 2>&1 && { echo "FAIL tidy5b accepted"; cat "$tv/tidy5b"; exit 1; }
+grep -q 'failed to parse' "$tv/tidy5b" || { echo "FAIL tidy5b text"; cat "$tv/tidy5b"; exit 1; }
+diff "$tv/m.save" "$tv/app/oxl.mod" >/dev/null || { echo "FAIL tidy5b rewrote manifest"; diff "$tv/m.save" "$tv/app/oxl.mod"; exit 1; }
+rm "$tv/app/app/broken.oxl"
+printf 'module file://%s/app\noxl 0.3\n' "$tv" > "$tv/app/oxl.mod"
+rm -f "$tv/app/oxl.sum"
 # restore keeps the floor: a require pinned at v1.0.0 whose MVS
 # selection is bumped to v1.2.0 by a dependency's own manifest gets
 # re-fetched at the SELECTED version — but the require line is a

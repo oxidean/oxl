@@ -486,6 +486,7 @@ struct Ck {
     loops: own LoopSt, // innermost loop break/continue taint snapshots
     srep: own SalIAS, // slice-backing alias edges (newest first)
     sgid: int, // next slice-backing group id
+    param_gens: own SList, // scope gens (as str) that hold closure params — fn params are scope 0, closure params a pushed scope
 }
 
 // E1/LSP index: a use-site record mapping (file, [lo,hi)) to the decl it
@@ -941,10 +942,10 @@ fn storage_src(ck: mut Ck, e: ref parser.Node, ty: int, env: ref Env) -> int {
             return storage_src(ck, obj, -1, env)
         }
         parser.Node.Index{obj} => {
-            return -1
+            return storage_src_root(ck, e, env)
         }
         parser.Node.Slice{obj} => {
-            return -1
+            return storage_src_root(ck, e, env)
         }
         parser.Node.Un{op, e} => {
             return -1
@@ -953,6 +954,21 @@ fn storage_src(ck: mut Ck, e: ref parser.Node, ty: int, env: ref Env) -> int {
             return borr_intern(ck, "<temporary>")
         }
     }
+}
+
+// borrow source for a receiver living inside a root binding's backing
+// (index/slice elements, `s[i].asreader()`): a local backing dies with
+// the fn so it mints `root@gen`; params (fn scope 0 or a recorded
+// closure-param scope) and globals outlive the call, so -1.
+fn storage_src_root(ck: mut Ck, e: ref parser.Node, env: ref Env) -> int {
+    rn := taint_root(e)
+    if len(rn) > 0 {
+        sc := scope_of(env, rn)
+        if sc > 0 && is_param_binding(ck, env, rn) == 0 {
+            return borr_intern(ck, rn + "@" + itoa(env.scopes[sc].gen))
+        }
+    }
+    return -1
 }
 
 // root binding an assignment target writes through — `s.f = v` and
@@ -1626,6 +1642,37 @@ fn taint_src(ck: ref Ck, idx: int) -> str {
     return src_name(s)
 }
 
+// any `|` component of idx's source set is a `<temporary>` borrow —
+// minted for receivers with no binding (call results, literals); the
+// temp dies when the statement ends, so a binding taking it on dangles
+// immediately rather than at scope pop
+fn taint_has_temp(ck: ref Ck, idx: int) -> int {
+    if idx < 0 || idx >= len(ck.borrn) {
+        return 0
+    }
+    if find(ck.borrn[idx], "<temporary>") >= 0 {
+        return 1
+    }
+    return 0
+}
+
+// is `n`'s binding a fn or closure parameter? Fn params occupy scope 0
+// (their bodies start at scope 1); closure params live in a pushed
+// scope whose gen is recorded in ck.param_gens.
+fn is_param_binding(ck: ref Ck, e: ref Env, n: str) -> int {
+    sc := scope_of(e, n)
+    if sc == 0 {
+        return 1
+    }
+    if sc < 0 {
+        return 0
+    }
+    if sl_has(ck.param_gens, itoa(e.scopes[sc].gen)) {
+        return 1
+    }
+    return 0
+}
+
 // borrow-source ids are `name@gen`: gen is the declaring scope's
 // instance stamp (Scope.gen) so shadowed same-named bindings can't be
 // mistaken for each other's storage. -1 for non-scope sources.
@@ -2164,7 +2211,7 @@ fn expr_alias_binds(n: ref parser.Node, rn: str, al: ref SList, acc: own SList) 
                     parser.Node.MArm{pat, body} => {
                         match pat {
                             parser.Node.PatBind{name} => {
-                                if alias_mentions(e, rn, al) == 1 {
+                                if expr_borrows(e, rn, al) == 1 {
                                     acc = alias_add(acc, rn, al, name)
                                 }
                             }
@@ -2232,21 +2279,21 @@ fn stmt_alias_binds(s: ref parser.Node, rn: str, al: ref SList, acc: own SList) 
         }
         parser.Node.Let{name, init} => {
             acc = expr_alias_binds(init, rn, al, acc)
-            if init != nil && alias_mentions(init, rn, al) == 1 {
+            if init != nil && expr_borrows(init, rn, al) == 1 {
                 acc = alias_add(acc, rn, al, name)
             }
             return acc
         }
         parser.Node.Bind{name, init} => {
             acc = expr_alias_binds(init, rn, al, acc)
-            if init != nil && alias_mentions(init, rn, al) == 1 {
+            if init != nil && expr_borrows(init, rn, al) == 1 {
                 acc = alias_add(acc, rn, al, name)
             }
             return acc
         }
         parser.Node.Let2{names, call} => {
             acc = expr_alias_binds(call, rn, al, acc)
-            if call != nil && alias_mentions(call, rn, al) == 1 {
+            if call != nil && expr_borrows(call, rn, al) == 1 {
                 i := find(names, ",")
                 an := names
                 bn := ""
@@ -2262,7 +2309,7 @@ fn stmt_alias_binds(s: ref parser.Node, rn: str, al: ref SList, acc: own SList) 
         parser.Node.Assign{target, val} => {
             acc = expr_alias_binds(target, rn, al, acc)
             acc = expr_alias_binds(val, rn, al, acc)
-            if val != nil && alias_mentions(val, rn, al) == 1 {
+            if val != nil && expr_borrows(val, rn, al) == 1 {
                 acc = alias_add(acc, rn, al, taint_root(target))
             }
             return acc
@@ -2321,6 +2368,103 @@ fn stmt_alias_binds(s: ref parser.Node, rn: str, al: ref SList, acc: own SList) 
         }
         _ => {
             return acc
+        }
+    }
+}
+
+// does `e`'s value potentially carry a borrow of `rn`'s storage (or a
+// tracked alias's)? The plain mention scan can't tell `h.buf =
+// new(b.buf)` (a copy into a fresh heap object) or `h.rd = b.rd` (a
+// field's value copy) from a real borrow — both wrongly flagged the
+// owned `into_*` variants as receiver-aliasing. What borrows: the
+// receiver/alias name itself (the mut view), a call mentioning it
+// (as*/store methods and passthroughs — except `new`, which
+// heap-copies), a sub-slice of it (shared backing), and literals built
+// from such pieces.
+fn expr_borrows(e: ref parser.Node, rn: str, al: ref SList) -> int {
+    if e == nil {
+        return 0
+    }
+    match e {
+        parser.Node.Name{n} => {
+            if n == rn || sl_has(al, n) {
+                return 1
+            }
+            return 0
+        }
+        parser.Node.Field{obj} => {
+            // a field read of the receiver is a value copy — fields
+            // don't borrow their own struct. A field of a tracked
+            // alias may be the slot a borrow was stored into, so
+            // aliases stay conservative.
+            match obj {
+                parser.Node.Name{n} => {
+                    if n == rn {
+                        return 0
+                    }
+                }
+                _ => {
+                }
+            }
+            return expr_borrows(obj, rn, al)
+        }
+        parser.Node.Index{obj} => {
+            match obj {
+                parser.Node.Name{n} => {
+                    if n == rn {
+                        return 0
+                    }
+                }
+                _ => {
+                }
+            }
+            return expr_borrows(obj, rn, al)
+        }
+        parser.Node.Slice{obj} => {
+            return expr_borrows(obj, rn, al)
+        }
+        parser.Node.Un{e} => {
+            // value operators (!, -) produce copies, never a borrow
+            return 0
+        }
+        parser.Node.Bin{l, r} => {
+            return 0
+        }
+        parser.Node.As{e} => {
+            // a conversion preserves the value — `b as []T` keeps the
+            // backing, `b as io.Reader` boxes the mut view
+            return expr_borrows(e, rn, al)
+        }
+        parser.Node.Call{f, args} => {
+            match f {
+                parser.Node.Name{n} => {
+                    if n == "new" {
+                        return 0
+                    }
+                }
+                _ => {
+                }
+            }
+            return alias_mentions(e, rn, al)
+        }
+        parser.Node.Lit{obj, fields} => {
+            fl := fields
+            for fl != nil {
+                match fl.v {
+                    parser.Node.NamedField{val} => {
+                        if expr_borrows(val, rn, al) == 1 {
+                            return 1
+                        }
+                    }
+                    _ => {
+                    }
+                }
+                fl = fl.next
+            }
+            return expr_borrows(obj, rn, al)
+        }
+        _ => {
+            return alias_mentions(e, rn, al)
         }
     }
 }
@@ -5668,7 +5812,7 @@ fn call(ck: mut Ck, f: ref parser.Node, args: ref parser.NList, env: mut Env) ->
             st := expr(ck, args.v, env)
             stat := ck.et
             if ck.tyv[st].k == k_slice() {
-                if args.next != nil {
+                if args.next != nil && args.next.next == nil {
                     vt := expr(ck, args.next.v, env)
                     vat := ck.et
                     assignable(ck, ck.tyv[st].i, vt)
@@ -5680,7 +5824,10 @@ fn call(ck: mut Ck, f: ref parser.Node, args: ref parser.NList, env: mut Env) ->
                         pt = vat
                         rn := taint_root(args.v)
                         if len(rn) > 0 {
-                            if scope_of(env, rn) == 0 {
+                            rgt := env_get(ck, env, rn)
+                            if scope_of(env, rn) < 0 && rgt >= 0 {
+                                diag(ck, "check", "`push` into `" + rn + "` escapes a borrow of local `" + taint_src(ck, vat) + "` — it dangles when the scope ends")
+                            } else if is_param_binding(ck, env, rn) == 1 {
                                 diag(ck, "check", "`push` into `" + rn + "` stores a borrow of local `" + taint_src(ck, vat) + "` in borrowed storage — it can outlive this scope")
                             } else {
                                 sal_taint_name(ck, env, rn, vat)
@@ -6139,6 +6286,9 @@ fn stmt(ck: mut Ck, s: ref parser.Node, env: mut Env) {
             }
             env_set(env, name, t, lo, hi)
             if bs >= 0 {
+                if taint_has_temp(ck, bs) == 1 {
+                    diag(ck, "check", "`" + name + "` binds a borrow of a temporary — it dangles at the end of this statement")
+                }
                 env_taint_set(env, name, bs)
             }
             sal_bind(ck, env, name, t, init)
@@ -6164,6 +6314,9 @@ fn stmt(ck: mut Ck, s: ref parser.Node, env: mut Env) {
             if an != "_" {
                 env_set(env, an, val_ty, lo, hi)
                 if bs >= 0 {
+                    if taint_has_temp(ck, bs) == 1 {
+                        diag(ck, "check", "`" + an + "` binds a borrow of a temporary — it dangles at the end of this statement")
+                    }
                     env_taint_set(env, an, bs)
                 }
                 sal_bind(ck, env, an, val_ty, call)
@@ -6216,7 +6369,7 @@ fn stmt(ck: mut Ck, s: ref parser.Node, env: mut Env) {
                         }
                         if scope_of(env, rt2) < 0 && rt >= 0 {
                             diag(ck, "check", "assignment to `" + rt2 + "` escapes a borrow of local `" + taint_src(ck, vtaint) + "` — it dangles when the scope ends")
-                        } else if rk == k_mut() || rk == k_ref() || scope_of(env, rt2) == 0 && (rk == k_slice() || rk == k_own()) {
+                        } else if rk == k_mut() || rk == k_ref() || is_param_binding(ck, env, rt2) == 1 && (rk == k_slice() || rk == k_own()) {
                             diag(ck, "check", "assignment to `" + rt2 + "` stores a borrow of local `" + taint_src(ck, vtaint) + "` in borrowed storage — it can outlive this scope")
                         } else {
                             env_taint_merge(ck, env, rt2, vtaint)
@@ -6241,6 +6394,9 @@ fn stmt(ck: mut Ck, s: ref parser.Node, env: mut Env) {
                     diag(ck, "check", "assignment to `" + idn + "` escapes a borrow of local `" + taint_src(ck, vtaint) + "` — it dangles when the scope ends")
                 }
                 if vtaint >= 0 {
+                    if taint_has_temp(ck, vtaint) == 1 {
+                        diag(ck, "check", "assignment to `" + idn + "` binds a borrow of a temporary — it dangles at the end of this statement")
+                    }
                     env_taint_set(env, idn, vtaint)
                 } else {
                     env_taint_clear(env, idn)
@@ -6482,6 +6638,9 @@ fn stmt(ck: mut Ck, s: ref parser.Node, env: mut Env) {
             // decl span is the name token itself — `lo` is its offset
             env_set(env, name, t, lo, lo + len(name))
             if bs >= 0 {
+                if taint_has_temp(ck, bs) == 1 {
+                    diag(ck, "check", "`" + name + "` binds a borrow of a temporary — it dangles at the end of this statement")
+                }
                 env_taint_set(env, name, bs)
             }
             sal_bind(ck, env, name, t, init)
@@ -6824,6 +6983,7 @@ fn closure_expr(ck: mut Ck, params: ref parser.NList, body: ref parser.Node, env
     ck.in_cl = 1
     ck.cl_ret = -1
     env_push(env)
+    ck.param_gens = scons(itoa(env.scopes[len(env.scopes) - 1].gen), ck.param_gens)
     pl = params
     wl := ps
     for pl != nil && wl != nil {

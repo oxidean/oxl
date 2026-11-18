@@ -1,0 +1,13 @@
+package main
+
+import "std/bytes"
+
+import "std/io"
+
+fn leak() {
+    buf := bytes.newbuffer()
+    [wb, web] = buf.write("x" as []byte)
+    f := { |items: []io.Reader| items[0] = buf.asreader() }
+}
+
+fn main() {}

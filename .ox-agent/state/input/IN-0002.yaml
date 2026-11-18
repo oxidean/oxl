@@ -1,0 +1,14 @@
+schema_version: 1
+request_id: IN-0002
+work_item_id: WI-0020
+kind: decision
+question: 'WI-0020 (issue #135) suspendable-vtable route — brainstorm recommends B-interim + A-milestone. Pick the route. B = document sync-iface contract + sanctioned spawn+handle pattern (small, ships now). A = descriptor-slot suspendable vtable ABI: vtab[i] holds {poll, make} for susp-marked methods, preserving RtFrame protocol — milestone-scale, needs new susp surface syntax (precedent-setting for fn-values later). Sub-decisions ride with the route: (1) descriptor-in-slot vs RtFrame extension [rec: descriptor]; (3) shim frames for non-susp impls vs exact susp-match [rec: shims]; (5) spawn w.m() under A [rec: excluded for v1].'
+options:
+    - B interim + A milestone (recommended)
+    - A now — descriptor-slot ABI as next milestone
+    - B only — sync-iface contract is the design
+status: cancelled
+created_by: cli
+answered_by: devin
+created_at: "2026-11-18T21:23:02Z"
+answered_at: "2026-11-18T21:30:44Z"

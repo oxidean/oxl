@@ -241,13 +241,15 @@ for t in test_sha256 test_md5 test_hmac; do
 done
 
 echo "== oxl test: aead (x2) =="
-out=$("$OXL" test tests/aesgcm_test.oxl)
+out=$("$OXL" test tests/aesgcm_test.oxl) || { printf '%s
+' "$out" >&2; exit 1; }
 printf '%s
 ' "$out" >&2
 for t in test_aes_block test_gcm test_aead_perf; do
     grep -q "$t ... ok" <<<"$out" || { echo "FAIL aesgcm: $out"; exit 1; }
 done
-out=$("$OXL" test tests/chacha_test.oxl)
+out=$("$OXL" test tests/chacha_test.oxl) || { printf '%s
+' "$out" >&2; exit 1; }
 printf '%s
 ' "$out" >&2
 for t in test_chacha20 test_poly1305 test_aead; do

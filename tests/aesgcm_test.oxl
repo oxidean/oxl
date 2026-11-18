@@ -118,6 +118,62 @@ fn test_gcm() {
     testing.expect(eee == nil, "gcm empty open")
 }
 
+fn test_gcm_carry() {
+    // counter-carry regression (X6 interop find): inc32 must carry
+    // out of the low byte at 256-block boundary — a TLS record past
+    // ~4 KiB crosses it. Sealing was self-consistent under the bug,
+    // so only a cross-implementation pin catches it: sha256 of the
+    // whole ct is pinned to the AES-GCM reference answer.
+    key := mkslice(byte, 16)
+    key[0] = 0
+    key[1] = 17
+    key[2] = 34
+    key[3] = 51
+    key[4] = 68
+    key[5] = 85
+    key[6] = 102
+    key[7] = 119
+    key[8] = 136
+    key[9] = 153
+    key[10] = 170
+    key[11] = 187
+    key[12] = 204
+    key[13] = 221
+    key[14] = 238
+    key[15] = 255
+    iv := mkslice(byte, 12)
+    iv[0] = 170
+    iv[1] = 187
+    iv[2] = 204
+    iv[3] = 221
+    iv[4] = 238
+    iv[5] = 255
+    iv[6] = 0
+    iv[7] = 17
+    iv[8] = 34
+    iv[9] = 51
+    iv[10] = 68
+    iv[11] = 85
+    pt := mkslice(byte, 4200)
+    i := 0
+    for i < len(pt) {
+        pt[i] = (i * 13 + 7) % 256
+        i = i + 1
+    }
+    [ct, e] = aesgcm.seal(key, iv, "TLS13REC" as []byte, pt)
+    testing.expect(e == nil, "carry seal")
+    // block 254 ciphertext (offset 4064) pins the carry boundary
+    // verbatim; the digest pins the rest
+    testing.expect_streq(hex.encode(ct[4064:4080]), "9ffdab1fc13e912a2058e5fcbc17824e", "carry boundary ct")
+    [dt, e2] = aesgcm.open(key, iv, "TLS13REC" as []byte, ct)
+    testing.expect(e2 == nil, "carry open")
+    i = 0
+    for i < len(dt) {
+        testing.expect(dt[i] == pt[i], "carry round-trip at " + itoa(i))
+        i = i + 1
+    }
+}
+
 fn test_aead_perf() {
     // Perf smoke: 4 MiB seal+open, best of 3, must beat 30 s per op.
     // The spec's MiB/s figure assumes bare-metal headroom; shared CI

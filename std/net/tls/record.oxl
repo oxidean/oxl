@@ -1,0 +1,674 @@
+package tls
+
+// std/net/tls record layer — TLSCiphertext framing, AEAD nonce
+// (iv ^ seq), inner-type strip, alert mapping. Contract: items/
+// tls13-wire.md §Record layer.
+import "std/io"
+
+import "std/errors"
+
+import "std/crypto/aesgcm"
+
+import "std/crypto/chacha20poly1305"
+
+// content types
+let CT_CCS = 20
+
+let CT_ALERT = 21
+
+let CT_HANDSHAKE = 22
+
+let CT_APPDATA = 23
+
+// fragment cap: 2^14 plaintext + 256 expansion — larger inbound
+// records trip record_overflow.
+let FRAG_MAX = 16640
+
+// pending decrypted handshake bytes cap — a peer streaming fragments
+// without finishing a flight trips record_overflow.
+let HS_PENDING_MAX = 262144
+
+// handshake message types
+let HS_CLIENT_HELLO = 1
+
+let HS_SERVER_HELLO = 2
+
+let HS_NEW_SESSION_TICKET = 4
+
+let HS_END_OF_EARLY = 5
+
+let HS_ENCRYPTED_EXT = 8
+
+let HS_CERTIFICATE = 11
+
+let HS_CERT_REQUEST = 13
+
+let HS_CERT_VERIFY = 15
+
+let HS_FINISHED = 20
+
+let HS_KEY_UPDATE = 24
+
+let HS_MESSAGE_HASH = 254
+
+// Rec is one inbound record's disposition — ty is the inner content
+// type (23/22/21 handled inside; 20 CCS-consumed; -1 close_notify)
+// and pl the content bytes for handshake/appdata records.
+struct Rec { ty: int, pl: []byte }
+
+// HsMsg is one reassembled handshake message — ty and the raw bytes
+// (4-byte header included, the form the transcript hashes).
+struct HsMsg { ty: int, raw: []byte }
+
+// Inner is a stripped TLSCiphertext plaintext — real type + content.
+struct Inner { ty: int, pl: []byte }
+
+// alert descriptions sent (name → code, RFC 8446 §6)
+let AL_CLOSE_NOTIFY = 0
+
+let AL_UNEXPECTED = 10
+
+let AL_BAD_MAC = 20
+
+let AL_OVERFLOW = 22
+
+let AL_HANDSHAKE_FAIL = 40
+
+let AL_BAD_CERT = 42
+
+let AL_CERT_EXPIRED = 44
+
+let AL_CERT_UNKNOWN = 45
+
+let AL_ILLEGAL_PARAM = 46
+
+let AL_UNKNOWN_CA = 47
+
+let AL_DECODE_ERR = 49
+
+let AL_DECRYPT_ERR = 50
+
+let AL_PROTOCOL_VER = 70
+
+let AL_INTERNAL = 80
+
+let AL_MISSING_EXT = 109
+
+let AL_NO_APP_PROTO = 120
+
+// alert_name maps a received alert description to its RFC name — the
+// server's complaint belongs in the err text (debugging a failed
+// handshake demands it).
+fn alert_name(d: int) -> str {
+    if d == 0 {
+        return "close_notify"
+    }
+    if d == 10 {
+        return "unexpected_message"
+    }
+    if d == 20 {
+        return "bad_record_mac"
+    }
+    if d == 22 {
+        return "record_overflow"
+    }
+    if d == 40 {
+        return "handshake_failure"
+    }
+    if d == 42 {
+        return "bad_certificate"
+    }
+    if d == 43 {
+        return "unsupported_certificate"
+    }
+    if d == 44 {
+        return "certificate_expired"
+    }
+    if d == 45 {
+        return "certificate_unknown"
+    }
+    if d == 46 {
+        return "illegal_parameter"
+    }
+    if d == 47 {
+        return "unknown_ca"
+    }
+    if d == 48 {
+        return "access_denied"
+    }
+    if d == 49 {
+        return "decode_error"
+    }
+    if d == 50 {
+        return "decrypt_error"
+    }
+    if d == 70 {
+        return "protocol_version"
+    }
+    if d == 80 {
+        return "internal_error"
+    }
+    if d == 86 {
+        return "inappropriate_fallback"
+    }
+    if d == 90 {
+        return "user_canceled"
+    }
+    if d == 109 {
+        return "missing_extension"
+    }
+    if d == 110 {
+        return "unsupported_extension"
+    }
+    if d == 112 {
+        return "unrecognized_name"
+    }
+    if d == 113 {
+        return "bad_certificate_status_response"
+    }
+    if d == 115 {
+        return "unknown_psk_identity"
+    }
+    if d == 116 {
+        return "certificate_required"
+    }
+    if d == 120 {
+        return "no_application_protocol"
+    }
+    return "alert_" + itoa(d)
+}
+
+// sock_readn fills b from the inner socket — the handshake receive
+// budget rides SO_RCVTIMEO as a *remaining* deadline refreshed per
+// read so a byte-dripping peer can't park the handshake. Mid-fill EOF
+// is err_eof (truncation is never silent).
+fn sock_readn(c: mut Conn, b: []byte) -> err {
+    s := c.s
+    off := 0
+    for off < len(b) {
+        if s.deadline != 0 {
+            rem := s.deadline - now_ms()
+            if rem <= 0 {
+                return errors.wrap("tls: handshake receive timeout", err_eof())
+            }
+            set_rcvtimo_ms(c.inner.fd, rem)
+        }
+        [n, e] = c.inner.read(b[off:len(b)])
+        if e != nil {
+            if e == io.eof() {
+                return errors.wrap("tls: peer closed mid-record", err_eof())
+            }
+            return e
+        }
+        if n <= 0 {
+            return errors.wrap("tls: peer closed mid-record", err_eof())
+        }
+        off = off + n
+    }
+    return nil
+}
+
+// nonce is iv ^ (seq zero-padded to iv len) — seq is per direction
+// and resets at each epoch; a wrap would be err_proto but can't
+// legally happen (2^64 records).
+fn nonce_of(iv: []byte, seq: int) -> []byte {
+    n := bclone(iv)
+    i := 0
+    for i < 8 {
+        // big-endian seq XORed into the trailing 8 bytes — LSB last
+        v := seq / pow256b(i) % 256
+        n[len(n) - 1 - i] = n[len(n) - 1 - i] ^ v
+        i = i + 1
+    }
+    return n
+}
+
+// aead_seal dispatches on the negotiated suite.
+fn aead_seal(aead: int, key: []byte, nonce: []byte, aad: []byte, pt: []byte) -> [own []byte, err] {
+    if aead == AEAD_CHACHA {
+        return chacha20poly1305.seal(key, nonce, aad, pt)
+    }
+    return aesgcm.seal(key, nonce, aad, pt)
+}
+
+fn aead_open(aead: int, key: []byte, nonce: []byte, aad: []byte, ct: []byte) -> [own []byte, err] {
+    if aead == AEAD_CHACHA {
+        return chacha20poly1305.open(key, nonce, aad, ct)
+    }
+    return aesgcm.open(key, nonce, aad, ct)
+}
+
+// inner_write sends exactly one TLS record on the inner conn —
+// write() may go short, so loop.
+fn inner_write(c: mut Conn, rec: []byte) -> err {
+    off := 0
+    for off < len(rec) {
+        [n, e] = c.inner.write(rec[off:len(rec)])
+        if e != nil {
+            return e
+        }
+        if n <= 0 {
+            return errors.new("tls: inner write stalled")
+        }
+        off = off + n
+    }
+    if sget(hook_on) != 0 {
+        i := 0
+        for i < len(rec) {
+            c.s.capout = push(c.s.capout, rec[i])
+            i = i + 1
+        }
+    }
+    return nil
+}
+
+// rec_write emits one record of type `typ` carrying `content`. Armed
+// epochs seal content||typ and send outer type 23; plaintext epochs
+// send the content naked (version 0x0301 on the wire — middlebox
+// compat, the field is ignored by 1.3 peers anyway).
+fn rec_write(c: mut Conn, typ: int, content: []byte) -> err {
+    s := c.s
+    w := mkwr()
+    if s.wen != 0 {
+        if s.wseq < 0 {
+            return errors.wrap("tls: write seq wrapped", err_proto())
+        }
+        w.u8(CT_APPDATA)
+        w.u16(771) // 0x0303
+        hdr_off := len(w.b)
+        w.u16(0)
+        // inner plaintext: content || type — no outbound padding
+        inner := bcat(content, mkslice(byte, 1))
+        inner[len(inner) - 1] = typ
+        // the length field must be final BEFORE the seal — it is
+        // part of the AAD; AEAD output is plaintext + 16-byte tag
+        w.b[hdr_off] = (len(inner) + 16) / 256 % 256
+        w.b[hdr_off + 1] = (len(inner) + 16) % 256
+        nnc := nonce_of(s.wiv, s.wseq)
+        aad := w.b[0:len(w.b)]
+        [ct, e] = aead_seal(s.aead, s.wkey, nnc, aad, inner)
+        if e != nil {
+            return errors.wrap("tls: seal: " + errors.msg(e), err_keys())
+        }
+        w.put(ct)
+        s.wseq = s.wseq + 1
+    } else {
+        w.u8(typ)
+        // legacy_record_version: 0x0301 is the CH-only middlebox
+        // allowance; every other plaintext record is MUST-be-0x0303
+        // (RFC 8446 §5.1) — openssl's tls13 header check enforces it
+        if typ == CT_HANDSHAKE {
+            w.u16(769)
+        } else {
+            w.u16(771)
+        }
+        w.u16(len(content))
+        w.put(content)
+    }
+    return inner_write(c, w.b)
+}
+
+// send_alert emits an alert record (encrypted once the write epoch is
+// armed) — always best-effort: the caller is already erroring out.
+fn send_alert(c: mut Conn, level: int, desc: int) {
+    pl := mkslice(byte, 2)
+    pl[0] = level
+    pl[1] = desc
+    rec_write(c, CT_ALERT, pl)
+    if desc == 0 {
+        c.s.wclosed = 1
+    }
+}
+
+// fail sends a fatal alert then returns the wrapped protocol error —
+// the "matching alert sent, then err_proto" pattern.
+fn fail(c: mut Conn, desc: int, msg: str) -> err {
+    send_alert(c, 2, desc)
+    return errors.wrap("tls: " + msg, err_proto())
+}
+
+// strip_inner removes the zero padding from a decrypted TLSCiphertext
+// — last nonzero byte is the real content type; an all-zero plaintext
+// reports ty -1 (caller maps to unexpected_message).
+fn strip_inner(pt: []byte) -> Inner {
+    i := len(pt) - 1
+    for i >= 0 && pt[i] == 0 {
+        i = i - 1
+    }
+    if i < 0 {
+        return Inner{ty: -1, pl: pt[0:0]}
+    }
+    return Inner{ty: pt[i], pl: pt[0:i]}
+}
+
+// rec_read pulls exactly one record and returns [type, payload, err]:
+// type is the *inner* content type for protected records (21 alert /
+// 22 handshake / 23 appdata / 20 CCS-consumed-and-nil-payload) or the
+// wire type in the plaintext epoch. Alerts and CCS are handled inside
+// — alert records map to err_alert (name in text) or, for
+// close_notify, type -1 with s.notify latched.
+fn rec_read(c: mut Conn) -> [Rec, err] {
+    z := Rec{ty: 0, pl: nil}
+    s := c.s
+    hdr := mkslice(byte, 5)
+    e := sock_readn(c, hdr)
+    if e != nil {
+        return z, e
+    }
+    typ := hdr[0]
+    vlen := hdr[3] * 256 + hdr[4]
+    if vlen > FRAG_MAX {
+        return z, fail(c, AL_OVERFLOW, "record fragment " + itoa(vlen) + " over cap")
+    }
+    frag := mkslice(byte, vlen)
+    e = sock_readn(c, frag)
+    if e != nil {
+        return z, e
+    }
+    if sget(hook_on) != 0 {
+        i := 0
+        for i < 5 {
+            s.capin = push(s.capin, hdr[i])
+            i = i + 1
+        }
+        i = 0
+        for i < len(frag) {
+            s.capin = push(s.capin, frag[i])
+            i = i + 1
+        }
+    }
+    if s.ren != 0 {
+        // armed epoch: outer type is always 23 — a plaintext
+        // handshake/alert record here is unexpected_message; a
+        // plaintext CCS is tolerated once per direction (§D.4)
+        if typ == CT_CCS {
+            if s.ccs != 0 {
+                return z, fail(c, AL_UNEXPECTED, "second change_cipher_spec")
+            }
+            s.ccs = 1
+            z.ty = CT_CCS
+            return z, nil
+        }
+        if typ != CT_APPDATA {
+            return z, fail(c, AL_UNEXPECTED, "plaintext record type " + itoa(typ) + " post-ServerHello")
+        }
+        if s.rseq < 0 {
+            return z, fail(c, AL_UNEXPECTED, "read seq wrapped")
+        }
+        nnc := nonce_of(s.riv, s.rseq)
+        [pt, oe] = aead_open(s.aead, s.rkey, nnc, hdr, frag)
+        if oe != nil {
+            // AEAD-open failure is the record layer's only integrity
+            // verdict — bad_record_mac, never a bare close
+            return z, fail(c, AL_BAD_MAC, "bad_record_mac")
+        }
+        s.rseq = s.rseq + 1
+        inn := strip_inner(pt)
+        if inn.ty < 0 {
+            return z, fail(c, AL_UNEXPECTED, "all-zero inner plaintext")
+        }
+        if inn.ty == CT_ALERT {
+            return alert_recv(c, inn.pl)
+        }
+        z.ty = inn.ty
+        z.pl = inn.pl
+        return z, nil
+    }
+    // plaintext epoch — only handshake/alert/CCS-once are legal
+    if typ == CT_CCS {
+        if s.ccs != 0 {
+            return z, fail(c, AL_UNEXPECTED, "second change_cipher_spec")
+        }
+        s.ccs = 1
+        z.ty = CT_CCS
+        return z, nil
+    }
+    if typ == CT_ALERT {
+        return alert_recv(c, frag)
+    }
+    if typ != CT_HANDSHAKE {
+        return z, fail(c, AL_UNEXPECTED, "record type " + itoa(typ) + " pre-handshake")
+    }
+    z.ty = CT_HANDSHAKE
+    z.pl = frag
+    return z, nil
+}
+
+// alert_recv interprets a decrypted alert payload: close_notify
+// latches s.notify and reports type -1; anything else is err_alert
+// carrying the alert's name.
+fn alert_recv(c: mut Conn, pl: []byte) -> [Rec, err] {
+    z := Rec{ty: 0, pl: nil}
+    if len(pl) < 2 {
+        return z, fail(c, AL_DECODE_ERR, "short alert record")
+    }
+    desc := pl[1]
+    if desc == 0 {
+        c.s.notify = 1
+        z.ty = -1
+        return z, nil
+    }
+    return z, errors.wrap("tls: alert: " + alert_name(desc), err_alert())
+}
+
+// hs_feed appends a handshake-typed payload to the reassembly window
+// — records ≠ messages, so bytes accumulate until each 4-byte header
+// length completes; the window is capped at 256 KiB pre-flight.
+fn hs_feed(c: mut Conn, frag: []byte) -> err {
+    s := c.s
+    if len(s.hsbuf) + len(frag) > HS_PENDING_MAX {
+        return fail(c, AL_OVERFLOW, "pending handshake bytes over 256KiB")
+    }
+    i := 0
+    for i < len(frag) {
+        s.hsbuf = push(s.hsbuf, frag[i])
+        i = i + 1
+    }
+    return nil
+}
+
+// hs_pending returns a complete handshake message's raw bytes
+// (4-byte header included) or nil — no read happens here.
+fn hs_pending(c: mut Conn) -> []byte {
+    s := c.s
+    if len(s.hsbuf) < 4 {
+        return nil
+    }
+    mlen := s.hsbuf[1] * 65536 + s.hsbuf[2] * 256 + s.hsbuf[3]
+    if len(s.hsbuf) < 4 + mlen {
+        return nil
+    }
+    raw := s.hsbuf[0:4 + mlen]
+    s.hsbuf = s.hsbuf[4 + mlen:len(s.hsbuf)]
+    return raw
+}
+
+// hs_next pops the next complete handshake message (raw includes the
+// 4-byte header — the form the transcript hashes), pulling records
+// until one assembles.
+fn hs_next(c: mut Conn) -> [HsMsg, err] {
+    z := HsMsg{ty: 0, raw: nil}
+    for true {
+        raw := hs_pending(c)
+        if len(raw) > 0 {
+            z.ty = raw[0]
+            z.raw = raw
+            return z, nil
+        }
+        [rc, e] = rec_read(c)
+        if e != nil {
+            return z, e
+        }
+        if rc.ty < 0 {
+            // close_notify mid-handshake is a truncation, not an
+            // orderly end
+            return z, errors.wrap("tls: close_notify mid-handshake", err_eof())
+        }
+        if rc.ty == CT_HANDSHAKE {
+            e = hs_feed(c, rc.pl)
+            if e != nil {
+                return z, e
+            }
+        }
+        // rc.ty == CT_CCS: consumed, keep looping
+    }
+    return z, errors.new("tls: unreachable")
+}
+
+// rec_pump pulls records until at least one app-data byte is buffered
+// or an error/close_notify surfaces — post-handshake handshake
+// messages are dispatched here so read() callers see only app data.
+fn rec_pump(c: mut Conn) -> err {
+    s := c.s
+    for len(s.appbuf) == 0 && s.notify == 0 {
+        [rc, e] = rec_read(c)
+        if e != nil {
+            return e
+        }
+        if rc.ty < 0 {
+            return nil // close_notify — read() maps to io.eof
+        }
+        if rc.ty == CT_APPDATA {
+            i := 0
+            for i < len(rc.pl) {
+                s.appbuf = push(s.appbuf, rc.pl[i])
+                i = i + 1
+            }
+            return nil
+        }
+        if rc.ty == CT_HANDSHAKE {
+            e = hs_feed(c, rc.pl)
+            if e != nil {
+                return e
+            }
+            e = post_hs_dispatch(c)
+            if e != nil {
+                return e
+            }
+        }
+        // CT_CCS: consumed, keep pumping
+    }
+    return nil
+}
+
+// post_hs_dispatch consumes every complete post-handshake message
+// pending in hsbuf — NewSessionTicket parsed-and-dropped, KeyUpdate
+// consume+rotate(+reply when requested), stray CertificateRequest
+// answered leniently, anything else unexpected_message.
+fn post_hs_dispatch(c: mut Conn) -> err {
+    for true {
+        raw := hs_pending(c)
+        if len(raw) == 0 {
+            return nil
+        }
+        ty := raw[0]
+        body := raw[4:len(raw)]
+        if ty == HS_NEW_SESSION_TICKET {
+            // parsed and dropped — resumption is out of scope;
+            // erroring would break interop with every real server
+        } else if ty == HS_KEY_UPDATE {
+            e := key_update_recv(c, body)
+            if e != nil {
+                return e
+            }
+        } else if ty == HS_CERT_REQUEST {
+            e := cert_request_recv(c, body)
+            if e != nil {
+                return e
+            }
+        } else {
+            return fail(c, AL_UNEXPECTED, "post-handshake message type " + itoa(ty))
+        }
+    }
+    return nil
+}
+
+// key_update_recv applies RFC 8446 §4.6.3: peer traffic secret
+// rotates (read epoch rekeys); update_requested additionally answers
+// update_not_requested — our send epoch rotates AFTER the reply goes
+// out under the current keys.
+fn key_update_recv(c: mut Conn, body: []byte) -> err {
+    s := c.s
+    if len(body) != 1 || body[0] > 1 {
+        return fail(c, AL_DECODE_ERR, "bad key_update body")
+    }
+    req := body[0]
+    [ns, e] = s.ks.traffic_upd(s.rsecret)
+    if e != nil {
+        return errors.wrap("tls: keyupdate rotate: " + errors.msg(e), err_keys())
+    }
+    s.rsecret = ns[0:len(ns)]
+    [ki, e2] = s.ks.key_iv(s.suite, s.rsecret)
+    if e2 != nil {
+        return errors.wrap("tls: keyupdate keys: " + errors.msg(e2), err_keys())
+    }
+    s.rkey = ki.key
+    s.riv = ki.iv
+    s.rseq = 0
+    if req == 1 {
+        // answer update_not_requested under the current write epoch,
+        // then rotate our send keys
+        e = hs_send(c, HS_KEY_UPDATE, mkslice(byte, 1))
+        if e != nil {
+            return e
+        }
+        [nw, e3] = s.ks.traffic_upd(s.wsecret)
+        if e3 != nil {
+            return errors.wrap("tls: keyupdate rotate: " + errors.msg(e3), err_keys())
+        }
+        s.wsecret = nw[0:len(nw)]
+        [wki, e4] = s.ks.key_iv(s.suite, s.wsecret)
+        if e4 != nil {
+            return errors.wrap("tls: keyupdate keys: " + errors.msg(e4), err_keys())
+        }
+        s.wkey = wki.key
+        s.wiv = wki.iv
+        s.wseq = 0
+    }
+    return nil
+}
+
+// hs_send wraps one handshake body in its 4-byte header and emits it
+// as a handshake record — the transcript is NOT updated here (the
+// caller decides whether the message belongs to it; post-handshake
+// messages don't feed the app-traffic transcript).
+fn hs_send(c: mut Conn, ty: int, body: []byte) -> err {
+    w := mkwr()
+    w.u8(ty)
+    w.u24(len(body))
+    w.put(body)
+    return rec_write(c, CT_HANDSHAKE, w.b)
+}
+
+// cert_request_recv answers a CertificateRequest — mid-flight or
+// post-handshake — with the RFC-mandated empty Certificate (context
+// echoed verbatim) followed by Finished and NO CertificateVerify.
+// The lenient answer is chosen over unexpected_message: real servers
+// send this unbidden, and the server's own follow-up ends the session
+// either way (wire doc §state machine).
+fn cert_request_recv(c: mut Conn, body: []byte) -> err {
+    s := c.s
+    r := mkrd(body)
+    ctx := r.bytes(r.u8())
+    r.u16() // extensions len — we ignore the contents
+    if r.ok == 0 {
+        return fail(c, AL_DECODE_ERR, "bad certificate_request")
+    }
+    // feed the CR into the running transcript, then emit the flight:
+    // Certificate(ctx echo, empty list) + Finished keyed by c_hs —
+    // the same shape as the mid-flight answer (RFC 8446 forbids CV
+    // without a non-empty Certificate)
+    e := th_update(c, raw_msg(HS_CERT_REQUEST, body))
+    if e != nil {
+        return e
+    }
+    certw := mkwr()
+    certw.u8(len(ctx))
+    certw.put(ctx)
+    certw.u24(0) // empty certificate_list
+    e = hs_send_t(c, HS_CERTIFICATE, certw.b)
+    if e != nil {
+        return e
+    }
+    return send_client_finished(c)
+}

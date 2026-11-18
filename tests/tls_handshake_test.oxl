@@ -1,0 +1,170 @@
+package main
+
+// X6: std/net/tls client handshake — replays tests/tls/flight.hex, a
+// real `openssl s_server -www -tls1_3` flight recorded by
+// tests/tls/capture.oxl under the deterministic fixture hook (the
+// hook emits the same ClientHello here, so the transcript — and
+// every Finished — stays valid). The fake peer just pushes the
+// recorded bytes; the client must:
+//   1. verify the chain against tests/tls/ca.pem and the iPAddress
+//      SAN for 127.0.0.1,
+//   2. verify CertificateVerify and both Finished MACs,
+//   3. consume-and-ignore the two NewSessionTickets,
+//   4. deliver the -www status page as app data,
+//   5. consume the forged KeyUpdate, answer update_not_requested,
+//      rotate, and read the post-rotation app record,
+//   6. map the forged close_notify to io.eof.
+// Regenerate: ./scripts/gen_tls_fixtures.sh flight (openssl only —
+// the suite itself never execs it).
+import "std/crypto/x509"
+
+import "std/encoding/hex"
+
+import "std/errors"
+
+import "std/io"
+
+import "std/net"
+
+import "std/net/tls"
+
+import "std/os"
+
+import "std/strings"
+
+import "std/testing"
+
+// fixture_server plays the recorded peer: push the whole flight then
+// drain the client's records (Finished, request, KU answer,
+// close_notify) so nothing RSTs early; close when the client goes.
+// (spawn args must be values — the task re-reads the fixture itself.)
+fn fixture_server(path: str, port: shared, ready: shared) {
+    [fb, fe] = hex.decode(os.readfile_(path))
+    if fe != nil {
+        sset(ready, -1)
+        return
+    }
+    flight := fb[0:len(fb)]
+    [l, le] = net.listen(0)
+    if le != nil {
+        sset(ready, -1)
+        return
+    }
+    sset(port, l.port())
+    sset(ready, 1)
+    set_rcvtimo(l.rawfd(), 10)
+    [c, ae] = l.accept()
+    if ae != nil {
+        l.close()
+        return
+    }
+    set_rcvtimo(c.rawfd(), 10)
+    off := 0
+    for off < len(flight) {
+        [n, we] = c.write(flight[off:len(flight)])
+        if we != nil || n <= 0 {
+            break
+        }
+        off = off + n
+    }
+    drain := mkslice(byte, 8192)
+    deadline := now_ms() + 8000
+    for now_ms() < deadline {
+        [n, re] = c.read(drain)
+        if re != nil || n <= 0 {
+            break
+        }
+    }
+    c.close()
+    l.close()
+}
+
+fn hx(s: str) -> []byte {
+    [b, e] = hex.decode(s)
+    testing.expect(e == nil, "hx")
+    return b[0:len(b)]
+}
+
+fn test_handshake() {
+    flight := hx(os.readfile_("tests/tls/flight.hex"))
+    testing.expect(len(flight) > 1000, "flight fixture nonempty")
+
+    roots := x509.Roots{cas: nil}
+    [n, le] = roots.load_pem(os.readfile_("tests/tls/ca.pem"))
+    testing.expect(le == nil && n == 1, "ca load")
+
+    tls.fixture_hook()
+    port := mkshared(0)
+    ready := mkshared(0)
+    spawnBlocking fixture_server("tests/tls/flight.hex", port, ready)
+    i := 0
+    for sget(ready) == 0 && i < 500 {
+        usleep(10000)
+        i = i + 1
+    }
+    testing.expect(sget(ready) == 1, "fixture server listen")
+
+    cfg := tls.default_cfg()
+    cfg.roots = roots
+    [c, e] = tls.dial("127.0.0.1", sget(port), cfg)
+    testing.expect(e == nil, "handshake: " + errors.msg(e))
+
+    // peer() hands back the verified leaf — CN=localhost, IP SAN
+    leaf := c.peer()
+    testing.expect(strings.contains(leaf.subject, "localhost"), "peer subject " + leaf.subject)
+
+    // read all app data through the io.Reader adapter — page bytes,
+    // then the post-KeyUpdate forged record, then close_notify
+    r := c.asreader()
+    buf := mkslice(byte, 2048)
+    got := ""
+    done := 0
+    for done == 0 {
+        [nr, re] = r.read(buf)
+        if nr > 0 {
+            got = got + buf[0:nr] as str
+        }
+        if re != nil {
+            testing.expect(re == io.eof(), "read end is close_notify, got " + errors.msg(re))
+            done = 1
+        }
+    }
+    testing.expect(strings.contains(got, "HTTP/1.0"), "server page in flight, got " + itoa(len(got)) + " bytes")
+    testing.expect(strings.contains(got, "hello-x6-replay"), "post-KeyUpdate app data")
+
+    // close is best-effort close_notify then inner close; a second
+    // close must be a no-op
+    ce := c.close()
+    testing.expect(ce == nil, "close")
+    ce = c.close()
+    testing.expect(ce == nil, "double close")
+}
+
+// test_rawfd_and_adapters pins the net.Conn parity surface: rawfd is
+// the inner socket, and the io adapters are live objects.
+fn test_rawfd_and_adapters() {
+    roots := x509.Roots{cas: nil}
+    [n, le] = roots.load_pem(os.readfile_("tests/tls/ca.pem"))
+    testing.expect(le == nil && n == 1, "ca load")
+    tls.fixture_hook()
+    port := mkshared(0)
+    ready := mkshared(0)
+    spawnBlocking fixture_server("tests/tls/flight.hex", port, ready)
+    i := 0
+    for sget(ready) == 0 && i < 500 {
+        usleep(10000)
+        i = i + 1
+    }
+    cfg := tls.default_cfg()
+    cfg.roots = roots
+    [inner, de] = net.dial("127.0.0.1", sget(port))
+    testing.expect(de == nil, "inner dial")
+    cfg.server_name = "127.0.0.1"
+    [c, e] = tls.client(inner, cfg)
+    testing.expect(e == nil, "client wrap: " + errors.msg(e))
+    testing.expect(c.rawfd() >= 0, "rawfd")
+    w := c.aswriter()
+    [nw, we] = w.write("x" as []byte)
+    testing.expect(we == nil && nw == 1, "aswriter")
+    c.close()
+}

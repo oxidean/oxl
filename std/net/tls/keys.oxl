@@ -1,0 +1,219 @@
+package tls
+
+// std/net/tls key schedule — RFC 8446 §7.1 over std/crypto/hkdf.
+// expand_label is TLS-shaped ("tls13 " prefix) and lives here per
+// plan.md, not in generic hkdf.
+import "std/hash"
+
+import "std/crypto/hkdf"
+
+import "std/crypto/hmac"
+
+import "std/crypto/sha256"
+
+import "std/crypto/sha512"
+
+import "std/errors"
+
+// cipher suites offered, in ClientHello preference order
+let SUITE_AES128_GCM = 4865 // 0x1301
+
+let SUITE_CHACHA20 = 4867 // 0x1303
+
+let SUITE_AES256_GCM = 4866 // 0x1302
+
+// AEAD ids (record-layer dispatch)
+let AEAD_AES128 = 1
+
+let AEAD_AES256 = 2
+
+let AEAD_CHACHA = 3
+
+fn suite_ok(s: int) -> bool {
+    return s == SUITE_AES128_GCM || s == SUITE_CHACHA20 || s == SUITE_AES256_GCM
+}
+
+// suite_hash picks the transcript/kdf hash: SHA-256 for 0x1301 and
+// 0x1303, SHA-384 for 0x1302 (RFC 8446 §4.1.1's suite→hash pin).
+fn suite_hash(s: int) -> fn() -> hash.Hash {
+    if s == SUITE_AES256_GCM {
+        return sha512.new384
+    }
+    return sha256.new
+}
+
+fn suite_hlen(s: int) -> int {
+    if s == SUITE_AES256_GCM {
+        return 48
+    }
+    return 32
+}
+
+fn suite_aead(s: int) -> int {
+    if s == SUITE_AES256_GCM {
+        return AEAD_AES256
+    }
+    if s == SUITE_CHACHA20 {
+        return AEAD_CHACHA
+    }
+    return AEAD_AES128
+}
+
+fn suite_klen(s: int) -> int {
+    if s == SUITE_AES256_GCM {
+        return 32
+    }
+    if s == SUITE_CHACHA20 {
+        return 32
+    }
+    return 16
+}
+
+/// expand_label is HKDF-Expand-Label (RFC 8446 §7.1): info =
+/// u16(len) || u8-vector("tls13 " || label) || u8-vector(ctx).
+fn expand_label(hf: fn() -> hash.Hash, secret: []byte, label: str, ctx: []byte, outlen: int) -> [own []byte, err] {
+    w := mkwr()
+    w.u16(outlen)
+    lb := "tls13 " + label
+    w.u8(len(lb))
+    w.putstr(lb)
+    w.u8(len(ctx))
+    w.put(ctx)
+    return hkdf.expand(hf, secret, w.b, outlen)
+}
+
+// hash_empty is Hash("") under hf — the transcript context for the
+// "derived" secrets (RFC 8446 §7.1: Derive-Secret hashes the messages
+// so far; at the extract points the message list is empty).
+fn hash_empty(hf: fn() -> hash.Hash) -> own []byte {
+    h := hf()
+    return h.sum(nil)
+}
+
+// hmac_sum is HMAC-Hash(key, msg) — verify_data computation.
+fn hmac_sum(hf: fn() -> hash.Hash, key: []byte, msg: []byte) -> [own []byte, err] {
+    hm := hmac.new(hf, key)
+    [n, e] = hm.write(msg)
+    if e != nil || n != len(msg) {
+        return nil, errors.new("tls: hmac write failed")
+    }
+    return hm.sum(nil), nil
+}
+
+// ---- the §7.1 chain -----------------------------------------------------
+
+// keysched carries the running schedule state between the three
+// extract points.
+struct KeySched {
+    hf: fn() -> hash.Hash,
+    hlen: int,
+    early: []byte,
+    hs: []byte, // handshake secret — holds c_hs/s_hs too
+    master: []byte,
+    c_hs: []byte,
+    s_hs: []byte,
+    c_ap: []byte,
+    s_ap: []byte,
+}
+
+// ks_begin computes the early secret (no PSK — IKM is HashLen zeros).
+fn ks_begin(hf: fn() -> hash.Hash, hlen: int) -> [KeySched, err] {
+    k := KeySched{hf: hf, hlen: hlen, early: nil, hs: nil, master: nil, c_hs: nil, s_hs: nil, c_ap: nil, s_ap: nil}
+    [e, err] = hkdf.extract(hf, bzeros(hlen), bzeros(hlen))
+    if err != nil {
+        return k, err
+    }
+    k.early = e[0:len(e)]
+    return k, nil
+}
+
+// ks_handshake runs extract #2 and derives both handshake traffic
+// secrets; thash is Transcript-Hash(CH..SH).
+fn (k mut KeySched) handshake(ecdhe: []byte, thash: []byte) -> err {
+    [der, e] = expand_label(k.hf, k.early, "derived", hash_empty(k.hf), k.hlen)
+    if e != nil {
+        return e
+    }
+    [hs, e2] = hkdf.extract(k.hf, der, ecdhe)
+    if e2 != nil {
+        return e2
+    }
+    k.hs = hs[0:len(hs)]
+    [c, e3] = expand_label(k.hf, k.hs, "c hs traffic", thash, k.hlen)
+    if e3 != nil {
+        return e3
+    }
+    k.c_hs = c[0:len(c)]
+    [s, e4] = expand_label(k.hf, k.hs, "s hs traffic", thash, k.hlen)
+    if e4 != nil {
+        return e4
+    }
+    k.s_hs = s[0:len(s)]
+    return nil
+}
+
+// ks_master runs extract #3.
+fn (k mut KeySched) mk_master() -> err {
+    [der, e] = expand_label(k.hf, k.hs, "derived", hash_empty(k.hf), k.hlen)
+    if e != nil {
+        return e
+    }
+    [m, e2] = hkdf.extract(k.hf, der, bzeros(k.hlen))
+    if e2 != nil {
+        return e2
+    }
+    k.master = m[0:len(m)]
+    return nil
+}
+
+// ks_app derives both application traffic secrets; thash is
+// Transcript-Hash(CH..server Finished).
+fn (k mut KeySched) app(thash: []byte) -> err {
+    e := k.mk_master()
+    if e != nil {
+        return e
+    }
+    [c, e3] = expand_label(k.hf, k.master, "c ap traffic", thash, k.hlen)
+    if e3 != nil {
+        return e3
+    }
+    k.c_ap = c[0:len(c)]
+    [s, e4] = expand_label(k.hf, k.master, "s ap traffic", thash, k.hlen)
+    if e4 != nil {
+        return e4
+    }
+    k.s_ap = s[0:len(s)]
+    return nil
+}
+
+// finished_key derives the verify_data HMAC key from a handshake
+// traffic secret.
+fn (k ref KeySched) finished_key(base: []byte) -> [own []byte, err] {
+    return expand_label(k.hf, base, "finished", bzeros(0), k.hlen)
+}
+
+// traffic_upd rotates a traffic secret per RFC 8446 §4.6.3 —
+// application-traffic-secret_N+1.
+fn (k ref KeySched) traffic_upd(secret: []byte) -> [own []byte, err] {
+    return expand_label(k.hf, secret, "traffic upd", bzeros(0), k.hlen)
+}
+
+// KeyIv is one epoch's AEAD material — key + 12-byte static iv.
+struct KeyIv { key: []byte, iv: []byte }
+
+// key_iv derives the AEAD key and 12-byte static iv from a traffic
+// secret.
+fn (k ref KeySched) key_iv(suite: int, secret: []byte) -> [KeyIv, err] {
+    z := KeyIv{key: nil, iv: nil}
+    [key, e] = expand_label(k.hf, secret, "key", bzeros(0), suite_klen(suite))
+    if e != nil {
+        return z, e
+    }
+    [iv, e2] = expand_label(k.hf, secret, "iv", bzeros(0), 12)
+    if e2 != nil {
+        return z, e2
+    }
+    z.key = key[0:len(key)]
+    z.iv = iv[0:len(iv)]
+    return z, nil
+}

@@ -1,0 +1,149 @@
+package main
+
+// tests/tls/capture.oxl — the flight-fixture recorder (X6). Driven by
+// scripts/gen_tls_fixtures.sh's `flight` section against openssl
+// s_server; never invoked by the suite.
+//
+//   oxl run tests/tls/capture.oxl -- <port> <ca.pem> <out.hex>
+//
+// Arms the deterministic fixture hook, handshakes a real s_server,
+// reads the -www status page, then appends a FORGED post-handshake
+// segment to the captured inbound bytes: KeyUpdate(update_requested)
+// under the current app epoch, then a second app-data record and a
+// close_notify under the rotated secret — so the replay fixture pins
+// consume+reply+rotation deterministically (live KU timing can't be).
+// The recorded server flight stays transcript-valid because the hook
+// emits the same ClientHello at replay.
+import "std/crypto/x509"
+
+import "std/encoding/hex"
+
+import "std/errors"
+
+import "std/net/tls"
+
+import "std/os"
+
+fn die(msg: str) {
+    println("capture: " + msg)
+    exit(1)
+}
+
+// forge emits one sealed record (header + ciphertext) for the
+// fixture's post-handshake segment.
+fn forge(c: tls.Conn, aead: int, key: []byte, iv: []byte, seq: int, typ: int, content: []byte) -> []byte {
+    w := tls.mkwr()
+    w.u8(23)
+    w.u16(771)
+    w.u16(0)
+    hdroff := len(w.b) - 2
+    inner := tls.bcat(content, mkslice(byte, 1))
+    inner[len(inner) - 1] = typ
+    // aad is the FINAL header — length patched before the seal,
+    // exactly like rec_write's armed branch
+    w.b[hdroff] = (len(inner) + 16) / 256 % 256
+    w.b[hdroff + 1] = (len(inner) + 16) % 256
+    [ct, e] = tls.aead_seal(aead, key, tls.nonce_of(iv, seq), w.b, inner)
+    if e != nil {
+        die("forge seal: " + errors.msg(e))
+    }
+    w.put(ct)
+    return w.b
+}
+
+fn main() {
+    if os.nargs() < 4 {
+        die("usage: capture.oxl <port> <ca.pem> <out.hex>")
+    }
+    port := atoi(os.args(1))
+    cafile := os.args(2)
+    outf := os.args(3)
+
+    roots := x509.Roots{cas: nil}
+    [n, le] = roots.load_pem(os.readfile_(cafile))
+    if le != nil || n < 1 {
+        die("ca load: " + errors.msg(le))
+    }
+    tls.fixture_hook()
+    cfg := tls.default_cfg()
+    cfg.roots = roots
+    [c, e] = tls.dial("127.0.0.1", port, cfg)
+    if e != nil {
+        die("handshake: " + errors.msg(e))
+    }
+    [nw, we] = c.write("GET / HTTP/1.0\r\nhost: x\r\n\r\n" as []byte)
+    if we != nil {
+        die("write: " + errors.msg(we))
+    }
+    // drain the -www status page; the conn stays open in -www mode
+    set_rcvtimo(c.rawfd(), 8)
+    buf := mkslice(byte, 4096)
+    page := mkslice(byte, 0)
+    deadline := now_ms() + 8000
+    for now_ms() < deadline {
+        [nr, re] = c.read(buf)
+        if nr > 0 {
+            i := 0
+            for i < nr {
+                page = push(page, buf[i])
+                i = i + 1
+            }
+        }
+        if re != nil {
+            println("capture: read err: " + errors.msg(re))
+            break
+        }
+        if len(page) > 200 {
+            break
+        }
+    }
+    if len(page) == 0 {
+        die("no app data from s_server")
+    }
+
+    // forged segment: KeyUpdate(update_requested) under the live
+    // epoch's next seq, then app-data + close_notify under the rotated
+    // secret — the replay client must rotate to read them
+    s := c.s
+    seq := s.rseq
+    ku := forge(c, s.aead, s.rkey, s.riv, seq, tls.CT_HANDSHAKE, tls.raw_msg(tls.HS_KEY_UPDATE, mkslice(byte, 1)))
+    [ns, ue] = s.ks.traffic_upd(s.rsecret)
+    if ue != nil {
+        die("traffic_upd: " + errors.msg(ue))
+    }
+    [ki, ke] = s.ks.key_iv(s.suite, ns)
+    if ke != nil {
+        die("key_iv: " + errors.msg(ke))
+    }
+    ad := forge(c, s.aead, ki.key, ki.iv, 0, tls.CT_APPDATA, "hello-x6-replay\n" as []byte)
+    cn := forge(c, s.aead, ki.key, ki.iv, 1, tls.CT_ALERT, unhexb("0100"))
+    i := 0
+    for i < len(ku) {
+        s.capin = push(s.capin, ku[i])
+        i = i + 1
+    }
+    i = 0
+    for i < len(ad) {
+        s.capin = push(s.capin, ad[i])
+        i = i + 1
+    }
+    i = 0
+    for i < len(cn) {
+        s.capin = push(s.capin, cn[i])
+        i = i + 1
+    }
+    rc := os.writefile_(outf, hex.encode(s.capin))
+    if rc < 0 {
+        die("writefile rc=" + itoa(rc) + " to " + outf)
+    }
+    println("capture: wrote " + itoa(len(s.capin)) + " wire bytes, page " + itoa(len(page)) + " bytes")
+    c.close()
+}
+
+fn unhexb(s: str) -> []byte {
+    [b, e] = hex.decode(s)
+    if e != nil {
+        die("unhexb")
+    }
+    return b[0:len(b)]
+}

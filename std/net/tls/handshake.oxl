@@ -1,0 +1,1148 @@
+package tls
+
+// std/net/tls handshake — the client state machine:
+// ClientHello → [HRR ≤1] → ServerHello → EncryptedExtensions →
+// [CertificateRequest] → Certificate → CertificateVerify → Finished
+// → client flight. Contract: items/tls13-wire.md §Handshake state
+// machine + §Offered parameters.
+import "std/errors"
+
+import "std/net"
+
+import "std/encoding/hex"
+
+import "std/crypto/x509"
+
+import "std/crypto/x25519"
+
+import "std/crypto/nistec"
+
+import "std/crypto/rsa"
+
+import "std/crypto/ed25519"
+
+import "std/crypto/sha256"
+
+import "std/crypto/sha512"
+
+import "std/time"
+
+// named groups
+let G_X25519 = 29
+
+let G_P256 = 23
+
+let G_P384 = 24
+
+// signature_algorithms offered (decimal forms of the RFC code points)
+let SA_ECDSA_P256_SHA256 = 1027 // 0x0403
+
+let SA_ECDSA_P384_SHA384 = 1283 // 0x0503
+
+let SA_ED25519 = 2055 // 0x0807
+
+let SA_PSS_SHA256 = 2052 // 0x0804
+
+let SA_PSS_SHA384 = 2053 // 0x0805
+
+let SA_PSS_SHA512 = 2054 // 0x0806
+
+let SA_PKCS1_SHA256 = 1025 // 0x0401
+
+let SA_PKCS1_SHA384 = 1281 // 0x0501
+
+let SA_PKCS1_SHA512 = 1537 // 0x0601
+
+// extension types
+let X_SERVER_NAME = 0
+
+let X_SUPPORTED_GROUPS = 10
+
+let X_SIG_ALGS = 13
+
+let X_ALPN = 16
+
+let X_SUPPORTED_VERS = 43
+
+let X_COOKIE = 44
+
+let X_PSK_MODES = 45
+
+let X_KEY_SHARE = 51
+
+// unhex is hex.decode for compile-time-known constants — a bad
+// literal here is a bug, not input, so it asserts.
+fn unhex(s: str) -> []byte {
+    [b, e] = hex.decode(s)
+    assert(e == nil)
+    return b[0:len(b)]
+}
+
+// hrr_magic is the fixed ServerHello.random that names a
+// HelloRetryRequest (RFC 8446 §4.1.3) — exempt from the
+// downgrade-sentinel check.
+fn hrr_magic() -> []byte {
+    return unhex("cf21ad74e59a6111be1d8c021e65b891c2a211167abb8c5e079e09e2c8a8339c")
+}
+
+// downgrade sentinels — RFC 8446 §4.1.3. We offer 1.3 only, so their
+// presence in a ServerHello.random is an attack, not a negotiation.
+fn downgrade_v12() -> []byte {
+    return unhex("444f574e47524401") // "DOWNGRD\x01"
+}
+
+fn downgrade_v11() -> []byte {
+    return unhex("444f574e47524400") // "DOWNGRD\x00"
+}
+
+// raw_msg wraps a handshake body in its 4-byte header.
+fn raw_msg(ty: int, body: []byte) -> own []byte {
+    w := mkwr()
+    w.u8(ty)
+    w.u24(len(body))
+    w.put(body)
+    return new(w.b)
+}
+
+// th_update feeds raw handshake-message bytes into the transcript —
+// the transcript hashes raw wire bytes, never re-serialized forms.
+fn th_update(c: mut Conn, raw: []byte) -> err {
+    s := c.s
+    if s.th == nil {
+        return errors.new("tls: transcript unbound")
+    }
+    [n, e] = s.th.write(raw)
+    if e != nil || n != len(raw) {
+        return errors.wrap("tls: transcript write", err_keys())
+    }
+    return nil
+}
+
+// th_sum snapshots the running transcript hash (sum doesn't disturb
+// the streaming state).
+fn th_sum(c: mut Conn) -> []byte {
+    return c.s.th.sum(nil)
+}
+
+// hs_send_t is hs_send + transcript update — every handshake message
+// we emit after epoch arm rides this (the flight's messages all join
+// the transcript).
+fn hs_send_t(c: mut Conn, ty: int, body: []byte) -> err {
+    raw := raw_msg(ty, body)
+    e := th_update(c, raw)
+    if e != nil {
+        return e
+    }
+    return rec_write(c, CT_HANDSHAKE, raw)
+}
+
+// ---- ClientHello ---------------------------------------------------------
+
+// is_ipish reports whether name is an IP literal (v4 dotted quad or
+// v6-ish containing ':' / brackets) — SNI is DNS-only, but the
+// hostname check still runs for literals.
+fn is_ipish(name: str) -> bool {
+    if len(name) == 0 {
+        return false
+    }
+    if byteat(name, 0) == 91 { // '['
+        return true
+    }
+    return net.isip4(name) || net.isip6(name)
+}
+
+// ch_exts appends the CH extension block (minus its own u16 wrapper,
+// which the caller emits) to w — share_groups lists the groups to
+// send key_share for ([x25519, p256] initially, [demanded] post-HRR).
+fn ch_exts(c: mut Conn, cfg: Config, share_groups: []int, w: mut wr) -> err {
+    s := c.s
+    // server_name — DNS names only
+    if len(cfg.server_name) > 0 && !is_ipish(cfg.server_name) {
+        w.u16(X_SERVER_NAME)
+        host_off := len(w.b)
+        w.u16(0)
+        w.u16(0) // server_name_list len
+        w.u8(0) // host_name
+        w.u16(len(cfg.server_name))
+        w.putstr(cfg.server_name)
+        w.lenpatch(host_off + 2, 2)
+        w.lenpatch(host_off, 2)
+    }
+    // supported_versions: 0x0304 only
+    w.u16(X_SUPPORTED_VERS)
+    w.u16(3)
+    w.u8(2)
+    w.u8(3)
+    w.u8(4)
+    // supported_groups: all three advertised
+    w.u16(X_SUPPORTED_GROUPS)
+    w.u16(8)
+    w.u16(6)
+    w.u16(G_X25519)
+    w.u16(G_P256)
+    w.u16(G_P384)
+    // key_share — one share per group in share_groups
+    w.u16(X_KEY_SHARE)
+    ks_off := len(w.b)
+    w.u16(0)
+    w.u16(0) // client_shares len
+    i := 0
+    for i < len(share_groups) {
+        g := share_groups[i]
+        if g == G_X25519 {
+            w.u16(G_X25519)
+            w.u16(32)
+            w.put(s.xpk)
+        } else if g == G_P256 {
+            w.u16(G_P256)
+            w.u16(65)
+            w.put(s.ppk)
+        } else if g == G_P384 {
+            // the HRR path generates this share on demand
+            w.u16(G_P384)
+            w.u16(97)
+            w.put(s.gsk_pub)
+        } else {
+            return errors.new("tls: bad share group")
+        }
+        i = i + 1
+    }
+    w.lenpatch(ks_off + 2, 2)
+    w.lenpatch(ks_off, 2)
+    // signature_algorithms — the full advertised set (PKCS#1 values
+    // ride for cert signatures; they are illegal in CV per §4.4.3)
+    w.u16(X_SIG_ALGS)
+    w.u16(20)
+    w.u16(18)
+    w.u16(SA_ECDSA_P256_SHA256)
+    w.u16(SA_ECDSA_P384_SHA384)
+    w.u16(SA_ED25519)
+    w.u16(SA_PSS_SHA256)
+    w.u16(SA_PSS_SHA384)
+    w.u16(SA_PSS_SHA512)
+    w.u16(SA_PKCS1_SHA256)
+    w.u16(SA_PKCS1_SHA384)
+    w.u16(SA_PKCS1_SHA512)
+    // psk_key_exchange_modes — sent for form (we offer no PSKs)
+    w.u16(X_PSK_MODES)
+    w.u16(2)
+    w.u8(1)
+    w.u8(1) // psk_dhe_ke
+    // alpn — only when configured
+    if len(cfg.alpn) > 0 {
+        w.u16(X_ALPN)
+        al_off := len(w.b)
+        w.u16(0)
+        w.u16(0) // protocol_name_list len
+        i = 0
+        for i < len(cfg.alpn) {
+            p := cfg.alpn[i]
+            w.u8(len(p))
+            w.putstr(p)
+            i = i + 1
+        }
+        w.lenpatch(al_off + 2, 2)
+        w.lenpatch(al_off, 2)
+    }
+    // cookie — CH2 only: echo the HRR cookie verbatim (§4.2.2)
+    if len(s.cookie) > 0 {
+        w.u16(X_COOKIE)
+        w.u16(2 + len(s.cookie))
+        w.u16(len(s.cookie))
+        w.put(s.cookie)
+    }
+    return nil
+}
+
+// ch_build marshals the ClientHello handshake message (header
+// included — the transcript and the wire want the same bytes).
+// share_groups selects the key_share contents.
+fn ch_build(c: mut Conn, cfg: Config, share_groups: []int) -> [own []byte, err] {
+    s := c.s
+    w := mkwr()
+    w.u8(HS_CLIENT_HELLO)
+    body_off := len(w.b)
+    w.u24(0)
+    w.u16(771) // legacy_version 0x0303
+    w.put(s.random)
+    w.u8(len(s.session_id))
+    w.put(s.session_id)
+    w.u16(6)
+    w.u16(SUITE_AES128_GCM)
+    w.u16(SUITE_CHACHA20)
+    w.u16(SUITE_AES256_GCM)
+    w.u8(1)
+    w.u8(0) // null compression
+    exts_off := len(w.b)
+    w.u16(0)
+    e := ch_exts(c, cfg, share_groups, w)
+    if e != nil {
+        return nil, e
+    }
+    w.lenpatch(exts_off, 2)
+    w.lenpatch(body_off, 3)
+    return new(w.b), nil
+}
+
+// keygen draws the client random, session id, and both ECDHE shares —
+// every draw rides crand so the test hook pins the whole CH.
+fn keygen(c: mut Conn) -> err {
+    s := c.s
+    s.random = mkslice(byte, 32)
+    e := crand(s.random)
+    if e != nil {
+        return e
+    }
+    s.session_id = mkslice(byte, 32)
+    e = crand(s.session_id)
+    if e != nil {
+        return e
+    }
+    s.xsk = mkslice(byte, 32)
+    e = crand(s.xsk)
+    if e != nil {
+        return e
+    }
+    bp := mkslice(byte, 32)
+    bp[0] = 9
+    s.xpk = x25519.scalarmult(s.xsk, bp)
+    s.psk2 = mkslice(byte, 32)
+    e = crand(s.psk2)
+    if e != nil {
+        return e
+    }
+    [pk, e2] = nistec.pub_from_priv(nistec.p256(), s.psk2)
+    if e2 != nil {
+        return e2
+    }
+    s.ppk = pk[0:len(pk)]
+    return nil
+}
+
+// ---- ServerHello / HRR ---------------------------------------------------
+
+// sh is the parsed ServerHello surface we act on.
+struct ShInfo {
+    random: []byte,
+    suite: int,
+    vers_ok: int, // supported_versions carried 0x0304
+    ks_group: int, // key_share group (SH) or demanded group (HRR)
+    ks_key: []byte, // peer's key share bytes (SH only)
+    cookie: []byte,
+    badext: int, // an extension we didn't offer / can't take
+}
+
+fn sh_parse(body: []byte) -> [ShInfo, err] {
+    z := ShInfo{random: nil, suite: 0, vers_ok: 0, ks_group: 0, ks_key: nil, cookie: nil, badext: -1}
+    r := mkrd(body)
+    r.u16() // legacy_version — checked by caller
+    z.random = r.bytes(32)
+    sidlen := r.u8()
+    sid := r.bytes(sidlen)
+    z.suite = r.u16()
+    r.u8() // compression — checked by caller
+    elen := r.u16()
+    if r.ok == 0 {
+        return z, errors.new("tls: malformed server_hello")
+    }
+    end := r.p + elen
+    for r.ok != 0 && r.p < end {
+        ty := r.u16()
+        dlen := r.u16()
+        d := r.bytes(dlen)
+        if r.ok == 0 {
+            break
+        }
+        if ty == X_SUPPORTED_VERS {
+            if len(d) == 2 && d[0] == 3 && d[1] == 4 {
+                z.vers_ok = 1
+            } else {
+                z.vers_ok = -1 // present but not 0x0304
+            }
+        } else if ty == X_KEY_SHARE {
+            if len(d) == 2 {
+                // HRR form: bare group demand
+                z.ks_group = d[0] * 256 + d[1]
+            } else if len(d) >= 4 {
+                z.ks_group = d[0] * 256 + d[1]
+                klen := d[2] * 256 + d[3]
+                if len(d) == 4 + klen {
+                    z.ks_key = d[4:len(d)]
+                } else {
+                    z.badext = ty
+                }
+            } else {
+                z.badext = ty
+            }
+        } else if ty == X_COOKIE {
+            if len(d) >= 2 {
+                cl := d[0] * 256 + d[1]
+                if len(d) == 2 + cl {
+                    z.cookie = d[2:len(d)]
+                } else {
+                    z.badext = ty
+                }
+            } else {
+                z.badext = ty
+            }
+        } else {
+            // an extension we didn't offer — illegal_parameter
+            z.badext = ty
+        }
+    }
+    if r.ok == 0 || r.p != end {
+        return z, errors.new("tls: malformed server_hello")
+    }
+    return z, nil
+}
+
+// ecdhe computes the shared secret for the negotiated group —
+// x25519 answers with the RFC 7748 all-zero check, nist groups ride
+// point_sec1's point-on-curve gate (invalid-curve defense).
+fn ecdhe(c: mut Conn, group: int, pub: []byte) -> [own []byte, err] {
+    s := c.s
+    if group == G_X25519 {
+        if len(pub) != 32 {
+            return nil, errors.new("tls: bad x25519 share length")
+        }
+        z := x25519.scalarmult(s.gsk, pub)
+        if biszero(z) {
+            return nil, errors.wrap("tls: x25519 all-zero output", err_proto())
+        }
+        return z, nil
+    }
+    if group == G_P256 {
+        return nistec.ecdh(nistec.p256(), s.gsk, pub)
+    }
+    if group == G_P384 {
+        return nistec.ecdh(nistec.p384(), s.gsk, pub)
+    }
+    return nil, errors.new("tls: unknown group")
+}
+
+// sel_share picks our private key for a key_share group we offered a
+// share for — post-HRR this is the demanded group (generated fresh
+// for p384, which CH1 never carries a share of).
+fn sel_share(c: mut Conn, group: int) -> err {
+    s := c.s
+    if group == G_X25519 {
+        s.gsk = s.xsk
+        return nil
+    }
+    if group == G_P256 {
+        s.gsk = s.psk2
+        return nil
+    }
+    if group == G_P384 {
+        sk := mkslice(byte, 48)
+        e := crand(sk)
+        if e != nil {
+            return e
+        }
+        s.gsk = sk
+        [pk, e2] = nistec.pub_from_priv(nistec.p384(), sk)
+        if e2 != nil {
+            return e2
+        }
+        s.gsk_pub = pk[0:len(pk)]
+        return nil
+    }
+    return errors.new("tls: share not offered")
+}
+
+// group_offered reports whether a key_share for group was actually in
+// the CH the peer saw — merely listing it in supported_groups carries
+// no ECDHE secret.
+fn share_sent(group: int, shares: []int) -> bool {
+    i := 0
+    for i < len(shares) {
+        if shares[i] == group {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// ---- encrypted extensions -------------------------------------------------
+fn ee_parse(c: mut Conn, body: []byte, cfg: Config) -> err {
+    s := c.s
+    r := mkrd(body)
+    elen := r.u16()
+    if r.ok == 0 {
+        return fail(c, AL_DECODE_ERR, "bad encrypted_extensions")
+    }
+    end := r.p + elen
+    for r.ok != 0 && r.p < end {
+        ty := r.u16()
+        dlen := r.u16()
+        d := r.bytes(dlen)
+        if r.ok == 0 {
+            break
+        }
+        if ty == X_ALPN {
+            // echo must be exactly one protocol from our list
+            if len(d) < 3 {
+                return fail(c, AL_DECODE_ERR, "bad alpn ext")
+            }
+            plen := d[2]
+            if len(d) != 3 + plen {
+                return fail(c, AL_DECODE_ERR, "bad alpn ext")
+            }
+            pb := mkslice(byte, plen)
+            i := 0
+            for i < plen {
+                pb[i] = d[3 + i]
+                i = i + 1
+            }
+            proto := pb as str
+            if !slices_contains_str(cfg.alpn, proto) {
+                // RFC 7301 names no_application_protocol; the wire
+                // doc pins illegal_parameter — the divergence is
+                // documented in docs/tls.md
+                return fail(c, AL_ILLEGAL_PARAM, "alpn echo not offered")
+            }
+            s.alpn = proto
+        } else if ty == X_SERVER_NAME {
+            // empty SNI ack — must carry no data
+            if len(d) != 0 {
+                return fail(c, AL_ILLEGAL_PARAM, "server_name ext with data")
+            }
+        } else if ty == X_SUPPORTED_GROUPS {
+            // informational — the server updating its preference list
+        } else {
+            return fail(c, AL_ILLEGAL_PARAM, "unoffered extension " + itoa(ty))
+        }
+    }
+    if r.ok == 0 || r.p != end {
+        return fail(c, AL_DECODE_ERR, "bad encrypted_extensions")
+    }
+    return nil
+}
+
+fn slices_contains_str(v: []str, x: str) -> bool {
+    i := 0
+    for i < len(v) {
+        if v[i] == x {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// ---- certificate flight ----------------------------------------------------
+
+// CertMsg is a parsed Certificate message — context + DER certs.
+struct CertMsg { ctx: []byte, ders: [][]byte }
+
+// cert_msg_parse splits a Certificate message — per-entry extensions
+// (OCSP staples, SCTs) parse over, ignored.
+fn cert_msg_parse(body: []byte) -> [CertMsg, err] {
+    z := CertMsg{ctx: nil, ders: nil}
+    r := mkrd(body)
+    ctx := r.bytes(r.u8())
+    tot := r.u24()
+    if r.ok == 0 || r.left() < tot {
+        return z, errors.new("tls: bad certificate message")
+    }
+    end := r.p + tot
+    let out: [][]byte = nil
+    for r.p < end {
+        clen := r.u24()
+        der := r.bytes(clen)
+        xlen := r.u16()
+        xexts := r.bytes(xlen) // parsed over, ignored
+        if r.ok == 0 {
+            return z, errors.new("tls: bad certificate entry")
+        }
+        out = push(out, der)
+    }
+    if r.p != end {
+        return z, errors.new("tls: bad certificate list")
+    }
+    z.ctx = bclone(ctx)
+    z.ders = out
+    return z, nil
+}
+
+// x509_alert maps a verification verdict to the alert the peer
+// should see — the wire doc pins: CV *signature* → decrypt_error,
+// chain-sig/parse → bad_certificate, validity → certificate_expired.
+fn x509_alert(e: err) -> int {
+    if errors.is(e, x509.err_expired()) || errors.is(e, x509.err_notyet()) {
+        return AL_CERT_EXPIRED
+    }
+    if errors.is(e, x509.err_root()) {
+        return AL_UNKNOWN_CA
+    }
+    if errors.is(e, x509.err_roots()) {
+        return AL_INTERNAL
+    }
+    return AL_BAD_CERT
+}
+
+// verify_chain runs the configured verification — cfg.verify
+// replaces BOTH chain and hostname checks; nil rides
+// x509.verify + match_hostname with lazy system roots.
+fn verify_chain(c: mut Conn, cfg: Config, leaf: x509.Cert, untrusted: []x509.Cert) -> err {
+    if cfg.verify != nil {
+        e := cfg.verify.check(leaf, untrusted)
+        if e != nil {
+            send_alert(c, 2, AL_BAD_CERT)
+            return e
+        }
+        return nil
+    }
+    roots := cfg.roots
+    if roots.cas == nil {
+        [r, e] = x509.load_system_roots()
+        if e != nil {
+            send_alert(c, 2, AL_INTERNAL)
+            return errors.wrap("tls: " + errors.msg(e), e)
+        }
+        roots = r
+    }
+    [vpath, e] = x509.verify(leaf, untrusted, roots, cfg.server_name, time.unix())
+    if e != nil {
+        send_alert(c, 2, x509_alert(e))
+        return errors.wrap("tls: " + errors.msg(e), e)
+    }
+    return nil
+}
+
+// cv_verify checks the CertificateVerify signature over the running
+// transcript (CH..Certificate): alg must be CV-legal and offered;
+// signature failure → decrypt_error, never a bare close.
+fn cv_verify(c: mut Conn, body: []byte) -> err {
+    s := c.s
+    r := mkrd(body)
+    alg := r.u16()
+    sig := r.bytes(r.u16())
+    if r.ok == 0 {
+        return fail(c, AL_DECODE_ERR, "bad certificate_verify")
+    }
+    // CV-legal set: rsa_pss_rsae_*, ecdsa_*, ed25519 — rsa_pkcs1_*
+    // values are advertised (cert signatures need them) but illegal
+    // here per RFC 8446 §4.4.3
+    legal := alg == SA_PSS_SHA256 || alg == SA_PSS_SHA384 || alg == SA_PSS_SHA512 || alg == SA_ECDSA_P256_SHA256 || alg == SA_ECDSA_P384_SHA384 || alg == SA_ED25519
+    if !legal {
+        return fail(c, AL_ILLEGAL_PARAM, "certificate_verify alg " + itoa(alg))
+    }
+    leaf := s.leaf
+    [key, ke] = x509.spki_key(leaf.spki)
+    if ke != nil {
+        return fail(c, AL_BAD_CERT, "leaf spki unreadable")
+    }
+    // signed content: 0x20*64 || "TLS 1.3, server CertificateVerify"
+    // || 0x00 || transcript(CH..Certificate)
+    w := mkwr()
+    i := 0
+    for i < 64 {
+        w.u8(32)
+        i = i + 1
+    }
+    w.putstr("TLS 1.3, server CertificateVerify")
+    w.u8(0)
+    w.put(th_sum(c))
+    content := w.b
+    ve := errors.new("tls: bad cv alg")
+    if alg == SA_PSS_SHA256 || alg == SA_PSS_SHA384 || alg == SA_PSS_SHA512 {
+        if leaf.spki_alg != x509.SPKI_rsa {
+            return fail(c, AL_ILLEGAL_PARAM, "pss cv on non-rsa key")
+        }
+        [pk, e] = rsa.parse_pub_key(key)
+        if e != nil {
+            return fail(c, AL_BAD_CERT, "leaf rsa key unreadable")
+        }
+        if alg == SA_PSS_SHA256 {
+            ve = rsa.verify_pss(pk, sha256.new, content, sig, 32)
+        } else if alg == SA_PSS_SHA384 {
+            ve = rsa.verify_pss(pk, sha512.new384, content, sig, 48)
+        } else {
+            ve = rsa.verify_pss(pk, sha512.new, content, sig, 64)
+        }
+    } else if alg == SA_ECDSA_P256_SHA256 || alg == SA_ECDSA_P384_SHA384 {
+        want := x509.SPKI_ec_p256
+        if alg == SA_ECDSA_P384_SHA384 {
+            want = x509.SPKI_ec_p384
+        }
+        if leaf.spki_alg != want {
+            return fail(c, AL_ILLEGAL_PARAM, "ecdsa cv on wrong curve key")
+        }
+        [rs, e] = x509.ecdsa_rs(sig)
+        if e != nil {
+            return fail(c, AL_DECRYPT_ERR, "bad ecdsa signature der")
+        }
+        if alg == SA_ECDSA_P256_SHA256 {
+            ve = nistec.ecdsa_verify(nistec.p256(), key, sha256.new, content, rs.r, rs.s)
+        } else {
+            ve = nistec.ecdsa_verify(nistec.p384(), key, sha512.new384, content, rs.r, rs.s)
+        }
+    } else {
+        if leaf.spki_alg != x509.SPKI_ed25519 {
+            return fail(c, AL_ILLEGAL_PARAM, "ed25519 cv on wrong key")
+        }
+        ve = ed25519.verify(key, content, sig)
+    }
+    if ve != nil {
+        return fail(c, AL_DECRYPT_ERR, "certificate_verify: " + errors.msg(ve))
+    }
+    return nil
+}
+
+// fin_verify checks the server Finished: verify_data ==
+// HMAC(finished_key(s_hs), transcript(CH..CV)).
+fn fin_verify(c: mut Conn, body: []byte) -> err {
+    s := c.s
+    if len(body) != s.hlen {
+        return fail(c, AL_DECODE_ERR, "bad finished length")
+    }
+    [fk, e] = s.ks.finished_key(s.ks.s_hs)
+    if e != nil {
+        return errors.wrap("tls: finished_key: " + errors.msg(e), err_keys())
+    }
+    [vd, e2] = hmac_sum(s.hf, fk, th_sum(c))
+    if e2 != nil {
+        return errors.wrap("tls: finished mac: " + errors.msg(e2), err_keys())
+    }
+    if !bequal(body, vd) {
+        return fail(c, AL_DECRYPT_ERR, "finished verify_data mismatch")
+    }
+    return nil
+}
+
+// send_client_finished computes and emits our Finished —
+// verify_data = HMAC(finished_key(c_hs), transcript-so-far). The
+// message then joins the transcript itself.
+fn send_client_finished(c: mut Conn) -> err {
+    s := c.s
+    [fk, e] = s.ks.finished_key(s.c_hs)
+    if e != nil {
+        return errors.wrap("tls: finished_key: " + errors.msg(e), err_keys())
+    }
+    [vd, e2] = hmac_sum(s.hf, fk, th_sum(c))
+    if e2 != nil {
+        return errors.wrap("tls: finished mac: " + errors.msg(e2), err_keys())
+    }
+    return hs_send_t(c, HS_FINISHED, vd)
+}
+
+// client_flight is the post-server-Finished emission: [empty
+// Certificate when a CertificateRequest arrived] + Finished.
+fn client_flight(c: mut Conn) -> err {
+    s := c.s
+    if s.cr_seen != 0 {
+        // RFC-mandated answer: empty certificate_list, context echoed
+        // — and RFC 8446 forbids CertificateVerify without a
+        // non-empty Certificate, so none follows
+        w := mkwr()
+        w.u8(len(s.cr_ctx))
+        w.put(s.cr_ctx)
+        w.u24(0)
+        e := hs_send_t(c, HS_CERTIFICATE, w.b)
+        if e != nil {
+            return e
+        }
+    }
+    return send_client_finished(c)
+}
+
+// ---- the driver -------------------------------------------------------------
+
+// arm_read installs an inbound epoch (key+iv from a traffic secret,
+// seq reset).
+fn arm_read(c: mut Conn, secret: []byte) -> err {
+    s := c.s
+    [ki, e] = s.ks.key_iv(s.suite, secret)
+    if e != nil {
+        return errors.wrap("tls: traffic keys: " + errors.msg(e), err_keys())
+    }
+    s.rkey = ki.key
+    s.riv = ki.iv
+    s.rseq = 0
+    s.ren = 1
+    s.rsecret = secret
+    return nil
+}
+
+fn arm_write(c: mut Conn, secret: []byte) -> err {
+    s := c.s
+    [ki, e] = s.ks.key_iv(s.suite, secret)
+    if e != nil {
+        return errors.wrap("tls: traffic keys: " + errors.msg(e), err_keys())
+    }
+    s.wkey = ki.key
+    s.wiv = ki.iv
+    s.wseq = 0
+    s.wen = 1
+    s.wsecret = secret
+    return nil
+}
+
+// hs_client drives the state machine to completion (or a wrapped
+// err — alerts already emitted on the paths that name one).
+fn hs_client(c: mut Conn, cfg: Config) -> err {
+    s := c.s
+    e := keygen(c)
+    if e != nil {
+        return e
+    }
+    shares := mkslice(int, 0)
+    shares = push(shares, G_X25519)
+    shares = push(shares, G_P256)
+    [ch, e2] = ch_build(c, cfg, shares)
+    if e2 != nil {
+        return e2
+    }
+    s.ch1 = ch[0:len(ch)]
+    e = rec_write(c, CT_HANDSHAKE, ch)
+    if e != nil {
+        return e
+    }
+    // compat mode: one dummy ChangeCipherSpec (§D.4 middlebox
+    // accommodation); inbound CCS is tolerated once per direction
+    ccsb := mkslice(byte, 1)
+    ccsb[0] = 1
+    e = rec_write(c, CT_CCS, ccsb)
+    if e != nil {
+        return e
+    }
+    // the receive budget begins with the server flight
+    s.deadline = now_ms() + s.hs_tmo
+
+    // ---- ServerHello / HelloRetryRequest ----
+    [m0, e3] = hs_next(c)
+    if e3 != nil {
+        return e3
+    }
+    if m0.ty != HS_SERVER_HELLO {
+        return fail(c, AL_UNEXPECTED, "expected server_hello, got " + itoa(m0.ty))
+    }
+    raw := m0.raw
+    [sh, she] = sh_parse(raw[4:len(raw)])
+    if she != nil {
+        return fail(c, AL_DECODE_ERR, "bad server_hello")
+    }
+    if !suite_ok(sh.suite) {
+        return fail(c, AL_ILLEGAL_PARAM, "unoffered cipher suite")
+    }
+    is_hrr := bequal(sh.random, hrr_magic())
+    if !is_hrr {
+        tail := sh.random[24:32]
+        if bequal(tail, downgrade_v12()) || bequal(tail, downgrade_v11()) {
+            return fail(c, AL_ILLEGAL_PARAM, "downgrade sentinel in server random")
+        }
+    }
+    // session id echo is mandatory in compat mode (§4.1.3)
+    r2 := mkrd(raw[4:len(raw)])
+    r2.u16()
+    r2.bytes(32)
+    echo := r2.bytes(r2.u8())
+    if r2.ok == 0 || !bequal(echo, s.session_id) {
+        return fail(c, AL_ILLEGAL_PARAM, "session id echo mismatch")
+    }
+    r2.u16()
+    if r2.u8() != 0 {
+        return fail(c, AL_ILLEGAL_PARAM, "nonzero compression")
+    }
+    if sh.vers_ok <= 0 {
+        // a 0x0303-only ServerHello is a 1.2 answer — mandatory
+        // supported_versions pin missing/wrong
+        return fail(c, AL_PROTOCOL_VER, "server_hello without tls 1.3")
+    }
+    s.suite = sh.suite
+    s.aead = suite_aead(sh.suite)
+    s.hlen = suite_hlen(sh.suite)
+    s.hf = suite_hash(sh.suite)
+    [kst, kbe] = ks_begin(s.hf, s.hlen)
+    if kbe != nil {
+        return errors.wrap("tls: key schedule: " + errors.msg(kbe), err_keys())
+    }
+    s.ks = kst
+
+    if is_hrr {
+        e = hrr_apply(c, raw, sh, shares, cfg)
+        if e != nil {
+            return e
+        }
+        // second ServerHello — an HRR may not repeat
+        [m3, e3b] = hs_next(c)
+        if e3b != nil {
+            return e3b
+        }
+        if m3.ty != HS_SERVER_HELLO {
+            return fail(c, AL_UNEXPECTED, "expected server_hello after hrr")
+        }
+        raw3 := m3.raw
+        [sh3, she3] = sh_parse(raw3[4:len(raw3)])
+        if she3 != nil {
+            return fail(c, AL_DECODE_ERR, "bad server_hello")
+        }
+        if bequal(sh3.random, hrr_magic()) {
+            return fail(c, AL_UNEXPECTED, "second hello_retry_request")
+        }
+        tail := sh3.random[24:32]
+        if bequal(tail, downgrade_v12()) || bequal(tail, downgrade_v11()) {
+            return fail(c, AL_ILLEGAL_PARAM, "downgrade sentinel in server random")
+        }
+        if sh3.suite != sh.suite {
+            return fail(c, AL_ILLEGAL_PARAM, "suite changed across hrr")
+        }
+        rr := mkrd(raw3[4:len(raw3)])
+        rr.u16()
+        rr.bytes(32)
+        echo2 := rr.bytes(rr.u8())
+        if rr.ok == 0 || !bequal(echo2, s.session_id) {
+            return fail(c, AL_ILLEGAL_PARAM, "session id echo mismatch")
+        }
+        rr.u16()
+        if rr.u8() != 0 {
+            return fail(c, AL_ILLEGAL_PARAM, "nonzero compression")
+        }
+        if sh3.vers_ok <= 0 {
+            return fail(c, AL_PROTOCOL_VER, "server_hello without tls 1.3")
+        }
+        if sh3.badext >= 0 {
+            return fail(c, AL_ILLEGAL_PARAM, "unoffered extension " + itoa(sh3.badext))
+        }
+        // post-HRR the only share that carries a secret is the
+        // demanded one
+        if sh3.ks_group != s.group || len(sh3.ks_key) == 0 {
+            return fail(c, AL_ILLEGAL_PARAM, "bad key_share after hrr")
+        }
+        th_update(c, raw3)
+        sh = sh3
+        raw = raw3
+    } else {
+        if sh.badext >= 0 {
+            return fail(c, AL_ILLEGAL_PARAM, "unoffered extension " + itoa(sh.badext))
+        }
+        // plain SH: the selected group must be one whose key_share we
+        // actually sent
+        if !share_sent(sh.ks_group, shares) || len(sh.ks_key) == 0 {
+            return fail(c, AL_ILLEGAL_PARAM, "key_share for unsent group")
+        }
+        s.group = sh.ks_group
+        e = sel_share(c, sh.ks_group)
+        if e != nil {
+            return fail(c, AL_ILLEGAL_PARAM, "key_share for unsent group")
+        }
+        // transcript begins now the suite (and its hash) is known
+        s.th = s.hf()
+        th_update(c, s.ch1)
+        th_update(c, raw)
+    }
+
+    // ECDHE — the peer's share validates BEFORE use (all-zero /
+    // point-on-curve live inside ecdhe)
+    [shared, e4] = ecdhe(c, s.group, sh.ks_key)
+    if e4 != nil {
+        if errors.is(e4, err_proto()) {
+            return fail(c, AL_ILLEGAL_PARAM, "x25519 all-zero share")
+        }
+        return fail(c, AL_ILLEGAL_PARAM, "bad peer key_share")
+    }
+    // handshake epoch: transcript(CH..SH) keys the hs traffic secrets
+    e = s.ks.handshake(shared, th_sum(c))
+    if e != nil {
+        return errors.wrap("tls: key schedule: " + errors.msg(e), err_keys())
+    }
+    s.c_hs = s.ks.c_hs
+    e = arm_read(c, s.ks.s_hs)
+    if e != nil {
+        return e
+    }
+
+    // ---- server flight: EE [CR] Cert CV Fin ----
+    state := 0 // 0=expect EE, 1=Cert|CR, 2=CV, 3=Fin
+    done := 0
+    for done == 0 {
+        [hm, me] = hs_next(c)
+        if me != nil {
+            return me
+        }
+        mty := hm.ty
+        mraw := hm.raw
+        body := mraw[4:len(mraw)]
+        if mty == HS_ENCRYPTED_EXT {
+            if state != 0 {
+                return fail(c, AL_UNEXPECTED, "encrypted_extensions out of order")
+            }
+            e = ee_parse(c, body, cfg)
+            if e != nil {
+                return e
+            }
+            state = 1
+        } else if mty == HS_CERT_REQUEST {
+            if state != 1 {
+                return fail(c, AL_UNEXPECTED, "certificate_request out of order")
+            }
+            rr := mkrd(body)
+            ctx := rr.bytes(rr.u8())
+            if rr.ok == 0 {
+                return fail(c, AL_DECODE_ERR, "bad certificate_request")
+            }
+            s.cr_seen = 1
+            s.cr_ctx = bclone(ctx)
+        } else if mty == HS_CERTIFICATE {
+            if state != 1 {
+                return fail(c, AL_UNEXPECTED, "certificate out of order")
+            }
+            [cm, pe] = cert_msg_parse(body)
+            if pe != nil {
+                return fail(c, AL_DECODE_ERR, "bad certificate: " + errors.msg(pe))
+            }
+            if len(cm.ctx) != 0 {
+                return fail(c, AL_ILLEGAL_PARAM, "nonempty certificate context")
+            }
+            if len(cm.ders) == 0 {
+                return fail(c, AL_BAD_CERT, "empty certificate")
+            }
+            [leaf, le] = x509.parse_cert(cm.ders[0])
+            if le != nil {
+                send_alert(c, 2, AL_BAD_CERT)
+                return errors.wrap("tls: leaf: " + errors.msg(le), le)
+            }
+            chain := mkslice(x509.Cert, 0)
+            i := 1
+            for i < len(cm.ders) {
+                [cc, ce2] = x509.parse_cert(cm.ders[i])
+                if ce2 != nil {
+                    send_alert(c, 2, AL_BAD_CERT)
+                    return errors.wrap("tls: chain cert: " + errors.msg(ce2), ce2)
+                }
+                chain = push(chain, cc)
+                i = i + 1
+            }
+            s.leaf = leaf
+            s.has_leaf = 1
+            e = verify_chain(c, cfg, leaf, chain)
+            if e != nil {
+                return e
+            }
+            state = 2
+        } else if mty == HS_CERT_VERIFY {
+            if state != 2 {
+                return fail(c, AL_UNEXPECTED, "certificate_verify out of order")
+            }
+            e = cv_verify(c, body)
+            if e != nil {
+                return e
+            }
+            state = 3
+        } else if mty == HS_FINISHED {
+            if state != 3 {
+                return fail(c, AL_UNEXPECTED, "finished out of order")
+            }
+            e = fin_verify(c, body)
+            if e != nil {
+                return e
+            }
+            done = 1
+        } else {
+            return fail(c, AL_UNEXPECTED, "message type " + itoa(mty) + " in server flight")
+        }
+        // every flight message joins the transcript in wire order —
+        // CV/Finished verified against the pre-message hash, then
+        // fold in for the next
+        e = th_update(c, mraw)
+        if e != nil {
+            return e
+        }
+    }
+
+    // ---- client flight + app epoch ----
+    e = arm_write(c, s.ks.c_hs)
+    if e != nil {
+        return e
+    }
+    // transcript(CH..server Finished) keys the app traffic secrets —
+    // snapshot BEFORE our own Finished joins the transcript
+    th_app := th_sum(c)
+    e = client_flight(c)
+    if e != nil {
+        return e
+    }
+    e = s.ks.app(th_app)
+    if e != nil {
+        return errors.wrap("tls: key schedule: " + errors.msg(e), err_keys())
+    }
+    e = arm_write(c, s.ks.c_ap)
+    if e != nil {
+        return e
+    }
+    e = arm_read(c, s.ks.s_ap)
+    if e != nil {
+        return e
+    }
+    // handshake budget disarms — the caller's own set_*timo applies
+    // from here on
+    s.deadline = 0
+    set_rcvtimo_ms(c.inner.fd, 0)
+    return nil
+}
+
+// hrr_apply rebuilds state for ClientHello#2: transcript resynthesis
+// per §4.4.1 (message_hash of CH1 replaces CH1, then the HRR itself),
+// cookie echo, and a key_share for the demanded group — or the
+// existing shares when the HRR carries only a cookie.
+fn hrr_apply(c: mut Conn, raw: []byte, sh: ShInfo, shares: []int, cfg: Config) -> err {
+    s := c.s
+    if s.hrr != 0 {
+        return fail(c, AL_UNEXPECTED, "second hello_retry_request")
+    }
+    s.hrr = 1
+    if sh.badext >= 0 {
+        return fail(c, AL_ILLEGAL_PARAM, "unoffered hrr extension " + itoa(sh.badext))
+    }
+    // demanded group must be one we advertise
+    if sh.ks_group != 0 && sh.ks_group != G_X25519 && sh.ks_group != G_P256 && sh.ks_group != G_P384 {
+        return fail(c, AL_ILLEGAL_PARAM, "hrr demands unknown group " + itoa(sh.ks_group))
+    }
+    s.group = sh.ks_group
+    if len(sh.cookie) > 0 {
+        s.cookie = bclone(sh.cookie)
+    }
+    // transcript resynthesis — the hash is now known (suite came in
+    // the HRR), so: hash( CH1 ) wrapped in a message_hash handshake
+    // msg, then the HRR's raw bytes
+    s.th = s.hf()
+    h1 := s.hf()
+    [wn, e] = h1.write(s.ch1)
+    if e != nil {
+        return errors.wrap("tls: transcript write", err_keys())
+    }
+    mh := raw_msg(HS_MESSAGE_HASH, h1.sum(nil))
+    e = th_update(c, mh)
+    if e != nil {
+        return e
+    }
+    e = th_update(c, raw)
+    if e != nil {
+        return e
+    }
+    // CH2: same random + session id; key_share for the demanded group
+    // — a cookie-only HRR keeps the original shares
+    newshares := shares
+    if s.group != 0 {
+        if !share_sent(s.group, shares) && s.group != G_P384 {
+            return fail(c, AL_ILLEGAL_PARAM, "hrr demands unoffered group")
+        }
+        e = sel_share(c, s.group)
+        if e != nil {
+            return fail(c, AL_ILLEGAL_PARAM, "hrr demands unoffered group")
+        }
+        newshares = mkslice(int, 0)
+        newshares = push(newshares, s.group)
+    }
+    [ch2, e2] = ch_build(c, cfg, newshares)
+    if e2 != nil {
+        return e2
+    }
+    e = rec_write(c, CT_HANDSHAKE, ch2)
+    if e != nil {
+        return e
+    }
+    return th_update(c, ch2)
+}

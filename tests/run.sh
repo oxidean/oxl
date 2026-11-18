@@ -381,7 +381,7 @@ out=$("$OXL" test tests/aesgcm_test.oxl) || { printf '%s
 ' "$out" >&2; exit 1; }
 printf '%s
 ' "$out" >&2
-for t in test_aes_block test_gcm test_aead_perf; do
+for t in test_aes_block test_gcm test_gcm_carry test_aead_perf; do
     grep -q "$t ... ok" <<<"$out" || { echo "FAIL aesgcm: $out"; exit 1; }
 done
 out=$("$OXL" test tests/chacha_test.oxl) || { printf '%s
@@ -536,6 +536,22 @@ out=$(OXL_SSL_CERT_FILE= OXL_SSL_CERT_DIR=tests/fixtures/x509/dirbad "$OXL" test
 printf '%s\n' "$out" >&2
 for t in test_env_dir_bad_entry; do
     grep -q "$t ... ok" <<<"$out" || { echo "FAIL x509 env_dirbad: $out"; exit 1; }
+done
+
+echo "== oxl test: tls (x6) =="
+out=$("$OXL" test tests/tls_keys_test.oxl) || { printf '%s
+' "$out" >&2; exit 1; }
+printf '%s
+' "$out" >&2
+for t in test_keyschedule test_record; do
+    grep -q "$t ... ok" <<<"$out" || { echo "FAIL tls_keys: $out"; exit 1; }
+done
+out=$("$OXL" test tests/tls_handshake_test.oxl) || { printf '%s
+' "$out" >&2; exit 1; }
+printf '%s
+' "$out" >&2
+for t in test_handshake test_rawfd_and_adapters; do
+    grep -q "$t ... ok" <<<"$out" || { echo "FAIL tls_handshake: $out"; exit 1; }
 done
 
 echo "== oxl test: compress & archive =="
@@ -1480,11 +1496,12 @@ done
 # s4 enc/hash/crypto + x1/x3/x4 crypto through the self-hosted emitter +
 # cc — exercises [][]str return emission (csv.read_all), hash/crypto,
 # and the big-limb arithmetic under -test
-for tf in enc hash crypto aesgcm chacha sha512 hkdf crypto_rand bignum rsa x25519 nistec ed25519 x509; do
+for tf in enc hash crypto aesgcm chacha sha512 hkdf crypto_rand bignum rsa x25519 nistec ed25519 x509 tls_keys tls_handshake; do
     "$OXL" run bootstrap/cmd/codegen -- --test "tests/${tf}_test.oxl" > "$cgen_dir/$tf.c"
-    tfcrypto=""; tfcryptolib=""
+    tfcrypto=""; tfcryptolib=""; tfnet=""
     grep -q 'rt_csrand(' "$cgen_dir/$tf.c" && { tfcrypto="-DOXL_CRYPTO"; tfcryptolib="$CRYPTO_LIBS"; }
-    "$CC" -O2 $THREAD_FLAG -Iruntime $tfcrypto "$cgen_dir/$tf.c" runtime/rt.c $tfcryptolib $NET_LIBS -o "$cgen_dir/$tf$EXE" || { echo "FAIL codegen cc $tf"; exit 1; }
+    grep -qE 'rt_sock_|rt_bind_any|rt_set_(reuseaddr|rcvtimo|sndtimo)|rt_htons|rt_htonl' "$cgen_dir/$tf.c" && tfnet="-DOXL_NET"
+    "$CC" -O2 $THREAD_FLAG -Iruntime $tfnet $tfcrypto "$cgen_dir/$tf.c" runtime/rt.c $tfcryptolib $NET_LIBS -o "$cgen_dir/$tf$EXE" || { echo "FAIL codegen cc $tf"; exit 1; }
     "$cgen_dir/$tf$EXE" > "$cgen_dir/$tf.out"
     printf '%s
 ' "$(cat "$cgen_dir/$tf.out")" >&2
@@ -1498,7 +1515,7 @@ done
 for t in test_sha256 test_md5 test_hmac; do
     grep -q "$t ... ok" "$cgen_dir/crypto.out" || { echo "FAIL codegen crypto $t"; cat "$cgen_dir/crypto.out"; exit 1; }
 done
-for t in test_aes_block test_gcm; do
+for t in test_aes_block test_gcm test_gcm_carry; do
     grep -q "$t ... ok" "$cgen_dir/aesgcm.out" || { echo "FAIL codegen aesgcm $t"; cat "$cgen_dir/aesgcm.out"; exit 1; }
 done
 for t in test_chacha20 test_poly1305 test_aead; do
@@ -1530,6 +1547,12 @@ for t in test_ed25519; do
 done
 for t in test_parse test_chain_ok test_expired test_bad_name test_wildcard test_untrusted test_bad_ca test_sha1_reject test_eku test_ip_san test_self_anchor test_anchor_exemption test_critical_ext test_search_bounds test_badsig test_xsign_alternates; do
     grep -q "$t ... ok" "$cgen_dir/x509.out" || { echo "FAIL codegen x509 $t"; cat "$cgen_dir/x509.out"; exit 1; }
+done
+for t in test_keyschedule test_record; do
+    grep -q "$t ... ok" "$cgen_dir/tls_keys.out" || { echo "FAIL codegen tls_keys $t"; cat "$cgen_dir/tls_keys.out"; exit 1; }
+done
+for t in test_handshake test_rawfd_and_adapters; do
+    grep -q "$t ... ok" "$cgen_dir/tls_handshake.out" || { echo "FAIL codegen tls_handshake $t"; cat "$cgen_dir/tls_handshake.out"; exit 1; }
 done
 # x5 env-root discovery through codegen — the same three
 # configurations as the native lane

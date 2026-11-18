@@ -1,0 +1,20 @@
+package main
+
+import "std/bytes"
+
+import "std/io"
+
+fn leak(flag: bool) -> io.Reader {
+    a := mkslice(io.Reader, 1)
+    b := a
+    c := mkslice(io.Reader, 1)
+    if flag {
+        a = c
+    }
+    buf := bytes.newbuffer()
+    [wb, web] = buf.write("x" as []byte)
+    a[0] = buf.asreader()
+    return b[0]
+}
+
+fn main() {}

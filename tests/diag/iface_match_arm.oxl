@@ -1,0 +1,16 @@
+package main
+
+import "std/bytes"
+
+import "std/io"
+
+fn leak() -> io.Reader {
+    buf := bytes.newbuffer()
+    [wb, web] = buf.write("x" as []byte)
+    r := match buf {
+        b => b.asreader()
+    }
+    return r
+}
+
+fn main() {}

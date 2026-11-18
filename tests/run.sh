@@ -222,6 +222,18 @@ fn alias_scoped() -> int {
     return n
 }
 
+// rebinding `b` drops its membership in `a`'s backing group — writes
+// through `a` must not taint the fresh slice `b` now denotes
+fn alias_rebind() -> io.Reader {
+    a := mkslice(io.Reader, 1)
+    b := a
+    b = mkslice(io.Reader, 1)
+    buf := bytes.newbuffer()
+    [wb, web] = buf.write("x" as []byte)
+    a[0] = buf.asreader()
+    return b[0]
+}
+
 fn main() {
     b := mkslice(byte, 16)
     r := via_into()

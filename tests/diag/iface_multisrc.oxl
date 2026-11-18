@@ -1,0 +1,23 @@
+package main
+
+import "std/bytes"
+
+import "std/io"
+
+struct Pair { l: io.Reader, r: io.Reader }
+
+fn leak() -> int {
+    outer := bytes.newbuffer()
+    [wo, eo] = outer.write("o" as []byte)
+    p := Pair{l: outer.asreader(), r: outer.asreader()}
+    if true {
+        inner := bytes.newbuffer()
+        [wi, ei] = inner.write("i" as []byte)
+        p = Pair{l: outer.asreader(), r: inner.asreader()}
+    }
+    bb := mkslice(byte, 8)
+    [n, err] = p.r.read(bb)
+    return n
+}
+
+fn main() {}

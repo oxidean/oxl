@@ -1,0 +1,82 @@
+package main
+
+// X5: std/crypto/x509 environment root discovery — the run.sh lane
+// invokes this file once per OXL_SSL_* configuration (cert file,
+// cert dir, bogus path); each test returns early unless its scenario
+// is the configured one, so a single file covers all three
+// invocations on both the native and codegen lanes.
+import "std/crypto/x509"
+
+import "std/errors"
+
+import "std/os"
+
+import "std/strings"
+
+import "std/testing"
+
+// bundle parses a PEM fixture into borrowed certs.
+fn bundle(name: str) -> []x509.Cert {
+    [cs, e] = x509.parse_pem(os.readfile_("tests/fixtures/x509/" + name))
+    testing.expect(e == nil, "fixture " + name)
+    return cs[0:len(cs)]
+}
+
+fn test_env_file() {
+    f := os.getenv("OXL_SSL_CERT_FILE")
+    d := os.getenv("OXL_SSL_CERT_DIR")
+    if len(f) == 0 || len(d) > 0 || !os.exists(f) {
+        return // not this invocation's scenario
+    }
+    [r, e] = x509.load_system_roots()
+    testing.expect(e == nil, "cert_file roots load")
+    testing.expect(r.cas != nil && len(r.cas) == 2, "cert_file pool size")
+    leaf := bundle("leaf.pem")[0]
+    [p, e2] = x509.verify(leaf, bundle("inter.pem"), r, "www.example.com", leaf.not_before + 60)
+    testing.expect(e2 == nil, "cert_file chain")
+    testing.expect_eq(len(p), 3, "cert_file path depth")
+}
+
+fn test_env_dir() {
+    f := os.getenv("OXL_SSL_CERT_FILE")
+    d := os.getenv("OXL_SSL_CERT_DIR")
+    if len(d) == 0 || len(f) > 0 && !os.exists(f) || !strings.endswith(d, "/dir") {
+        return // not this invocation's scenario
+    }
+    // dir scans *.pem/*.crt/*.cer — the fixture carries one of each
+    // (the .cer is raw DER, loaded through the single-cert fallback)
+    [r, e] = x509.load_system_roots()
+    testing.expect(e == nil, "cert_dir roots load")
+    testing.expect(r.cas != nil && len(r.cas) == 3, "cert_dir pool size")
+    leaf := bundle("leaf.pem")[0]
+    [p, e2] = x509.verify(leaf, bundle("inter.pem"), r, "www.example.com", leaf.not_before + 60)
+    testing.expect(e2 == nil, "cert_dir chain")
+}
+
+fn test_env_bad_path_fails() {
+    f := os.getenv("OXL_SSL_CERT_FILE")
+    if len(f) == 0 || os.exists(f) {
+        return // not this invocation's scenario
+    }
+    // a set-but-broken override is loud err_roots — never a silent
+    // fall through to platform roots
+    [r, e] = x509.load_system_roots()
+    testing.expect(e != nil, "bad cert_file must fail")
+    testing.expect(errors.is(e, x509.err_roots()), "bad cert_file is err_roots")
+    testing.expect(r.cas == nil, "bad cert_file yields no pool")
+}
+
+fn test_env_dir_bad_entry() {
+    f := os.getenv("OXL_SSL_CERT_FILE")
+    d := os.getenv("OXL_SSL_CERT_DIR")
+    if len(d) == 0 || len(f) > 0 || !strings.endswith(d, "/dirbad") {
+        return // not this invocation's scenario
+    }
+    // a set _DIR override is explicit config — a matching-named
+    // entry that is unreadable or yields no certs fails loud, never
+    // silently skipped into a half-applied pool
+    [r, e] = x509.load_system_roots()
+    testing.expect(e != nil, "bad dir entry must fail")
+    testing.expect(errors.is(e, x509.err_roots()), "bad dir entry is err_roots")
+    testing.expect(r.cas == nil, "bad dir entry yields no pool")
+}

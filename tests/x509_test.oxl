@@ -1,0 +1,456 @@
+package main
+
+// X5: std/crypto/x509 — certificate parse + trust-chain verification
+// against the checked-in openssl-minted fixtures
+// (tests/fixtures/x509/, scripts/gen_tls_fixtures.sh — openssl runs
+// at generation time only, never here). Covers DER strictness, every
+// accepted signature family on real chains, expiry/not-yet, hostname
+// + wildcard rules, untrusted/empty pools, CA-worthiness, EKU, and
+// the sha1 hard-reject. Assertions ride errors.is on the sentinels.
+import "std/bytes"
+
+import "std/crypto/x509"
+
+import "std/errors"
+
+import "std/os"
+
+import "std/slices"
+
+import "std/testing"
+
+// fx reads a fixture file's text.
+fn fx(name: str) -> str {
+    s := os.readfile_("tests/fixtures/x509/" + name)
+    testing.expect(len(s) > 0, "fixture missing " + name)
+    return s
+}
+
+// bundle parses a PEM fixture into borrowed certs.
+fn bundle(name: str) -> []x509.Cert {
+    [cs, e] = x509.parse_pem(fx(name))
+    testing.expect(e == nil, "parse_pem " + name)
+    return cs[0:len(cs)]
+}
+
+fn cert(name: str) -> x509.Cert {
+    return bundle(name)[0]
+}
+
+// roots is the trust pool: the RSA root + the Ed25519 root.
+fn roots() -> x509.Roots {
+    r := x509.Roots{cas: nil}
+    cs := bundle("roots.pem")
+    i := 0
+    for i < len(cs) {
+        r.append(cs[i])
+        i = i + 1
+    }
+    return r
+}
+
+fn test_parse() {
+    c := cert("leaf.pem")
+    testing.expect_eq(c.version, 3, "leaf version")
+    testing.expect_streq(c.subject, "CN=www.example.com", "leaf subject")
+    testing.expect_streq(c.issuer, "CN=Oxl Test P256 Intermediate CA", "leaf issuer")
+    testing.expect(len(c.serial) > 0, "leaf serial")
+    testing.expect_eq(c.sig_alg, x509.SIG_ecdsa_p256_sha256, "leaf sig_alg")
+    testing.expect_eq(c.spki_alg, x509.SPKI_rsa, "leaf spki_alg")
+    testing.expect_eq(len(c.dns_names), 1, "leaf dns count")
+    testing.expect_streq(c.dns_names[0], "www.example.com", "leaf dns0")
+    testing.expect_eq(len(c.ip_addrs), 0, "leaf ip count")
+    testing.expect_eq(c.is_ca, 0, "leaf ca flag")
+    testing.expect(len(c.eku) == 1 && c.eku[0] == x509.EKU_serverauth, "leaf eku")
+    testing.expect(len(c.skid) > 0 && len(c.akid) > 0, "leaf skid/akid")
+    testing.expect(len(c.raw) > 0 && len(c.tbs) > 0 && len(c.sig) > 0, "leaf raw/tbs/sig")
+    testing.expect(len(c.issuer_der) > 0 && len(c.subject_der) > 0, "leaf name ders")
+    testing.expect(c.not_before > 0 && c.not_before < c.not_after, "leaf window")
+
+    // raw-DER path produces the same certificate
+    [dc, de] = x509.parse_cert(fx("leaf.der") as []byte)
+    testing.expect(de == nil, "der parse")
+    testing.expect_streq(dc.subject, "CN=www.example.com", "der subject")
+    testing.expect(bytes.equal(dc.serial, c.serial), "der serial == pem serial")
+    testing.expect(bytes.equal(dc.raw, c.raw), "der raw == pem raw")
+
+    // the roots carry CA flags + key usage, no SANs
+    r := cert("root.pem")
+    testing.expect_eq(r.is_ca, 1, "root ca flag")
+    testing.expect_eq(len(r.dns_names), 0, "root san empty")
+    testing.expect(r.ku >= 0 && (r.ku & x509.KU_keyCertSign) != 0, "root ku keyCertSign")
+
+    // roots.pem carries both anchors; mixed.pem's non-certificate
+    // block is skipped
+    testing.expect_eq(len(bundle("roots.pem")), 2, "roots.pem count")
+    mm := bundle("mixed.pem")
+    testing.expect_eq(len(mm), 1, "mixed.pem count")
+    testing.expect_streq(mm[0].subject, "CN=Oxl Test Ed25519 Root CA", "mixed.pem cert")
+
+    // load_pem appends and counts
+    rp := x509.Roots{cas: nil}
+    [n, le] = rp.load_pem(fx("roots.pem"))
+    testing.expect(le == nil && n == 2, "load_pem count")
+    testing.expect(rp.cas != nil && len(rp.cas) == 2, "load_pem pool")
+
+    // DER rejects — all err_der
+    [jc, je] = x509.parse_cert("junk" as []byte)
+    testing.expect(errors.is(je, x509.err_der()), "junk input")
+    // indefinite-length form
+    indef := mkslice(byte, 0)
+    indef = push(indef, 48)
+    indef = push(indef, 128)
+    indef = push(indef, 0)
+    indef = push(indef, 0)
+    [ic, ie] = x509.parse_cert(indef)
+    testing.expect(errors.is(ie, x509.err_der()), "indefinite length")
+    // trailing garbage after the top SEQUENCE
+    tg := mkslice(byte, len(c.raw) + 1)
+    i := 0
+    for i < len(c.raw) {
+        tg[i] = c.raw[i]
+        i = i + 1
+    }
+    [tc, te] = x509.parse_cert(tg)
+    testing.expect(errors.is(te, x509.err_der()), "trailing garbage")
+    // truncated DER
+    [uc, ue] = x509.parse_cert(c.raw[0:len(c.raw) - 1])
+    testing.expect(errors.is(ue, x509.err_der()), "truncated")
+    // strict pem: a bad base64 body is err_der
+    [pc, pe] = x509.parse_pem("-----BEGIN CERTIFICATE-----\n###\n-----END CERTIFICATE-----\n")
+    testing.expect(errors.is(pe, x509.err_der()), "bad pem body")
+    // an empty bundle parses to an empty list
+    [ec, ee] = x509.parse_pem("")
+    testing.expect(ee == nil && len(ec) == 0, "empty pem")
+}
+
+fn test_chain_ok() {
+    rs := roots()
+    inter := bundle("inter.pem")
+    leaf := cert("leaf.pem")
+    at := leaf.not_before + 60
+    // rsa-keyed leaf signed ecdsa-p256 by the P-256 intermediate,
+    // itself signed rsa-pkcs1 by the RSA root — three schemes in one
+    // path
+    [p, e] = x509.verify(leaf, inter, rs, "", at)
+    testing.expect(e == nil, "rsa chain verify")
+    testing.expect_eq(len(p), 3, "rsa chain depth")
+    testing.expect_streq(p[0].subject, "CN=www.example.com", "path[0] leaf")
+    testing.expect_streq(p[1].subject, "CN=Oxl Test P256 Intermediate CA", "path[1] inter")
+    testing.expect_streq(p[2].subject, "CN=Oxl Test Root CA", "path[2] anchor")
+    // name check composes with a verified path
+    [p1, e1] = x509.verify(leaf, inter, rs, "www.example.com", at)
+    testing.expect(e1 == nil, "named verify")
+
+    // P-256 leaf signed ecdsa-p384 by the P-384 intermediate
+    ec := cert("leaf_ec.pem")
+    [p2, e2] = x509.verify(ec, bundle("inter384.pem"), rs, "www.example.com", ec.not_before + 60)
+    testing.expect(e2 == nil, "p384 chain verify")
+    testing.expect_eq(len(p2), 3, "p384 chain depth")
+    testing.expect_eq(ec.sig_alg, x509.SIG_ecdsa_p384_sha384, "ec sig_alg")
+    testing.expect_eq(ec.spki_alg, x509.SPKI_ec_p256, "ec spki_alg")
+
+    // ed25519 leaf anchors directly to the ed25519 root
+    ed := cert("leaf_ed.pem")
+    empty := mkslice(x509.Cert, 0)
+    [p3, e3] = x509.verify(ed, empty, rs, "www.example.com", ed.not_before + 60)
+    testing.expect(e3 == nil, "ed25519 chain verify")
+    testing.expect_eq(len(p3), 2, "ed25519 chain depth")
+    testing.expect_streq(p3[1].subject, "CN=Oxl Test Ed25519 Root CA", "ed anchor")
+    testing.expect_eq(ed.sig_alg, x509.SIG_ed25519, "ed sig_alg")
+    testing.expect_eq(ed.spki_alg, x509.SPKI_ed25519, "ed spki_alg")
+
+    // rsa-pss (sha256/mgf1) leaf anchors directly to the RSA root
+    ps := cert("leaf_pss.pem")
+    [p4, e4] = x509.verify(ps, empty, rs, "www.example.com", ps.not_before + 60)
+    testing.expect(e4 == nil, "pss chain verify")
+    testing.expect_eq(len(p4), 2, "pss chain depth")
+    testing.expect_eq(ps.sig_alg, x509.SIG_rsa_pss_sha256, "pss sig_alg")
+
+    // the returned path is a fresh owned list each call
+    [p5, e5] = x509.verify(leaf, inter, rs, "", at)
+    testing.expect(e5 == nil && len(p5) == len(p), "path stability")
+    testing.expect(bytes.equal(p5[2].raw, p[2].raw), "same anchor cert")
+}
+
+fn test_expired() {
+    rs := roots()
+    inter := bundle("inter.pem")
+    x := cert("leaf_expired.pem") // valid 2020→2021 only
+    // 2030: inside inter/root windows, past the leaf's
+    [p, e] = x509.verify(x, inter, rs, "", 1900000000)
+    testing.expect(errors.is(e, x509.err_expired()), "expired leaf")
+    // 2017: before every window — the leaf's own notyet lands first
+    [p2, e2] = x509.verify(x, inter, rs, "", 1500000000)
+    testing.expect(errors.is(e2, x509.err_notyet()), "not-yet leaf")
+    // sanity: the good leaf at a pre-window `at` is also notyet
+    leaf := cert("leaf.pem")
+    [p3, e3] = x509.verify(leaf, inter, rs, "", leaf.not_before - 1)
+    testing.expect(errors.is(e3, x509.err_notyet()), "boundary notyet")
+    // and the inclusive bound itself verifies
+    [p4, e4] = x509.verify(leaf, inter, rs, "", leaf.not_before)
+    testing.expect(e4 == nil, "boundary instant ok")
+}
+
+fn test_bad_name() {
+    rs := roots()
+    inter := bundle("inter.pem")
+    leaf := cert("leaf.pem")
+    at := leaf.not_before + 60
+    // right chain, wrong name → err_name after the path verifies
+    [p, e] = x509.verify(leaf, inter, rs, "www.other-example.com", at)
+    testing.expect(errors.is(e, x509.err_name()), "wrong hostname")
+    // the leaf's own SAN vs a name it doesn't carry
+    wn := cert("leaf_wrongname.pem")
+    [p2, e2] = x509.verify(wn, inter, rs, "www.example.com", wn.not_before + 60)
+    testing.expect(errors.is(e2, x509.err_name()), "wrongname leaf")
+    [p3, e3] = x509.verify(wn, inter, rs, "www.wrong-name.example", wn.not_before + 60)
+    testing.expect(e3 == nil, "wrongname own san")
+    // match_hostname's contract: empty name always errs, even on a
+    // good cert — "" inside verify is the skip hatch instead
+    e4 := x509.match_hostname(leaf, "")
+    testing.expect(errors.is(e4, x509.err_name()), "empty hostname")
+    // no CN fallback: a name matching only the subject CN still fails
+    e5 := x509.match_hostname(cert("root.pem"), "Oxl Test Root CA")
+    testing.expect(errors.is(e5, x509.err_name()), "cn fallback absent")
+    // dns_names don't satisfy an IP literal
+    e6 := x509.match_hostname(leaf, "93.184.216.34")
+    testing.expect(errors.is(e6, x509.err_name()), "ip vs dns san")
+    // name "" skips the check inside verify entirely
+    [p7, e7] = x509.verify(leaf, inter, rs, "", at)
+    testing.expect(e7 == nil, "empty name skips check")
+}
+
+fn test_wildcard() {
+    rs := roots()
+    inter := bundle("inter.pem")
+    w := cert("leaf_wildcard.pem") // SAN: *.example.com
+    at := w.not_before + 60
+    // exactly one left-most label
+    [p, e] = x509.verify(w, inter, rs, "www.example.com", at)
+    testing.expect(e == nil, "wildcard one label")
+    [p2, e2] = x509.verify(w, inter, rs, "a.b.example.com", at)
+    testing.expect(errors.is(e2, x509.err_name()), "wildcard two labels")
+    [p3, e3] = x509.verify(w, inter, rs, "example.com", at)
+    testing.expect(errors.is(e3, x509.err_name()), "wildcard apex")
+    [p4, e4] = x509.verify(w, inter, rs, "xample.com", at)
+    testing.expect(errors.is(e4, x509.err_name()), "wildcard suffix")
+    [p5, e5] = x509.verify(w, inter, rs, "WWW.Example.COM", at)
+    testing.expect(e5 == nil, "wildcard case")
+    e6 := x509.match_hostname(w, ".example.com")
+    testing.expect(errors.is(e6, x509.err_name()), "wildcard empty label")
+}
+
+fn test_untrusted() {
+    rs := roots()
+    inter := bundle("inter.pem")
+    leaf := cert("leaf.pem")
+    at := leaf.not_before + 60
+    empty := mkslice(x509.Cert, 0)
+    // a well-formed chain anchoring outside the pool
+    rog := cert("leaf_rogue.pem")
+    [p, e] = x509.verify(rog, empty, rs, "", rog.not_before + 60)
+    testing.expect(errors.is(e, x509.err_root()), "rogue chain")
+    // ...which verifies fine when the caller pins its own anchor
+    rp := x509.Roots{cas: nil}
+    rp.append(cert("rogue.pem"))
+    [p2, e2] = x509.verify(rog, empty, rp, "", rog.not_before + 60)
+    testing.expect(e2 == nil, "rogue pinned")
+    // non-nil-but-empty cas is the deliberate zero-anchor pin
+    zp := x509.Roots{cas: new(mkslice(x509.Cert, 0))}
+    [p3, e3] = x509.verify(leaf, inter, zp, "", at)
+    testing.expect(errors.is(e3, x509.err_root()), "empty pool")
+    // a nil pool anchors nothing either (Config-level fallback is the
+    // caller's job — verify uses the pool it's handed)
+    np := x509.Roots{cas: nil}
+    [p4, e4] = x509.verify(leaf, inter, np, "", at)
+    testing.expect(errors.is(e4, x509.err_root()), "nil pool")
+    // dropping the intermediate leaves no path to an anchor
+    [p5, e5] = x509.verify(leaf, empty, rs, "", at)
+    testing.expect(errors.is(e5, x509.err_root()), "no intermediate")
+}
+
+fn test_bad_ca() {
+    rs := roots()
+    // leaf_badca's issuer is notca — a leaf-cert keypair (cA=false)
+    // whose signature is valid but whose CA-worthiness isn't
+    leaf := cert("leaf_badca.pem")
+    notca := bundle("notca.pem")
+    [p, e] = x509.verify(leaf, notca, rs, "", leaf.not_before + 60)
+    testing.expect(errors.is(e, x509.err_ca()), "not-a-ca issuer")
+    // a CA-keyed cert as the leaf dies on the leaf checks — its KU
+    // carries no digitalSignature, which step 4 requires
+    root := cert("root.pem")
+    empty := mkslice(x509.Cert, 0)
+    rp := x509.Roots{cas: nil}
+    rp.append(root)
+    [p2, e2] = x509.verify(root, empty, rp, "", root.not_before + 60)
+    testing.expect(errors.is(e2, x509.err_eku()), "ca as leaf")
+}
+
+fn test_sha1_reject() {
+    // parses cleanly — sig_alg lands 0 outside the acceptance set —
+    // but verify hard-fails err_alg even though the signature itself
+    // is cryptographically valid under openssl
+    s := cert("leaf_sha1.pem")
+    testing.expect_streq(s.subject, "CN=www.example.com", "sha1 leaf parses")
+    testing.expect_eq(s.sig_alg, 0, "sha1 sig_alg unaccepted")
+    rs := roots()
+    empty := mkslice(x509.Cert, 0)
+    [p, e] = x509.verify(s, empty, rs, "", s.not_before + 60)
+    testing.expect(errors.is(e, x509.err_alg()), "sha1 rejected")
+}
+
+fn test_eku() {
+    rs := roots()
+    // a clientAuth-only CA can't issue for serverAuth — the
+    // intermediate's EKU constraint fails the link
+    ek := cert("leaf_eku.pem")
+    [p, e] = x509.verify(ek, bundle("inter_eku.pem"), rs, "", ek.not_before + 60)
+    testing.expect(errors.is(e, x509.err_eku()), "clientauth ca")
+    // and a leaf carrying clientAuth (not serverAuth) fails its own
+    // EKU check even under the unrestricted intermediate
+    bek := cert("leaf_badeku.pem")
+    [p2, e2] = x509.verify(bek, bundle("inter.pem"), rs, "", bek.not_before + 60)
+    testing.expect(errors.is(e2, x509.err_eku()), "clientauth leaf")
+}
+
+fn test_ip_san() {
+    c := cert("leaf_ip.pem") // SAN: IP 10.0.0.9, IP fd00::1, DNS ip.example.com
+    testing.expect_eq(len(c.ip_addrs), 2, "ip san count")
+    testing.expect_streq(c.ip_addrs[0], "10.0.0.9", "v4 san")
+    testing.expect_streq(c.ip_addrs[1], "fd00::1", "v6 san canonical")
+    testing.expect_eq(len(c.dns_names), 1, "ip leaf dns count")
+    e := x509.match_hostname(c, "10.0.0.9")
+    testing.expect(e == nil, "v4 literal")
+    e = x509.match_hostname(c, "[fd00::1]")
+    testing.expect(e == nil, "v6 bracket")
+    e = x509.match_hostname(c, "[FD00:0:0:0:0:0:0:1]")
+    testing.expect(e == nil, "v6 expanded uppercase")
+    e = x509.match_hostname(c, "[fd00::2]")
+    testing.expect(errors.is(e, x509.err_name()), "v6 miss")
+    e = x509.match_hostname(c, "ip.example.com")
+    testing.expect(e == nil, "dns on ip cert")
+    e = x509.match_hostname(c, "10.0.0.9.example.com")
+    testing.expect(errors.is(e, x509.err_name()), "ip-lookalike dns")
+    // end-to-end: the IP SAN also satisfies verify's name check
+    rs := roots()
+    [p, e2] = x509.verify(c, bundle("inter.pem"), rs, "[fd00::1]", c.not_before + 60)
+    testing.expect(e2 == nil, "v6 verify")
+}
+
+fn test_self_anchor() {
+    // a self-signed cert already in the roots pool is its own issuer —
+    // pool membership must terminate the path even though the
+    // candidate is already in it (the returned path is [leaf, leaf])
+    s := cert("selfsigned.pem")
+    testing.expect_streq(s.issuer, s.subject, "selfsigned issuer == subject")
+    rp := x509.Roots{cas: nil}
+    rp.append(s)
+    empty := mkslice(x509.Cert, 0)
+    [p, e] = x509.verify(s, empty, rp, "", s.not_before + 60)
+    testing.expect(e == nil, "self-signed anchor verify")
+    testing.expect_eq(len(p), 2, "self-signed path depth")
+    testing.expect(bytes.equal(p[0].raw, p[1].raw), "self-signed path [leaf, leaf]")
+}
+
+fn test_anchor_exemption() {
+    // root_sha1's own self-signature is sha1 — outside the acceptance
+    // set — but store membership vouches for the anchor, so it still
+    // anchors the sha256 chain it signed (real trust stores match)
+    r := cert("root_sha1.pem")
+    testing.expect_eq(r.sig_alg, 0, "sha1 root sig_alg unaccepted")
+    rp := x509.Roots{cas: nil}
+    rp.append(r)
+    leaf := cert("leaf_sha1root.pem")
+    empty := mkslice(x509.Cert, 0)
+    [p, e] = x509.verify(leaf, empty, rp, "www.example.com", leaf.not_before + 60)
+    testing.expect(e == nil, "sha1 root anchors sha256 chain")
+    testing.expect_eq(len(p), 2, "sha1 anchor path depth")
+    testing.expect(bytes.equal(p[1].raw, r.raw), "path anchor is sha1 root")
+}
+
+fn test_critical_ext() {
+    // the processed critical set is {bc, ku, eku, san, skid, akid} — a
+    // critical nameConstraints we can't honor must not validate:
+    // parse fails err_der before the cert can anchor anything
+    [cs, e] = x509.parse_pem(fx("inter_nc.pem"))
+    testing.expect(errors.is(e, x509.err_der()), "critical nameConstraints parse")
+    testing.expect(cs == nil, "critical nameConstraints yields no certs")
+}
+
+fn test_search_bounds() {
+    // untrusted is attacker-controlled: byte-identical duplicate
+    // issuers dedupe to a single try, so a flight padded with
+    // duplicates still verifies — quickly, and inside the eval
+    // budget that caps worst-case signature checks
+    rs := roots()
+    inter := bundle("inter.pem")
+    leaf := cert("leaf.pem")
+    at := leaf.not_before + 60
+    dup := mkslice(x509.Cert, 0)
+    i := 0
+    for i < 8 {
+        dup = push(dup, inter[0])
+        i = i + 1
+    }
+    [p, e] = x509.verify(leaf, dup, rs, "", at)
+    testing.expect(e == nil, "dup-padded untrusted verifies")
+    testing.expect_eq(len(p), 3, "dup path depth")
+    // junk that can't link changes nothing — skipped by name
+    junk := push(dup, cert("leaf_sha1.pem"))
+    [p2, e2] = x509.verify(leaf, junk, rs, "", at)
+    testing.expect(e2 == nil, "junk-padded untrusted verifies")
+}
+
+fn test_badsig() {
+    // signature rejection is the security core: splice one byte out
+    // of the signature tail of leaf's DER — parse still succeeds
+    // (lengths untouched) but verify must fail err_sig
+    der := slices.clone(cert("leaf.pem").raw)
+    der[len(der) - 4] = (der[len(der) - 4] + 1) % 256
+    [bad, pe] = x509.parse_cert(der)
+    testing.expect(pe == nil, "spliced leaf parses")
+    rs := roots()
+    inter := bundle("inter.pem")
+    [p, e] = x509.verify(bad, inter, rs, "", bad.not_before + 60)
+    testing.expect(errors.is(e, x509.err_sig()), "corrupt signature")
+    testing.expect(p == nil, "corrupt signature yields no path")
+}
+
+fn test_xsign_alternates() {
+    // same-subject+key twins are not dedup duplicates — cross-signed
+    // intermediates and same-key CA renewals share subject_der+spki
+    // but differ in issuer_der/validity/linking, and the spec
+    // requires alternates to be tried. Forge the dead-end twin
+    // in-test: splice inter's issuer CN to a CA name nobody carries
+    // — DER stays valid, subject+key stay identical, so the twin
+    // links off the leaf and then dead-ends on its own issuer.
+    rs := roots()
+    inter := cert("inter.pem")
+    leaf := cert("leaf.pem")
+    at := leaf.not_before + 60
+    twin_der := slices.clone(inter.raw)
+    pat := "Oxl Test Root CA"
+    pos := bytes.index(twin_der, pat as []byte)
+    testing.expect(pos >= 0, "issuer CN found in inter DER")
+    repl := "Oxl Test Dead CA"
+    rb := repl as []byte
+    i := 0
+    for i < len(rb) {
+        twin_der[pos + i] = rb[i]
+        i = i + 1
+    }
+    [twin, te] = x509.parse_cert(twin_der)
+    testing.expect(te == nil, "spliced twin parses")
+    testing.expect_streq(twin.issuer, "CN=" + repl, "twin issuer")
+    testing.expect_streq(twin.subject, inter.subject, "twin subject")
+    // dead-end twin first: old (subject_der, spki) dedup skipped the
+    // viable twin outright and the verify failed err_root
+    untrusted := mkslice(x509.Cert, 0)
+    untrusted = push(untrusted, twin)
+    untrusted = push(untrusted, inter)
+    [p, e] = x509.verify(leaf, untrusted, rs, "", at)
+    testing.expect(e == nil, "viable twin tried past dead-end twin")
+    testing.expect_eq(len(p), 3, "xsign path depth")
+}

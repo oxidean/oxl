@@ -508,6 +508,36 @@ for t in test_ed25519; do
     grep -q "$t ... ok" <<<"$out" || { echo "FAIL ed25519: $out"; exit 1; }
 done
 
+echo "== oxl test: x509 (x5) =="
+out=$("$OXL" test tests/x509_test.oxl) || { printf '%s\n' "$out" >&2; exit 1; }
+printf '%s\n' "$out" >&2
+for t in test_parse test_chain_ok test_expired test_bad_name test_wildcard test_untrusted test_bad_ca test_sha1_reject test_eku test_ip_san test_self_anchor test_anchor_exemption test_critical_ext test_search_bounds test_badsig test_xsign_alternates; do
+    grep -q "$t ... ok" <<<"$out" || { echo "FAIL x509: $out"; exit 1; }
+done
+# env-root discovery — three configurations over one file; each
+# test_ fn returns early outside its scenario
+out=$(OXL_SSL_CERT_FILE=tests/fixtures/x509/roots.pem OXL_SSL_CERT_DIR= "$OXL" test tests/x509_env_test.oxl) || { printf '%s\n' "$out" >&2; exit 1; }
+printf '%s\n' "$out" >&2
+for t in test_env_file; do
+    grep -q "$t ... ok" <<<"$out" || { echo "FAIL x509 env_file: $out"; exit 1; }
+done
+out=$(OXL_SSL_CERT_FILE= OXL_SSL_CERT_DIR=tests/fixtures/x509/dir "$OXL" test tests/x509_env_test.oxl) || { printf '%s\n' "$out" >&2; exit 1; }
+printf '%s\n' "$out" >&2
+for t in test_env_dir; do
+    grep -q "$t ... ok" <<<"$out" || { echo "FAIL x509 env_dir: $out"; exit 1; }
+done
+out=$(OXL_SSL_CERT_FILE=tests/fixtures/x509/does-not-exist.pem OXL_SSL_CERT_DIR= "$OXL" test tests/x509_env_test.oxl) || { printf '%s\n' "$out" >&2; exit 1; }
+printf '%s\n' "$out" >&2
+for t in test_env_bad_path_fails; do
+    grep -q "$t ... ok" <<<"$out" || { echo "FAIL x509 env_bad: $out"; exit 1; }
+done
+
+out=$(OXL_SSL_CERT_FILE= OXL_SSL_CERT_DIR=tests/fixtures/x509/dirbad "$OXL" test tests/x509_env_test.oxl) || { printf '%s\n' "$out" >&2; exit 1; }
+printf '%s\n' "$out" >&2
+for t in test_env_dir_bad_entry; do
+    grep -q "$t ... ok" <<<"$out" || { echo "FAIL x509 env_dirbad: $out"; exit 1; }
+done
+
 echo "== oxl test: compress & archive =="
 out=$("$OXL" test tests/compress_flate.oxl)
 printf '%s
@@ -1450,7 +1480,7 @@ done
 # s4 enc/hash/crypto + x1/x3/x4 crypto through the self-hosted emitter +
 # cc — exercises [][]str return emission (csv.read_all), hash/crypto,
 # and the big-limb arithmetic under -test
-for tf in enc hash crypto aesgcm chacha sha512 hkdf crypto_rand bignum rsa x25519 nistec ed25519; do
+for tf in enc hash crypto aesgcm chacha sha512 hkdf crypto_rand bignum rsa x25519 nistec ed25519 x509; do
     "$OXL" run bootstrap/cmd/codegen -- --test "tests/${tf}_test.oxl" > "$cgen_dir/$tf.c"
     tfcrypto=""; tfcryptolib=""
     grep -q 'rt_csrand(' "$cgen_dir/$tf.c" && { tfcrypto="-DOXL_CRYPTO"; tfcryptolib="$CRYPTO_LIBS"; }
@@ -1498,6 +1528,23 @@ done
 for t in test_ed25519; do
     grep -q "$t ... ok" "$cgen_dir/ed25519.out" || { echo "FAIL codegen ed25519 $t"; cat "$cgen_dir/ed25519.out"; exit 1; }
 done
+for t in test_parse test_chain_ok test_expired test_bad_name test_wildcard test_untrusted test_bad_ca test_sha1_reject test_eku test_ip_san test_self_anchor test_anchor_exemption test_critical_ext test_search_bounds test_badsig test_xsign_alternates; do
+    grep -q "$t ... ok" "$cgen_dir/x509.out" || { echo "FAIL codegen x509 $t"; cat "$cgen_dir/x509.out"; exit 1; }
+done
+# x5 env-root discovery through codegen — the same three
+# configurations as the native lane
+"$OXL" run bootstrap/cmd/codegen -- --test "tests/x509_env_test.oxl" > "$cgen_dir/x509env.c"
+x5crypto=""; x5cryptolib=""
+grep -q 'rt_csrand(' "$cgen_dir/x509env.c" && { x5crypto="-DOXL_CRYPTO"; x5cryptolib="$CRYPTO_LIBS"; }
+"$CC" -O2 $THREAD_FLAG -Iruntime $x5crypto "$cgen_dir/x509env.c" runtime/rt.c $x5cryptolib $NET_LIBS -o "$cgen_dir/x509env$EXE" || { echo "FAIL codegen cc x509env"; exit 1; }
+OXL_SSL_CERT_FILE=tests/fixtures/x509/roots.pem OXL_SSL_CERT_DIR= "$cgen_dir/x509env$EXE" > "$cgen_dir/x509env_file.out"
+grep -q "test_env_file ... ok" "$cgen_dir/x509env_file.out" || { echo "FAIL codegen x509env file"; cat "$cgen_dir/x509env_file.out"; exit 1; }
+OXL_SSL_CERT_FILE= OXL_SSL_CERT_DIR=tests/fixtures/x509/dir "$cgen_dir/x509env$EXE" > "$cgen_dir/x509env_dir.out"
+grep -q "test_env_dir ... ok" "$cgen_dir/x509env_dir.out" || { echo "FAIL codegen x509env dir"; cat "$cgen_dir/x509env_dir.out"; exit 1; }
+OXL_SSL_CERT_FILE=tests/fixtures/x509/does-not-exist.pem OXL_SSL_CERT_DIR= "$cgen_dir/x509env$EXE" > "$cgen_dir/x509env_bad.out"
+grep -q "test_env_bad_path_fails ... ok" "$cgen_dir/x509env_bad.out" || { echo "FAIL codegen x509env bad"; cat "$cgen_dir/x509env_bad.out"; exit 1; }
+OXL_SSL_CERT_FILE= OXL_SSL_CERT_DIR=tests/fixtures/x509/dirbad "$cgen_dir/x509env$EXE" > "$cgen_dir/x509env_dirbad.out"
+grep -q "test_env_dir_bad_entry ... ok" "$cgen_dir/x509env_dirbad.out" || { echo "FAIL codegen x509env dirbad"; cat "$cgen_dir/x509env_dirbad.out"; exit 1; }
 # s5 regexp through the self-hosted emitter + cc — the NFA engine is
 # the heaviest pure-.oxl package (struct slices, closures, utf8)
 "$OXL" run bootstrap/cmd/codegen -- --test "tests/regexp_test.oxl" > "$cgen_dir/rx.c"

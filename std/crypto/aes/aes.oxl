@@ -1,0 +1,476 @@
+package aes
+
+// std/crypto/aes — FIPS-197 AES key expansion + encrypt-only block.
+// Decryption is omitted by design: aesgcm (X2's only consumer)
+// encrypts in both directions, and TLS's AES suites are all GCM.
+// Words ride in int64 masked to 32 bits (M32); the language has no
+// shifts so x>>n is x/2**n and x<<n is (x*2**n)&M32 — operands stay
+// non-negative so / is exact.
+import "std/errors"
+
+import "std/slices"
+
+let M32: int = 4294967295
+
+let M24: int = 16777215
+
+/// Aes is an expanded AES key — rk holds the 16*(nr+1) round-key
+/// bytes and nr the round count (10/12/14 for AES-128/192/256).
+struct Aes { rk: []int, nr: int }
+
+let SBOX: own []int = nil
+
+// the FIPS-197 §5.1.1 substitution table
+fn sbox() -> own []int {
+    if SBOX == nil {
+        t := mkslice(int, 256)
+        t[0] = 99
+        t[1] = 124
+        t[2] = 119
+        t[3] = 123
+        t[4] = 242
+        t[5] = 107
+        t[6] = 111
+        t[7] = 197
+        t[8] = 48
+        t[9] = 1
+        t[10] = 103
+        t[11] = 43
+        t[12] = 254
+        t[13] = 215
+        t[14] = 171
+        t[15] = 118
+        t[16] = 202
+        t[17] = 130
+        t[18] = 201
+        t[19] = 125
+        t[20] = 250
+        t[21] = 89
+        t[22] = 71
+        t[23] = 240
+        t[24] = 173
+        t[25] = 212
+        t[26] = 162
+        t[27] = 175
+        t[28] = 156
+        t[29] = 164
+        t[30] = 114
+        t[31] = 192
+        t[32] = 183
+        t[33] = 253
+        t[34] = 147
+        t[35] = 38
+        t[36] = 54
+        t[37] = 63
+        t[38] = 247
+        t[39] = 204
+        t[40] = 52
+        t[41] = 165
+        t[42] = 229
+        t[43] = 241
+        t[44] = 113
+        t[45] = 216
+        t[46] = 49
+        t[47] = 21
+        t[48] = 4
+        t[49] = 199
+        t[50] = 35
+        t[51] = 195
+        t[52] = 24
+        t[53] = 150
+        t[54] = 5
+        t[55] = 154
+        t[56] = 7
+        t[57] = 18
+        t[58] = 128
+        t[59] = 226
+        t[60] = 235
+        t[61] = 39
+        t[62] = 178
+        t[63] = 117
+        t[64] = 9
+        t[65] = 131
+        t[66] = 44
+        t[67] = 26
+        t[68] = 27
+        t[69] = 110
+        t[70] = 90
+        t[71] = 160
+        t[72] = 82
+        t[73] = 59
+        t[74] = 214
+        t[75] = 179
+        t[76] = 41
+        t[77] = 227
+        t[78] = 47
+        t[79] = 132
+        t[80] = 83
+        t[81] = 209
+        t[82] = 0
+        t[83] = 237
+        t[84] = 32
+        t[85] = 252
+        t[86] = 177
+        t[87] = 91
+        t[88] = 106
+        t[89] = 203
+        t[90] = 190
+        t[91] = 57
+        t[92] = 74
+        t[93] = 76
+        t[94] = 88
+        t[95] = 207
+        t[96] = 208
+        t[97] = 239
+        t[98] = 170
+        t[99] = 251
+        t[100] = 67
+        t[101] = 77
+        t[102] = 51
+        t[103] = 133
+        t[104] = 69
+        t[105] = 249
+        t[106] = 2
+        t[107] = 127
+        t[108] = 80
+        t[109] = 60
+        t[110] = 159
+        t[111] = 168
+        t[112] = 81
+        t[113] = 163
+        t[114] = 64
+        t[115] = 143
+        t[116] = 146
+        t[117] = 157
+        t[118] = 56
+        t[119] = 245
+        t[120] = 188
+        t[121] = 182
+        t[122] = 218
+        t[123] = 33
+        t[124] = 16
+        t[125] = 255
+        t[126] = 243
+        t[127] = 210
+        t[128] = 205
+        t[129] = 12
+        t[130] = 19
+        t[131] = 236
+        t[132] = 95
+        t[133] = 151
+        t[134] = 68
+        t[135] = 23
+        t[136] = 196
+        t[137] = 167
+        t[138] = 126
+        t[139] = 61
+        t[140] = 100
+        t[141] = 93
+        t[142] = 25
+        t[143] = 115
+        t[144] = 96
+        t[145] = 129
+        t[146] = 79
+        t[147] = 220
+        t[148] = 34
+        t[149] = 42
+        t[150] = 144
+        t[151] = 136
+        t[152] = 70
+        t[153] = 238
+        t[154] = 184
+        t[155] = 20
+        t[156] = 222
+        t[157] = 94
+        t[158] = 11
+        t[159] = 219
+        t[160] = 224
+        t[161] = 50
+        t[162] = 58
+        t[163] = 10
+        t[164] = 73
+        t[165] = 6
+        t[166] = 36
+        t[167] = 92
+        t[168] = 194
+        t[169] = 211
+        t[170] = 172
+        t[171] = 98
+        t[172] = 145
+        t[173] = 149
+        t[174] = 228
+        t[175] = 121
+        t[176] = 231
+        t[177] = 200
+        t[178] = 55
+        t[179] = 109
+        t[180] = 141
+        t[181] = 213
+        t[182] = 78
+        t[183] = 169
+        t[184] = 108
+        t[185] = 86
+        t[186] = 244
+        t[187] = 234
+        t[188] = 101
+        t[189] = 122
+        t[190] = 174
+        t[191] = 8
+        t[192] = 186
+        t[193] = 120
+        t[194] = 37
+        t[195] = 46
+        t[196] = 28
+        t[197] = 166
+        t[198] = 180
+        t[199] = 198
+        t[200] = 232
+        t[201] = 221
+        t[202] = 116
+        t[203] = 31
+        t[204] = 75
+        t[205] = 189
+        t[206] = 139
+        t[207] = 138
+        t[208] = 112
+        t[209] = 62
+        t[210] = 181
+        t[211] = 102
+        t[212] = 72
+        t[213] = 3
+        t[214] = 246
+        t[215] = 14
+        t[216] = 97
+        t[217] = 53
+        t[218] = 87
+        t[219] = 185
+        t[220] = 134
+        t[221] = 193
+        t[222] = 29
+        t[223] = 158
+        t[224] = 225
+        t[225] = 248
+        t[226] = 152
+        t[227] = 17
+        t[228] = 105
+        t[229] = 217
+        t[230] = 142
+        t[231] = 148
+        t[232] = 155
+        t[233] = 30
+        t[234] = 135
+        t[235] = 233
+        t[236] = 206
+        t[237] = 85
+        t[238] = 40
+        t[239] = 223
+        t[240] = 140
+        t[241] = 161
+        t[242] = 137
+        t[243] = 13
+        t[244] = 191
+        t[245] = 230
+        t[246] = 66
+        t[247] = 104
+        t[248] = 65
+        t[249] = 153
+        t[250] = 45
+        t[251] = 15
+        t[252] = 176
+        t[253] = 84
+        t[254] = 187
+        t[255] = 22
+        SBOX = slices.clone(t)
+    }
+    return SBOX
+}
+
+let RCON: own []int = nil
+
+// key-schedule round constants rcon[i] for i in 1..14 — index 0 is
+// a padding zero so the table is subscripted directly by i/Nk
+fn rcon() -> own []int {
+    if RCON == nil {
+        t := mkslice(int, 15)
+        t[0] = 0
+        t[1] = 1
+        t[2] = 2
+        t[3] = 4
+        t[4] = 8
+        t[5] = 16
+        t[6] = 32
+        t[7] = 64
+        t[8] = 128
+        t[9] = 27
+        t[10] = 54
+        t[11] = 108
+        t[12] = 216
+        t[13] = 171
+        t[14] = 77
+        RCON = slices.clone(t)
+    }
+    return RCON
+}
+
+// xtime is the GF(2^8) doubling map x -> 02·x used by MixColumns
+// and the key schedule's implicit field work
+fn xtime(x: int) -> int {
+    y := x * 2
+    if y >= 256 {
+        y = y ^ 283
+    }
+    return y
+}
+
+// subword applies the sbox to all four bytes of a word; a word's
+// byte 0 is its most significant byte (FIPS-197 §5.2 convention)
+fn subword(sb: []int, w: int) -> int {
+    return sb[w / 16777216] * 16777216 | sb[w / 65536 % 256] * 65536 | sb[w / 256 % 256] * 256 | sb[w % 256]
+}
+
+// rotword is the cyclic byte rotation [a0,a1,a2,a3] -> [a1,a2,a3,a0]
+fn rotword(w: int) -> int {
+    return (w & M24) * 256 | w / 16777216
+}
+
+/// new expands a 16/24/32-byte key into an Aes context.
+fn new(key: []byte) -> [Aes, err] {
+    nk := len(key) / 4
+    if nk != 4 && nk != 6 && nk != 8 {
+        return Aes{rk: nil, nr: 0}, errors.new("aes: key must be 16, 24, or 32 bytes")
+    }
+    nr := nk + 6
+    nw := 4 * (nr + 1)
+    sb := sbox()
+    rc := rcon()
+    w := mkslice(int, nw)
+    i := 0
+    for i < nk {
+        w[i] = key[4 * i] * 16777216 | key[4 * i + 1] * 65536 | key[4 * i + 2] * 256 | key[4 * i + 3]
+        i = i + 1
+    }
+    for i < nw {
+        temp := w[i - 1]
+        if i % nk == 0 {
+            temp = subword(sb, rotword(temp)) ^ rc[i / nk] * 16777216
+        } else if nk == 8 && i % nk == 4 {
+            temp = subword(sb, temp)
+        }
+        w[i] = w[i - nk] ^ temp & M32
+        i = i + 1
+    }
+    // unpack to bytes — the round loop xors a flat 16-byte state
+    rk := mkslice(int, 16 * (nr + 1))
+    i = 0
+    for i < nw {
+        rk[4 * i] = w[i] / 16777216
+        rk[4 * i + 1] = w[i] / 65536 % 256
+        rk[4 * i + 2] = w[i] / 256 % 256
+        rk[4 * i + 3] = w[i] % 256
+        i = i + 1
+    }
+    // heap-backed: Aes escapes into callers' structs (aesgcm keeps it
+    // across seal/open calls) — an arena slice would dangle.
+    return Aes{rk: slices.clone(rk), nr: nr}, nil
+}
+
+fn need(b: []byte, n: int) {
+    if len(b) < n {
+        assert(false)
+    }
+}
+
+// mixcolumns runs the fixed matrix over one 4-byte column in place
+fn mixcol(s: []int, c: int) {
+    a0 := s[c]
+    a1 := s[c + 1]
+    a2 := s[c + 2]
+    a3 := s[c + 3]
+    x0 := xtime(a0)
+    x1 := xtime(a1)
+    x2 := xtime(a2)
+    x3 := xtime(a3)
+    s[c] = x0 ^ x1 ^ a1 ^ a2 ^ a3
+    s[c + 1] = a0 ^ x1 ^ x2 ^ a2 ^ a3
+    s[c + 2] = a0 ^ a1 ^ x2 ^ x3 ^ a3
+    s[c + 3] = x0 ^ a0 ^ a1 ^ a2 ^ x3
+}
+
+/// encrypt_block writes the 16-byte encryption of src[0:16] to
+/// dst[0:16] — AES has no decrypt path here (see package doc).
+/// Aliased dst == src is not supported; aesgcm never aliases.
+fn (a ref Aes) encrypt_block(dst: []byte, src: []byte) {
+    need(dst, 16)
+    need(src, 16)
+    sb := sbox()
+    s := mkslice(int, 16)
+    i := 0
+    for i < 16 {
+        s[i] = src[i] ^ a.rk[i]
+        i = i + 1
+    }
+    r := 1
+    for r < a.nr {
+        ko := 16 * r
+        i = 0
+        for i < 16 {
+            s[i] = sb[s[i]]
+            i = i + 1
+        }
+        // ShiftRows: s[4*col+row] -> s[4*((col+row)%4)+row]; the
+        // write set is a permutation so staging is per-row.
+        r1 := s[1]
+        s[1] = s[5]
+        s[5] = s[9]
+        s[9] = s[13]
+        s[13] = r1
+        r2 := s[2]
+        r6 := s[6]
+        s[2] = s[10]
+        s[6] = s[14]
+        s[10] = r2
+        s[14] = r6
+        r3 := s[3]
+        s[3] = s[15]
+        s[15] = s[11]
+        s[11] = s[7]
+        s[7] = r3
+        mixcol(s, 0)
+        mixcol(s, 4)
+        mixcol(s, 8)
+        mixcol(s, 12)
+        i = 0
+        for i < 16 {
+            s[i] = s[i] ^ a.rk[ko + i]
+            i = i + 1
+        }
+        r = r + 1
+    }
+    ko := 16 * a.nr
+    i = 0
+    for i < 16 {
+        s[i] = sb[s[i]]
+        i = i + 1
+    }
+    r1 := s[1]
+    s[1] = s[5]
+    s[5] = s[9]
+    s[9] = s[13]
+    s[13] = r1
+    r2 := s[2]
+    r6 := s[6]
+    s[2] = s[10]
+    s[6] = s[14]
+    s[10] = r2
+    s[14] = r6
+    r3 := s[3]
+    s[3] = s[15]
+    s[15] = s[11]
+    s[11] = s[7]
+    s[7] = r3
+    i = 0
+    for i < 16 {
+        dst[i] = s[i] ^ a.rk[ko + i]
+        i = i + 1
+    }
+}

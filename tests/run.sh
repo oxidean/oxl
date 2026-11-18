@@ -239,6 +239,20 @@ printf '%s
 for t in test_sha256 test_md5 test_hmac; do
     grep -q "$t ... ok" <<<"$out" || { echo "FAIL crypto: $out"; exit 1; }
 done
+
+echo "== oxl test: aead (x2) =="
+out=$("$OXL" test tests/aesgcm_test.oxl)
+printf '%s
+' "$out" >&2
+for t in test_aes_block test_gcm test_aead_perf; do
+    grep -q "$t ... ok" <<<"$out" || { echo "FAIL aesgcm: $out"; exit 1; }
+done
+out=$("$OXL" test tests/chacha_test.oxl)
+printf '%s
+' "$out" >&2
+for t in test_chacha20 test_poly1305 test_aead; do
+    grep -q "$t ... ok" <<<"$out" || { echo "FAIL chacha: $out"; exit 1; }
+done
 out=$("$OXL" test tests/net_test.oxl)
 printf '%s
 ' "$out" >&2
@@ -1229,7 +1243,7 @@ for t in test_path test_filepath test_cmp test_sort test_slices test_maps test_m
 done
 # s4 enc/hash/crypto through the self-hosted emitter + cc — exercises
 # [][]str return emission (csv.read_all) and hash/crypto under -test
-for tf in enc hash crypto; do
+for tf in enc hash crypto aesgcm chacha; do
     "$OXL" run bootstrap/cmd/codegen -- --test "tests/${tf}_test.oxl" > "$cgen_dir/$tf.c"
     "$CC" -O2 $THREAD_FLAG -Iruntime "$cgen_dir/$tf.c" runtime/rt.c $NET_LIBS -o "$cgen_dir/$tf$EXE" || { echo "FAIL codegen cc $tf"; exit 1; }
     "$cgen_dir/$tf$EXE" > "$cgen_dir/$tf.out"
@@ -1244,6 +1258,12 @@ for t in test_fnv test_adler_crc test_incremental; do
 done
 for t in test_sha256 test_md5 test_hmac; do
     grep -q "$t ... ok" "$cgen_dir/crypto.out" || { echo "FAIL codegen crypto $t"; cat "$cgen_dir/crypto.out"; exit 1; }
+done
+for t in test_aes_block test_gcm; do
+    grep -q "$t ... ok" "$cgen_dir/aesgcm.out" || { echo "FAIL codegen aesgcm $t"; cat "$cgen_dir/aesgcm.out"; exit 1; }
+done
+for t in test_chacha20 test_poly1305 test_aead; do
+    grep -q "$t ... ok" "$cgen_dir/chacha.out" || { echo "FAIL codegen chacha $t"; cat "$cgen_dir/chacha.out"; exit 1; }
 done
 # s5 regexp through the self-hosted emitter + cc — the NFA engine is
 # the heaviest pure-.oxl package (struct slices, closures, utf8)

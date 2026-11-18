@@ -11,6 +11,8 @@ import "std/errors"
 
 import "std/os"
 
+import "std/strings"
+
 import "std/testing"
 
 // bundle parses a PEM fixture into borrowed certs.
@@ -38,7 +40,7 @@ fn test_env_file() {
 fn test_env_dir() {
     f := os.getenv("OXL_SSL_CERT_FILE")
     d := os.getenv("OXL_SSL_CERT_DIR")
-    if len(d) == 0 || len(f) > 0 && !os.exists(f) {
+    if len(d) == 0 || len(f) > 0 && !os.exists(f) || !strings.endswith(d, "/dir") {
         return // not this invocation's scenario
     }
     // dir scans *.pem/*.crt/*.cer — the fixture carries one of each
@@ -62,4 +64,19 @@ fn test_env_bad_path_fails() {
     testing.expect(e != nil, "bad cert_file must fail")
     testing.expect(errors.is(e, x509.err_roots()), "bad cert_file is err_roots")
     testing.expect(r.cas == nil, "bad cert_file yields no pool")
+}
+
+fn test_env_dir_bad_entry() {
+    f := os.getenv("OXL_SSL_CERT_FILE")
+    d := os.getenv("OXL_SSL_CERT_DIR")
+    if len(d) == 0 || len(f) > 0 || !strings.endswith(d, "/dirbad") {
+        return // not this invocation's scenario
+    }
+    // a set _DIR override is explicit config — a matching-named
+    // entry that is unreadable or yields no certs fails loud, never
+    // silently skipped into a half-applied pool
+    [r, e] = x509.load_system_roots()
+    testing.expect(e != nil, "bad dir entry must fail")
+    testing.expect(errors.is(e, x509.err_roots()), "bad dir entry is err_roots")
+    testing.expect(r.cas == nil, "bad dir entry yields no pool")
 }

@@ -15,6 +15,8 @@ import "std/errors"
 
 import "std/os"
 
+import "std/slices"
+
 import "std/testing"
 
 // fx reads a fixture file's text.
@@ -378,7 +380,7 @@ fn test_critical_ext() {
 }
 
 fn test_search_bounds() {
-    // untrusted is attacker-controlled: repeated name+key-equal
+    // untrusted is attacker-controlled: byte-identical duplicate
     // issuers dedupe to a single try, so a flight padded with
     // duplicates still verifies — quickly, and inside the eval
     // budget that caps worst-case signature checks
@@ -399,4 +401,56 @@ fn test_search_bounds() {
     junk := push(dup, cert("leaf_sha1.pem"))
     [p2, e2] = x509.verify(leaf, junk, rs, "", at)
     testing.expect(e2 == nil, "junk-padded untrusted verifies")
+}
+
+fn test_badsig() {
+    // signature rejection is the security core: splice one byte out
+    // of the signature tail of leaf's DER — parse still succeeds
+    // (lengths untouched) but verify must fail err_sig
+    der := slices.clone(cert("leaf.pem").raw)
+    der[len(der) - 4] = (der[len(der) - 4] + 1) % 256
+    [bad, pe] = x509.parse_cert(der)
+    testing.expect(pe == nil, "spliced leaf parses")
+    rs := roots()
+    inter := bundle("inter.pem")
+    [p, e] = x509.verify(bad, inter, rs, "", bad.not_before + 60)
+    testing.expect(errors.is(e, x509.err_sig()), "corrupt signature")
+    testing.expect(p == nil, "corrupt signature yields no path")
+}
+
+fn test_xsign_alternates() {
+    // same-subject+key twins are not dedup duplicates — cross-signed
+    // intermediates and same-key CA renewals share subject_der+spki
+    // but differ in issuer_der/validity/linking, and the spec
+    // requires alternates to be tried. Forge the dead-end twin
+    // in-test: splice inter's issuer CN to a CA name nobody carries
+    // — DER stays valid, subject+key stay identical, so the twin
+    // links off the leaf and then dead-ends on its own issuer.
+    rs := roots()
+    inter := cert("inter.pem")
+    leaf := cert("leaf.pem")
+    at := leaf.not_before + 60
+    twin_der := slices.clone(inter.raw)
+    pat := "Oxl Test Root CA"
+    pos := bytes.index(twin_der, pat as []byte)
+    testing.expect(pos >= 0, "issuer CN found in inter DER")
+    repl := "Oxl Test Dead CA"
+    rb := repl as []byte
+    i := 0
+    for i < len(rb) {
+        twin_der[pos + i] = rb[i]
+        i = i + 1
+    }
+    [twin, te] = x509.parse_cert(twin_der)
+    testing.expect(te == nil, "spliced twin parses")
+    testing.expect_streq(twin.issuer, "CN=" + repl, "twin issuer")
+    testing.expect_streq(twin.subject, inter.subject, "twin subject")
+    // dead-end twin first: old (subject_der, spki) dedup skipped the
+    // viable twin outright and the verify failed err_root
+    untrusted := mkslice(x509.Cert, 0)
+    untrusted = push(untrusted, twin)
+    untrusted = push(untrusted, inter)
+    [p, e] = x509.verify(leaf, untrusted, rs, "", at)
+    testing.expect(e == nil, "viable twin tried past dead-end twin")
+    testing.expect_eq(len(p), 3, "xsign path depth")
 }

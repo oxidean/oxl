@@ -1729,6 +1729,9 @@ fn env_dir(v: str) -> [own []Cert, err] {
             if e2 != nil {
                 return nil, errors.wrap("x509: " + v + " (" + dir + "/" + n + "): " + errors.msg(e2), err_roots())
             }
+            if cs == nil || len(cs) == 0 {
+                return nil, errors.wrap("x509: " + v + " (" + dir + "/" + n + ") unreadable or yielded no certificates", err_roots())
+            }
             j := 0
             for j < len(cs) {
                 out = push(out, cs[j])
@@ -2105,14 +2108,18 @@ fn has_eku(c: Cert, oid: str) -> bool {
     return slices.contains(c.eku, oid)
 }
 
-// issuer_dup reports whether cs[i] has an earlier twin with equal
-// subject_der and equal spki — a name+key-equal candidate produces
-// identical link outcomes (same name match, same verifying key), so
-// the search only ever tries the first of each equivalence class.
+// issuer_dup reports whether cs[i] has an earlier byte-identical
+// twin — identical DER provably produces an identical try_link
+// outcome, so the search only ever tries the first exact duplicate.
+// Name+key twins are NOT duplicates: cross-signed intermediates and
+// same-key CA renewals share subject_der+spki but differ in
+// issuer_der, validity, and akid/skid linking — collapsing them
+// would skip a viable alternate path whenever the failing twin
+// sorts first (dedup on (subject_der, spki) did exactly that).
 fn issuer_dup(cs: []Cert, i: int) -> bool {
     j := 0
     for j < i {
-        if bytes.equal(cs[i].subject_der, cs[j].subject_der) && bytes.equal(cs[i].spki, cs[j].spki) {
+        if bytes.equal(cs[i].raw, cs[j].raw) {
             return true
         }
         j = j + 1

@@ -189,6 +189,39 @@ fn scoped() -> int {
     return n
 }
 
+// every select arm replaces the borrow with a heap-backed reader —
+// the join must not retain the pre-select taint
+fn select_clear() -> io.Reader {
+    buf := bytes.newbuffer()
+    h := new(bytes.Buffer)
+    [wh, weh] = h.write("sel" as []byte)
+    r := buf.asreader()
+    c := mkchan(1)
+    select {
+        v := recv(c) => {
+            r = h.asreader()
+        }
+        timeout(0) => {
+            r = h.asreader()
+        }
+    }
+    return r
+}
+
+// slice aliases share backing — a borrow written through `a` is
+// readable through `b`, but in-scope use stays legal
+fn alias_scoped() -> int {
+    a := mkslice(io.Reader, 1)
+    b := a
+    buf := bytes.newbuffer()
+    [wa, wea] = buf.write("alias" as []byte)
+    a[0] = buf.asreader()
+    r := b[0]
+    bb := mkslice(byte, 16)
+    [n, err] = r.read(bb)
+    return n
+}
+
 fn main() {
     b := mkslice(byte, 16)
     r := via_into()
@@ -198,12 +231,17 @@ fn main() {
     [n2, err2] = r2.read(b)
     println("heap:" + substr(b as str, 0, n2))
     h2 := new(bytes.Buffer)
-    bw := bufio.newwriter(h2)
+    bw := bufio.newwriter(h2.aswriter())
     [wn3, we3] = bw.write("bufio" as []byte)
     w := bw.into_writer()
     [nw, we2] = w.write("direct" as []byte)
     println("bufio:" + itoa(nw))
+    println("sink:" + h2.str())
     println("scoped:" + itoa(scoped()))
+    r3 := select_clear()
+    [n3, err3] = r3.read(b)
+    println("select:" + substr(b as str, 0, n3))
+    println("alias:" + itoa(alias_scoped()))
 }
 EOF
 out=$("$OXL" run "$scratch/ifaceescape.oxl")
@@ -211,6 +249,9 @@ grep -q "into:owned" <<<"$out" || { echo "FAIL ifaceescape into: $out"; exit 1; 
 grep -q "heap:heap" <<<"$out" || { echo "FAIL ifaceescape heap: $out"; exit 1; }
 grep -q "scoped:6" <<<"$out" || { echo "FAIL ifaceescape scoped: $out"; exit 1; }
 grep -q "bufio:6" <<<"$out" || { echo "FAIL ifaceescape bufio: $out"; exit 1; }
+grep -q "sink:bufiodirect" <<<"$out" || { echo "FAIL ifaceescape sink: $out"; exit 1; }
+grep -q "select:sel" <<<"$out" || { echo "FAIL ifaceescape select: $out"; exit 1; }
+grep -q "alias:5" <<<"$out" || { echo "FAIL ifaceescape alias: $out"; exit 1; }
 # char literals decode to their scalar (scratch, not corpus — fmt
 # normalizes 'a' to 97 in formatted files)
 cat > "$scratch/charlit.oxl" <<'EOF'
@@ -1372,6 +1413,42 @@ for inv in "" "bogus" "list"; do
     fi
 done
 
+# #144: driver diagnostics carry file:line:col — a package-dir build must
+# point at the offending file/line, not just print a bare kind+msg.
+mkdir -p "$scratch/diagpos"
+printf 'package main\nfn main() {}\n' > "$scratch/diagpos/a.oxl"
+cat > "$scratch/diagpos/b.oxl" <<'EOF'
+package main
+
+fn f() -> int {
+    return "s"
+}
+EOF
+diagpos_out=$("$SELFOXL" build "$scratch/diagpos" -o "$scratch/diagposbin" 2>&1 || true)
+printf '%s\n' "$diagpos_out" | grep -Eq 'diagpos/b\.oxl:[0-9]+:[0-9]+: error \[type\] expected `int`, found `str`' || { echo "FAIL diag position: $diagpos_out"; exit 1; }
+
+# #145: the `[T, err]` rule is validated at the signature, not only at
+# return sites — a `[str, str]` declaration must fail on the second
+# member instead of compiling because its only return delegates.
+cat > "$scratch/pairsig.oxl" <<'EOF'
+package main
+
+fn h() -> [str, err] {
+    return "a", nil
+}
+
+fn g() -> [str, str] {
+    return h()
+}
+
+fn main() {}
+EOF
+pairsig_out=$("$SELFOXL" build "$scratch/pairsig.oxl" -o "$scratch/pairsigbin" 2>&1 || true)
+printf '%s\n' "$pairsig_out" | grep -Eq 'pairsig\.oxl:[0-9]+:[0-9]+: error \[type\] multi-return signature must be' || { echo "FAIL pair signature position: $pairsig_out"; exit 1; }
+if printf '%s\n' "$pairsig_out" | grep -q 'expected `err`, found `str`'; then
+    echo "FAIL pair signature still diagnosed at return site: $pairsig_out"; exit 1
+fi
+
 # #131: package-dir args — `oxl test` fans out over every leading dir,
 # build/run reject multiples, mixed dir+file lists and stray args are
 # loud usage errors (exit 2), and driver flags may interleave between
@@ -1403,7 +1480,7 @@ mp_out=$("$SELFOXL" test "$scratch/mp/a" --target c "$scratch/mp/b" 2>&1) && mp_
 # same text, same exit code, and neither side may accept
 for f in tests/diag/*.oxl; do
     seed_out=$("$SEEDOXL" build "$f" -o "$scratch/drvbin" 2>&1 | sed 's/^[^:]*:[0-9][0-9]*:[0-9][0-9]*: //') && seed_rc=0 || seed_rc=$?
-    self_out=$("$SELFOXL" build "$f" -o "$scratch/drvbin2" 2>&1) && self_rc=0 || self_rc=$?
+    self_out=$("$SELFOXL" build "$f" -o "$scratch/drvbin2" 2>&1 | sed 's/^[^:]*:[0-9][0-9]*:[0-9][0-9]*: //') && self_rc=0 || self_rc=$?
     if [ "$seed_rc" = 0 ] || [ "$self_rc" = 0 ]; then
         echo "FAIL driver corpus $f: a driver accepted"; exit 1
     fi

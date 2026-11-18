@@ -172,7 +172,7 @@ fn (b mut Buffer) asreadwriter() -> io.ReadWriter {
 /// would dangle. The receiver is consumed: don't use it afterwards.
 fn (b mut Buffer) into_reader() -> io.Reader {
     h := new(Buffer)
-    h.buf = b.buf
+    h.buf = new(b.buf)
     h.rd = b.rd
     return h
 }
@@ -182,7 +182,7 @@ fn (b mut Buffer) into_reader() -> io.Reader {
 /// would dangle. The receiver is consumed: don't use it afterwards.
 fn (b mut Buffer) into_writer() -> io.Writer {
     h := new(Buffer)
-    h.buf = b.buf
+    h.buf = new(b.buf)
     h.rd = b.rd
     return h
 }
@@ -192,7 +192,7 @@ fn (b mut Buffer) into_writer() -> io.Writer {
 /// don't use it afterwards.
 fn (b mut Buffer) into_readwriter() -> io.ReadWriter {
     h := new(Buffer)
-    h.buf = b.buf
+    h.buf = new(b.buf)
     h.rd = b.rd
     return h
 }

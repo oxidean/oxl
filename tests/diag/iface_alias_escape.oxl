@@ -1,0 +1,15 @@
+package main
+
+import "std/bytes"
+
+import "std/io"
+
+fn leak() -> io.Reader {
+    a := mkslice(io.Reader, 1)
+    b := a
+    buf := bytes.newbuffer()
+    a[0] = buf.asreader()
+    return b[0]
+}
+
+fn main() {}

@@ -50,7 +50,7 @@ enum Node {
     Un { op: str, e: own Node }, // {"un": s, "e": <e>}
     Bin { op: str, l: own Node, r: own Node }, // {"bin": s, "l": <l>, "r": <r>}
     Let { name: str, ty: own Node, init: own Node, lo: int, hi: int }, // {"let": s} (+"ty","init")
-    Ret { vals: own NList }, // {"return": [...]}
+    Ret { vals: own NList, lo: int, hi: int }, // {"return": [...]}
     Break, // {"break": null}
     Continue, // {"continue": null}
     Scope { body: own Node }, // {"scope": <body>}
@@ -426,6 +426,7 @@ fn nlo(n: ref Node) -> int {
         Node.Let{lo} => lo
         Node.Let2{lo} => lo
         Node.Bind{lo} => lo
+        Node.Ret{lo} => lo
         Node.Fn{lo} => lo
         Node.Struct{lo} => lo
         Node.Interface{lo} => lo
@@ -450,6 +451,7 @@ fn nhi(n: ref Node) -> int {
         Node.Let{hi} => hi
         Node.Let2{hi} => hi
         Node.Bind{hi} => hi
+        Node.Ret{hi} => hi
         Node.Fn{hi} => hi
         Node.Struct{hi} => hi
         Node.Interface{hi} => hi
@@ -930,7 +932,7 @@ fn p_stmt(c: mut PCur) -> own Node {
                 break
             }
         }
-        return b(Node.Ret{vals: nrev(vals)})
+        return b(Node.Ret{vals: nrev(vals), lo: m, hi: c.phi})
     }
     if eat(c, "break") {
         return b(Node.Break)

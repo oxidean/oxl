@@ -1,0 +1,22 @@
+package main
+
+import "std/bytes"
+
+import "std/io"
+
+fn leak() -> io.Reader {
+    h := new(bytes.Buffer)
+    buf := bytes.newbuffer()
+    r := h.asreader()
+    i := 0
+    for i < 3 {
+        if i == 0 {
+            r = buf.asreader()
+            break
+        }
+        i = i + 1
+    }
+    return r
+}
+
+fn main() {}

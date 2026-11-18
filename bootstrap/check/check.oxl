@@ -425,6 +425,7 @@ struct Loader { items: []It }
 
 struct Ck {
     tyv: []T, // interned type records
+    tyhs: []int, // ty_has_slice memo — slot t*16+d: -1 unknown, 0/1 result
     fns: own collections.Map, // name -> idx into fnsv
     fnsv: []FnSig,
     structs: own collections.Map, // name -> idx into structsv
@@ -994,14 +995,31 @@ fn ty_slice_k(ck: ref Ck, t: int) -> int {
     return 0
 }
 
-// deep copy — branch joins snapshot/restore the edge list like borr
+// deep copy — branch joins snapshot/restore the edge list like borr.
+// Iterative: the recursive form paid a borrow push + frame per edge,
+// and srep runs ~10^3 edges deep on the driver itself — 52M nested
+// calls per build. Two passes (reverse, then frev-style flip) keep
+// the original order without recursion.
 fn sal_clone(l: ref SalIAS) -> own SalIAS {
-    if l == nil {
-        return nil
+    let rev: own SalIAS = nil
+    for l != nil {
+        c := new(SalIAS)
+        c.m = l.m
+        c.g = l.g
+        c.sc = l.sc
+        c.gen = l.gen
+        c.next = rev
+        rev = c
+        l = l.next
     }
-    c := salcons(l.m, l.g, l.sc, l.gen, nil)
-    c.next = sal_clone(l.next)
-    return c
+    let out: own SalIAS = nil
+    for rev != nil {
+        n := rev.next
+        rev.next = out
+        out = rev
+        rev = n
+    }
+    return out
 }
 
 fn sal_edge_live(l: ref SalIAS, m: str, g: int, sc: int, gen: int) -> int {
@@ -1119,13 +1137,31 @@ fn sal_del_name(ck: mut Ck, env: ref Env, n: str) {
 
 // may a value of type `t` contain a slice (directly or through
 // aggregate fields)? mirrors taint_may_d's depth cap
-fn ty_has_slice_d(ck: ref Ck, t: int, d: int) -> int {
+// memoized entry — the raw walk re-visits shared type DAGs
+// (parser.Node & friends) once per (type, remaining depth); without
+// the cache a single query is exponential in type depth
+fn ty_has_slice_d(ck: mut Ck, t: int, d: int) -> int {
     if t < 0 {
         return 0
     }
     if d > 8 {
         return 1
     }
+    i := t * 16 + d
+    if i < len(ck.tyhs) {
+        v := ck.tyhs[i]
+        if v >= 0 {
+            return v
+        }
+    }
+    r := ty_has_slice_r(ck, t, d)
+    if i < len(ck.tyhs) {
+        ck.tyhs[i] = r
+    }
+    return r
+}
+
+fn ty_has_slice_r(ck: mut Ck, t: int, d: int) -> int {
     k := ck.tyv[t].k
     if k == k_slice() {
         return 1
@@ -1181,7 +1217,7 @@ fn ty_has_slice_d(ck: ref Ck, t: int, d: int) -> int {
     return 0
 }
 
-fn ty_has_slice(ck: ref Ck, t: int) -> int {
+fn ty_has_slice(ck: mut Ck, t: int) -> int {
     return ty_has_slice_d(ck, t, 0)
 }
 
@@ -3132,6 +3168,11 @@ fn diag(ck: mut Ck, kind: str, msg: str) {
 // ---------- ty handles ----------
 fn tm(ck: mut Ck, k: int, i: int, args: own IList, r: int, name: str) -> int {
     ck.tyv = push(ck.tyv, T{k: k, i: i, args: args, r: r, name: name})
+    j := 0
+    for j < 16 {
+        ck.tyhs = push(ck.tyhs, -1)
+        j = j + 1
+    }
     return len(ck.tyv) - 1
 }
 
@@ -9814,6 +9855,7 @@ struct CkRes { ck: own Ck, items: []It }
 fn ck_new() -> own Ck {
     ck := new(Ck)
     ck.tyv = mkslice(T, 0)
+    ck.tyhs = mkslice(int, 0)
     ck.fns = collections.map_new()
     ck.fnsv = mkslice(FnSig, 0)
     ck.structs = collections.map_new()

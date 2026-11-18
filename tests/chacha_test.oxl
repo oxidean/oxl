@@ -1,0 +1,78 @@
+package main
+
+// X2: std/crypto/chacha20poly1305 — RFC 8439 vectors: the §2.4.2
+// keystream (via seal's ct), §2.5.2 Poly1305 plus length sweep,
+// §2.8.2 AEAD with tampered-tag reject, and round-trips.
+import "std/crypto/chacha20poly1305"
+
+import "std/encoding/hex"
+
+import "std/testing"
+
+fn test_chacha20() {
+    // RFC 8439 §2.4.2 — "Ladies and Gentlemen" under key 00..1f,
+    // nonce 000000000000004a00000000, block counter 1. seal's ct is
+    // the same keystream-xor output (tag dropped for the compare).
+    [key, _e1] = hex.decode("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+    [nonce, _e2] = hex.decode("000000000000004a00000000")
+    [pt, _e3] = hex.decode("4c616469657320616e642047656e746c656d656e206f662074686520636c617373206f66202739393a204966204920636f756c64206f6666657220796f75206f6e6c79206f6e652074697020666f7220746865206675747572652c2073756e73637265656e20776f756c642062652069742e")
+    want := "6e2e359a2568f98041ba0728dd0d6981e97e7aec1d4360c20a27afccfd9fae0bf91b65c5524733ab8f593dabcd62b3571639d624e65152ab8f530c359f0861d807ca0dbf500d6a6156a38e088a22b65e52bc514d16ccf806818ce91ab77937365af90bbf74a35be6b40b8eedf2785e42874d"
+    [out, e] = chacha20poly1305.seal(key, nonce, mkslice(byte, 0), pt)
+    testing.expect(e == nil, "chacha seal")
+    testing.expect_streq(hex.encode(out[:len(pt)]), want, "chacha20 stream")
+}
+
+fn test_poly1305() {
+    // RFC 8439 §2.5.2
+    [otk, _e1] = hex.decode("85d6be7857556d337f4452fe42d506a80103808afb0db2fd4abff6af4149f51b")
+    tag := chacha20poly1305.sum(otk, "Cryptographic Forum Research Group" as []byte)
+    testing.expect_streq(hex.encode(tag), "a8061dc1305136c6c22b8baf0c0127a9", "poly1305 rfc")
+    // length sweep — empty, partial tails both sides of 16
+    testing.expect_streq(hex.encode(chacha20poly1305.sum(otk, mkslice(byte, 0))), "0103808afb0db2fd4abff6af4149f51b", "poly1305 empty")
+    testing.expect_streq(hex.encode(chacha20poly1305.sum(otk, mkslice(byte, 15))), "8af18a33a656b69820a60840cc51ffa0", "poly1305 15B")
+    testing.expect_streq(hex.encode(chacha20poly1305.sum(otk, mkslice(byte, 16))), "268f6e95a4b8fa01e694ddc1d1d3fd25", "poly1305 16B")
+    testing.expect_streq(hex.encode(chacha20poly1305.sum(otk, mkslice(byte, 17))), "740d53bb9ab558b8042871ae21d61218", "poly1305 17B")
+    testing.expect_streq(hex.encode(chacha20poly1305.sum(otk, mkslice(byte, 32))), "8f146b073b0c4c4f9c81136ea320461b", "poly1305 32B")
+}
+
+fn test_aead() {
+    // RFC 8439 §2.8.2
+    [key, _e1] = hex.decode("808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f")
+    [nonce, _e2] = hex.decode("070000004041424344454647")
+    [aad, _e3] = hex.decode("50515253c0c1c2c3c4c5c6c7")
+    [pt, _e4] = hex.decode("4c616469657320616e642047656e746c656d656e206f662074686520636c617373206f66202739393a204966204920636f756c64206f6666657220796f75206f6e6c79206f6e652074697020666f7220746865206675747572652c2073756e73637265656e20776f756c642062652069742e")
+    want := "d31a8d34648e60db7b86afbc53ef7ec2a4aded51296e08fea9e2b5a736ee62d63dbea45e8ca9671282fafb69da92728b1a71de0a9e060b2905d6a5b67ecd3b3692ddbd7f2d778b8c9803aee328091b58fab324e4fad675945585808b4831d7bc3ff4def08e4b7a9de576d26586cec64b61161ae10b594f09e26a7e902ecbd0600691"
+    [out, e] = chacha20poly1305.seal(key, nonce, aad, pt)
+    testing.expect(e == nil, "aead seal")
+    testing.expect_streq(hex.encode(out), want, "aead ct+tag")
+    [back, e2] = chacha20poly1305.open(key, nonce, aad, out)
+    testing.expect(e2 == nil, "aead open")
+    testing.expect(hex.encode(back) == hex.encode(pt), "aead round-trip")
+    // wrong-tag reject — flip the last byte
+    bad := mkslice(byte, len(out))
+    i := 0
+    for i < len(out) {
+        bad[i] = out[i]
+        i = i + 1
+    }
+    bad[len(out) - 1] = bad[len(out) - 1] ^ 1
+    [_p, e3] = chacha20poly1305.open(key, nonce, aad, bad)
+    testing.expect(e3 != nil, "aead wrong-tag rejected")
+    // tampered aad rejects too
+    badaad := mkslice(byte, len(aad))
+    i = 0
+    for i < len(aad) {
+        badaad[i] = aad[i]
+        i = i + 1
+    }
+    badaad[0] = badaad[0] ^ 1
+    [_p2, e4] = chacha20poly1305.open(key, nonce, badaad, out)
+    testing.expect(e4 != nil, "aead tampered-aad rejected")
+    // input validation: key and nonce lengths are pinned
+    [_s1, e5] = chacha20poly1305.seal(mkslice(byte, 31), nonce, aad, pt)
+    testing.expect(e5 != nil, "short key rejected")
+    [_s2, e6] = chacha20poly1305.seal(key, mkslice(byte, 8), aad, pt)
+    testing.expect(e6 != nil, "short nonce rejected")
+    [_p3, e7] = chacha20poly1305.open(key, nonce, aad, out[:8])
+    testing.expect(e7 != nil, "short ct rejected")
+}

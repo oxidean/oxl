@@ -2386,7 +2386,19 @@ fn ret_sig(ck: mut Ck, ret: ref parser.Node) -> own CRet {
             match ret {
                 parser.Node.List{items} => {
                     cr.rk = 2
-                    if items != nil {
+                    if items == nil || items.next == nil || items.next.next != nil {
+                        diag(ck, "type", "multi-return signature must be `[T, err]`")
+                        cr.r1 = t_unk(ck)
+                    } else {
+                        if items.next.v != nil {
+                            epos := parser.nlo(items.next.v)
+                            if epos >= 0 {
+                                ck.dpos = epos
+                            }
+                        }
+                        if ty_str(items.next.v) != "err" {
+                            diag(ck, "type", "multi-return signature must be `[T, err]`")
+                        }
                         cr.r1 = ty_parse(ck, ty_str(items.v))
                     }
                 }

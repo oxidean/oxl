@@ -54,15 +54,19 @@ fn eprintln(s: str) {
     eprint(s + "\n")
 }
 
-// check.oxl diags carry {kind,msg} with no position — the seed's
-// `file:line:col:` prefix is stripped by the parity corpus before
-// comparison (the tests/diag convention), so the bare form is what
-// both sides converge on
+// check.oxl diags carry {kind,msg,file,off}; render the seed-style
+// `file:line:col:` prefix whenever the checker recorded a source
+// position. Load/module diags have no position and stay bare.
 fn report_diags(diags: []check.DBox) {
     i := 0
     for i < len(diags) {
         d := diags[i]
-        eprintln("error [" + d.kind + "] " + d.msg)
+        if len(d.file) > 0 && d.off >= 0 {
+            fp := fpos(readfile(d.file), d.off)
+            eprintln(d.file + ":" + itoa(fp.line) + ":" + itoa(fp.col) + ": error [" + d.kind + "] " + d.msg)
+        } else {
+            eprintln("error [" + d.kind + "] " + d.msg)
+        }
         i = i + 1
     }
 }

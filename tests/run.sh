@@ -1319,6 +1319,42 @@ for inv in "" "bogus" "list"; do
     fi
 done
 
+# #144: driver diagnostics carry file:line:col — a package-dir build must
+# point at the offending file/line, not just print a bare kind+msg.
+mkdir -p "$scratch/diagpos"
+printf 'package main\nfn main() {}\n' > "$scratch/diagpos/a.oxl"
+cat > "$scratch/diagpos/b.oxl" <<'EOF'
+package main
+
+fn f() -> int {
+    return "s"
+}
+EOF
+diagpos_out=$("$SELFOXL" build "$scratch/diagpos" -o "$scratch/diagposbin" 2>&1 || true)
+printf '%s\n' "$diagpos_out" | grep -Eq 'diagpos/b\.oxl:[0-9]+:[0-9]+: error \[type\] expected `int`, found `str`' || { echo "FAIL diag position: $diagpos_out"; exit 1; }
+
+# #145: the `[T, err]` rule is validated at the signature, not only at
+# return sites — a `[str, str]` declaration must fail on the second
+# member instead of compiling because its only return delegates.
+cat > "$scratch/pairsig.oxl" <<'EOF'
+package main
+
+fn h() -> [str, err] {
+    return "a", nil
+}
+
+fn g() -> [str, str] {
+    return h()
+}
+
+fn main() {}
+EOF
+pairsig_out=$("$SELFOXL" build "$scratch/pairsig.oxl" -o "$scratch/pairsigbin" 2>&1 || true)
+printf '%s\n' "$pairsig_out" | grep -Eq 'pairsig\.oxl:[0-9]+:[0-9]+: error \[type\] multi-return signature must be' || { echo "FAIL pair signature position: $pairsig_out"; exit 1; }
+if printf '%s\n' "$pairsig_out" | grep -q 'expected `err`, found `str`'; then
+    echo "FAIL pair signature still diagnosed at return site: $pairsig_out"; exit 1
+fi
+
 # #131: package-dir args — `oxl test` fans out over every leading dir,
 # build/run reject multiples, mixed dir+file lists and stray args are
 # loud usage errors (exit 2), and driver flags may interleave between
@@ -1350,7 +1386,7 @@ mp_out=$("$SELFOXL" test "$scratch/mp/a" --target c "$scratch/mp/b" 2>&1) && mp_
 # same text, same exit code, and neither side may accept
 for f in tests/diag/*.oxl; do
     seed_out=$("$SEEDOXL" build "$f" -o "$scratch/drvbin" 2>&1 | sed 's/^[^:]*:[0-9][0-9]*:[0-9][0-9]*: //') && seed_rc=0 || seed_rc=$?
-    self_out=$("$SELFOXL" build "$f" -o "$scratch/drvbin2" 2>&1) && self_rc=0 || self_rc=$?
+    self_out=$("$SELFOXL" build "$f" -o "$scratch/drvbin2" 2>&1 | sed 's/^[^:]*:[0-9][0-9]*:[0-9][0-9]*: //') && self_rc=0 || self_rc=$?
     if [ "$seed_rc" = 0 ] || [ "$self_rc" = 0 ]; then
         echo "FAIL driver corpus $f: a driver accepted"; exit 1
     fi

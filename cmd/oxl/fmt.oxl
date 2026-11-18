@@ -507,7 +507,14 @@ struct FVar { name: str, vk: int, tys: own SSL, fields: own PL, lo: int }
 
 struct VL { v: own FVar, next: own VL }
 
-struct FMethod { name: str, params: own PL, retk: int, retty: str, lo: int }
+struct FMethod {
+    name: str,
+    params: own PL,
+    retk: int,
+    retty: str,
+    lo: int,
+    susp: int,
+}
 
 struct MSL { v: own FMethod, next: own MSL }
 
@@ -1209,6 +1216,14 @@ fn fp_item(p: mut FPar) -> own FItem {
         let methods: own MSL = nil
         for !feat_p(p, "}") && !fat_eof(p) {
             t := fcurt(p)
+            // `susp` + ident marks the next method suspendable (the
+            // contextual rule `susp(` = a method named susp)
+            msusp := 0
+            if t.txt == "susp" && t.kind == 1 && fpeekt(p).kind == 1 {
+                fbump(p)
+                msusp = 1
+                t = fcurt(p)
+            }
             if t.kind == 1 {
                 if fpeekt(p).kind == 5 && fpeekt(p).txt == "(" {
                     mlo := fspan_lo(p)
@@ -1228,6 +1243,7 @@ fn fp_item(p: mut FPar) -> own FItem {
                     m.retk = mr.k
                     m.retty = mr.s
                     m.lo = mlo
+                    m.susp = msusp
                     methods = mscons(m, methods)
                 } else {
                     ops = sscons(t.txt, ops)
@@ -2648,7 +2664,11 @@ fn fitem(f: mut Fmt2, it: own FItem) {
             l2 := methods
             for l2 != nil {
                 mm := l2.v
-                mems = push(mems, FMem{lo: mm.lo, txt: mm.name + "(" + fparams_txt(mm.params) + ")" + fret_txt(mm.retk, mm.retty)})
+                spfx := ""
+                if mm.susp == 1 {
+                    spfx = "susp "
+                }
+                mems = push(mems, FMem{lo: mm.lo, txt: spfx + mm.name + "(" + fparams_txt(mm.params) + ")" + fret_txt(mm.retk, mm.retty)})
                 l2 = l2.next
             }
             fmember_list(f, it.lo, "interface " + name, mems, 0)

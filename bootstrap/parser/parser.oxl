@@ -69,7 +69,7 @@ enum Node {
     Import { path: str, alias: str, names: own NList }, // {"import": s} (+"as","names")
     Struct { name: str, fields: own NList, lo: int, hi: int }, // {"struct": s, "fields": [...]}
     Interface { name: str, ops: own NList, methods: own NList, lo: int, hi: int }, // {"interface": s}
-    Method { name: str, params: own NList, ret: own Node, lo: int, hi: int }, // {"method": s}
+    Method { name: str, susp: int, params: own NList, ret: own Node, lo: int, hi: int }, // {"method": s} (+"susp")
     Skip { text: str }, // {"skip": s}
     Root { items: own NList }, // {"items": [...]}
     Enum { name: str, vars: own NList, lo: int, hi: int }, // {"enum": s, "variants": [...]}
@@ -291,8 +291,11 @@ fn to_json(n: own Node) -> own json.Json {
             json.jadd(o, "ops", jl_items(ops))
             json.jadd(o, "methods", jl_items(methods))
         }
-        Node.Method{name, params, ret} => {
+        Node.Method{name, susp, params, ret} => {
             json.jadd(o, "method", json.jstr(name))
+            if susp != 0 {
+                json.jadd(o, "susp", json.jbool(true))
+            }
             json.jadd(o, "params", jl_items(params))
             if ret != nil {
                 json.jadd(o, "ret", to_json(ret))
@@ -1288,13 +1291,27 @@ fn p_item(c: mut PCur) -> own Node {
         let methods: own NList = nil
         for !at(c, "}") && !eof(c) {
             mm := coff(c)
+            // `susp` is a contextual marker, not a keyword: an ident (or
+            // keyword) right after it makes it a suspendable-method mark;
+            // `susp(` directly is a method literally named susp — and a
+            // bare `susp` before a punct still reads as an op word
+            msusp := 0
+            if peek(c) == "susp" && c.t.next != nil && (c.t.next.kind == lexlib.k_ident() || c.t.next.kind == lexlib.k_kw()) {
+                next(c)
+                msusp = 1
+            }
             mname := peek(c)
             next(c)
             if at(c, "(") {
                 mparams := p_params(c)
                 mret := p_ret(c)
-                methods = ncons(b(Node.Method{name: mname, params: mparams, ret: mret, lo: mm, hi: c.phi}), methods)
+                methods = ncons(b(Node.Method{name: mname, susp: msusp, params: mparams, ret: mret, lo: mm, hi: c.phi}), methods)
             } else {
+                if msusp == 1 {
+                    // the mark only applies to method names — `susp eq`
+                    // surfaces as an unparsed fragment
+                    methods = ncons(b(Node.Skip{text: "susp " + mname}), methods)
+                }
                 ops = ncons(b(Node.Name{n: mname, lo: mm, hi: c.phi}), ops)
             }
             eat(c, ",")

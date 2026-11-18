@@ -485,6 +485,29 @@ grep -q 'esc="\\a\\b\\v\\f"' <<<"$out" || { echo "FAIL slog short escapes: $out"
 grep -q 'ufffd="\\ufffd"' <<<"$out" || { echo "FAIL slog valid ufffd: $out"; exit 1; }
 true
 
+echo "== oxl test: curves (x4) =="
+out=$("$OXL" test tests/x25519_test.oxl) || { printf '%s
+' "$out" >&2; exit 1; }
+printf '%s
+' "$out" >&2
+for t in test_x25519; do
+    grep -q "$t ... ok" <<<"$out" || { echo "FAIL x25519: $out"; exit 1; }
+done
+out=$("$OXL" test tests/nistec_test.oxl) || { printf '%s
+' "$out" >&2; exit 1; }
+printf '%s
+' "$out" >&2
+for t in test_ecdh_p256 test_ecdh_p384 test_ecdsa; do
+    grep -q "$t ... ok" <<<"$out" || { echo "FAIL nistec: $out"; exit 1; }
+done
+out=$("$OXL" test tests/ed25519_test.oxl) || { printf '%s
+' "$out" >&2; exit 1; }
+printf '%s
+' "$out" >&2
+for t in test_ed25519; do
+    grep -q "$t ... ok" <<<"$out" || { echo "FAIL ed25519: $out"; exit 1; }
+done
+
 echo "== oxl test: compress & archive =="
 out=$("$OXL" test tests/compress_flate.oxl)
 printf '%s
@@ -1424,10 +1447,10 @@ printf '%s
 for t in test_path test_filepath test_cmp test_sort test_slices test_maps test_math test_rand test_utf8; do
     grep -q "$t ... ok" <<<"$out" || { echo "FAIL codegen util: $out"; exit 1; }
 done
-# s4 enc/hash/crypto + x1/x3 crypto through the self-hosted emitter +
+# s4 enc/hash/crypto + x1/x3/x4 crypto through the self-hosted emitter +
 # cc — exercises [][]str return emission (csv.read_all), hash/crypto,
 # and the big-limb arithmetic under -test
-for tf in enc hash crypto aesgcm chacha sha512 hkdf crypto_rand bignum rsa; do
+for tf in enc hash crypto aesgcm chacha sha512 hkdf crypto_rand bignum rsa x25519 nistec ed25519; do
     "$OXL" run bootstrap/cmd/codegen -- --test "tests/${tf}_test.oxl" > "$cgen_dir/$tf.c"
     tfcrypto=""; tfcryptolib=""
     grep -q 'rt_csrand(' "$cgen_dir/$tf.c" && { tfcrypto="-DOXL_CRYPTO"; tfcryptolib="$CRYPTO_LIBS"; }
@@ -1465,6 +1488,15 @@ for t in test_modmul test_modexp test_modinv; do
 done
 for t in test_rsav15 test_rsapss; do
     grep -q "$t ... ok" "$cgen_dir/rsa.out" || { echo "FAIL codegen rsa $t"; cat "$cgen_dir/rsa.out"; exit 1; }
+done
+for t in test_x25519; do
+    grep -q "$t ... ok" "$cgen_dir/x25519.out" || { echo "FAIL codegen x25519 $t"; cat "$cgen_dir/x25519.out"; exit 1; }
+done
+for t in test_ecdh_p256 test_ecdh_p384 test_ecdsa; do
+    grep -q "$t ... ok" "$cgen_dir/nistec.out" || { echo "FAIL codegen nistec $t"; cat "$cgen_dir/nistec.out"; exit 1; }
+done
+for t in test_ed25519; do
+    grep -q "$t ... ok" "$cgen_dir/ed25519.out" || { echo "FAIL codegen ed25519 $t"; cat "$cgen_dir/ed25519.out"; exit 1; }
 done
 # s5 regexp through the self-hosted emitter + cc — the NFA engine is
 # the heaviest pure-.oxl package (struct slices, closures, utf8)

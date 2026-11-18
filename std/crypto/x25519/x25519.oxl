@@ -1,0 +1,337 @@
+package x25519
+
+// std/crypto/x25519 — RFC 7748 X25519: Curve25519 ECDH via the
+// Montgomery ladder. The field is ref10-style: elements are 10 i64
+// limbs on an alternating 26/25-bit radix (limb i sits at bit
+// weight 0,26,51,77,102,128,153,179,204,230), carry-normalized after
+// every op so mul accumulators stay under 2^61 — int is i64 here,
+// there is no u128 headroom.
+//
+// Public surface is scalarmult(sk, pk) only — the field ops stay
+// private by design (std/crypto/ed25519 carries its own copy rather
+// than exporting these).
+//
+// Constant-time posture: the ladder is branch-free over the scalar
+// (fixed 255 iterations, masked cswap), but it is not strictly
+// constant-time — carry/bit math uses / and % (C idiv, operand-
+// dependent latency) and fe_tobytes' conditional subtract is a
+// branch. Callers must pre-validate input lengths: scalarmult
+// asserts len == 32 rather than erroring.
+import "std/slices"
+
+// powers of two — eager table: a lazy fill would publish a shared
+// global unsynchronized; the let initializer runs at program start
+fn mkp2() -> []int {
+    t := mkslice(int, 33)
+    v := 1
+    i := 0
+    for i < 33 {
+        t[i] = v
+        v = v * 2
+        i = i + 1
+    }
+    return slices.clone(t)
+}
+
+let P2: []int = mkp2()
+
+// lbits is the limb width: even positions 26 bits, odd 25
+fn lbits(i: int) -> int {
+    if i % 2 == 0 {
+        return 26
+    }
+    return 25
+}
+
+// plimb is field-prime p = 2^255-19 in limb form — used as a sub
+// bias (adding k*p changes nothing mod p). p's limbs are all-max
+// except limb0, which is 18 short.
+fn plimb(i: int) -> int {
+    if i == 0 {
+        return P2[26] - 19
+    }
+    return P2[lbits(i)] - 1
+}
+
+fn fe0() -> []int {
+    return mkslice(int, 10)
+}
+
+fn fe1() -> []int {
+    h := mkslice(int, 10)
+    h[0] = 1
+    return h
+}
+
+fn fecopy(f: []int) -> []int {
+    h := mkslice(int, 10)
+    i := 0
+    for i < 10 {
+        h[i] = f[i]
+        i = i + 1
+    }
+    return h
+}
+
+// carry propagates each limb's excess into the next; the wrap carry
+// out of limb 9 folds back into limb 0 times 19 (2^255 == 19 mod p),
+// then limb 0 carries once more — output limbs sit under 2^26/2^25.
+fn carry(h: []int) {
+    i := 0
+    for i < 9 {
+        b := P2[lbits(i)]
+        c := h[i] / b
+        h[i] = h[i] - c * b
+        h[i + 1] = h[i + 1] + c
+        i = i + 1
+    }
+    b := P2[25]
+    c := h[9] / b
+    h[9] = h[9] - c * b
+    h[0] = h[0] + c * 19
+    c = h[0] / P2[26]
+    h[0] = h[0] - c * P2[26]
+    h[1] = h[1] + c
+}
+
+// carry_drop propagates limb excesses up and drops the carry out
+// of limb 9 — the tobytes subtract step, where pushing +19 must
+// yield h + 19 - 2^255 (= h - p), not h + 19 mod p.
+fn carry_drop(h: []int) {
+    i := 0
+    for i < 9 {
+        b := P2[lbits(i)]
+        c := h[i] / b
+        h[i] = h[i] - c * b
+        h[i + 1] = h[i + 1] + c
+        i = i + 1
+    }
+    h[9] = h[9] - h[9] / P2[25] * P2[25]
+}
+
+fn fe_add(f: []int, g: []int) -> []int {
+    h := mkslice(int, 10)
+    i := 0
+    for i < 10 {
+        h[i] = f[i] + g[i]
+        i = i + 1
+    }
+    carry(h)
+    return h
+}
+
+// fe_sub is f - g + 2p — the 2p bias keeps every limb non-negative
+// (congruence is unaffected), then a carry pass re-normalizes.
+fn fe_sub(f: []int, g: []int) -> []int {
+    h := mkslice(int, 10)
+    i := 0
+    for i < 10 {
+        h[i] = f[i] + 2 * plimb(i) - g[i]
+        i = i + 1
+    }
+    carry(h)
+    return h
+}
+
+// fe_mul is f * g mod p. The limb weights aren't uniform (26/25
+// alternating), so a product f_i*g_j lands one bit above position
+// i+j when i and j are both odd — direct terms fold at 2x, wrap
+// terms (weight >= 2^255) at 38x (19 for the mod-p fold, 2 for the
+// odd-odd shift). The ~270 bounded products stay under 2^61.
+fn fe_mul(f: []int, g: []int) -> []int {
+    h := mkslice(int, 10)
+    k := 0
+    for k < 10 {
+        s := 0
+        i := 0
+        for i <= k {
+            j := k - i
+            if i % 2 == 1 && j % 2 == 1 {
+                s = s + 2 * f[i] * g[j]
+            } else {
+                s = s + f[i] * g[j]
+            }
+            i = i + 1
+        }
+        for i < 10 {
+            j := k + 10 - i
+            if i % 2 == 1 && j % 2 == 1 {
+                s = s + 38 * f[i] * g[j]
+            } else {
+                s = s + 19 * f[i] * g[j]
+            }
+            i = i + 1
+        }
+        h[k] = s
+        k = k + 1
+    }
+    carry(h)
+    return h
+}
+
+fn fe_sq(f: []int) -> []int {
+    return fe_mul(f, f)
+}
+
+// fe_mul_small is f * s for a small positive scalar — one carry
+// pass keeps it canonical.
+fn fe_mul_small(f: []int, s: int) -> []int {
+    h := mkslice(int, 10)
+    i := 0
+    for i < 10 {
+        h[i] = f[i] * s
+        i = i + 1
+    }
+    carry(h)
+    return h
+}
+
+// fe_invert is z^(p-2) = z^(2^255-21) — the exponent's bits are all
+// 1 from bit 5 up to 254, plus bits 0,1,3 (2^255-21 = (2^250-1)*32
+// + 11).
+fn fe_invert(z: []int) -> []int {
+    r := fe1()
+    i := 254
+    for i >= 0 {
+        r = fe_sq(r)
+        if i >= 5 || i == 0 || i == 1 || i == 3 {
+            r = fe_mul(r, z)
+        }
+        i = i - 1
+    }
+    return r
+}
+
+// fe_frombytes loads 32 little-endian bytes into limbs — bit
+// extraction, no shifts available.
+fn fe_frombytes(b: []byte) -> []int {
+    h := mkslice(int, 10)
+    w := 0
+    i := 0
+    for i < 10 {
+        v := 0
+        nb := lbits(i)
+        bit := 0
+        for bit < nb {
+            pos := w + bit
+            if b[pos / 8] / P2[pos % 8] % 2 == 1 {
+                v = v + P2[bit]
+            }
+            bit = bit + 1
+        }
+        h[i] = v
+        w = w + nb
+        i = i + 1
+    }
+    return h
+}
+
+// geqp reports whether normalized h >= p — h + 19 reaching 2^255 is
+// the test (carry survives only through all-max limbs).
+fn geqp(h: []int) -> bool {
+    c := (h[0] + 19) / P2[26]
+    i := 1
+    for i < 10 {
+        c = (h[i] + c) / P2[lbits(i)]
+        i = i + 1
+    }
+    return c > 0
+}
+
+// fe_tobytes emits the canonical 32-byte little-endian form: fully
+// carried, then a conditional subtract of p, then bit packing.
+fn fe_tobytes(h: []int) -> []byte {
+    t := fecopy(h)
+    carry(t)
+    if geqp(t) {
+        // h >= p: subtracting p == +19 then DISCARD the 2^255
+        // overflow — carry_drop, not the mod-p folding carry
+        t[0] = t[0] + 19
+        carry_drop(t)
+    }
+    out := mkslice(byte, 32)
+    pos := 0
+    i := 0
+    for i < 10 {
+        v := t[i]
+        nb := lbits(i)
+        bit := 0
+        for bit < nb {
+            if v % 2 == 1 {
+                j := pos / 8
+                out[j] = out[j] + P2[pos % 8]
+            }
+            v = v / 2
+            pos = pos + 1
+            bit = bit + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// cswap conditionally swaps a and b limb-wise — mask form, no data
+// branch (swap is the scalar bit, i.e. secret).
+fn cswap(swap: int, a: []int, b: []int) {
+    m := 0 - swap
+    i := 0
+    for i < 10 {
+        x := m & (a[i] ^ b[i])
+        a[i] = a[i] ^ x
+        b[i] = b[i] ^ x
+        i = i + 1
+    }
+}
+
+/// scalarmult is X25519: the RFC 7748 Montgomery ladder — returns
+/// the 32-byte shared u-coordinate of sk * pk. sk is clamped inside
+/// (RFC form); pk's top bit is masked per the RFC's decode rule.
+/// Lengths other than 32 are contract violations and trap.
+fn scalarmult(sk: []byte, pk: []byte) -> own []byte {
+    assert(len(sk) == 32)
+    assert(len(pk) == 32)
+    p := P2
+    k := mkslice(byte, 32)
+    u := mkslice(byte, 32)
+    i := 0
+    for i < 32 {
+        k[i] = sk[i]
+        u[i] = pk[i]
+        i = i + 1
+    }
+    k[0] = k[0] & 248
+    k[31] = k[31] & 127 | 64
+    u[31] = u[31] & 127
+    x1 := fe_frombytes(u)
+    x2 := fe1()
+    z2 := fe0()
+    x3 := fecopy(x1)
+    z3 := fe1()
+    swap := 0
+    t := 254
+    for t >= 0 {
+        kt := k[t / 8] / p[t % 8] % 2
+        swap = swap ^ kt
+        cswap(swap, x2, x3)
+        cswap(swap, z2, z3)
+        swap = kt
+        a := fe_add(x2, z2)
+        aa := fe_sq(a)
+        b := fe_sub(x2, z2)
+        bb := fe_sq(b)
+        e := fe_sub(aa, bb)
+        c := fe_add(x3, z3)
+        d := fe_sub(x3, z3)
+        da := fe_mul(d, a)
+        cb := fe_mul(c, b)
+        x3 = fe_sq(fe_add(da, cb))
+        z3 = fe_mul(x1, fe_sq(fe_sub(da, cb)))
+        x2 = fe_mul(aa, bb)
+        z2 = fe_mul(e, fe_add(aa, fe_mul_small(e, 121665)))
+        t = t - 1
+    }
+    cswap(swap, x2, x3)
+    cswap(swap, z2, z3)
+    r := fe_mul(x2, fe_invert(z2))
+    return new(fe_tobytes(r))
+}

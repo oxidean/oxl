@@ -1,0 +1,355 @@
+package nistec
+
+// std/crypto/nistec — the NIST prime curves P-256 and P-384 (X4):
+// SEC1 uncompressed-point decode, scalar multiplication (ECDH) and
+// ECDSA verify. Field and group-order arithmetic rides on
+// std/crypto/bignum; point math is Jacobian coordinates so scalar
+// mul costs one modinv total, not one per bit.
+//
+// Verify/ECDH only — no sign. Nothing here is constant-time:
+// scalarmult branches on scalar bits and every field op bottoms
+// out in i64 / and %, whose latency is operand-dependent on
+// mainstream ISAs — strict constant-time is not achievable on the
+// current substrate. For ECDSA verify and peer public keys that's
+// the right posture (public data), but ecdh/pub_from_priv feed a
+// private scalar through the same variable-time path: the TLS
+// ECDHE private share is a real secret, so this is a documented
+// limitation, not a secrets-free surface.
+import "std/crypto/bignum"
+
+import "std/encoding/hex"
+
+import "std/errors"
+
+import "std/hash"
+
+import "std/slices"
+
+// powers of two — eager table (a lazy fill would publish a shared
+// global unsynchronized); scalar bit tests need / * % on limbs
+fn mkp2() -> []int {
+    t := mkslice(int, 33)
+    v := 1
+    i := 0
+    for i < 33 {
+        t[i] = v
+        v = v * 2
+        i = i + 1
+    }
+    return slices.clone(t)
+}
+
+let P2: []int = mkp2()
+
+// cst decodes a big-endian hex constant into bignum limbs
+fn cst(h: str) -> []int {
+    [b, e] = hex.decode(h)
+    if e != nil {
+        // unreachable: literals below are fixed — trap rather than
+        // hide a broken table
+        assert(e == nil)
+    }
+    return bignum.from_be_bytes(b)
+}
+
+/// Curve is a NIST prime curve: field prime p, coefficient b
+/// (a == -3 for both curves here), base point (gx, gy), group order
+/// n, and the field byte size.
+struct Curve { p: []int, b: []int, gx: []int, gy: []int, n: []int, size: int }
+
+/// p256 returns the NIST P-256 (secp256r1) parameters.
+fn p256() -> Curve {
+    return Curve{p: cst("ffffffff00000001000000000000000000000000ffffffffffffffffffffffff"), b: cst("5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604b"), gx: cst("6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296"), gy: cst("4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5"), n: cst("ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551"), size: 32}
+}
+
+/// p384 returns the NIST P-384 (secp384r1) parameters.
+fn p384() -> Curve {
+    return Curve{p: cst("fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffeffffffff0000000000000000ffffffff"), b: cst("b3312fa7e23ee7e4988e056be3f82d19181d9c6efe8141120314088f5013875ac656398d8a2ed19d2a85c8edd3ec2aef"), gx: cst("aa87ca22be8b05378eb1c71ef320ad746e1d3b628ba79b9859f741e082542a385502f25dbf55296c3a545e3872760ab7"), gy: cst("3617de4a96262c6f5d9e98bf9292dc29f8f41dbd289a147ce9da3113b5f0b8c00a60b1ce1d7e819d7a431d7c90ea0e5f"), n: cst("ffffffffffffffffffffffffffffffffffffffffffffffffc7634d81f4372ddf581a0db248b0a77aecec196accc52973"), size: 48}
+}
+
+/// Point is an affine curve point (bignum limbs per coordinate).
+struct Point { x: []int, y: []int }
+
+// JP is a Jacobian point — z == 0 is the point at infinity.
+struct JP { x: []int, y: []int, z: []int }
+
+// ---- field ops mod c.p (results always reduced < p) ----
+fn madd(c: Curve, a: []int, b: []int) -> []int {
+    s := bignum.add(a, b)
+    if bignum.cmp(s, c.p) >= 0 {
+        return bignum.sub(s, c.p)
+    }
+    return s
+}
+
+fn msub(c: Curve, a: []int, b: []int) -> []int {
+    if bignum.cmp(a, b) >= 0 {
+        return bignum.sub(a, b)
+    }
+    return bignum.sub(c.p, bignum.sub(b, a))
+}
+
+fn mdbl(c: Curve, a: []int) -> []int {
+    return madd(c, a, a)
+}
+
+fn mmul(c: Curve, a: []int, b: []int) -> []int {
+    return bignum.modmul(a, b, c.p)
+}
+
+// ---- Jacobian point ops ----
+fn jinf() -> JP {
+    return JP{x: bignum.from_int(0), y: bignum.from_int(1), z: bignum.from_int(0)}
+}
+
+fn is_inf(p: JP) -> bool {
+    return bignum.is_zero(p.z)
+}
+
+// jdbl doubles a Jacobian point (a == -3 formulas: alpha =
+// 3*(x-z^2)*(x+z^2)).
+fn jdbl(c: Curve, q: JP) -> JP {
+    if is_inf(q) {
+        return q
+    }
+    yy := mmul(c, q.y, q.y)
+    zz := mmul(c, q.z, q.z)
+    beta := mmul(c, q.x, yy)
+    t := mmul(c, msub(c, q.x, zz), madd(c, q.x, zz))
+    alpha := madd(c, madd(c, t, t), t)
+    x3 := msub(c, mmul(c, alpha, alpha), mdbl(c, mdbl(c, mdbl(c, beta))))
+    s := madd(c, q.y, q.z)
+    z3 := msub(c, msub(c, mmul(c, s, s), yy), zz)
+    b4 := mdbl(c, mdbl(c, beta))
+    g2 := mmul(c, yy, yy)
+    g8 := mdbl(c, mdbl(c, mdbl(c, g2)))
+    y3 := msub(c, mmul(c, alpha, msub(c, b4, x3)), g8)
+    return JP{x: x3, y: y3, z: z3}
+}
+
+// jmix adds a Jacobian point and an affine point (z2 == 1) —
+// add-2007-bl with U2/S2 against Z1.
+fn jmix(c: Curve, q: JP, x2: []int, y2: []int) -> JP {
+    if is_inf(q) {
+        return JP{x: x2, y: y2, z: bignum.from_int(1)}
+    }
+    zz := mmul(c, q.z, q.z)
+    u2 := mmul(c, x2, zz)
+    s2 := mmul(c, y2, mmul(c, q.z, zz))
+    h := msub(c, u2, q.x)
+    r := msub(c, s2, q.y)
+    if bignum.is_zero(h) {
+        if bignum.is_zero(r) {
+            return jdbl(c, q)
+        }
+        return jinf()
+    }
+    hh := mmul(c, h, h)
+    hhh := mmul(c, h, hh)
+    v := mmul(c, q.x, hh)
+    x3 := msub(c, msub(c, mmul(c, r, r), hhh), mdbl(c, v))
+    y3 := msub(c, mmul(c, r, msub(c, v, x3)), mmul(c, q.y, hhh))
+    z3 := mmul(c, q.z, h)
+    return JP{x: x3, y: y3, z: z3}
+}
+
+// jadd adds two Jacobian points — the general form for u1*G + u2*Q.
+fn jadd(c: Curve, p1: JP, p2: JP) -> JP {
+    if is_inf(p1) {
+        return p2
+    }
+    if is_inf(p2) {
+        return p1
+    }
+    z1z1 := mmul(c, p1.z, p1.z)
+    z2z2 := mmul(c, p2.z, p2.z)
+    u1 := mmul(c, p1.x, z2z2)
+    u2 := mmul(c, p2.x, z1z1)
+    s1 := mmul(c, p1.y, mmul(c, p2.z, z2z2))
+    s2 := mmul(c, p2.y, mmul(c, p1.z, z1z1))
+    h := msub(c, u2, u1)
+    r := msub(c, s2, s1)
+    if bignum.is_zero(h) {
+        if bignum.is_zero(r) {
+            return jdbl(c, p1)
+        }
+        return jinf()
+    }
+    hh := mmul(c, h, h)
+    hhh := mmul(c, h, hh)
+    v := mmul(c, u1, hh)
+    x3 := msub(c, msub(c, mmul(c, r, r), hhh), mdbl(c, v))
+    y3 := msub(c, mmul(c, r, msub(c, v, x3)), mmul(c, s1, hhh))
+    z3 := mmul(c, p1.z, p2.z)
+    z3 = mmul(c, z3, h)
+    return JP{x: x3, y: y3, z: z3}
+}
+
+// bn_bit extracts bit i of a bignum — / % on base-2^26 limbs
+fn bn_bit(a: []int, i: int) -> int {
+    li := i / 26
+    if li >= len(a) {
+        return 0
+    }
+    return a[li] / P2[i % 26] % 2
+}
+
+// scalarmult is k*Q — binary double-and-add over the scalar bits,
+// Jacobian throughout.
+fn scalarmult(c: Curve, k: []int, qx: []int, qy: []int) -> JP {
+    r := jinf()
+    i := bignum.bitlen(k) - 1
+    for i >= 0 {
+        r = jdbl(c, r)
+        if bn_bit(k, i) == 1 {
+            r = jmix(c, r, qx, qy)
+        }
+        i = i - 1
+    }
+    return r
+}
+
+// to_affine converts a Jacobian point back — the single modinv.
+fn to_affine(c: Curve, q: JP) -> [Point, err] {
+    z := Point{x: nil, y: nil}
+    if is_inf(q) {
+        return z, errors.new("nistec: point at infinity")
+    }
+    [zi, e] = bignum.modinv(q.z, c.p)
+    if e != nil {
+        return z, e
+    }
+    zi2 := mmul(c, zi, zi)
+    return Point{x: mmul(c, q.x, zi2), y: mmul(c, q.y, mmul(c, zi2, zi))}, nil
+}
+
+// on_curve checks y^2 == x^3 - 3x + b mod p.
+fn on_curve(c: Curve, x: []int, y: []int) -> bool {
+    lhs := mmul(c, y, y)
+    x3 := mmul(c, mmul(c, x, x), x)
+    rhs := madd(c, msub(c, x3, madd(c, madd(c, x, x), x)), c.b)
+    return bignum.equal(lhs, rhs)
+}
+
+/// point_sec1 decodes a SEC1 uncompressed point (0x04 || X || Y) on
+/// c — rejects wrong shape, out-of-range coordinates, and points
+/// not on the curve.
+fn point_sec1(c: Curve, b: []byte) -> [Point, err] {
+    z := Point{x: nil, y: nil}
+    if len(b) != 1 + 2 * c.size || b[0] != 4 {
+        return z, errors.new("nistec: not a SEC1 uncompressed point")
+    }
+    x := bignum.from_be_bytes(b[1:1 + c.size])
+    y := bignum.from_be_bytes(b[1 + c.size:1 + 2 * c.size])
+    if bignum.cmp(x, c.p) >= 0 || bignum.cmp(y, c.p) >= 0 {
+        return z, errors.new("nistec: coordinate out of range")
+    }
+    if !on_curve(c, x, y) {
+        return z, errors.new("nistec: point not on curve")
+    }
+    return Point{x: x, y: y}, nil
+}
+
+// scalar_of reads a big-endian scalar byte string reduced mod n —
+// callers reject a zero residue (bignum.is_zero) themselves.
+fn scalar_of(c: Curve, sk: []byte) -> []int {
+    s := bignum.mod(bignum.from_be_bytes(sk), c.n)
+    return s
+}
+
+// enc_sec1 renders a Jacobian point as SEC1 uncompressed bytes —
+// shared by pub_from_priv and the test helpers.
+fn enc_sec1(c: Curve, q: JP) -> [own []byte, err] {
+    [p, e] = to_affine(c, q)
+    if e != nil {
+        return nil, e
+    }
+    out := mkslice(byte, 1 + 2 * c.size)
+    out[0] = 4
+    xb := bignum.to_be_bytes(p.x, c.size)
+    yb := bignum.to_be_bytes(p.y, c.size)
+    i := 0
+    for i < c.size {
+        out[1 + i] = xb[i]
+        out[1 + c.size + i] = yb[i]
+        i = i + 1
+    }
+    return new(out), nil
+}
+
+/// pub_from_priv is the SEC1 uncompressed encoding of sk * G —
+/// keygen for the ECDH side of TLS and test support.
+fn pub_from_priv(c: Curve, sk: []byte) -> [own []byte, err] {
+    d := scalar_of(c, sk)
+    if bignum.is_zero(d) {
+        return nil, errors.new("nistec: zero private scalar")
+    }
+    return enc_sec1(c, scalarmult(c, d, c.gx, c.gy))
+}
+
+/// ecdh returns the shared secret: the x-coordinate of sk * pk as
+/// c.size big-endian bytes. pk is a SEC1 uncompressed point.
+fn ecdh(c: Curve, sk: []byte, pk: []byte) -> [own []byte, err] {
+    [q, e] = point_sec1(c, pk)
+    if e != nil {
+        return nil, e
+    }
+    d := scalar_of(c, sk)
+    if bignum.is_zero(d) {
+        return nil, errors.new("nistec: zero private scalar")
+    }
+    [p, e2] = to_affine(c, scalarmult(c, d, q.x, q.y))
+    if e2 != nil {
+        return nil, e2
+    }
+    return bignum.to_be_bytes(p.x, c.size), nil
+}
+
+// trunc_e is the ECDSA hash truncation: the leftmost nbits bits of
+// digest (both curves' nbit is a multiple of 8), reduced mod n.
+fn trunc_e(c: Curve, digest: []byte) -> []int {
+    nb := bignum.bitlen(c.n)
+    keep := nb / 8
+    if keep > len(digest) {
+        keep = len(digest)
+    }
+    return bignum.mod(bignum.from_be_bytes(digest[0:keep]), c.n)
+}
+
+/// ecdsa_verify checks signature (r, s) — unsigned big-endian byte
+/// strings as a DER ECDSA-Sig-Value carries — over msg hashed with
+/// hf, against the SEC1 public key pk.
+fn ecdsa_verify(c: Curve, pk: []byte, hf: fn() -> hash.Hash, msg: []byte, r: []byte, s: []byte) -> err {
+    [q, e] = point_sec1(c, pk)
+    if e != nil {
+        return e
+    }
+    rb := bignum.from_be_bytes(r)
+    sb := bignum.from_be_bytes(s)
+    if bignum.is_zero(rb) || bignum.cmp(rb, c.n) >= 0 {
+        return errors.new("nistec: r out of range")
+    }
+    if bignum.is_zero(sb) || bignum.cmp(sb, c.n) >= 0 {
+        return errors.new("nistec: s out of range")
+    }
+    h := hf()
+    [wn, we] = h.write(msg)
+    digest := h.sum(nil)
+    eb := trunc_e(c, digest)
+    [w, ew] = bignum.modinv(sb, c.n)
+    if ew != nil {
+        return ew
+    }
+    u1 := bignum.modmul(eb, w, c.n)
+    u2 := bignum.modmul(rb, w, c.n)
+    s1 := scalarmult(c, u1, c.gx, c.gy)
+    s2 := scalarmult(c, u2, q.x, q.y)
+    [v, ev] = to_affine(c, jadd(c, s1, s2))
+    if ev != nil {
+        return errors.new("nistec: signature verifies to infinity")
+    }
+    if bignum.cmp(bignum.mod(v.x, c.n), rb) != 0 {
+        return errors.new("nistec: signature mismatch")
+    }
+    return nil
+}

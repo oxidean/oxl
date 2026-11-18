@@ -186,7 +186,9 @@ package main
 fn id(r io.Reader) -> int { return 0 }
 fn main() {}
 EOF
-diag=$("$OXL" build "$scratch/badparam.oxl" -o "$scratch/badparam$EXE" 2>&1 || true)
+if diag=$("$OXL" build "$scratch/badparam.oxl" -o "$scratch/badparam$EXE" 2>&1); then
+    echo "FAIL param-sep: build succeeded: $diag"; exit 1
+fi
 grep -q "parameter list" <<<"$diag" || { echo "FAIL param-sep diag: $diag"; exit 1; }
 
 echo "== oxl test: util (s3) =="

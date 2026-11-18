@@ -511,7 +511,7 @@ done
 echo "== oxl test: x509 (x5) =="
 out=$("$OXL" test tests/x509_test.oxl) || { printf '%s\n' "$out" >&2; exit 1; }
 printf '%s\n' "$out" >&2
-for t in test_parse test_chain_ok test_expired test_bad_name test_wildcard test_untrusted test_bad_ca test_sha1_reject test_eku test_ip_san; do
+for t in test_parse test_chain_ok test_expired test_bad_name test_wildcard test_untrusted test_bad_ca test_sha1_reject test_eku test_ip_san test_self_anchor test_anchor_exemption test_critical_ext test_search_bounds; do
     grep -q "$t ... ok" <<<"$out" || { echo "FAIL x509: $out"; exit 1; }
 done
 # env-root discovery — three configurations over one file; each
@@ -1522,7 +1522,7 @@ done
 for t in test_ed25519; do
     grep -q "$t ... ok" "$cgen_dir/ed25519.out" || { echo "FAIL codegen ed25519 $t"; cat "$cgen_dir/ed25519.out"; exit 1; }
 done
-for t in test_parse test_chain_ok test_expired test_bad_name test_wildcard test_untrusted test_bad_ca test_sha1_reject test_eku test_ip_san; do
+for t in test_parse test_chain_ok test_expired test_bad_name test_wildcard test_untrusted test_bad_ca test_sha1_reject test_eku test_ip_san test_self_anchor test_anchor_exemption test_critical_ext test_search_bounds; do
     grep -q "$t ... ok" "$cgen_dir/x509.out" || { echo "FAIL codegen x509 $t"; cat "$cgen_dir/x509.out"; exit 1; }
 done
 # x5 env-root discovery through codegen — the same three

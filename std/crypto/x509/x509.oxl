@@ -264,7 +264,10 @@ fn need(t: tlv, tag: int, what: str) -> err {
 }
 
 // int_win is the positive-magnitude window of an INTEGER content —
-// a set high bit means negative, then zero padding is stripped.
+// a set high bit means negative. DER minimality: a leading 0x00 is
+// legal only to keep the value positive (the next byte's high bit
+// set); a pad over a low-bit byte, or more than one pad, is
+// non-minimal and rejected.
 struct IntWin { off: int, len: int, ok: bool }
 
 fn int_win(der: []byte, t: tlv) -> IntWin {
@@ -274,7 +277,10 @@ fn int_win(der: []byte, t: tlv) -> IntWin {
     }
     o := t.off
     l := t.len
-    for l > 1 && der[o] == 0 {
+    if l > 1 && der[o] == 0 {
+        if der[o + 1] < 128 {
+            return z // the pad byte wasn't needed for sign
+        }
         o = o + 1
         l = l - 1
     }
@@ -477,6 +483,9 @@ fn name_str(der: []byte, t: tlv) -> str {
         if e != nil {
             break
         }
+        if tlend(st) > tlend(t) {
+            break // a child may not overrun its parent's end
+        }
         p = tlend(st)
         if st.tag != 49 {
             continue
@@ -487,12 +496,15 @@ fn name_str(der: []byte, t: tlv) -> str {
             if e2 != nil {
                 break
             }
+            if tlend(atv) > tlend(st) {
+                break
+            }
             q = tlend(atv)
             if atv.tag != 48 {
                 continue
             }
             [o, e3] = dnext(der, atv.off)
-            if e3 != nil || o.tag != 6 {
+            if e3 != nil || o.tag != 6 || tlend(o) > tlend(atv) {
                 continue
             }
             [oid, e4] = oid_str(der, o)
@@ -500,7 +512,7 @@ fn name_str(der: []byte, t: tlv) -> str {
                 continue
             }
             [v, e5] = dnext(der, tlend(o))
-            if e5 != nil {
+            if e5 != nil || tlend(v) > tlend(atv) {
                 continue
             }
             sv := str_val(der, v)
@@ -715,9 +727,15 @@ fn ext_bc(der: []byte, t: tlv, x: mut exts) -> err {
         if e2 != nil {
             return e2
         }
+        if tlend(v) > tlend(seq) {
+            return errors.wrap("x509: basicConstraints field overruns sequence", err_der())
+        }
         p = tlend(v)
         if v.tag == 1 {
-            if v.len > 0 && der[v.off] != 0 {
+            if v.len != 1 {
+                return errors.wrap("x509: basicConstraints cA boolean length", err_der())
+            }
+            if der[v.off] != 0 {
                 x.is_ca = 1
             }
         } else if v.tag == 2 {
@@ -750,27 +768,22 @@ fn ext_ku(der: []byte, t: tlv, x: mut exts) -> err {
     if e != nil {
         return e
     }
+    // Only 9 keyUsage bits are defined (0..8 → byte 0 plus byte 1's
+    // MSB); content bits past them are ignored, never folded into ku.
+    // m is the running bit mask — no inner multiply loop.
     ku := 0
+    m := 1
     n := 0
-    for n < w.len {
+    for n < w.len && m < 512 {
         vb := der[w.off + n]
+        src := 128 // bit 0 is the first content byte's MSB
         j := 0
-        for j < 8 {
-            bit := 1
-            k := 0
-            for k < 7 - j {
-                bit = bit * 2
-                k = k + 1
-            }
-            if (vb & bit) != 0 {
-                m := 1
-                k = 0
-                for k < 8 * n + j {
-                    m = m * 2
-                    k = k + 1
-                }
+        for j < 8 && m < 512 {
+            if (vb & src) != 0 {
                 ku = ku + m
             }
+            src = src / 2
+            m = m * 2
             j = j + 1
         }
         n = n + 1
@@ -797,6 +810,9 @@ fn ext_eku(der: []byte, t: tlv, x: mut exts) -> err {
         [o, e2] = dnext(der, p)
         if e2 != nil {
             return e2
+        }
+        if tlend(o) > tlend(seq) {
+            return errors.wrap("x509: eku entry overruns sequence", err_der())
         }
         p = tlend(o)
         if o.tag != 6 {
@@ -831,6 +847,9 @@ fn ext_san(der: []byte, t: tlv, x: mut exts) -> err {
         [g, e2] = dnext(der, p)
         if e2 != nil {
             return e2
+        }
+        if tlend(g) > tlend(seq) {
+            return errors.wrap("x509: san entry overruns sequence", err_der())
         }
         p = tlend(g)
         if g.tag == 130 {
@@ -883,6 +902,9 @@ fn ext_akid(der: []byte, t: tlv, x: mut exts) -> err {
         if e2 != nil {
             return e2
         }
+        if tlend(v) > tlend(seq) {
+            return errors.wrap("x509: akid field overruns sequence", err_der())
+        }
         p = tlend(v)
         if v.tag == 128 {
             x.akid = slices.clone(der[v.off:v.off + v.len])
@@ -910,6 +932,9 @@ fn parse_exts(der: []byte, t: tlv, x: mut exts) -> err {
         if e2 != nil {
             return e2
         }
+        if tlend(ext) > tlend(seq) {
+            return errors.wrap("x509: extension overruns sequence", err_der())
+        }
         p = tlend(ext)
         e2 = need(ext, 48, "extension sequence")
         if e2 != nil {
@@ -918,6 +943,9 @@ fn parse_exts(der: []byte, t: tlv, x: mut exts) -> err {
         [o, e3] = dnext(der, ext.off)
         if e3 != nil {
             return e3
+        }
+        if tlend(o) > tlend(ext) {
+            return errors.wrap("x509: extension oid overruns extension", err_der())
         }
         e3 = need(o, 6, "extension oid")
         if e3 != nil {
@@ -932,15 +960,24 @@ fn parse_exts(der: []byte, t: tlv, x: mut exts) -> err {
         if e5 != nil {
             return e5
         }
+        if tlend(nv) > tlend(ext) {
+            return errors.wrap("x509: extension value overruns extension", err_der())
+        }
         crit := 0
         if nv.tag == 1 {
-            if nv.len > 0 && der[nv.off] != 0 {
+            if nv.len != 1 {
+                return errors.wrap("x509: extension critical boolean length", err_der())
+            }
+            if der[nv.off] != 0 {
                 crit = 1
             }
             inner = tlend(nv)
             [nv2, e6] = dnext(der, inner)
             if e6 != nil {
                 return e6
+            }
+            if tlend(nv2) > tlend(ext) {
+                return errors.wrap("x509: extension value overruns extension", err_der())
             }
             nv = nv2
         }
@@ -1019,12 +1056,18 @@ fn pss_params(der: []byte, t: tlv) -> [int, err] {
         if e != nil {
             return 0, e
         }
+        if tlend(v) > tlend(t) {
+            return 0, errors.wrap("x509: pss param overruns params", err_der())
+        }
         p = tlend(v)
         if v.tag == 160 {
             // [0] hashAlgorithm — EXPLICIT AlgorithmIdentifier
             [alg, e2] = dnext(der, v.off)
             if e2 != nil {
                 return 0, e2
+            }
+            if tlend(alg) > tlend(v) {
+                return 0, errors.wrap("x509: pss hash algid overruns [0]", err_der())
             }
             e2 = need(alg, 48, "pss hash algid")
             if e2 != nil {
@@ -1033,6 +1076,9 @@ fn pss_params(der: []byte, t: tlv) -> [int, err] {
             [o, e3] = dnext(der, alg.off)
             if e3 != nil {
                 return 0, e3
+            }
+            if tlend(o) > tlend(alg) {
+                return 0, errors.wrap("x509: pss hash oid overruns", err_der())
             }
             e3 = need(o, 6, "pss hash oid")
             if e3 != nil {
@@ -1049,6 +1095,9 @@ fn pss_params(der: []byte, t: tlv) -> [int, err] {
             if e2 != nil {
                 return 0, e2
             }
+            if tlend(alg) > tlend(v) {
+                return 0, errors.wrap("x509: pss mgf algid overruns [1]", err_der())
+            }
             e2 = need(alg, 48, "pss mgf algid")
             if e2 != nil {
                 return 0, e2
@@ -1056,6 +1105,9 @@ fn pss_params(der: []byte, t: tlv) -> [int, err] {
             [o, e3] = dnext(der, alg.off)
             if e3 != nil {
                 return 0, e3
+            }
+            if tlend(o) > tlend(alg) {
+                return 0, errors.wrap("x509: pss mgf oid overruns", err_der())
             }
             e3 = need(o, 6, "pss mgf oid")
             if e3 != nil {
@@ -1072,6 +1124,9 @@ fn pss_params(der: []byte, t: tlv) -> [int, err] {
             if e5 != nil {
                 return 0, e5
             }
+            if tlend(hp) > tlend(alg) {
+                return 0, errors.wrap("x509: pss mgf hash algid overruns", err_der())
+            }
             e5 = need(hp, 48, "pss mgf hash algid")
             if e5 != nil {
                 return 0, e5
@@ -1079,6 +1134,9 @@ fn pss_params(der: []byte, t: tlv) -> [int, err] {
             [ho, e6] = dnext(der, hp.off)
             if e6 != nil {
                 return 0, e6
+            }
+            if tlend(ho) > tlend(hp) {
+                return 0, errors.wrap("x509: pss mgf hash oid overruns", err_der())
             }
             e6 = need(ho, 6, "pss mgf hash oid")
             if e6 != nil {
@@ -1093,8 +1151,15 @@ fn pss_params(der: []byte, t: tlv) -> [int, err] {
             }
             hash_oid = mh
         } else if v.tag == 163 {
-            // [3] trailerField — must be 1
+            // [3] trailerField — must be INTEGER 1
             [iv, e2] = dnext(der, v.off)
+            if e2 != nil {
+                return 0, e2
+            }
+            if tlend(iv) > tlend(v) {
+                return 0, errors.wrap("x509: pss trailer field overruns [3]", err_der())
+            }
+            e2 = need(iv, 2, "pss trailer field")
             if e2 != nil {
                 return 0, e2
             }
@@ -1118,6 +1183,9 @@ fn sig_alg_of(der: []byte, t: tlv) -> [int, err] {
     [o, e] = dnext(der, t.off)
     if e != nil {
         return 0, e
+    }
+    if tlend(o) > tlend(t) {
+        return 0, errors.wrap("x509: sig alg oid overruns algid", err_der())
     }
     e = need(o, 6, "signature algorithm oid")
     if e != nil {
@@ -1174,6 +1242,9 @@ fn spki_alg_of(der: []byte, t: tlv) -> [int, err] {
     if e != nil {
         return 0, e
     }
+    if tlend(alg) > tlend(t) {
+        return 0, errors.wrap("x509: spki algid overruns spki", err_der())
+    }
     e = need(alg, 48, "spki algid")
     if e != nil {
         return 0, e
@@ -1181,6 +1252,9 @@ fn spki_alg_of(der: []byte, t: tlv) -> [int, err] {
     [o, e2] = dnext(der, alg.off)
     if e2 != nil {
         return 0, e2
+    }
+    if tlend(o) > tlend(alg) {
+        return 0, errors.wrap("x509: spki oid overruns algid", err_der())
     }
     e2 = need(o, 6, "spki oid")
     if e2 != nil {
@@ -1204,6 +1278,9 @@ fn spki_alg_of(der: []byte, t: tlv) -> [int, err] {
         [co, e4] = dnext(der, p)
         if e4 != nil {
             return 0, e4
+        }
+        if tlend(co) > tlend(alg) {
+            return 0, errors.wrap("x509: ec curve oid overruns algid", err_der())
         }
         e4 = need(co, 6, "ec curve oid")
         if e4 != nil {
@@ -1311,6 +1388,9 @@ fn parse_cert(der: []byte) -> [Cert, err] {
             return z, e8
         }
         version = vv + 1
+        if version > 3 {
+            return z, errors.wrap("x509: version above v3", err_der())
+        }
         p = tlend(f)
         [f2, e9] = dnext(der, p)
         if e9 != nil {
@@ -1321,6 +1401,9 @@ fn parse_cert(der: []byte) -> [Cert, err] {
     e6 = need(f, 2, "serial number")
     if e6 != nil {
         return z, e6
+    }
+    if tlend(f) > tend {
+        return z, errors.wrap("x509: serial overruns tbs", err_der())
     }
     serw := int_win(der, f)
     if !serw.ok {
@@ -1337,6 +1420,9 @@ fn parse_cert(der: []byte) -> [Cert, err] {
     if e9 != nil {
         return z, e9
     }
+    if tlend(sa2) > tend {
+        return z, errors.wrap("x509: tbs signature algid overruns tbs", err_der())
+    }
     if !bytes.equal(el(der, sa2), el(der, salgo)) {
         return z, errors.wrap("x509: signature algorithms differ", err_der())
     }
@@ -1350,6 +1436,9 @@ fn parse_cert(der: []byte) -> [Cert, err] {
     if e10 != nil {
         return z, e10
     }
+    if tlend(iss) > tend {
+        return z, errors.wrap("x509: issuer name overruns tbs", err_der())
+    }
     issuer_der := slices.clone(el(der, iss))
     issuer := name_str(der, iss)
     p = tlend(iss)
@@ -1361,6 +1450,9 @@ fn parse_cert(der: []byte) -> [Cert, err] {
     e11 = need(val, 48, "validity sequence")
     if e11 != nil {
         return z, e11
+    }
+    if tlend(val) > tend {
+        return z, errors.wrap("x509: validity overruns tbs", err_der())
     }
     [nb, e12] = dnext(der, val.off)
     if e12 != nil {
@@ -1391,6 +1483,9 @@ fn parse_cert(der: []byte) -> [Cert, err] {
     if e16 != nil {
         return z, e16
     }
+    if tlend(sub) > tend {
+        return z, errors.wrap("x509: subject name overruns tbs", err_der())
+    }
     subject_der := slices.clone(el(der, sub))
     subject := name_str(der, sub)
     p = tlend(sub)
@@ -1402,6 +1497,9 @@ fn parse_cert(der: []byte) -> [Cert, err] {
     e17 = need(spk, 48, "spki sequence")
     if e17 != nil {
         return z, e17
+    }
+    if tlend(spk) > tend {
+        return z, errors.wrap("x509: spki overruns tbs", err_der())
     }
     spki := slices.clone(el(der, spk))
     [spki_alg, e18] = spki_alg_of(der, spk)
@@ -1415,6 +1513,9 @@ fn parse_cert(der: []byte) -> [Cert, err] {
         [u, e19] = dnext(der, p)
         if e19 != nil {
             return z, e19
+        }
+        if tlend(u) > tend {
+            return z, errors.wrap("x509: tbs field overruns tbs", err_der())
         }
         p = tlend(u)
         if u.tag == 129 || u.tag == 130 {
@@ -1559,10 +1660,13 @@ fn (r mut Roots) load_pem(text: str) -> [int, err] {
 // candidates yield nil on miss and the walk continues. Everything
 // empty → err_roots pointing at OXL_SSL_CERT_FILE.
 
-// pem_of_file strict-parses one PEM bundle path; a DER single-cert
-// file is accepted as a fallback (capath-style .cer). nil,nil = the
-// file is absent/unreadable (platform candidates keep walking).
-fn pem_of_file(path: str) -> [own []Cert, err] {
+// pem_of_file parses one bundle path; a DER single-cert file is
+// accepted as a fallback (capath-style .cer). strict selects the
+// parse mode: env overrides pass 1 (a set override is explicit
+// config — a malformed block is an error), platform-store
+// candidates pass 0 (one bad block must not nuke a system bundle).
+// nil,nil = the file is absent/unreadable (the walk continues).
+fn pem_of_file(path: str, strict: int) -> [own []Cert, err] {
     if !os.exists(path) || os.isdir(path) {
         return nil, nil
     }
@@ -1570,7 +1674,7 @@ fn pem_of_file(path: str) -> [own []Cert, err] {
     if len(text) == 0 {
         return nil, nil
     }
-    [cs, e] = parse_pem(text)
+    [cs, e] = pem_scan(text, strict)
     if e == nil && len(cs) > 0 {
         return cs, nil
     }
@@ -1593,7 +1697,7 @@ fn env_file(v: str) -> [own []Cert, err] {
     if len(path) == 0 {
         return nil, nil
     }
-    [cs, e] = pem_of_file(path)
+    [cs, e] = pem_of_file(path, 1)
     if e != nil {
         return nil, errors.wrap("x509: " + v + " (" + path + "): " + errors.msg(e), err_roots())
     }
@@ -1621,7 +1725,7 @@ fn env_dir(v: str) -> [own []Cert, err] {
     for i < len(names) {
         n := names[i]
         if strings.endswith(n, ".pem") || strings.endswith(n, ".crt") || strings.endswith(n, ".cer") {
-            [cs, e2] = pem_of_file(dir + "/" + n)
+            [cs, e2] = pem_of_file(dir + "/" + n, 1)
             if e2 != nil {
                 return nil, errors.wrap("x509: " + v + " (" + dir + "/" + n + "): " + errors.msg(e2), err_roots())
             }
@@ -1696,6 +1800,8 @@ fn roots_exec(which: int) -> [own []byte, err] {
 fn pem_exec(which: int) -> [own []byte, err] {
     for sget(sysroots_state) != 2 {
         if scas(sysroots_state, 0, 1) != 0 {
+            // another caller's exec is in flight — poll, don't spin
+            usleep(1000)
             continue
         }
         [o, e] = roots_exec(which)
@@ -1732,10 +1838,14 @@ fn load_system_roots() -> [Roots, err] {
     if cs != nil {
         return Roots{cas: cs}, nil
     }
-    // POSIX bundle paths — first file that parses to ≥1 cert wins
+    // POSIX bundle paths — first file that parses to ≥1 cert wins.
+    // Lenient scan: these are shared system stores, so one malformed
+    // block skips to the next cert rather than sinking the file.
     paths := mkslice(str, 0)
     paths = push(paths, "/etc/ssl/certs/ca-certificates.crt")
     paths = push(paths, "/etc/pki/tls/certs/ca-bundle.crt")
+    paths = push(paths, "/etc/ssl/ca-bundle.pem")
+    paths = push(paths, "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem")
     paths = push(paths, "/etc/ssl/cert.pem")
     paths = push(paths, "/etc/ssl/certs/ca-bundle.crt")
     paths = push(paths, "/etc/ssl/certs/ca-bundle.trust.crt")
@@ -1743,7 +1853,7 @@ fn load_system_roots() -> [Roots, err] {
     paths = push(paths, "/etc/ssl/certs/ca-certificates.pem")
     i := 0
     for i < len(paths) {
-        [cs2, e2] = pem_of_file(paths[i])
+        [cs2, e2] = pem_of_file(paths[i], 0)
         if e2 == nil && cs2 != nil && len(cs2) > 0 {
             return Roots{cas: cs2}, nil
         }
@@ -1946,8 +2056,17 @@ fn verify_sig(issuer: Cert, child: Cert) -> err {
 // Depth-first search over untrusted intermediates + pool members —
 // Go's model. A candidate is only committed after its issuer-of-child
 // signature verifies; failures at any link note a candidate error and
-// the search backtracks so an alternate route can succeed.
-struct Builder { path: []Cert, pn: int, cause: err }
+// the search backtracks so an alternate route can succeed. Two bounds
+// keep attacker-controlled `untrusted` from forcing exponential work:
+// name+key-equal candidates dedupe to a single try (their link
+// outcomes are identical), and `evals` caps total verify_sig calls.
+struct Builder { path: []Cert, pn: int, evals: int, cause: err }
+
+// max_sig_evals — the signature-check budget for one verify call.
+// With dedupe, |untrusted|+|cas| distinct issuers is the natural
+// ceiling; 256 leaves headroom for cross-signed alternates while
+// staying far below a DoS-relevant number of RSA/ECDSA verifications.
+let max_sig_evals = 256
 
 fn note(b: mut Builder, e: err) {
     if b.cause == nil {
@@ -1986,6 +2105,32 @@ fn has_eku(c: Cert, oid: str) -> bool {
     return slices.contains(c.eku, oid)
 }
 
+// issuer_dup reports whether cs[i] has an earlier twin with equal
+// subject_der and equal spki — a name+key-equal candidate produces
+// identical link outcomes (same name match, same verifying key), so
+// the search only ever tries the first of each equivalence class.
+fn issuer_dup(cs: []Cert, i: int) -> bool {
+    j := 0
+    for j < i {
+        if bytes.equal(cs[i].subject_der, cs[j].subject_der) && bytes.equal(cs[i].spki, cs[j].spki) {
+            return true
+        }
+        j = j + 1
+    }
+    return false
+}
+
+// try_sig runs one budgeted signature check: each verify_sig call
+// costs one eval, and spending the budget fails the link err_path so
+// a crafted untrusted list can't drive exponential crypto work.
+fn try_sig(b: mut Builder, issuer: Cert, child: Cert) -> err {
+    b.evals = b.evals + 1
+    if b.evals > max_sig_evals {
+        return errors.wrap("x509: path search budget exhausted", err_path())
+    }
+    return verify_sig(issuer, child)
+}
+
 // extend tries to lengthen the chain above child — untrusted
 // intermediates first, then pool members; the first link that both
 // cryptographically verifies and reaches an anchor wins.
@@ -1996,6 +2141,10 @@ fn extend(b: mut Builder, child: Cert, untrusted: []Cert, roots: Roots, at: int)
     }
     i := 0
     for i < len(untrusted) {
+        if issuer_dup(untrusted, i) {
+            i = i + 1
+            continue
+        }
         if try_link(b, child, untrusted[i], untrusted, roots, at) {
             return true
         }
@@ -2004,6 +2153,10 @@ fn extend(b: mut Builder, child: Cert, untrusted: []Cert, roots: Roots, at: int)
     if roots.cas != nil {
         i = 0
         for i < len(roots.cas) {
+            if issuer_dup(roots.cas, i) {
+                i = i + 1
+                continue
+            }
             if try_link(b, child, roots.cas[i], untrusted, roots, at) {
                 return true
             }
@@ -2021,7 +2174,10 @@ fn extend(b: mut Builder, child: Cert, untrusted: []Cert, roots: Roots, at: int)
 // membership ends the path — the anchor's own validity and CA flags
 // are trusted by membership, only the link signature verifies) or
 // intermediate rules (CA-worthiness, usages, validity, max_path)
-// before the recursion.
+// before the recursion. Pool membership is checked before the
+// in-path cycle rejection: a self-signed cert already in `roots` is
+// its own issuer, so it appears in the path AND terminates it —
+// the returned path is [leaf, leaf].
 fn try_link(b: mut Builder, child: Cert, cand: Cert, untrusted: []Cert, roots: Roots, at: int) -> bool {
     if !bytes.equal(child.issuer_der, cand.subject_der) {
         return false
@@ -2029,15 +2185,12 @@ fn try_link(b: mut Builder, child: Cert, cand: Cert, untrusted: []Cert, roots: R
     if len(child.akid) > 0 && len(cand.skid) > 0 && !bytes.equal(child.akid, cand.skid) {
         return false
     }
-    if in_path(b, cand) {
-        return false
-    }
     if in_roots(cand, roots) {
         if child.sig_alg <= 0 {
             note(b, errors.wrap("x509: " + child.subject + " has an unacceptable signature algorithm", err_alg()))
             return false
         }
-        e := verify_sig(cand, child)
+        e := try_sig(b, cand, child)
         if e != nil {
             note(b, e)
             return false
@@ -2045,6 +2198,9 @@ fn try_link(b: mut Builder, child: Cert, cand: Cert, untrusted: []Cert, roots: R
         b.path[b.pn] = cand
         b.pn = b.pn + 1
         return true
+    }
+    if in_path(b, cand) {
+        return false
     }
     // non-anchor candidate — a full intermediate
     if cand.is_ca == 0 {
@@ -2075,7 +2231,7 @@ fn try_link(b: mut Builder, child: Cert, cand: Cert, untrusted: []Cert, roots: R
         note(b, errors.wrap("x509: " + child.subject + " has an unacceptable signature algorithm", err_alg()))
         return false
     }
-    e := verify_sig(cand, child)
+    e := try_sig(b, cand, child)
     if e != nil {
         note(b, e)
         return false
@@ -2124,7 +2280,7 @@ fn verify(leaf: Cert, untrusted: []Cert, roots: Roots, name: str, at: int) -> [o
     if e != nil {
         return nil, e
     }
-    b := new(Builder{path: mkslice(Cert, 9), pn: 0, cause: nil})
+    b := new(Builder{path: mkslice(Cert, 9), pn: 0, evals: 0, cause: nil})
     b.path[0] = leaf
     b.pn = 1
     if !extend(b, leaf, untrusted, roots, at) {

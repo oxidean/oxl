@@ -336,3 +336,67 @@ fn test_ip_san() {
     [p, e2] = x509.verify(c, bundle("inter.pem"), rs, "[fd00::1]", c.not_before + 60)
     testing.expect(e2 == nil, "v6 verify")
 }
+
+fn test_self_anchor() {
+    // a self-signed cert already in the roots pool is its own issuer —
+    // pool membership must terminate the path even though the
+    // candidate is already in it (the returned path is [leaf, leaf])
+    s := cert("selfsigned.pem")
+    testing.expect_streq(s.issuer, s.subject, "selfsigned issuer == subject")
+    rp := x509.Roots{cas: nil}
+    rp.append(s)
+    empty := mkslice(x509.Cert, 0)
+    [p, e] = x509.verify(s, empty, rp, "", s.not_before + 60)
+    testing.expect(e == nil, "self-signed anchor verify")
+    testing.expect_eq(len(p), 2, "self-signed path depth")
+    testing.expect(bytes.equal(p[0].raw, p[1].raw), "self-signed path [leaf, leaf]")
+}
+
+fn test_anchor_exemption() {
+    // root_sha1's own self-signature is sha1 — outside the acceptance
+    // set — but store membership vouches for the anchor, so it still
+    // anchors the sha256 chain it signed (real trust stores match)
+    r := cert("root_sha1.pem")
+    testing.expect_eq(r.sig_alg, 0, "sha1 root sig_alg unaccepted")
+    rp := x509.Roots{cas: nil}
+    rp.append(r)
+    leaf := cert("leaf_sha1root.pem")
+    empty := mkslice(x509.Cert, 0)
+    [p, e] = x509.verify(leaf, empty, rp, "www.example.com", leaf.not_before + 60)
+    testing.expect(e == nil, "sha1 root anchors sha256 chain")
+    testing.expect_eq(len(p), 2, "sha1 anchor path depth")
+    testing.expect(bytes.equal(p[1].raw, r.raw), "path anchor is sha1 root")
+}
+
+fn test_critical_ext() {
+    // the processed critical set is {bc, ku, eku, san, skid, akid} — a
+    // critical nameConstraints we can't honor must not validate:
+    // parse fails err_der before the cert can anchor anything
+    [cs, e] = x509.parse_pem(fx("inter_nc.pem"))
+    testing.expect(errors.is(e, x509.err_der()), "critical nameConstraints parse")
+    testing.expect(cs == nil, "critical nameConstraints yields no certs")
+}
+
+fn test_search_bounds() {
+    // untrusted is attacker-controlled: repeated name+key-equal
+    // issuers dedupe to a single try, so a flight padded with
+    // duplicates still verifies — quickly, and inside the eval
+    // budget that caps worst-case signature checks
+    rs := roots()
+    inter := bundle("inter.pem")
+    leaf := cert("leaf.pem")
+    at := leaf.not_before + 60
+    dup := mkslice(x509.Cert, 0)
+    i := 0
+    for i < 8 {
+        dup = push(dup, inter[0])
+        i = i + 1
+    }
+    [p, e] = x509.verify(leaf, dup, rs, "", at)
+    testing.expect(e == nil, "dup-padded untrusted verifies")
+    testing.expect_eq(len(p), 3, "dup path depth")
+    // junk that can't link changes nothing — skipped by name
+    junk := push(dup, cert("leaf_sha1.pem"))
+    [p2, e2] = x509.verify(leaf, junk, rs, "", at)
+    testing.expect(e2 == nil, "junk-padded untrusted verifies")
+}

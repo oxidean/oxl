@@ -42,8 +42,9 @@ and never match message strings.
    (directory of `*.pem`/`*.crt`/`*.cer` files).
 2. `SSL_CERT_FILE`, then `SSL_CERT_DIR`.
 3. The POSIX bundle paths (`/etc/ssl/certs/ca-certificates.crt`,
-   `/etc/pki/tls/certs/ca-bundle.crt`, `/etc/ssl/cert.pem`,
-   `/etc/ssl/certs/ca-bundle.crt`,
+   `/etc/pki/tls/certs/ca-bundle.crt`, `/etc/ssl/ca-bundle.pem`,
+   `/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem`,
+   `/etc/ssl/cert.pem`, `/etc/ssl/certs/ca-bundle.crt`,
    `/etc/ssl/certs/ca-bundle.trust.crt`,
    `/var/lib/ca-certificates/ca-bundle.pem`,
    `/etc/ssl/certs/ca-certificates.pem`).
@@ -53,7 +54,10 @@ and never match message strings.
    `Cert:\LocalMachine\Root` and `Cert:\CurrentUser\Root` as PEM.
 
 A set-but-broken env override fails `err_roots` naming the variable
-— overrides are loud, never silently ignored. Exec-based discovery
+— overrides are loud, never silently ignored, and every file an
+override names must strict-parse. Platform candidates parse
+leniently instead: a malformed block inside a shared system bundle
+is skipped rather than sinking the whole store. Exec-based discovery
 spawns once per process (memoized in a `shared` cell); the returned
 `Roots` is a per-call value. Everything empty → `err_roots` naming
 `OXL_SSL_CERT_FILE` as the override.

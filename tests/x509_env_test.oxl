@@ -41,10 +41,11 @@ fn test_env_dir() {
     if len(d) == 0 || len(f) > 0 && !os.exists(f) {
         return // not this invocation's scenario
     }
-    // dir scans *.pem/*.crt — the fixture carries one of each
+    // dir scans *.pem/*.crt/*.cer — the fixture carries one of each
+    // (the .cer is raw DER, loaded through the single-cert fallback)
     [r, e] = x509.load_system_roots()
     testing.expect(e == nil, "cert_dir roots load")
-    testing.expect(r.cas != nil && len(r.cas) == 2, "cert_dir pool size")
+    testing.expect(r.cas != nil && len(r.cas) == 3, "cert_dir pool size")
     leaf := bundle("leaf.pem")[0]
     [p, e2] = x509.verify(leaf, bundle("inter.pem"), r, "www.example.com", leaf.not_before + 60)
     testing.expect(e2 == nil, "cert_dir chain")

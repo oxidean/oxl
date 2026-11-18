@@ -11,9 +11,14 @@
 #         Ed25519 root CA) with ECDSA P-256/P-384 intermediates and
 #         leaves (RSA, ECDSA, Ed25519 keys; expired, wrong-name,
 #         wildcard, sha1-signed, PSS-signed, EKU-restricted, not-a-CA
-#         issuer, and untrusted-root chains). roots.pem is the
+#         issuer, and untrusted-root chains). X5-review additions:
+#         selfsigned.pem (self-signed anchor/leaf), inter_nc.pem
+#         (critical nameConstraints — must fail parse), root_sha1.pem
+#         + leaf_sha1root.pem (sha1 self-signed anchor still anchors
+#         the sha256 chain it signs). roots.pem is the
 #         OXL_SSL_CERT_FILE bundle; dir/ is the OXL_SSL_CERT_DIR store
-#         (a *.pem + a *.crt file — plain-dir layout, not capath).
+#         (a *.pem + a *.crt + a DER-form *.cer — plain-dir layout,
+#         not capath).
 #
 # (X6's `flight` capture appends a section here.)
 #
@@ -116,6 +121,15 @@ extendedKeyUsage=clientAuth
 subjectKeyIdentifier=hash
 authorityKeyIdentifier=keyid
 EOF
+    # critical nameConstraints — outside the processed critical set,
+    # so parse_cert must reject it outright (err_der)
+    cat > "$work/ca_nc.cnf" <<'EOF'
+basicConstraints=critical,CA:TRUE
+keyUsage=critical,keyCertSign,cRLSign
+nameConstraints=critical,permitted;DNS:example.com
+subjectKeyIdentifier=hash
+authorityKeyIdentifier=keyid
+EOF
 
     # --- keys -------------------------------------------------------
     # RSA-2048 keeps verify fast; roots/intermediates mix RSA, ECDSA
@@ -131,6 +145,9 @@ EOF
     openssl genpkey -algorithm ED25519 -out "$work/leaf_ed.key" 2>/dev/null
     openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$work/notca.key" 2>/dev/null
     openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$work/rogue.key" 2>/dev/null
+    openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$work/inter_nc.key" 2>/dev/null
+    openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$work/selfsigned.key" 2>/dev/null
+    openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$work/root_sha1.key" 2>/dev/null
 
     # --- roots (self-signed anchors) --------------------------------
     for r in root root_ed rogue; do
@@ -171,6 +188,11 @@ EOF
     # openssl issues through any cert+key pair regardless of cA
     issue "$work/notca.csr" "$work/root.pem" "$work/root.key" 3650 -sha256 notca.pem \
         -extfile "$work/leaf.cnf"
+    # a CA carrying a *critical* nameConstraints — outside the
+    # processed critical set, so parse_cert must reject it (err_der)
+    csr inter_nc "/CN=Oxl Test NameConstraints CA"
+    issue "$work/inter_nc.csr" "$work/root.pem" "$work/root.key" 3650 -sha256 inter_nc.pem \
+        -extfile "$work/ca_nc.cnf"
 
     # --- leaves ------------------------------------------------------
     # leafext <name> — leaf.cnf plus a per-cert subjectAltName
@@ -271,21 +293,48 @@ EOF
     issue "$work/leaf.csr" "$work/rogue.pem" "$work/rogue.key" 3650 -sha256 leaf_rogue.pem \
         -extfile "$work/x_leaf.cnf"
 
+    # self-signed anchor that doubles as its own leaf — with
+    # digitalSignature in KU it also passes the leaf checks, so
+    # verify(S, [], Roots{S}) pins the anchor-terminates-path rule
+    openssl req -x509 -new -key "$work/selfsigned.key" -sha256 -days 3650 \
+        -subj "/CN=Oxl Test Self-Signed CA" \
+        -addext "basicConstraints=critical,CA:TRUE" \
+        -addext "keyUsage=critical,digitalSignature,keyCertSign,cRLSign" \
+        -addext "subjectKeyIdentifier=hash" \
+        -addext "authorityKeyIdentifier=keyid" \
+        -out "$work/selfsigned.pem"
+
+    # sha1 self-signed root — its own sig_alg is outside the
+    # acceptance set, yet store membership still lets it anchor the
+    # sha256-signed leaf it issues (the anchor exemption)
+    openssl req -x509 -new -key "$work/root_sha1.key" -sha1 -days 3650 \
+        -subj "/CN=Oxl Test SHA1 Root CA" \
+        -addext "basicConstraints=critical,CA:TRUE" \
+        -addext "keyUsage=critical,keyCertSign,cRLSign" \
+        -addext "subjectKeyIdentifier=hash" \
+        -out "$work/root_sha1.pem"
+    csr leaf "/CN=www.example.com"
+    issue "$work/leaf.csr" "$work/root_sha1.pem" "$work/root_sha1.key" 3650 -sha256 leaf_sha1root.pem \
+        -extfile "$work/x_leaf.cnf"
+
     # --- publish -----------------------------------------------------
-    for f in root root_ed rogue inter inter384 inter_eku notca \
+    for f in root root_ed rogue inter inter384 inter_eku inter_nc notca \
              leaf leaf_ec leaf_ed leaf_pss leaf_expired leaf_wrongname \
              leaf_wildcard leaf_sha1 leaf_eku leaf_badeku leaf_badca \
-             leaf_rogue leaf_ip; do
+             leaf_rogue leaf_ip selfsigned root_sha1 leaf_sha1root; do
         cp "$work/$f.pem" "$outdir/$f.pem"
     done
     # DER forms for the parse tests (PEM covers the same content, but
     # parse_cert's raw-DER path wants a DER file to read)
     openssl x509 -in "$work/root.pem" -outform DER -out "$outdir/root.der"
     openssl x509 -in "$work/leaf.pem" -outform DER -out "$outdir/leaf.der"
-    # the env-override fixtures: a one-file bundle and a scan dir
+    # the env-override fixtures: a one-file bundle and a scan dir —
+    # the .cer entry is DER-form, exercising pem_of_file's raw-cert
+    # fallback inside the dir walk
     cat "$work/root.pem" "$work/root_ed.pem" > "$outdir/roots.pem"
     cp "$work/root.pem" "$outdir/dir/root.pem"
     cp "$work/root_ed.pem" "$outdir/dir/root_ed.crt"
+    openssl x509 -in "$work/selfsigned.pem" -outform DER -out "$outdir/dir/selfsigned.cer"
     # a non-certificate block mixed in proves parse_pem's skip rule —
     # a PUBLIC KEY block (no secret material) ahead of a real cert
     openssl pkey -in "$work/root.key" -pubout > "$outdir/mixed.pem"

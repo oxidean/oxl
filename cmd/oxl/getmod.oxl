@@ -2214,11 +2214,12 @@ fn pkg_dir_files(dir: str) -> own []str {
 
 // the import paths one file declares — nil-able via the parser, like
 // the seed's parse_pkg_file().ok()
-struct WalkRes { needed: own WantEnt, unresolved: own UnEnt }
+struct WalkRes { needed: own WantEnt, unresolved: own UnEnt, bad: str }
 
 fn tidy_walk(ck: ref check.Ck, main_files: []str) -> own WalkRes {
     let needed: own WantEnt = nil
     let unresolved: own UnEnt = nil
+    bad := ""
     seen := collections.set_new()
     queue := mkslice(str, 0)
     i := 0
@@ -2253,6 +2254,12 @@ fn tidy_walk(ck: ref check.Ck, main_files: []str) -> own WalkRes {
             }
             ast := parser.parse(lexlib.lex(src))
             if ast == nil {
+                // an unparseable file can't prove its imports are
+                // unused — record it so tidy aborts instead of dropping
+                // requirements the skipped file actually needs (#151)
+                if len(bad) == 0 {
+                    bad = f
+                }
                 continue
             }
             let body: own parser.NList = nil
@@ -2315,7 +2322,7 @@ fn tidy_walk(ck: ref check.Ck, main_files: []str) -> own WalkRes {
         rev = unresolved
         unresolved = n
     }
-    return new(WalkRes{needed: needed, unresolved: rev})
+    return new(WalkRes{needed: needed, unresolved: rev, bad: bad})
 }
 
 // want-list helpers: lookup by module path, and an upsert that only
@@ -3026,6 +3033,10 @@ fn mod_tidy(cwd: str) {
         }
         ctx = c
         w := tidy_walk(ctx, main_files)
+        if len(w.bad) > 0 {
+            eprintln("error: " + w.bad + ": failed to parse — fix the syntax error and re-run `oxl mod tidy`")
+            exit(1)
+        }
         if w.unresolved == nil {
             needed = w.needed
             done = 1

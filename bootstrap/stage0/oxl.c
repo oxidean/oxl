@@ -206,7 +206,7 @@ struct o_s_UnEnt {    OxlStr f_imp;    OxlStr f_root;    struct o_s_UnEnt* f_nex
 struct o_s_ProbeEnt {    OxlStr f_m;    struct o_s_Fetched* f_f;    int64_t f_ok;    struct o_s_ProbeEnt* f_next;};
 struct o_s_WantEnt {    OxlStr f_mp;    OxlStr f_ver;    int64_t f_ind;    struct o_s_WantEnt* f_next;};
 struct o_s_Prov {    OxlStr f_mp;    OxlStr f_dir;};
-struct o_s_WalkRes {    struct o_s_WantEnt* f_needed;    struct o_s_UnEnt* f_unresolved;};
+struct o_s_WalkRes {    struct o_s_WantEnt* f_needed;    struct o_s_UnEnt* f_unresolved;    OxlStr f_bad;};
 struct o_s_WantSnap {    OxlStr f_mp;    OxlStr f_ver;    int64_t f_ind;};
 struct o_s_SatState {    OxlStr f_mtext;    struct o_s_check_SumEnt* f_sums;    struct o_s_ProbeEnt* f_probed;    struct o_s_collections_Set* f_asked;    struct o_s_collections_Set* f_done;    RtSlice f_report;};
 struct o_s_ProbeSnap {    int64_t f_ok;    OxlStr f_ver;    RtSlice f_tar;    RtSlice f_manifest;    OxlStr f_subdir;};
@@ -18439,6 +18439,7 @@ struct o_s_WalkRes* o_f_tidy_walk(struct o_s_check_Ck* ck, RtSlice main_files) {
     RtDefer *_dmark = rt_defer_mark();
     struct o_s_WantEnt* needed = 0;
     struct o_s_UnEnt* unresolved = 0;
+    OxlStr bad = rt_str_lit("");
     struct o_s_collections_Set* seen = ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_collections_set_new }; ((struct o_s_collections_Set* (*)(void*))_fv.fp)(_fv.env); });
     RtSlice queue = rt_mkslice(0LL, sizeof(OxlStr));
     int64_t i = 0LL;
@@ -18473,6 +18474,9 @@ struct o_s_WalkRes* o_f_tidy_walk(struct o_s_check_Ck* ck, RtSlice main_files) {
     }
     struct o_en_parser_Node* ast = ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_parser_parse }; ((struct o_en_parser_Node* (*)(void*, struct o_s_lexlib_Tok*))_fv.fp)(_fv.env, ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_lexlib_lex }; ((struct o_s_lexlib_Tok* (*)(void*, OxlStr))_fv.fp)(_fv.env, src); })); });
     if ((ast == 0)) {
+    if ((rt_len(bad) == 0LL)) {
+    bad = f;
+    }
     continue;
     }
     struct o_s_parser_NList* body = 0;
@@ -18525,7 +18529,7 @@ struct o_s_WalkRes* o_f_tidy_walk(struct o_s_check_Ck* ck, RtSlice main_files) {
     unresolved = n;
     }
     rt_defer_drain_to(_dmark);
-    return ({ struct o_s_WalkRes *_nb = rt_alloc_own(sizeof(struct o_s_WalkRes)); *_nb = ((struct o_s_WalkRes){ .f_needed = needed, .f_unresolved = rev }); _nb; });
+    return ({ struct o_s_WalkRes *_nb = rt_alloc_own(sizeof(struct o_s_WalkRes)); *_nb = ((struct o_s_WalkRes){ .f_needed = needed, .f_unresolved = rev, .f_bad = bad }); _nb; });
     rt_defer_drain_to(_dmark);
 }
 
@@ -19238,6 +19242,10 @@ void o_f_mod_tidy(OxlStr cwd) {
     }
     ctx = c;
     struct o_s_WalkRes* w = ({ struct o_s_WalkRes* __rc; struct o_s_check_Ck* _ba714 = ctx; rt_borrow_read(_ba714); __rc = o_f_tidy_walk(_ba714, (*main_files)); rt_unborrow(_ba714); __rc; });
+    if ((rt_len(w->f_bad) > 0LL)) {
+    o_f_eprintln(rt_strcat(rt_strcat(rt_str_lit("error: "), w->f_bad), rt_str_lit(": failed to parse — fix the syntax error and re-run `oxl mod tidy`")));
+    rt_exit(1LL);
+    }
     if ((w->f_unresolved == 0)) {
     needed = w->f_needed;
     done = 1LL;

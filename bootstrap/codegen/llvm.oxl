@@ -20,6 +20,7 @@ package codegen
 import "oxl/bootstrap/check"
 
 import "std/collections"
+
 import "std/strings"
 
 // ---------- block / instruction helpers ----------
@@ -424,7 +425,9 @@ fn lstr_op_u(g: mut G, u: int, s: str) -> str {
 // — --triple cross-compile is an L3 driver item — so the boundary is
 // spelled for the host ABI: 1 sysv-x86_64, 2 aapcs64, 3 win64.
 extern fn rt_host_arch() -> str
+
 extern fn rt_is_windows() -> int
+
 extern fn rt_getenv(name: str) -> str
 
 fn labi(g: mut G) -> int {
@@ -432,10 +435,8 @@ fn labi(g: mut G) -> int {
         g.labi = 1
         if rt_is_windows() != 0 {
             g.labi = 3
-        } else {
-            if rt_host_arch() == "aarch64" {
-                g.labi = 2
-            }
+        } else if rt_host_arch() == "aarch64" {
+            g.labi = 2
         }
         // emit-time override — the cross-compile spelling hook the
         // driver's --triple wiring (L3) feeds; unset = host
@@ -485,15 +486,11 @@ fn lsplit_args(a: str) -> []str {
         c := byteat(a, i)
         if c == 40 || c == 91 || c == 123 {
             depth = depth + 1
-        } else {
-            if c == 41 || c == 93 || c == 125 {
-                depth = depth - 1
-            } else {
-                if c == 44 && depth == 0 {
-                    r = push(r, substr(a, st, i))
-                    st = i + 1
-                }
-            }
+        } else if c == 41 || c == 93 || c == 125 {
+            depth = depth - 1
+        } else if c == 44 && depth == 0 {
+            r = push(r, substr(a, st, i))
+            st = i + 1
         }
         i = i + 1
     }
@@ -1678,18 +1675,6 @@ fn lshort(g: mut G, op: str, l: ref parser.Node, r: ref parser.Node) -> str {
     lfin(g, le)
     llb(g, le)
     return lload(g, "i32", tmp)
-}
-
-// normalized operand pair for arithmetic — i64 ops on int-family
-// widths, i8 for byte-op-byte, double for float
-fn lbin_op(op: str, lt: int, rt: int) -> str {
-    if op == "/" || op == "%" {
-        if lt == check.k_byte() {
-            return "u"
-        }
-        return "s"
-    }
-    return ""
 }
 
 fn lxbin(g: mut G, op: str, l: ref parser.Node, r: ref parser.Node, e: ref parser.Node) -> str {
@@ -4178,7 +4163,7 @@ fn lemit_enum_ty(g: mut G, i: int) {
                 vi = vi + 1
                 vl = vl.next
             }
-            g.ltys = push(g.ltys, "%o_en_" + cname(qn) + " = type { i32, [4 x i8], " + pty + " }\n")
+            g.ltys = push(g.ltys, "%o_en_" + cname(qn) + " = type { i32, [4 x i8], " + pty + ", i64 }\n")
         }
         _ => {
         }
@@ -4908,7 +4893,10 @@ fn emit_llvm(r: own check.CkRes, testm: int) -> str {
     g.lfn = 1
     g.lall = mkslice(str, 0)
     g.fdecls = mkslice(str, 0)
+    g.lscsz = ""
     g.lterm = 0
+    g.lreg = 0
+    g.loops = mkslice(GLab, 0)
     wpush(g)
     wln(g, "define void @oxl_main() {")
     aidx := len(g.w)

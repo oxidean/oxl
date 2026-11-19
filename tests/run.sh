@@ -2038,6 +2038,36 @@ grep -q 'desc_rt ok' <<<"$self_out" || { echo "FAIL desc_rt output"; printf '%s
 printf 'package main\n\nfn add1(x: int) -> int {\n    return x + 1\n}\n\nfn main() {\n    value_of := add1\n    println(itoa(value_of(41)))\n}\n' > "$scratch/jsshadow.oxl"
 "$SEEDOXL" build "$scratch/jsshadow.oxl" --target js -o "$scratch/jsshad" >/dev/null 2>&1 || { echo "FAIL --target js shadowed value_of: seed rejected"; exit 1; }
 "$SELFOXL" build "$scratch/jsshadow.oxl" --target js -o "$scratch/jsshad2" >/dev/null 2>&1 || { echo "FAIL --target js shadowed value_of: self rejected"; exit 1; }
+# R3: typed err payloads — box folds to rt_err_box (heap-copy for
+# values, handle move for own) and errors.as folds to rt_err_as; the
+# fixture exercises round-trip, exact-descr match, once-only
+# consumption, and wrapped-chain walking through both drivers
+seed_out=$("$SEEDOXL" run tests/errors_as.oxl 2>&1) && seed_rc=0 || seed_rc=$?
+self_out=$("$SELFOXL" run tests/errors_as.oxl 2>&1) && self_rc=0 || self_rc=$?
+if [ "$seed_out" != "$self_out" ] || [ "$seed_rc" != "$self_rc" ]; then
+    echo "FAIL driver parity tests/errors_as.oxl"
+    echo "-- seed ($seed_rc) --"; printf '%s
+' "$seed_out"
+    echo "-- self ($self_rc) --"; printf '%s
+' "$self_out"
+    exit 1
+fi
+grep -q 'errors_as ok' <<<"$self_out" || { echo "FAIL errors_as output"; printf '%s
+' "$self_out"; exit 1; }
+# and the js lane rejects box/errors.as fold sites identically
+seed_out=$("$SEEDOXL" build tests/errors_as.oxl --target js -o "$scratch/easjs" 2>&1 | sed 's/^[^:]*:[0-9][0-9]*:[0-9][0-9]*: //') && seed_rc=0 || seed_rc=$?
+self_out=$("$SELFOXL" build tests/errors_as.oxl --target js -o "$scratch/easjs2" 2>&1 | sed 's/^[^:]*:[0-9][0-9]*:[0-9][0-9]*: //') && self_rc=0 || self_rc=$?
+if [ "$seed_rc" = 0 ] || [ "$self_rc" = 0 ]; then
+    echo "FAIL --target js accepted the typed-err lane"; exit 1
+fi
+if [ "$seed_out" != "$self_out" ] || [ "$seed_rc" != "$self_rc" ]; then
+    echo "FAIL driver parity errors_as --target js"
+    echo "-- seed --"; printf '%s
+' "$seed_out"
+    echo "-- self --"; printf '%s
+' "$self_out"
+    exit 1
+fi
 # the self driver covers the suite's core sections end to end —
 # build, run with args, test, and the sqlite/net feature gates
 out=$("$SELFOXL" run examples/hello.oxl)

@@ -732,11 +732,22 @@ fn llvm_triple_abi() -> int {
     if len(t) == 0 {
         return 0
     }
-    if strings.contains(t, "aarch64") || strings.contains(t, "arm64") || strings.contains(t, "armv7") || strings.contains(t, "armv8") {
-        return 2
+    // OS tail first — aarch64-pc-windows is the win64 byref ABI, not
+    // aapcs64. A 32-bit arch under either OS family falls back to the
+    // sysv stack-copy spelling, the closest of the three (win32's
+    // byval and AAPCS32's stack spill are nearer sysv than the 64-bit
+    // caller-copy forms)
+    if strings.contains(t, "windows") || strings.contains(t, "win64") {
+        if strings.contains(t, "aarch64") || strings.contains(t, "arm64") || strings.contains(t, "x86_64") || strings.contains(t, "amd64") {
+            return 3
+        }
+        return 1
     }
-    if strings.contains(t, "windows") || strings.contains(t, "win64") || strings.contains(t, "mingw") {
+    if strings.contains(t, "mingw") {
         return 3
+    }
+    if strings.contains(t, "aarch64") || strings.contains(t, "arm64") {
+        return 2
     }
     return 1
 }
@@ -818,6 +829,9 @@ fn emit_and_llvm(llsrc: str, out: str, entry: str) -> int {
     args = push(args, "-fdata-sections")
     if is_macos() == 1 {
         args = push(args, "-Wl,-dead_strip")
+    } else if rt_is_windows() != 0 || strings.contains(flag_value("--triple"), "windows") {
+        // lld-link has no --gc-sections spelling — it warns and
+        // ignores (OPT:REF is already the default)
     } else {
         args = push(args, "-Wl,--gc-sections")
     }
@@ -891,9 +905,13 @@ fn emit_and_llvm(llsrc: str, out: str, entry: str) -> int {
         // readability: out.ll lands beside the -o binary (scratch
         // intermediates are otherwise always removed on success)
         if has_flag("--emit-llvm") == 1 {
-            we = write_text(od + "/out.ll", llsrc)
+            // <out>.ll derives from the binary's own name — a fixed
+            // out.ll would collide with `-o dir/out.ll` (clobbering
+            // the binary) and across same-dir builds
+            lout := out + ".ll"
+            we = write_text(lout, llsrc)
             if we != 0 {
-                eprintln("cannot write " + od + "/out.ll: " + rt_errstr(we))
+                eprintln("cannot write " + lout + ": " + rt_errstr(we))
                 return 0
             }
         }
@@ -1270,6 +1288,13 @@ fn main() {
     }
     if has_flag("--emit-llvm") == 1 && target_is_llvm() == 0 {
         eprintln("--emit-llvm needs `--target llvm`")
+        exit(2)
+    }
+    if has_flag("--emit-llvm") == 1 && c != "build" {
+        // under run/test the kept .ll would land in the scratch dir
+        // the driver removes right after — a silent no-op is worse
+        // than a flag error
+        eprintln("--emit-llvm only applies to `build`")
         exit(2)
     }
     if c == "build" {

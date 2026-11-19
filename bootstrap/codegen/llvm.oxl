@@ -1,7 +1,7 @@
 package codegen
 
 // bootstrap/codegen/llvm.oxl — the LLVM textual-IR lane, milestone L2.
-// Sibling emitter behind the check.CkRes seam: emit_llvm(r, testm)
+// Sibling emitter behind the check.CkRes seam: emit_llvm(r, testm, abiov)
 // returns one .ll module per
 // docs/specs/2026-11-11-llvm-backend/llvm-semantics.md. Shares the G
 // state struct and every checker-facing helper with codegen.oxl; the

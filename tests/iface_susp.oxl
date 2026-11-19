@@ -1,0 +1,29 @@
+package main
+
+// susp-declared iface methods dispatch through an RtSuspDesc slot —
+// make/poll/res_off — instead of a callable thunk. A susp impl's
+// frame drives to completion under the caller's poll.
+interface Transport { susp send(s: str) -> int, name() -> str }
+
+struct Pipe { n: int }
+
+fn (p mut Pipe) send(s: str) -> int {
+    sleep(1)
+    return p.n + len(s)
+}
+
+fn (p mut Pipe) name() -> str {
+    return "pipe"
+}
+
+fn drive(w: Transport) -> int {
+    // the caller suspends on the susp-declared vtab call regardless
+    // of the dynamic impl; the non-susp slot still calls directly
+    return w.send("hi") + len(w.name())
+}
+
+fn main() {
+    p := Pipe{n: 5}
+    println(itoa(drive(p)))
+    println("iface susp ok")
+}

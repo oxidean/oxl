@@ -329,8 +329,9 @@ fn tp_clone(l: ref TPList) -> own TPList {
     return c
 }
 
-// interface method sig + the registered decl
-struct IMethod { n: str, params: own IList, retk: int, ret1: int }
+// interface method sig + the registered decl — `susp` marks the method
+// suspendable: vtable calls to it drive an RtSuspDesc, not a bare thunk
+struct IMethod { n: str, params: own IList, retk: int, ret1: int, susp: int }
 
 struct IMList { v: own IMethod, next: own IMList }
 
@@ -468,6 +469,7 @@ struct Ck {
     ret1: int,
     in_let2: int,
     in_spawn: int, // inside `spawn`/`goin` callee — no calls edge (seed in_spawn)
+    vtab_spawn: []str, // "file|lo" keys already diag'd by the vtab susp spawn gate — goin's generic gate suppresses its dup
     in_infer: int, // generic ty-param inference pass — expr() re-runs for real checking, so index records stay off
     in_cl: int, // inside `{ |..| }` — ret feeds cl_ret
     cl_ret: int, // inferred closure return ty (-1 none)
@@ -2794,7 +2796,7 @@ fn iface_covers(ck: ref Ck, have: str, want: str) -> bool {
         hm := ck.ifacesv[hi].methods
         ok := false
         for hm != nil {
-            if hm.v.n == wm.v.n && il_eq(ck, hm.v.params, wm.v.params) && ret_eq(ck, hm.v.retk, hm.v.ret1, wm.v.retk, wm.v.ret1) {
+            if hm.v.n == wm.v.n && il_eq(ck, hm.v.params, wm.v.params) && ret_eq(ck, hm.v.retk, hm.v.ret1, wm.v.retk, wm.v.ret1) && hm.v.susp == wm.v.susp {
                 ok = true
                 break
             }
@@ -4366,7 +4368,7 @@ fn reg_iface(ck: mut Ck, ii: int, ops: ref parser.NList, methods: ref parser.NLi
     l = methods
     for l != nil {
         match l.v {
-            parser.Node.Method{name, params, ret, lo, hi} => {
+            parser.Node.Method{name, susp, params, ret, lo, hi} => {
                 let ps: own IList = nil
                 pst := ""
                 pl := params
@@ -4385,7 +4387,13 @@ fn reg_iface(ck: mut Ck, ii: int, ops: ref parser.NList, methods: ref parser.NLi
                     pl = pl.next
                 }
                 cr := ret_sig(ck, ret)
-                m := new(IMethod{n: name, params: irev(ps), retk: cr.rk, ret1: cr.r1})
+                m := new(IMethod{n: name, params: irev(ps), retk: cr.rk, ret1: cr.r1, susp: susp})
+                if susp == 1 {
+                    // seed the susp set with the qualified `Iface.m` —
+                    // disjoint from every real fn name, so the fixpoint
+                    // propagates it to `w.m()` callers via their edge
+                    ck.susp = scons(ck.ifacesv[ii].n + "." + name, ck.susp)
+                }
                 mc := new(IMList)
                 mc.v = m
                 mc.next = ml
@@ -5533,6 +5541,16 @@ fn call(ck: mut Ck, f: ref parser.Node, args: ref parser.NList, env: mut Env) ->
                         if mt.k == 2 {
                             ms := member_span(f)
                             rec_use(ck, ms.lo, ms.hi, mt.q)
+                            if ck.in_spawn == 0 {
+                                // a susp-declared iface method suspends
+                                // its caller — mt.q names `Iface.m`, the
+                                // seeded susp-set member the fixpoint
+                                // propagates from
+                                add_edge(ck, mt.q)
+                            } else if sl_has(ck.susp, mt.q) {
+                                diag(ck, "check", "`spawn`/`goin` on a vtable susp call isn't supported yet — wrap the call in a susp fn and spawn that")
+                                ck.vtab_spawn = push(ck.vtab_spawn, ck.cur_file + "|" + itoa(parser.nlo(f)))
+                            }
                             rt := call_iface(ck, mt.ps, mt.rk, mt.r1, args, env)
                             // a vtable call on a borrow-carrying receiver
                             // hands the same borrow onward
@@ -7851,17 +7869,32 @@ fn walk_block(ck: mut Ck, items: ref parser.NList) {
                 // goin binds the task's scope at frame creation — only the
                 // susp-callee path has a frame to bind
                 ok := false
+                seen := false
                 if e != nil && nk(e) == 8 {
                     match e {
                         parser.Node.Call{f} => {
                             n := resolve_named(ck, callee_name(f))
                             ok = len(n) > 0 && sl_has(ck.susp, n)
+                            // the vtab spawn gate keys on (file, lo) —
+                            // a bare lo would suppress a legit goin diag
+                            // in another file sharing the byte offset
+                            fk := ck.cur_file + "|" + itoa(parser.nlo(f))
+                            vi := 0
+                            for vi < len(ck.vtab_spawn) {
+                                if ck.vtab_spawn[vi] == fk {
+                                    seen = true
+                                }
+                                vi = vi + 1
+                            }
                         }
                         _ => {
                         }
                     }
                 }
-                if !ok {
+                // a susp-vtab target was already diag'd by the
+                // spawn/goin gate during the expr walk — the generic
+                // line would only double-report it
+                if !ok && !seen {
                     diag(ck, "check", "`goin` requires a susp fn call — the scope binds at frame-task creation")
                 }
                 scan_match(ck, e, false)
@@ -10219,12 +10252,14 @@ fn check_run_tail(ck: own Ck, ld: own Loader, root_pkg: str, need_main: int) -> 
     check_items(ck, ld.items)
     susp_seeds(ck, ld.items)
     susp_fixpoint(ck)
-    // D3: a suspendable method is unsafe only when vtable-reachable —
-    // its receiver satisfies an interface declaring that method name,
-    // and indirect calls carry no task frame. Direct calls suspend
-    // like plain fns, so other methods may suspend freely. The report
-    // names the first matching interface in byte order (parity with
-    // the seed checker's deterministic pick).
+    // D3: a suspendable method is unsafe only when vtable-reachable
+    // through a NON-susp slot — its receiver satisfies an interface
+    // declaring that method name without the `susp` mark (the vtab slot
+    // then expects a plain fn pointer the susp impl can't provide).
+    // `susp`-declared slots carry an RtSuspDesc, so a susp impl matched
+    // to one is legal; direct calls suspend like plain fns regardless.
+    // The report names the first matching interface in byte order
+    // (parity with the seed checker's deterministic pick).
     ml := ck.methods
     for ml != nil {
         if sl_has(ck.susp, ml.v) {
@@ -10239,7 +10274,7 @@ fn check_run_tail(ck: own Ck, ld: own Loader, root_pkg: str, need_main: int) -> 
                     mm := ck.ifacesv[ii].methods
                     has := 0
                     for mm != nil {
-                        if mm.v.n == mname {
+                        if mm.v.n == mname && mm.v.susp == 0 {
                             has = 1
                         }
                         mm = mm.next
@@ -10250,7 +10285,7 @@ fn check_run_tail(ck: own Ck, ld: own Loader, root_pkg: str, need_main: int) -> 
                     ii = ii + 1
                 }
                 if len(hit) > 0 {
-                    diag(ck, "check", "suspendable method `" + ml.v + "` — `" + recv + "` satisfies interface `" + hit + "`; vtable calls carry no task frame")
+                    diag(ck, "check", "suspendable method `" + ml.v + "` — `" + recv + "` satisfies interface `" + hit + "` whose method `" + mname + "` is not declared `susp` — add `susp` to `" + hit + "." + mname + "` or make `" + ml.v + "` non-suspending")
                 }
             }
         }

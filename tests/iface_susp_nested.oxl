@@ -1,0 +1,32 @@
+package main
+
+// a susp impl may itself suspend on another susp-declared vtab call —
+// each frame keeps its own descriptor slot, so nested dispatch
+// suspends and resumes independently.
+interface Port { susp send(s: str) -> int }
+
+struct Leaf { n: int }
+
+fn (l mut Leaf) send(s: str) -> int {
+    sleep(1)
+    return l.n + len(s)
+}
+
+struct Relay { inner: Port }
+
+fn (r mut Relay) send(s: str) -> int {
+    v := r.inner.send(s)
+    sleep(1)
+    return v + 100
+}
+
+fn drive(w: Port) -> int {
+    return w.send("hi")
+}
+
+fn main() {
+    l := Leaf{n: 5}
+    r := Relay{inner: l}
+    println(itoa(drive(r)))
+    println("iface susp nested ok")
+}

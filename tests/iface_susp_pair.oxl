@@ -1,0 +1,44 @@
+package main
+
+// [T, err] results cross the descriptor boundary through res_off —
+// the child frame's result slot has the callee's {val, err} layout
+// and the caller reads it as o_vret_<iface>_<method>.
+import "std/errors"
+
+interface Port { susp send(s: str) -> [int, err] }
+
+struct Pipe { n: int }
+
+fn (p mut Pipe) send(s: str) -> [int, err] {
+    sleep(1)
+    if len(s) == 0 {
+        return 0, errors.new("empty")
+    }
+    return p.n + len(s), nil
+}
+
+struct Fast { n: int }
+
+fn (f mut Fast) send(s: str) -> [int, err] {
+    if len(s) == 0 {
+        return 0, errors.new("empty")
+    }
+    return f.n + len(s) * 2, nil
+}
+
+fn use(w: Port, s: str) -> int {
+    [v, e] = w.send(s)
+    if e != nil {
+        return -1
+    }
+    return v
+}
+
+fn main() {
+    p := Pipe{n: 10}
+    f := Fast{n: 10}
+    println(itoa(use(p, "ab")))
+    println(itoa(use(p, "")))
+    println(itoa(use(f, "ab")))
+    println("iface susp pair ok")
+}

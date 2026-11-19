@@ -726,6 +726,17 @@ static void task_release_frame(RtTask *t, int trapped) {
             x = up;
         }
     }
+    /* a frame abandoned mid-suspension (cancel-before-poll, trap, or
+     * an RT_CANCEL exit that skipped the emitted free) still owns its
+     * inline child chain — generated frames link susp-call children on
+     * RtFrame.child and NULL the link when they free one themselves */
+    if (t->is_frame && t->frame) {
+        for (RtFrame *c = t->frame->child, *n; c; c = n) {
+            n = c->child;
+            free(c);
+        }
+        t->frame->child = NULL;
+    }
     task_unref(t);
 }
 

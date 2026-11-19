@@ -1,0 +1,32 @@
+package main
+
+// suspendability propagates through susp-declared iface calls by
+// declaration, not dynamic impl: a fn whose only susp reach is
+// `w.m()` compiles to a frame, and the propagation crosses caller
+// chains — every fn below is susp.
+interface Port { susp send(s: str) -> int }
+
+struct Pipe { n: int }
+
+fn (p mut Pipe) send(s: str) -> int {
+    sleep(1)
+    return p.n + len(s)
+}
+
+fn inner(w: Port) -> int {
+    return w.send("ab")
+}
+
+fn mid(w: Port) -> int {
+    return inner(w) + 10
+}
+
+fn outer(w: Port) -> int {
+    return mid(w) + 100
+}
+
+fn main() {
+    p := Pipe{n: 3}
+    println(itoa(outer(p)))
+    println("iface susp prop ok")
+}

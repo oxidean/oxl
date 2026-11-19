@@ -1,0 +1,33 @@
+package main
+
+// iface -> iface conversion over susp-declared methods emits a
+// wrapper frame: it stashes the inner pair's descriptor and forwards
+// make/poll through it, copying the inner result on READY.
+interface Big { susp send(s: str) -> int, extra() -> int }
+
+interface Small { susp send(s: str) -> int }
+
+struct Pipe { n: int }
+
+fn (p mut Pipe) send(s: str) -> int {
+    sleep(1)
+    return p.n + len(s)
+}
+
+fn (p mut Pipe) extra() -> int {
+    return p.n * 10
+}
+
+fn narrow(b: Big) -> Small {
+    return b
+}
+
+fn use(s: Small) -> int {
+    return s.send("xyz")
+}
+
+fn main() {
+    p := Pipe{n: 4}
+    println(itoa(use(narrow(p))))
+    println("iface susp rewrap ok")
+}

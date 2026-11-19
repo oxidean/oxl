@@ -1,0 +1,19 @@
+package main
+
+interface Port { susp send(s: str) -> int }
+
+struct Pipe { n: int }
+
+fn (p mut Pipe) send(s: str) -> int {
+    sleep(1)
+    return p.n
+}
+
+fn work(w: Port) {
+    spawn w.send("x")
+}
+
+fn main() {
+    p := Pipe{n: 1}
+    work(p)
+}

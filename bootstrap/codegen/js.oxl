@@ -1977,7 +1977,14 @@ fn jemvtab_one(g: mut G, vu: ref GVU) {
     for ml != nil {
         m := ml.v
         if len(vu.impl) > 6 && substr(vu.impl, 0, 6) == "iface:" {
-            ents = ents + m.n + ": (" + obj + ", ...a) => " + obj + ".methods." + m.n + "(" + obj + ".obj, ...a),"
+            if m.susp == 1 {
+                // susp rewrap: the inner slot is a {m, p} desc too —
+                // make forwards through it, poll reports the inner's
+                // result verbatim (.result is uniform)
+                ents = ents + m.n + ": {m: (" + obj + ", ...a) => { const _w = {cur_scope: rt.rt_scope_current(), state: 0}; _w.isd = " + obj + ".methods." + m.n + "; _w.inner = _w.isd.m(" + obj + ".obj, ...a); return _w; }, p: (f, t) => { const _p = f.isd.p(f.inner, t); if (_p === rt.RT_READY) { f.result = f.inner.result; } return _p; }},"
+            } else {
+                ents = ents + m.n + ": (" + obj + ", ...a) => " + obj + ".methods." + m.n + "(" + obj + ".obj, ...a),"
+            }
         } else {
             fname := vu.impl + "." + m.n
             fi := gfn(g, fname)
@@ -1986,10 +1993,12 @@ fn jemvtab_one(g: mut G, vu: ref GVU) {
             } else {
                 sig := g.ck.fnsv[fi]
                 callee := "o_f_" + cname(fname)
+                ftag := fname
                 if sig.typarams != nil {
                     b2 := gvtab_bind(g, fi, m)
                     if b2 != nil {
-                        callee = "o_f_" + cname(ginst_name(g, fname, sig.typarams, b2))
+                        ftag = ginst_name(g, fname, sig.typarams, b2)
+                        callee = "o_f_" + cname(ftag)
                     }
                 }
                 // receiver shape: the impl's declared recv param[0]
@@ -2017,7 +2026,34 @@ fn jemvtab_one(g: mut G, vu: ref GVU) {
                         }
                     }
                 }
-                ents = ents + m.n + ": (" + obj + ", ...a) => " + callee + "(" + recv + ", ...a),"
+                if m.susp == 1 && check.sl_has(g.ck.susp, fname) {
+                    // susp impl — make builds the child frame, p is
+                    // the impl's own poll driver
+                    ents = ents + m.n + ": {m: (" + obj + ", ...a) => { const _c = {cur_scope: rt.rt_scope_current(), state: 0};" + jvsm_fills(g, fname, "_c", recv) + " return _c; }, p: o_poll_" + cname(ftag) + "},"
+                } else if m.susp == 1 {
+                    // sync impl in a susp slot — ready-shim: poll runs
+                    // the plain fn once and reports READY
+                    afill := ""
+                    acall := ""
+                    il3 := m.params
+                    k3 := 0
+                    for il3 != nil {
+                        afill = afill + " _c.p_a" + itoa(k3) + " = a[" + itoa(k3) + "];"
+                        acall = acall + ", _c.p_a" + itoa(k3)
+                        il3 = il3.next
+                        k3 = k3 + 1
+                    }
+                    pbody := "    " + callee + "(_c.p_r" + acall + ");"
+                    if m.retk == 1 {
+                        pbody = "    _c.result = " + callee + "(_c.p_r" + acall + ");"
+                    }
+                    if m.retk == 2 {
+                        pbody = "    { const _r = " + callee + "(_c.p_r" + acall + "); _c.result = {val: _r.val, err: _r.err}; }"
+                    }
+                    ents = ents + m.n + ": {m: (" + obj + ", ...a) => { const _c = {cur_scope: rt.rt_scope_current(), state: 0}; _c.p_r = " + recv + ";" + afill + " return _c; }, p: (_c, t) => { " + pbody + " return rt.RT_READY; }},"
+                } else {
+                    ents = ents + m.n + ": (" + obj + ", ...a) => " + callee + "(" + recv + ", ...a),"
+                }
             }
         }
         ml = ml.next
@@ -2238,11 +2274,88 @@ fn gav_borrows(a: ref GAv) -> GArgOut {
     return o
 }
 
+// arg fills against an explicit IList signature — susp-vtab calls
+// adapt through the iface-declared params (jav_decl's susp arm)
+fn jav_ps(g: mut G, args: ref parser.NList, ps: ref check.IList) -> own GAv {
+    let head: own GAv = nil
+    let tail: own GAv = nil
+    il := ps
+    al := args
+    for al != nil {
+        v := jx(g, al.v)
+        apre := ""
+        apost := ""
+        if il != nil {
+            o := jarg_c(g, al.v, v, il.v, nil, 2)
+            v = o.v
+            apre = o.pre
+            apost = o.post
+            il = il.next
+        }
+        c := new(GAv)
+        c.v = v
+        c.pre = apre
+        c.post = apost
+        if head == nil {
+            head = c
+            tail = c
+        } else {
+            tail.next = c
+            tail = tail.next
+        }
+        al = al.next
+    }
+    return head
+}
+
+// ".p_<decl-name> = <v>" fills for a fn's recv + params as vtab text —
+// the susp-slot make arrows can't reuse jspawn_args (it emits via wln)
+fn jvsm_fills(g: mut G, fname: str, dst: str, rcvexpr: str) -> str {
+    fi := gfn_item(g, fname)
+    if fi < 0 || check.nk(g.its[fi].node) != 24 {
+        return ""
+    }
+    out := ""
+    match g.its[fi].node {
+        parser.Node.Fn{recv, params} => {
+            k := 0
+            if recv != nil {
+                match recv {
+                    parser.Node.Param{name} => {
+                        out = out + " " + dst + ".p_" + name + " = " + rcvexpr + ";"
+                    }
+                    _ => {
+                    }
+                }
+            }
+            pl := params
+            for pl != nil {
+                match pl.v {
+                    parser.Node.Param{name} => {
+                        out = out + " " + dst + ".p_" + name + " = a[" + itoa(k) + "];"
+                        k = k + 1
+                    }
+                    _ => {
+                    }
+                }
+                pl = pl.next
+            }
+        }
+        _ => {
+        }
+    }
+    return out
+}
+
 // suspend point for an oxl-fn call: bare child frame object, fill p_
 // slots, poll inline, propagate PENDING/CANCEL, bind on READY.
 // dk: 0 void, 1 frame-field(da), 2 assign-text(da), 3 pair(da,db; ""=blank),
 // 4 slice-index assign (rt_sidx_set(da,db,res))
-fn jfsusp_call(g: mut G, call: ref parser.Node, name: str, dk: int, da: str, db: str) {
+fn jfsusp_call(g: mut G, call: ref parser.Node, name: str, dk: int, da: str, db: str, dt: int) {
+    if name == "!vtab" {
+        jfsusp_vcall(g, call, dk, da, db, dt)
+        return
+    }
     cn := cname(name)
     let argvs: own GAv = nil
     bname := ""
@@ -2290,16 +2403,18 @@ fn jfsusp_call(g: mut G, call: ref parser.Node, name: str, dk: int, da: str, db:
     if len(bo.post) > 0 {
         wln(g, "      " + bo.post)
     }
+    // dt is the destination ty — concrete impl results must box into
+    // {obj, methods} when the dest is iface-typed (gfsusp_call parity)
     if dk == 1 {
-        wln(g, "      fr." + da + " = fr.child.result;")
+        wln(g, "      fr." + da + " = " + jconv_v(g, call, "fr.child.result", dt) + ";")
     }
     if dk == 2 {
-        wln(g, "      " + da + " = fr.child.result;")
+        wln(g, "      " + da + " = " + jconv_v(g, call, "fr.child.result", dt) + ";")
     }
     if dk == 3 {
         wln(g, "      { const _r" + itoa(k) + " = fr.child.result;")
         if len(da) > 0 {
-            wln(g, "        fr." + da + " = _r" + itoa(k) + ".val;")
+            wln(g, "        fr." + da + " = " + jconv_v(g, call, "_r" + itoa(k) + ".val", dt) + ";")
         }
         if len(db) > 0 {
             wln(g, "        fr." + db + " = _r" + itoa(k) + ".err;")
@@ -2307,9 +2422,76 @@ fn jfsusp_call(g: mut G, call: ref parser.Node, name: str, dk: int, da: str, db:
         wln(g, "      }")
     }
     if dk == 4 {
-        wln(g, "      rt.rt_sidx_set(" + da + ", " + db + ", fr.child.result);")
+        wln(g, "      rt.rt_sidx_set(" + da + ", " + db + ", " + jconv_v(g, call, "fr.child.result", dt) + ");")
     }
     wln(g, "      fr.child = null;")
+}
+
+// suspend point for a susp iface-method call: the vtab slot is a
+// {m, p} descriptor — stash it on the frame (fr.sd<N>), make the child
+// via .m, poll via .p, read fr.child.result on READY (jfsusp_call parity)
+fn jfsusp_vcall(g: mut G, call: ref parser.Node, dk: int, da: str, db: str, dt: int) {
+    match call {
+        parser.Node.Call{f, args} => {
+            cp := gcall_plan(g, f, args)
+            if cp.k != 2 {
+                return
+            }
+            let argvs: own GAv = jav_ps(g, args, cp.ps)
+            bo := gav_borrows(argvs)
+            n := g.vsdn
+            g.vsdn = g.vsdn + 1
+            ov := ""
+            match f {
+                parser.Node.Field{obj} => {
+                    ov = jx(g, obj)
+                }
+                _ => {
+                }
+            }
+            argl := ""
+            av := argvs
+            for av != nil {
+                argl = argl + ", " + av.v
+                av = av.next
+            }
+            if len(bo.pre) > 0 {
+                wln(g, "    " + bo.pre)
+            }
+            k := jfstate(g)
+            wln(g, "    { const _iv" + itoa(k) + " = " + ov + ";")
+            wln(g, "      fr.sd" + itoa(n) + " = _iv" + itoa(k) + ".methods." + cp.mname + ";")
+            wln(g, "      fr.child = fr.sd" + itoa(n) + ".m(_iv" + itoa(k) + ".obj" + argl + "); fr.state = " + itoa(k) + "; }")
+            wln(g, "    case " + itoa(k) + ":")
+            wln(g, "      _p = fr.sd" + itoa(n) + ".p(fr.child, t);")
+            wln(g, "      if (_p !== rt.RT_READY) { fr.cur_scope = rt.rt_scope_current(); rt.rt_scope_set(saved); return _p; }")
+            if len(bo.post) > 0 {
+                wln(g, "      " + bo.post)
+            }
+            if dk == 1 {
+                wln(g, "      fr." + da + " = " + jconv_v(g, call, "fr.child.result", dt) + ";")
+            }
+            if dk == 2 {
+                wln(g, "      " + da + " = " + jconv_v(g, call, "fr.child.result", dt) + ";")
+            }
+            if dk == 3 {
+                wln(g, "      { const _r" + itoa(k) + " = fr.child.result;")
+                if len(da) > 0 {
+                    wln(g, "        fr." + da + " = " + jconv_v(g, call, "_r" + itoa(k) + ".val", dt) + ";")
+                }
+                if len(db) > 0 {
+                    wln(g, "        fr." + db + " = _r" + itoa(k) + ".err;")
+                }
+                wln(g, "      }")
+            }
+            if dk == 4 {
+                wln(g, "      rt.rt_sidx_set(" + da + ", " + db + ", " + jconv_v(g, call, "fr.child.result", dt) + ");")
+            }
+            wln(g, "      fr.child = null;")
+        }
+        _ => {
+        }
+    }
 }
 
 // leaf suspends: recv/send/sleep/msleep/sjoin park on the chan/scope
@@ -2389,8 +2571,9 @@ fn jfsusp_leaf(g: mut G, name: str, args: ref parser.NList, dk: int, da: str, db
     }
 }
 
-// dispatch a stmt-level susp call: leaf builtin or oxl frame call
-fn jfsusp_go(g: mut G, call: ref parser.Node, dk: int, da: str, db: str) {
+// dispatch a stmt-level susp call: leaf builtin or oxl frame call —
+// dt is the destination ty the result lands in (-1 when none)
+fn jfsusp_go(g: mut G, call: ref parser.Node, dk: int, da: str, db: str, dt: int) {
     sn := g_call_susp(g, call)
     if len(sn) == 0 {
         return
@@ -2400,7 +2583,7 @@ fn jfsusp_go(g: mut G, call: ref parser.Node, dk: int, da: str, db: str) {
             if check.is_susp_builtin(sn) {
                 jfsusp_leaf(g, sn, args, dk, da, db)
             } else {
-                jfsusp_call(g, call, sn, dk, da, db)
+                jfsusp_call(g, call, sn, dk, da, db, dt)
             }
         }
         _ => {
@@ -2418,7 +2601,7 @@ fn jxsusp(g: mut G, e: ref parser.Node, sn: str) -> str {
             if check.is_susp_builtin(sn) {
                 jfsusp_leaf(g, sn, args, 1, fd, "")
             } else {
-                jfsusp_call(g, e, sn, 1, fd, "")
+                jfsusp_call(g, e, sn, 1, fd, "", rt)
             }
         }
         _ => {
@@ -2541,7 +2724,7 @@ fn jfmatch(g: mut G, scrut: ref parser.Node, arms: ref parser.NList) {
 // an expr in stmt position inside a frame (ExprStmt / match arm body)
 fn jfstmt_expr(g: mut G, e: ref parser.Node) {
     if check.nk(e) == 8 && len(g_call_susp(g, e)) > 0 {
-        jfsusp_go(g, e, 0, "", "")
+        jfsusp_go(g, e, 0, "", "", -1)
         return
     }
     if check.nk(e) == 32 {
@@ -2714,7 +2897,7 @@ fn jfstmt(g: mut G, s: ref parser.Node) {
             fd := jfslot(g, name, jzero(g, t))
             check.env_bind(g.env, name, t)
             if len(g_call_susp(g, init)) > 0 {
-                jfsusp_go(g, init, 1, fd, "")
+                jfsusp_go(g, init, 1, fd, "", t)
             } else {
                 v := jzero(g, t)
                 if init != nil {
@@ -2729,7 +2912,7 @@ fn jfstmt(g: mut G, s: ref parser.Node) {
             fd := jfslot(g, name, jzero(g, t))
             check.env_bind(g.env, name, t)
             if len(g_call_susp(g, init)) > 0 {
-                jfsusp_go(g, init, 1, fd, "")
+                jfsusp_go(g, init, 1, fd, "", t)
             } else {
                 v := jzero(g, t)
                 if init != nil {
@@ -2769,7 +2952,7 @@ fn jfstmt(g: mut G, s: ref parser.Node) {
                         if check.is_susp_builtin(sn) {
                             jfsusp_leaf(g, sn, args, 3, fa, fb)
                         } else {
-                            jfsusp_call(g, call, sn, 3, fa, fb)
+                            jfsusp_call(g, call, sn, 3, fa, fb, vt)
                         }
                     }
                     _ => {
@@ -2811,7 +2994,7 @@ fn jfstmt(g: mut G, s: ref parser.Node) {
                                 if check.is_susp_builtin(sn) {
                                     jfsusp_leaf(g, sn, args, 4, "fr." + of, "fr." + iv)
                                 } else {
-                                    jfsusp_call(g, val, sn, 4, "fr." + of, "fr." + iv)
+                                    jfsusp_call(g, val, sn, 4, "fr." + of, "fr." + iv, xty(g, target))
                                 }
                             }
                             _ => {
@@ -2828,7 +3011,7 @@ fn jfstmt(g: mut G, s: ref parser.Node) {
                             if check.is_susp_builtin(sn) {
                                 jfsusp_leaf(g, sn, args, 2, tc, "")
                             } else {
-                                jfsusp_call(g, val, sn, 2, tc, "")
+                                jfsusp_call(g, val, sn, 2, tc, "", xty(g, target))
                             }
                         }
                         _ => {
@@ -2871,7 +3054,7 @@ fn jfstmt(g: mut G, s: ref parser.Node) {
                     g.hoistn = g.hoistn + 1
                     jfscope_drain(g, 0)
                     jdefers(g)
-                    jfsusp_call(g, vals.v, sn, 3, pa, pe)
+                    jfsusp_call(g, vals.v, sn, 3, pa, pe, pr2.vt)
                     cv2 := jconv_v(g, vals.v, "fr." + pa, g.cret)
                     wln(g, "    fr.result = {val: " + cv2 + ", err: fr." + pe + "};")
                     jsusp_ret(g, "rt.RT_READY")
@@ -3216,6 +3399,7 @@ fn jframe(g: mut G, qn: str, recv: ref parser.Node, params: ref parser.NList, re
     g.sdecls = mkslice(str, 0)
     g.states = mkslice(int, 0)
     g.staten = 1
+    g.vsdn = 0
     g.loops = mkslice(GLab, 0)
     g.sopen = mkslice(int, 0)
     g.defers = nil

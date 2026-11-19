@@ -98,9 +98,11 @@ static inline long oxl_pid(void) { return (long)getpid(); }
 #endif
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 typedef struct {
     const char *p;
@@ -131,8 +133,20 @@ typedef struct RtTask RtTask;
 typedef struct RtFrame {
     struct RtScope *cur_scope; /* innermost live scope at last suspend */
     int state;                 /* resume counter: 0 = entry */
+    /* owned inner frame of an inline susp call (plain call child or
+       susp-vtab descriptor make) — emitted code keeps it NULL outside
+       a live suspension; task_release_frame frees whatever is still
+       linked when the task settles without re-entering the poll
+       (cancel-while-parked, trap, RT_CANCEL exit) */
+    struct RtFrame *child;
 } RtFrame;
 typedef int (*RtPoll)(RtFrame *, RtTask *);
+/* suspendable-vtable call descriptor: a susp iface method's vtab slot
+ * points at one of these instead of a callable thunk. `make` builds a
+ * fresh child frame from (erased data ptr, iface-declared args),
+ * `poll` drives it, and `res_off` is the byte offset of the result
+ * inside the child frame (0 for void rets). */
+typedef struct { RtPoll poll; void *make; size_t res_off; } RtSuspDesc;
 #define RT_READY 0   /* poll result: fn returned (result slot set) */
 #define RT_PENDING 1 /* suspended; the waker re-enqueues the task */
 #define RT_CANCEL 2  /* observed scope cancel at a suspend point */

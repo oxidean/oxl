@@ -1,0 +1,290 @@
+package sql
+
+// std/database/sql — sqlite lite. A DB is a sqlite3 handle; query
+// prepares a Rows cursor (a sqlite3_stmt); scan[T] maps each row's
+// columns in declared order onto a struct's fields through the
+// descriptor lane — no per-column dest pointers. The driver-registry
+// half of Go's database/sql — pluggable drivers, Scan(any), named
+// parameters — stays parked
+// (docs/specs/2026-11-06-0111-package-system/items/parked-stdlib.md).
+// The rt_sqlite_* shims compile only under -DOXL_SQLITE, which the
+// driver adds (with -lsqlite3 or the LANG_SQLITE_SRC amalgamation)
+// whenever the emitted program references them — native lane only.
+//
+// Handles spell `own byte`: an extern `own`-of-scalar param emits a
+// bare `void*` with no borrow marks (a `ref`/`mut` arg would emit
+// rt_borrow_* on a C pointer that owns no ObjHdr — a live corruption).
+// Passing the FIELD access — `d.h`, `rows.st` — is what keeps a
+// handle usable across calls: bindings move, fields don't.
+import "std/errors"
+
+import "std/reflect"
+
+extern fn rt_sqlite_open(path: cstr) -> own byte
+
+extern fn rt_sqlite_exec(db: own byte, sql: cstr) -> int
+
+extern fn rt_sqlite_exec_bind(db: own byte, sql: cstr, param: str) -> int
+
+extern fn rt_sqlite_close(db: own byte)
+
+extern fn rt_sqlite_prepare(db: own byte, sql: cstr) -> own byte
+
+extern fn rt_sqlite_step(st: own byte) -> int
+
+extern fn rt_sqlite_reset(st: own byte) -> int
+
+extern fn rt_sqlite_cols(st: own byte) -> int
+
+extern fn rt_sqlite_col_type(st: own byte, i: int) -> int
+
+extern fn rt_sqlite_col_int(st: own byte, i: int) -> int
+
+extern fn rt_sqlite_col_f64(st: own byte, i: int) -> float
+
+extern fn rt_sqlite_col_text(st: own byte, i: int) -> str
+
+extern fn rt_sqlite_finalize(st: own byte)
+
+extern fn rt_sqlite_errstr(db: own byte) -> str
+
+extern fn rt_sqlite_errstr_rc(rc: int) -> str
+
+// sqlite column-type codes — SQLITE_INTEGER..SQLITE_NULL.
+fn col_integer() -> int {
+    return 1
+}
+
+fn col_float() -> int {
+    return 2
+}
+
+fn col_text() -> int {
+    return 3
+}
+
+fn col_blob() -> int {
+    return 4
+}
+
+fn col_null() -> int {
+    return 5
+}
+
+/// err_kind is the sentinel for every field/column kind scan can't
+/// convert — a nested struct, slice, enum, or `own` field.
+fn err_kind() -> err {
+    return errors.new("sql: unsupported field kind")
+}
+
+/// err_cols reports a column count that doesn't match the scan
+/// target's struct field count.
+fn err_cols() -> err {
+    return errors.new("sql: column count does not match struct fields")
+}
+
+/// err_dbt reports a db-side call's failure; the driver text is
+/// scope-copied before the next db call can overwrite it.
+fn err_dbt(db: own byte, what: str) -> err {
+    return errors.new("sql: " + what + ": " + rt_sqlite_errstr(db))
+}
+
+/// DB is a sqlite3 connection handle — an opaque `own` pointer the
+/// shim owns; close releases it.
+struct DB { h: own byte }
+
+/// Rows is a prepared-statement cursor — one query's live result
+/// stream. scan consumes it; close finalizes the stmt.
+struct Rows { st: own byte }
+
+/// open connects a sqlite database file — ":memory:" for an ephemeral
+/// one. WAL mode and a 5s busy timeout are set by the shim.
+fn open(path: str) -> [DB, err] {
+    h := rt_sqlite_open(cstr(path))
+    if h == nil {
+        return DB{h: nil}, errors.new("sql: open " + path + " failed")
+    }
+    return DB{h: h}, nil
+}
+
+/// exec runs a statement that returns no rows — DDL and writes.
+/// A nonzero sqlite status reports through err with the driver text.
+fn (d DB) exec(q: str) -> err {
+    if rt_sqlite_exec(d.h, cstr(q)) != 0 {
+        return err_dbt(d.h, "exec")
+    }
+    return nil
+}
+
+/// exec_bind runs a one-parameter statement — the param binds ?1 as
+/// text, never concatenates into SQL.
+fn (d DB) exec_bind(q: str, param: str) -> err {
+    if rt_sqlite_exec_bind(d.h, cstr(q), param) != 0 {
+        return err_dbt(d.h, "exec")
+    }
+    return nil
+}
+
+/// query prepares q as a Rows cursor. The caller closes the Rows —
+/// or scans it, which consumes every row.
+fn (d DB) query(q: str) -> [Rows, err] {
+    st := rt_sqlite_prepare(d.h, cstr(q))
+    if st == nil {
+        return Rows{st: nil}, err_dbt(d.h, "query")
+    }
+    return Rows{st: st}, nil
+}
+
+/// close releases the connection.
+fn (d DB) close() {
+    rt_sqlite_close(d.h)
+}
+
+/// close finalizes the cursor's statement.
+fn (r Rows) close() {
+    rt_sqlite_finalize(r.st)
+}
+
+// set_col writes column j of the live row into the struct field fv
+// addresses. Column types coerce per the doc comment on scan; NULL
+// leaves the field at its minted zero.
+fn set_col(fv: reflect.Value, rows: Rows, j: int) -> err {
+    ct := rt_sqlite_col_type(rows.st, j)
+    if ct == col_null() {
+        return nil
+    }
+    ft := fv.typ()
+    k := ft.kind()
+    if k == reflect.KindInt() {
+        if ct == col_integer() {
+            return fv.set_int(rt_sqlite_col_int(rows.st, j))
+        }
+        if ct == col_float() {
+            return fv.set_int(ftoi(rt_sqlite_col_f64(rows.st, j)))
+        }
+        return err_kind()
+    }
+    if k == reflect.KindFloat() {
+        if ct == col_integer() {
+            return fv.set_f64(itof(rt_sqlite_col_int(rows.st, j)))
+        }
+        if ct == col_float() {
+            return fv.set_f64(rt_sqlite_col_f64(rows.st, j))
+        }
+        return err_kind()
+    }
+    if k == reflect.KindBool() {
+        if ct != col_integer() {
+            return err_kind()
+        }
+        if rt_sqlite_col_int(rows.st, j) != 0 {
+            return fv.set_bool(1)
+        }
+        return fv.set_bool(0)
+    }
+    if k == reflect.KindByte() {
+        if ct != col_integer() {
+            return err_kind()
+        }
+        return fv.set_byte(rt_sqlite_col_int(rows.st, j))
+    }
+    if k == reflect.KindStr() {
+        return fv.set_str(rt_sqlite_col_text(rows.st, j))
+    }
+    return err_kind()
+}
+
+/// scan consumes rows: every row's columns map in declared order onto
+/// T's struct fields, and the collected rows land in out. T must be a
+/// struct whose field count equals the query's column count — column
+/// j writes field j, err_cols on any other pairing. Conversions:
+/// INTEGER feeds int/bool/byte (and float via itof), FLOAT feeds
+/// float (and int via truncation), TEXT feeds str — as does any
+/// non-NULL column type through sqlite3_column_text — and NULL leaves
+/// the field at its minted zero. Field kinds outside the scalar lanes
+/// (nested structs, slices, enums, `own` pointers) report err_kind.
+///
+/// Rows are stepped twice — a count pass, then a reset + fill pass —
+/// so out's backing mints once at exact length on the own lane. scan
+/// resets the cursor before each pass, so re-scanning a live Rows
+/// deterministically replays the full result set.
+fn scan[T any](rows: Rows, out: mut []T) -> err {
+    t := type_of(T)
+    if t.kind() != reflect.KindStruct() {
+        return errors.new("sql: scan target " + t.name() + " is not a struct")
+    }
+    nf := t.nfields()
+    if rt_sqlite_cols(rows.st) != nf {
+        return err_cols()
+    }
+    // pre-flight the field kinds — fail before consuming a row
+    j := 0
+    for j < nf {
+        [fd, fde] = t.field(j)
+        if fde != nil {
+            return fde
+        }
+        if fd.ptr() != 0 {
+            return err_kind()
+        }
+        [ft, fte] = fd.typ()
+        if fte != nil {
+            return fte
+        }
+        k := ft.kind()
+        if k != reflect.KindInt() && k != reflect.KindFloat() && k != reflect.KindBool() && k != reflect.KindByte() && k != reflect.KindStr() {
+            return err_kind()
+        }
+        j = j + 1
+    }
+    // pass 1 — count the rows so the backing mints at exact length;
+    // reset first so a consumed cursor replays rather than erring
+    rst := rt_sqlite_reset(rows.st)
+    if rst != 0 {
+        return errors.new("sql: reset: " + rt_sqlite_errstr_rc(rst))
+    }
+    n := 0
+    rc := rt_sqlite_step(rows.st)
+    for rc == 1 {
+        n = n + 1
+        rc = rt_sqlite_step(rows.st)
+    }
+    if rc < 0 {
+        return errors.new("sql: step: " + rt_sqlite_errstr_rc(-rc))
+    }
+    rst = rt_sqlite_reset(rows.st)
+    if rst != 0 {
+        return errors.new("sql: reset: " + rt_sqlite_errstr_rc(rst))
+    }
+    // pass 2 — fill the own-lane backing in place, then land the
+    // header through out's mut Value
+    tmp := new(mkslice(T, n))
+    tv := value_of_mut(tmp)
+    i := 0
+    rc = rt_sqlite_step(rows.st)
+    for rc == 1 {
+        [ev, ee] = tv.index(i)
+        if ee != nil {
+            return ee
+        }
+        j = 0
+        for j < nf {
+            [fv, fe] = ev.field(j)
+            if fe != nil {
+                return fe
+            }
+            ce := set_col(fv, rows, j)
+            if ce != nil {
+                return ce
+            }
+            j = j + 1
+        }
+        i = i + 1
+        rc = rt_sqlite_step(rows.st)
+    }
+    if rc < 0 {
+        return errors.new("sql: step: " + rt_sqlite_errstr_rc(-rc))
+    }
+    ov := value_of_mut(out)
+    return ov.set_slice(tv)
+}

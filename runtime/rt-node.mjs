@@ -313,6 +313,17 @@ export function install(api) {
     rt_sqlite_query: trap21,
     rt_sqlite_close: trap21,
     rt_sqlite_exec_bind: trap21,
+    rt_sqlite_prepare: trap21,
+    rt_sqlite_step: trap21,
+    rt_sqlite_reset: trap21,
+    rt_sqlite_cols: trap21,
+    rt_sqlite_col_type: trap21,
+    rt_sqlite_col_int: trap21,
+    rt_sqlite_col_f64: trap21,
+    rt_sqlite_col_text: trap21,
+    rt_sqlite_finalize: trap21,
+    rt_sqlite_errstr: trap21,
+    rt_sqlite_errstr_rc: trap21,
 
     /* ---------- net — sync-blocking natives can't run on one thread.
      * These get the honest trap until W5's node-socket shims land. */

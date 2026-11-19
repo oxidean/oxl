@@ -2471,7 +2471,8 @@ fn lav(g: mut G, args: ref parser.NList) -> own GAv {
 }
 
 // arg list coerced against an IList signature (susp-vtab desc make
-// fns use it; borrows only when hoist==1, mirroring gav_ps)
+// fns use it; its only caller is lfsusp_vcall — hoist==2 so own->mut/ref
+// args take lsusp_borrow's frame-resident ledger, mirroring gfsusp)
 fn lav_ps(g: mut G, args: ref parser.NList, ps: ref check.IList) -> own GAv {
     let head: own GAv = nil
     let tail: own GAv = nil
@@ -2482,7 +2483,7 @@ fn lav_ps(g: mut G, args: ref parser.NList, ps: ref check.IList) -> own GAv {
         apre := ""
         apost := ""
         if il != nil {
-            o := larg_c(g, al.v, v, il.v, nil, 0)
+            o := larg_c(g, al.v, v, il.v, nil, 2)
             v = o.v
             apre = o.pre
             apost = o.post
@@ -5605,16 +5606,20 @@ fn lav_decl(g: mut G, args: ref parser.NList, fi: int, bind: ref collections.Map
         il = g.ck.fnsv[fi].params
     }
     if recv != nil {
-        v := lx(g, recv)
-        cpre := ""
-        cpost := ""
+        pt := xty(g, recv)
         if il != nil {
-            pt := il.v
+            pt = il.v
             if bind != nil {
                 pt = check.subst_ty(g.ck, pt, bind)
             }
-            pt = gsub(g, pt)
-            v = ladapt_v(g, recv, v, pt)
+        }
+        pt = gsub(g, pt)
+        // ladapt_e evaluates recv exactly once (seed HEAD's single-eval
+        // fix — the pre-eval + ladapt_v form re-ran call receivers)
+        v := ladapt_e(g, recv, pt)
+        cpre := ""
+        cpost := ""
+        if il != nil {
             if susp == 1 {
                 raw := gsub(g, xty(g, recv))
                 if tyk(g, raw) == check.k_own() {
@@ -6317,7 +6322,6 @@ fn lfsusp_go(g: mut G, call: ref parser.Node, dk: int, da: int, db: int, dt: int
 fn lxsusp_park(g: mut G, e: ref parser.Node, sn: str) {
     rt := xty(g, e)
     h := lfpush(g, lfty(g, rt))
-    g.hoistn = g.hoistn + 1
     match e {
         parser.Node.Call{args} => {
             if check.is_susp_builtin(sn) {
@@ -6826,6 +6830,7 @@ fn lframe(g: mut G, qn: str, recv: ref parser.Node, params: ref parser.NList, re
     dm := lcallrt(g, "ptr", "rt_defer_mark", "")
     lstore(g, "ptr", dm, lgepf(g, g.lfrty, "%_f", 3))
     lblk(g, body)
+    check.env_pop(g.fsl)
     check.env_pop(g.fsl)
     ldefers(g)
     lsusp_ret(g, "0")

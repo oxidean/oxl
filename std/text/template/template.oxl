@@ -1,0 +1,533 @@
+package template
+
+// std/text/template — a small Go text/template-shaped engine over
+// descriptor field names. Actions inside {{ }}:
+//
+//   {{.Field}}     field lookup by declared name — dotted paths
+//                  ({{.A.B}}) walk nested structs; {{.}} is the
+//                  current value itself
+//   {{if .Field}} … {{else}} … {{end}}   truthiness: nonzero numbers,
+//                  true bools, non-empty strings/slices; structs and
+//                  enums are always true
+//   {{range .Field}} … {{end}}   iterates a slice field — inside the
+//                  body `.` is the element, so {{.}} prints scalar
+//                  elements and {{.Sub}} reads element fields
+//
+// parse builds the node tree once; exec renders it against a value's
+// descriptor. render is the one-shot convenience. v1 limits: no
+// pipelines, functions, variables, or {{- -}} whitespace trimming;
+// field names are the declared names (struct tags are not consulted);
+// the if/range operand is a field path only, not a literal; and
+// {{else}} exists only on {{if}} (Go's range-else is unimplemented).
+// {{if}}/{{range}} nesting is capped at MAX_TDEPTH — deeper input
+// reports err_syntax instead of overflowing the C stack.
+import "std/errors"
+
+import "std/reflect"
+
+import "std/strings"
+
+/// err_syntax reports a malformed template — an unclosed action, a
+/// stopper with no opener, or an action word that isn't one of
+/// if/range/else/end/a field path.
+fn err_syntax() -> err {
+    return errors.new("template: syntax error")
+}
+
+// ---------- node tree ----------
+
+// Tpl is one parsed node in a linked list: kind 0 literal text, 1
+// {{.path}} print, 2 {{range .path}}, 3 {{if .path}}. body holds the
+// child list for range/if; alt the if's else branch.
+struct Tpl {
+    kind: int,
+    text: str,
+    path: str,
+    body: own Tpl,
+    alt: own Tpl,
+    next: own Tpl,
+}
+
+// TList accumulates nodes at O(1) append — the linked head/tail
+// pattern std/encoding/json uses for its tree.
+struct TList { head: own Tpl, tail: own Tpl }
+
+fn tadd(l: mut TList, n: own Tpl) {
+    if l.head == nil {
+        l.head = n
+        l.tail = l.head
+        return
+    }
+    l.tail.next = n
+    l.tail = l.tail.next
+}
+
+fn tnode(kind: int, text: str, path: str) -> own Tpl {
+    n := new(Tpl)
+    n.kind = kind
+    n.text = text
+    n.path = path
+    return n
+}
+
+// ---------- parser ----------
+
+// TCur is the parse cursor — src, pos, a sticky err flag, stop,
+// which names the token that ended the innermost list ("end", "else",
+// or "eof"), and depth, the count of enclosing {{if}}/{{range}}
+// bodies (bounded by MAX_TDEPTH so deep nesting cannot overflow the
+// recursive-descent call stack — same convention as MAX_XDEPTH in
+// std/encoding/xml and MAX_JDEPTH in std/encoding/json).
+struct TCur { src: str, pos: int, err: int, stop: str, depth: int }
+
+/// MAX_TDEPTH bounds {{if}}/{{range}} nesting against the call stack.
+let MAX_TDEPTH = 256
+
+// taction reads one action word: a field path ("." or ".A.B"), or a
+// keyword followed by its path operand ("if .F" / "range .F"). kind 1
+// print, 2 range, 3 if; p.path carries the operand.
+fn taction(act: str) -> own Tpl {
+    if strings.startswith(act, ".") {
+        return tnode(1, "", act)
+    }
+    kw := act
+    rest := ""
+    // the keyword boundary is the first whitespace of ANY kind —
+    // space, tab, newline, CR all separate `if` from its operand
+    sp := len(act)
+    p := find(act, " ")
+    if p >= 0 && p < sp {
+        sp = p
+    }
+    p = find(act, "\t")
+    if p >= 0 && p < sp {
+        sp = p
+    }
+    p = find(act, "\n")
+    if p >= 0 && p < sp {
+        sp = p
+    }
+    p = find(act, "\r")
+    if p >= 0 && p < sp {
+        sp = p
+    }
+    if sp < len(act) {
+        kw = substr(act, 0, sp)
+        rest = strings.trim(substr(act, sp + 1, len(act)))
+    }
+    if kw == "if" && strings.startswith(rest, ".") {
+        return tnode(3, "", rest)
+    }
+    if kw == "range" && strings.startswith(rest, ".") {
+        return tnode(2, "", rest)
+    }
+    return nil
+}
+
+// tlist parses nodes until {{end}}, {{else}}, or EOF — recursive
+// through itself for if/range bodies, so nesting composes.
+fn tlist(p: mut TCur) -> own Tpl {
+    l := new(TList)
+    for p.pos < len(p.src) && p.err == 0 {
+        o := find(substr(p.src, p.pos, len(p.src)), "{{")
+        if o < 0 {
+            tadd(l, tnode(0, substr(p.src, p.pos, len(p.src)), ""))
+            p.pos = len(p.src)
+            break
+        }
+        if o > 0 {
+            tadd(l, tnode(0, substr(p.src, p.pos, p.pos + o), ""))
+            p.pos = p.pos + o
+        }
+        c := find(substr(p.src, p.pos + 2, len(p.src)), "}}")
+        if c < 0 {
+            p.err = 1
+            return l.head
+        }
+        act := strings.trim(substr(p.src, p.pos + 2, p.pos + 2 + c))
+        p.pos = p.pos + 2 + c + 2
+        if act == "end" || act == "else" {
+            p.stop = act
+            return l.head
+        }
+        n := taction(act)
+        if n == nil {
+            p.err = 1
+            return l.head
+        }
+        if n.kind == 2 || n.kind == 3 {
+            if p.depth >= MAX_TDEPTH {
+                p.err = 1
+                return l.head
+            }
+            p.depth = p.depth + 1
+            p.stop = ""
+            n.body = tlist(p)
+            if p.err != 0 {
+                p.depth = p.depth - 1
+                return l.head
+            }
+            if n.kind == 3 && p.stop == "else" {
+                p.stop = ""
+                n.alt = tlist(p)
+                if p.err != 0 {
+                    p.depth = p.depth - 1
+                    return l.head
+                }
+            }
+            p.depth = p.depth - 1
+            if p.stop != "end" {
+                p.err = 1
+                return l.head
+            }
+        }
+        tadd(l, n)
+    }
+    p.stop = "eof"
+    return l.head
+}
+
+/// parse builds the node tree for src. {{end}}/{{else}} at top level,
+/// an unclosed {{, an unrecognized action, or {{if}}/{{range}}
+/// nesting past MAX_TDEPTH report err_syntax.
+fn parse(src: str) -> [own Tpl, err] {
+    p := new(TCur)
+    p.src = src
+    p.pos = 0
+    p.err = 0
+    p.stop = ""
+    p.depth = 0
+    t := tlist(p)
+    if p.err != 0 || p.stop != "eof" {
+        return nil, err_syntax()
+    }
+    return t, nil
+}
+
+// ---------- exec ----------
+
+// tpath resolves a dotted field path against v — "" or "." yields v
+// itself; each segment descends one struct field by declared name.
+fn tpath(v: reflect.Value, path: str) -> [reflect.Value, err] {
+    cur := v
+    if path == "" || path == "." {
+        return cur, nil
+    }
+    s := path
+    for len(s) > 0 {
+        if byteat(s, 0) != 46 {
+            return cur, err_syntax()
+        }
+        s = substr(s, 1, len(s))
+        j := find(s, ".")
+        seg := s
+        if j >= 0 {
+            seg = substr(s, 0, j)
+            s = substr(s, j, len(s))
+        } else {
+            s = ""
+        }
+        if len(seg) == 0 {
+            return cur, err_syntax()
+        }
+        t := cur.typ()
+        if t.kind() != reflect.KindStruct() {
+            return cur, errors.new("template: ." + seg + " on non-struct " + t.name())
+        }
+        idx := -1
+        i := 0
+        for i < t.nfields() {
+            [f, fe] = t.field(i)
+            if fe == nil && f.name() == seg {
+                idx = i
+            }
+            i = i + 1
+        }
+        if idx < 0 {
+            return cur, errors.new("template: no field " + seg + " on " + t.name())
+        }
+        [fv, ve] = cur.field(idx)
+        if ve != nil {
+            return cur, ve
+        }
+        cur = fv
+    }
+    return cur, nil
+}
+
+// tval renders a Value the %v way — scalar text, [a b] slices, {a b}
+// structs, the live variant's name for enums.
+fn tval(v: reflect.Value) -> [str, err] {
+    t := v.typ()
+    k := t.kind()
+    if k == reflect.KindInt() {
+        [x, e] = v.int()
+        if e != nil {
+            return "", e
+        }
+        return itoa(x), nil
+    }
+    if k == reflect.KindFloat() {
+        [x, e] = v.f64()
+        if e != nil {
+            return "", e
+        }
+        return ftoa(x), nil
+    }
+    if k == reflect.KindBool() {
+        [x, e] = v.bool()
+        if e != nil {
+            return "", e
+        }
+        if x != 0 {
+            return "true", nil
+        }
+        return "false", nil
+    }
+    if k == reflect.KindByte() {
+        [x, e] = v.byte()
+        if e != nil {
+            return "", e
+        }
+        return itoa(x), nil
+    }
+    if k == reflect.KindStr() || k == reflect.KindPtr() {
+        [x, e] = v.str()
+        if e != nil {
+            return "", e
+        }
+        return x, nil
+    }
+    if k == reflect.KindEnum() {
+        [tg, te] = v.tag()
+        if te != nil {
+            return "", te
+        }
+        [xv, ve] = t.variant(tg)
+        if ve != nil {
+            return "", ve
+        }
+        return xv.name(), nil
+    }
+    if k == reflect.KindSlice() {
+        [n, le] = v.len()
+        if le != nil {
+            return "", le
+        }
+        s := ""
+        i := 0
+        for i < n {
+            if i > 0 {
+                s = s + " "
+            }
+            [iv, ie] = v.index(i)
+            if ie != nil {
+                if errors.is(ie, reflect.err_nil()) {
+                    s = s + "<nil>"
+                    i = i + 1
+                    continue
+                }
+                return "", ie
+            }
+            [r, re] = tval(iv)
+            if re != nil {
+                return "", re
+            }
+            s = s + r
+            i = i + 1
+        }
+        return "[" + s + "]", nil
+    }
+    if k == reflect.KindStruct() {
+        s := ""
+        i := 0
+        for i < t.nfields() {
+            if i > 0 {
+                s = s + " "
+            }
+            [fv, fe] = v.field(i)
+            inner := "<nil>"
+            if fe == nil {
+                [r, re] = tval(fv)
+                if re != nil {
+                    return "", re
+                }
+                inner = r
+            } else if !errors.is(fe, reflect.err_nil()) {
+                return "", fe
+            }
+            s = s + inner
+            i = i + 1
+        }
+        return "{" + s + "}", nil
+    }
+    if k == reflect.KindErr() {
+        [x, e] = v.int()
+        if e != nil {
+            return "", e
+        }
+        return "err " + itoa(x), nil
+    }
+    return "", errors.new("template: cannot render kind " + itoa(k))
+}
+
+// ttrue is the {{if}} predicate: nonzero numbers and bytes, true
+// bools, non-empty strings and slices; structs, enums, and cstr
+// pointers count as present.
+fn ttrue(v: reflect.Value) -> [int, err] {
+    t := v.typ()
+    k := t.kind()
+    if k == reflect.KindInt() {
+        [x, e] = v.int()
+        if e != nil {
+            return 0, e
+        }
+        if x != 0 {
+            return 1, nil
+        }
+        return 0, nil
+    }
+    if k == reflect.KindFloat() {
+        [x, e] = v.f64()
+        if e != nil {
+            return 0, e
+        }
+        if x != 0.0 {
+            return 1, nil
+        }
+        return 0, nil
+    }
+    if k == reflect.KindBool() {
+        [x, e] = v.bool()
+        if e != nil {
+            return 0, e
+        }
+        if x != 0 {
+            return 1, nil
+        }
+        return 0, nil
+    }
+    if k == reflect.KindByte() {
+        [x, e] = v.byte()
+        if e != nil {
+            return 0, e
+        }
+        if x != 0 {
+            return 1, nil
+        }
+        return 0, nil
+    }
+    if k == reflect.KindStr() || k == reflect.KindPtr() {
+        [x, e] = v.str()
+        if e != nil {
+            return 0, e
+        }
+        if len(x) > 0 {
+            return 1, nil
+        }
+        return 0, nil
+    }
+    if k == reflect.KindSlice() {
+        [n, e] = v.len()
+        if e != nil {
+            return 0, e
+        }
+        if n > 0 {
+            return 1, nil
+        }
+        return 0, nil
+    }
+    if k == reflect.KindStruct() || k == reflect.KindEnum() {
+        return 1, nil
+    }
+    return 0, errors.new("template: cannot test kind " + itoa(k))
+}
+
+// texec_nodes renders one node list against v — recursion carries the
+// range element's Value down into its body.
+fn texec_nodes(n: ref Tpl, v: reflect.Value) -> [str, err] {
+    out := ""
+    m := n
+    for m != nil {
+        if m.kind == 0 {
+            out = out + m.text
+        }
+        if m.kind == 1 {
+            [pv, pe] = tpath(v, m.path)
+            if pe != nil {
+                return "", pe
+            }
+            [s, se] = tval(pv)
+            if se != nil {
+                return "", se
+            }
+            out = out + s
+        }
+        if m.kind == 2 {
+            [pv, pe] = tpath(v, m.path)
+            if pe != nil {
+                return "", pe
+            }
+            pt := pv.typ()
+            if pt.kind() != reflect.KindSlice() {
+                return "", errors.new("template: range of non-slice " + m.path)
+            }
+            [cnt, le] = pv.len()
+            if le != nil {
+                return "", le
+            }
+            j := 0
+            for j < cnt {
+                [iv, ie] = pv.index(j)
+                if ie != nil {
+                    return "", ie
+                }
+                [s, se] = texec_nodes(m.body, iv)
+                if se != nil {
+                    return "", se
+                }
+                out = out + s
+                j = j + 1
+            }
+        }
+        if m.kind == 3 {
+            [pv, pe] = tpath(v, m.path)
+            if pe != nil {
+                return "", pe
+            }
+            [tv, te] = ttrue(pv)
+            if te != nil {
+                return "", te
+            }
+            branch := m.body
+            if tv == 0 {
+                branch = m.alt
+            }
+            [s, se] = texec_nodes(branch, v)
+            if se != nil {
+                return "", se
+            }
+            out = out + s
+        }
+        m = m.next
+    }
+    return out, nil
+}
+
+/// exec renders a parsed template against v — `v: T` receives the
+/// value (an own arg moves in, same as fmt.sprintv); the descriptor
+/// walk reads it through a scope-bound Value.
+fn exec[T any](t: ref Tpl, v: T) -> [str, err] {
+    c := new(v)
+    rv := value_of(c)
+    return texec_nodes(t, rv)
+}
+
+/// render is parse + exec in one call.
+fn render[T any](src: str, v: T) -> [str, err] {
+    [t, e] = parse(src)
+    if e != nil {
+        return "", e
+    }
+    return exec(t, v)
+}

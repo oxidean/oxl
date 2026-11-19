@@ -1589,6 +1589,16 @@ out=$("$OXL" run tests/fmt_v.oxl)
 out=$("$OXL" run tests/db_sql.oxl)
 [ "$(tail -1 <<<"$out")" = "db_sql ok" ] || { echo "FAIL db_sql: $out"; exit 1; }
 
+echo "== xml + text/template (r5) =="
+# the descriptor consumers: encoding/xml marshal/unmarshal routed by
+# `tag "xml:..."` field metadata, text/template {{.F}}/{{range}}/{{if}}
+# against descriptor names — both fixtures assert in-process and end
+# with an ok line
+out=$("$OXL" run tests/enc_xml.oxl)
+[ "$(tail -1 <<<"$out")" = "enc_xml ok" ] || { echo "FAIL enc_xml: $out"; exit 1; }
+out=$("$OXL" run tests/text_template.oxl)
+[ "$(tail -1 <<<"$out")" = "text_template ok" ] || { echo "FAIL text_template: $out"; exit 1; }
+
 echo "== bootstrap codegen =="
 # the self-hosted C emitter must produce working binaries — every
 # example plus representative tests, run-and-compared end to end
@@ -1613,7 +1623,7 @@ cgen() {  # cgen <src> <name> — emit C via codegen.oxl, compile it
     grep -q 'rt_csrand(' "$cgen_dir/$2.c" && { cdef="-DOXL_CRYPTO"; clib="$CRYPTO_LIBS"; }
     "$CC" -O2 $THREAD_FLAG -Iruntime $def $net $mdef $cdef "$cgen_dir/$2.c" runtime/rt.c $lib $mlib $clib $NET_LIBS -o "$cgen_dir/$2$EXE" || { echo "FAIL codegen cc $1"; exit 1; }
 }
-for f in examples/hello.oxl examples/features.oxl tests/match.oxl tests/chanbuf.oxl tests/methods.oxl tests/pairfwd.oxl tests/iface_susp.oxl tests/iface_susp_shim.oxl tests/iface_susp_pair.oxl tests/iface_susp_nested.oxl tests/iface_susp_rewrap.oxl tests/iface_susp_prop.oxl tests/iface_susp_convdest.oxl tests/iface_susp_cancel.oxl tests/vtab_fn.oxl tests/reflect.oxl tests/fmt_v.oxl tests/db_sql.oxl; do
+for f in examples/hello.oxl examples/features.oxl tests/match.oxl tests/chanbuf.oxl tests/methods.oxl tests/pairfwd.oxl tests/iface_susp.oxl tests/iface_susp_shim.oxl tests/iface_susp_pair.oxl tests/iface_susp_nested.oxl tests/iface_susp_rewrap.oxl tests/iface_susp_prop.oxl tests/iface_susp_convdest.oxl tests/iface_susp_cancel.oxl tests/vtab_fn.oxl tests/reflect.oxl tests/fmt_v.oxl tests/enc_xml.oxl tests/text_template.oxl tests/db_sql.oxl; do
     n=$(basename "$f" .oxl)
     cgen "$f" "$n"
     got=$("$cgen_dir/$n$EXE")
@@ -1799,6 +1809,42 @@ want=$("$OXL" run bootstrap/cmd/check -- tests/diag/own_use_moved.oxl || true)
 "$cgen_dir/self_codegen$EXE" examples/hello.oxl > "$cgen_dir/chain.c"
 "$OXL" run bootstrap/cmd/codegen -- examples/hello.oxl > "$cgen_dir/direct.c"
 cmp "$cgen_dir/chain.c" "$cgen_dir/direct.c" || { echo "FAIL bootstrap chain"; exit 1; }
+
+echo "== llvm lane (l1) =="
+# the emitted .ll + the rt.h-offset shim must agree on every boundary
+# type — a drifted %OxlStr/%RtSlice/%RtFnv/%RtIface decl turns the
+# shim's reads to garbage. Gated on clang (the lane's only consumer).
+# Windows: `clang` on the runner is MSVC-target — it links only the
+# msvcrt/kernel32 defaults, so rt.c's advapi32 (security attrs) and
+# shell32 (CommandLineToArgvW) callers need explicit libs MinGW gcc
+# would add itself.
+if command -v clang >/dev/null 2>&1; then
+    abilibs=""
+    case "$(uname -s)" in
+        MINGW*|MSYS*|CYGWIN*) abilibs="-ladvapi32 -lshell32" ;;
+    esac
+    # pin the emit-side ABI guess: a stale OXL_LLVM_ABI in the env
+    # would spell the wrong boundary while the shim below is always
+    # the host build
+    OXL_LLVM_ABI= "$OXL" run bootstrap/cmd/codegen -- --emit llvm tests/llvm_abi_check.oxl > "$scratch/abi.ll" || { echo "FAIL llvm emit"; exit 1; }
+    echo "  llvm abi: emitted"
+    clang -O0 $THREAD_FLAG -Iruntime "$scratch/abi.ll" tests/llvm_abi_shim.c runtime/rt.c $abilibs -o "$scratch/abi_check$EXE" || { echo "FAIL llvm abi cc"; exit 1; }
+    echo "  llvm abi: built"
+    out=$("$scratch/abi_check$EXE" 2>&1) || {
+        rc=$?
+        echo "FAIL llvm abi run rc=$rc"
+        printf '%s\n' "$out"
+        # on a segfault, dump the backtrace — x86_64 can't reproduce
+        if command -v lldb >/dev/null 2>&1; then
+            lldb -b -o run -o "bt all" -o quit -- "$scratch/abi_check$EXE" 2>&1 | tail -50
+        fi
+        exit 1
+    }
+    grep -q "llvm_abi_check ok" <<<"$out" || { echo "FAIL llvm abi: $out"; exit 1; }
+    echo "  llvm abi: ok"
+else
+    echo "  clang not found — skipping llvm abi probe"
+fi
 
 echo "== toolchain driver in .oxl (t2) =="
 # cmd/oxl is the product driver ported to .oxl — argv dispatch, the

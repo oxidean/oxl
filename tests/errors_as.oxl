@@ -16,6 +16,8 @@ struct W { v: int }
 
 struct S { s: str }
 
+struct Holder { p: own Point }
+
 struct Dog { n: str }
 
 fn (d Dog) speak() -> str {
@@ -24,6 +26,10 @@ fn (d Dog) speak() -> str {
 
 fn mk() -> Speaker {
     return Dog{n: "rex"}
+}
+
+fn mv_hit(e: err, h: mut Holder) -> bool {
+    return errors.as(e, h.p)
 }
 
 fn main() {
@@ -106,6 +112,19 @@ fn main() {
         println("impl matched (BUG)")
     } else {
         println("exact-descr ok")
+    }
+    // mv=1: a `mut own Point` out binds T=own Point — the match moves
+    // the stored Point* handle into hp's slot instead of copying the
+    // pointee; hp then owns the boxed handle
+    mvsrc := new(Point)
+    mvsrc.x = 9
+    hb := box(mvsrc)
+    h := new(Holder)
+    h.p = new(Point)
+    if mv_hit(hb, h) && h.p.x == 9 {
+        println("mv ok")
+    } else {
+        println("mv miss (BUG)")
     }
     println("errors_as ok")
 }

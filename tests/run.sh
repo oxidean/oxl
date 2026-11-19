@@ -2052,8 +2052,8 @@ if [ "$seed_out" != "$self_out" ] || [ "$seed_rc" != "$self_rc" ]; then
 ' "$self_out"
     exit 1
 fi
-grep -q 'errors_as ok' <<<"$self_out" || { echo "FAIL errors_as output"; printf '%s
-' "$self_out"; exit 1; }
+grep -q 'errors_as ok' <<<"$self_out" || { echo "FAIL errors_as output"; printf '%s\n' "$self_out"; exit 1; }
+if grep -q '(BUG)' <<<"$self_out"; then echo "FAIL errors_as BUG marker"; printf '%s\n' "$self_out"; exit 1; fi
 # and the js lane rejects box/errors.as fold sites identically
 seed_out=$("$SEEDOXL" build tests/errors_as.oxl --target js -o "$scratch/easjs" 2>&1 | sed 's/^[^:]*:[0-9][0-9]*:[0-9][0-9]*: //') && seed_rc=0 || seed_rc=$?
 self_out=$("$SELFOXL" build tests/errors_as.oxl --target js -o "$scratch/easjs2" 2>&1 | sed 's/^[^:]*:[0-9][0-9]*:[0-9][0-9]*: //') && self_rc=0 || self_rc=$?

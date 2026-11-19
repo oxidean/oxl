@@ -6264,6 +6264,18 @@ fn call(ck: mut Ck, f: ref parser.Node, args: ref parser.NList, env: mut Env) ->
                 if ty_vbound(ck, bt) {
                     diag(ck, "check", "`box` of `reflect.Value` — scope-bound handles may not be stored in heap shapes")
                 }
+                // depth guard: the emit strips the outer qualifier to
+                // name the descriptor, so a doubly-qualified payload
+                // (`own own T`, `ref own T`, `mut own T`) would store
+                // a T* under desc(T) indistinguishable from box(T) —
+                // `as` then memcpys a pointer-sized slot past T's size
+                bq := ck.tyv[bt].k == k_own() || ck.tyv[bt].k == k_ref() || ck.tyv[bt].k == k_mut()
+                if bq && ck.tyv[bt].i >= 0 {
+                    iq := ck.tyv[ck.tyv[bt].i].k
+                    if iq == k_own() || iq == k_ref() || iq == k_mut() {
+                        diag(ck, "check", "`box` of a doubly-qualified handle — payload descriptors carry one qualifier level")
+                    }
+                }
                 // box consumes v — the registry adopts the payload. A
                 // bare `own` binding moves its handle (codegen emits
                 // it raw); other own exprs heap-copy the pointee so
@@ -6272,6 +6284,27 @@ fn call(ck: mut Ck, f: ref parser.Node, args: ref parser.NList, env: mut Env) ->
                 move_own(ck, args.v, env)
             }
             return t_err(ck)
+        }
+        if qn == "errors.as" {
+            // out-depth guard: `mut T` binds T to the out's pointee,
+            // and mv=1 handles a qualified T — but a bound T that is
+            // ITSELF doubly-qualified (`own own own X` out) would
+            // write a T* into a T** slot at the fold. T may carry at
+            // most one qualifier level.
+            if args != nil && args.next != nil {
+                ot := expr(ck, args.next.v, env)
+                oq := ck.tyv[ot].k == k_own() || ck.tyv[ot].k == k_ref() || ck.tyv[ot].k == k_mut()
+                if oq && ck.tyv[ot].i >= 0 {
+                    tt := ck.tyv[ot].i
+                    tq := ck.tyv[tt].k == k_own() || ck.tyv[tt].k == k_ref() || ck.tyv[tt].k == k_mut()
+                    if tq && ck.tyv[tt].i >= 0 {
+                        t2q := ck.tyv[ck.tyv[tt].i].k
+                        if t2q == k_own() || t2q == k_ref() || t2q == k_mut() {
+                            diag(ck, "check", "`errors.as` out is doubly-qualified beyond the bound T — `own own own T` can't be described")
+                        }
+                    }
+                }
+            }
         }
         if qn == "push" {
             if args == nil {

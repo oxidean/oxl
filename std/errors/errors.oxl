@@ -64,7 +64,9 @@ fn is(e: err, target: err) -> bool {
 /// work on it — and errors.msg yields the boxed type's name. A bare
 /// `own` binding moves its handle into the entry; other own exprs
 /// and value/ref/mut args heap-copy into an own-lane sizeof(T)
-/// block the registry adopts. See docs/semantics/errors.md.
+/// block the registry adopts. A nil `own` payload mints an
+// entry with no pdata that can never match `as` — box nil only to
+// reserve a code. See docs/semantics/errors.md.
 
 /// as reports whether a box in e's unwrap chain stores out's exact
 /// descriptor — first match wins; an iface-typed out matches only a

@@ -1589,6 +1589,16 @@ out=$("$OXL" run tests/fmt_v.oxl) || { echo "FAIL fmt_v run exit=$?: $out"; exit
 out=$("$OXL" run tests/enc_gob.oxl) || { echo "FAIL enc_gob run exit=$?: $out"; exit 1; }
 [ "$(tail -1 <<<"$out")" = "enc_gob ok" ] || { echo "FAIL enc_gob: $out"; exit 1; }
 
+echo "== xml + text/template (r5) =="
+# the descriptor consumers: encoding/xml marshal/unmarshal routed by
+# `tag "xml:..."` field metadata, text/template {{.F}}/{{range}}/{{if}}
+# against descriptor names — both fixtures assert in-process and end
+# with an ok line
+out=$("$OXL" run tests/enc_xml.oxl)
+[ "$(tail -1 <<<"$out")" = "enc_xml ok" ] || { echo "FAIL enc_xml: $out"; exit 1; }
+out=$("$OXL" run tests/text_template.oxl)
+[ "$(tail -1 <<<"$out")" = "text_template ok" ] || { echo "FAIL text_template: $out"; exit 1; }
+
 echo "== bootstrap codegen =="
 # the self-hosted C emitter must produce working binaries — every
 # example plus representative tests, run-and-compared end to end
@@ -1613,7 +1623,7 @@ cgen() {  # cgen <src> <name> — emit C via codegen.oxl, compile it
     grep -q 'rt_csrand(' "$cgen_dir/$2.c" && { cdef="-DOXL_CRYPTO"; clib="$CRYPTO_LIBS"; }
     "$CC" -O2 $THREAD_FLAG -Iruntime $def $net $mdef $cdef "$cgen_dir/$2.c" runtime/rt.c $lib $mlib $clib $NET_LIBS -o "$cgen_dir/$2$EXE" || { echo "FAIL codegen cc $1"; exit 1; }
 }
-for f in examples/hello.oxl examples/features.oxl tests/match.oxl tests/chanbuf.oxl tests/methods.oxl tests/pairfwd.oxl tests/iface_susp.oxl tests/iface_susp_shim.oxl tests/iface_susp_pair.oxl tests/iface_susp_nested.oxl tests/iface_susp_rewrap.oxl tests/iface_susp_prop.oxl tests/iface_susp_convdest.oxl tests/iface_susp_cancel.oxl tests/vtab_fn.oxl tests/reflect.oxl tests/fmt_v.oxl tests/enc_gob.oxl; do
+for f in examples/hello.oxl examples/features.oxl tests/match.oxl tests/chanbuf.oxl tests/methods.oxl tests/pairfwd.oxl tests/iface_susp.oxl tests/iface_susp_shim.oxl tests/iface_susp_pair.oxl tests/iface_susp_nested.oxl tests/iface_susp_rewrap.oxl tests/iface_susp_prop.oxl tests/iface_susp_convdest.oxl tests/iface_susp_cancel.oxl tests/vtab_fn.oxl tests/reflect.oxl tests/fmt_v.oxl tests/enc_xml.oxl tests/text_template.oxl tests/enc_gob.oxl; do
     n=$(basename "$f" .oxl)
     cgen "$f" "$n"
     got=$("$cgen_dir/$n$EXE")

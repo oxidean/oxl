@@ -1,0 +1,1402 @@
+package xml
+
+// std/encoding/xml — descriptor-driven marshal/unmarshal in the Go
+// encoding/xml shape. Element names come from `tag "xml:name"` field
+// metadata (the FieldDesc.tag slot); untagged fields use their
+// declared name. Options after a comma: `,attr` carries the field as
+// a parent attribute, `,chardata` maps the element's character data;
+// `xml:"-"` skips the field. The Go quoted spelling
+// `tag "xml:\"name,attr\""` parses identically — the tag text is
+// stored raw and both forms land on the same parse here.
+//
+// Covered: scalar fields (int/float/bool/byte/str), cstr on marshal,
+// nested structs (value and own — a nil own slot is omitted on
+// marshal and minted on unmarshal), slices as repeated sibling
+// elements, []byte as base64 text, enums as <f>VariantName</f> for
+// unit variants and <f><Variant>payload…</Variant></f> for payload
+// ones. marshal[T] walks a value_of read handle; unmarshal[T] fills a
+// mut-derived handle through set_*/alloc_field/alloc_slice/alloc_elem.
+//
+// v1 limits, deliberately: no `xml:"a>b"` nested paths, no namespace
+// handling (names compare literally, prefix and all), no prolog or
+// indentation on marshal, unmarshal ignores unmatched elements and
+// imposes no field order, []byte unmarshal reads the first matching
+// element only, an own-typed enum payload slot that is nil cannot be
+// minted (there is no alloc_vfield lane) and reports err, cstr fields
+// and slice-typed enum payload slots are marshal-only. Unknown tag
+// options (`,omitempty` and friends) parse and are ignored. Further
+// divergences from Go: repeated scalar elements take the FIRST match
+// (Go assigns the last), a `,chardata` field emits ahead of every
+// child element regardless of declaration order, and marshal on a
+// top-level slice writes sibling root elements a single unmarshal
+// call cannot read back. A malformed document abandons its partial
+// tree — the buffer leaks, same convention as std/encoding/json
+// (`own T` cannot cross rt_free's `own void` FFI boundary in v0).
+import "std/errors"
+
+import "std/reflect"
+
+import "std/strconv"
+
+import "std/strings"
+
+import "std/encoding/base64"
+
+/// err_syntax reports malformed XML input.
+fn err_syntax() -> err {
+    return errors.new("xml: syntax error")
+}
+
+/// err_kind reports a descriptor kind the walk cannot represent —
+//  maps, chans, ifaces, fns, and write attempts on read-only kinds.
+fn err_kind() -> err {
+    return errors.new("xml: kind mismatch")
+}
+
+// ---------- field tags ----------
+
+// XFld is one struct field's decoded xml routing: descriptor index,
+// element/attribute name, and the option bits.
+struct XFld { i: int, name: str, attr: int, chardata: int, skip: int }
+
+// XOpt is a decoded `tag "xml:..."` slot — the [T, err] pair ABI
+// returns at most one payload, so the four channels pack into a
+// struct.
+struct XOpt { name: str, attr: int, chardata: int, skip: int }
+
+// xtag decodes a `tag "xml:..."` slot. A tag without the xml: prefix
+// is no override — callers fall back to the declared field name.
+fn xtag(tg: str) -> XOpt {
+    o := XOpt{name: "", attr: 0, chardata: 0, skip: 0}
+    if !strings.startswith(tg, "xml:") {
+        return o
+    }
+    rest := substr(tg, 4, len(tg))
+    n := len(rest)
+    if n >= 2 && byteat(rest, 0) == 34 && byteat(rest, n - 1) == 34 {
+        rest = substr(rest, 1, n - 1)
+    }
+    if rest == "-" {
+        o.skip = 1
+        return o
+    }
+    o.name = rest
+    ci := find(rest, ",")
+    if ci >= 0 {
+        o.name = substr(rest, 0, ci)
+        opts := substr(rest, ci + 1, len(rest))
+        // options split on ',' and match whole tokens — a substring
+        // probe would route `xml:x,myattr` to the attribute lane
+        for len(opts) > 0 {
+            tok := opts
+            ci = find(opts, ",")
+            if ci >= 0 {
+                tok = substr(opts, 0, ci)
+                opts = substr(opts, ci + 1, len(opts))
+            } else {
+                opts = ""
+            }
+            if tok == "attr" {
+                o.attr = 1
+            }
+            if tok == "chardata" {
+                o.chardata = 1
+            }
+        }
+    }
+    return o
+}
+
+// xfields decodes every declared field of t once — tag lookups are
+// per-field string work, so both walks hoist the parse out of the
+// per-element loops.
+fn xfields(t: reflect.Type) -> []XFld {
+    out := mkslice(XFld, 0)
+    i := 0
+    for i < t.nfields() {
+        [f, e] = t.field(i)
+        if e != nil {
+            i = i + 1
+            continue
+        }
+        o := xtag(f.tag())
+        if o.skip == 1 {
+            out = push(out, XFld{i: i, name: "", attr: 0, chardata: 0, skip: 1})
+        } else {
+            nm := o.name
+            if len(nm) == 0 {
+                nm = f.name()
+            }
+            out = push(out, XFld{i: i, name: nm, attr: o.attr, chardata: o.chardata, skip: 0})
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// xfld_at finds the field routed to xml name `name`; attr selects the
+// attribute lane (1) or the element lane (0).
+fn xfld_at(fs: []XFld, name: str, attr: int) -> int {
+    i := 0
+    for i < len(fs) {
+        f := fs[i]
+        if f.skip == 0 && f.attr == attr && f.name == name {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// ---------- output escaping ----------
+
+// xesc renders character data — & < > are the mandatory escapes,
+// plus \r (a literal CR would normalize to \n on re-parse).
+fn xesc(s: str) -> str {
+    out := ""
+    i := 0
+    for i < len(s) {
+        c := byteat(s, i)
+        if c == 38 {
+            out = out + "&amp;"
+        } else if c == 60 {
+            out = out + "&lt;"
+        } else if c == 62 {
+            out = out + "&gt;"
+        } else if c == 13 {
+            out = out + "&#xD;"
+        } else {
+            out = out + substr(s, i, i + 1)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// xescq renders a double-quoted attribute value — xesc plus ".
+fn xescq(s: str) -> str {
+    out := ""
+    i := 0
+    for i < len(s) {
+        c := byteat(s, i)
+        if c == 38 {
+            out = out + "&amp;"
+        } else if c == 60 {
+            out = out + "&lt;"
+        } else if c == 62 {
+            out = out + "&gt;"
+        } else if c == 34 {
+            out = out + "&quot;"
+        } else if c == 9 {
+            out = out + "&#x9;"
+        } else if c == 10 {
+            out = out + "&#xA;"
+        } else if c == 13 {
+            out = out + "&#xD;"
+        } else {
+            out = out + substr(s, i, i + 1)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// xnameok reports whether s is already a legal XML name — the same
+// keep-set xname emits, plus the first-char gate (a letter or _;
+// digits, ., -, and : are interior-only). Routed tag names must
+// pass; anything else is a malformed tag, not a name to sanitize
+// silently.
+fn xnameok(s: str) -> bool {
+    if len(s) == 0 || !xnamest(byteat(s, 0)) {
+        return false
+    }
+    i := 1
+    for i < len(s) {
+        c := byteat(s, i)
+        ok := c >= 97 && c <= 122 || c >= 65 && c <= 90 || c >= 48 && c <= 57
+        if !ok && c != 46 && c != 95 && c != 45 && c != 58 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// xname sanitizes a descriptor name into an XML element name — keeps
+// letters, digits, and . _ - :, drops everything else ([]int lands on
+// int), and prefixes a name that would start outside a letter/_.
+fn xname(s: str) -> str {
+    out := ""
+    i := 0
+    for i < len(s) {
+        c := byteat(s, i)
+        if c >= 65 && c <= 90 || c >= 97 && c <= 122 || c >= 48 && c <= 57 || c == 46 || c == 95 || c == 45 || c == 58 {
+            out = out + substr(s, i, i + 1)
+        }
+        i = i + 1
+    }
+    if len(out) == 0 {
+        return "e"
+    }
+    c := byteat(out, 0)
+    if !(c >= 65 && c <= 90 || c >= 97 && c <= 122 || c == 95) {
+        return "e" + out
+    }
+    return out
+}
+
+// ---------- marshal ----------
+
+// xscalar renders the scalar kinds as character data. Byte prints its
+// numeric value; cstr (PTR kind) reads through the cstr lane.
+fn xscalar(v: reflect.Value) -> [str, err] {
+    t := v.typ()
+    k := t.kind()
+    if k == reflect.KindInt() {
+        [x, e] = v.int()
+        if e != nil {
+            return "", e
+        }
+        return itoa(x), nil
+    }
+    if k == reflect.KindFloat() {
+        [x, e] = v.f64()
+        if e != nil {
+            return "", e
+        }
+        return ftoa(x), nil
+    }
+    if k == reflect.KindBool() {
+        [x, e] = v.bool()
+        if e != nil {
+            return "", e
+        }
+        if x != 0 {
+            return "true", nil
+        }
+        return "false", nil
+    }
+    if k == reflect.KindByte() {
+        [x, e] = v.byte()
+        if e != nil {
+            return "", e
+        }
+        return itoa(x), nil
+    }
+    if k == reflect.KindStr() || k == reflect.KindPtr() {
+        [x, e] = v.str()
+        if e != nil {
+            return "", e
+        }
+        return x, nil
+    }
+    return "", err_kind()
+}
+
+// XPart carries xemit_struct's three output channels — the pair ABI
+// returns at most two values, so they pack into one struct.
+struct XPart { attrs: str, kids: str, text: str }
+
+// xis_bytes reports whether t is a slice-of-byte descriptor — the
+// []byte lane that base64s instead of repeating elements.
+fn xis_bytes(t: reflect.Type) -> bool {
+    if t.kind() != reflect.KindSlice() {
+        return false
+    }
+    [et, e] = t.elem()
+    if e != nil {
+        return false
+    }
+    return et.kind() == reflect.KindByte()
+}
+
+// xbytes reads a []byte Value into a fresh byte slice.
+fn xbytes(v: reflect.Value) -> [[]byte, err] {
+    [n, e] = v.len()
+    if e != nil {
+        return nil, e
+    }
+    out := mkslice(byte, 0)
+    i := 0
+    for i < n {
+        [iv, ie] = v.index(i)
+        if ie != nil {
+            return nil, ie
+        }
+        [b, be] = iv.byte()
+        if be != nil {
+            return nil, be
+        }
+        out = push(out, b as byte)
+        i = i + 1
+    }
+    return out, nil
+}
+
+// xemit renders v as the element <name>…</name>. SLICE kinds arrive
+// here only for []byte (other slices are unrolled by the caller into
+// repeated sibling elements) — a non-byte slice reports err_kind.
+fn xemit(v: reflect.Value, name: str) -> [str, err] {
+    t := v.typ()
+    k := t.kind()
+    if k == reflect.KindStruct() {
+        [p, e] = xemit_struct(v, t)
+        if e != nil {
+            return "", e
+        }
+        return "<" + name + p.attrs + ">" + xesc(p.text) + p.kids + "</" + name + ">", nil
+    }
+    if k == reflect.KindEnum() {
+        return xemit_enum(v, t, name)
+    }
+    if k == reflect.KindSlice() {
+        if !xis_bytes(t) {
+            return "", err_kind()
+        }
+        [b, e] = xbytes(v)
+        if e != nil {
+            return "", e
+        }
+        return "<" + name + ">" + base64.encode(b) + "</" + name + ">", nil
+    }
+    if k == reflect.KindMap() || k == reflect.KindChan() || k == reflect.KindIface() || k == reflect.KindFn() || k == reflect.KindErr() || k == reflect.KindVoid() {
+        return "", err_kind()
+    }
+    [s, e] = xscalar(v)
+    if e != nil {
+        return "", e
+    }
+    return "<" + name + ">" + xesc(s) + "</" + name + ">", nil
+}
+
+// xemit_struct renders v's fields: ,attr fields into the open tag,
+// ,chardata into the text channel, everything else as child elements
+// in declaration order (slices as repeated siblings under the field's
+// element name).
+fn xemit_struct(v: reflect.Value, t: reflect.Type) -> [XPart, err] {
+    p := XPart{attrs: "", kids: "", text: ""}
+    flds := xfields(t)
+    ncd := 0
+    i := 0
+    for i < len(flds) {
+        f := flds[i]
+        i = i + 1
+        if f.skip == 1 {
+            continue
+        }
+        if !xnameok(f.name) {
+            return p, errors.new("xml: tag name has illegal chars: " + f.name)
+        }
+        if f.chardata == 1 {
+            ncd = ncd + 1
+            if ncd > 1 {
+                return p, errors.new("xml: multiple ,chardata fields")
+            }
+        }
+        [fv, ve] = v.field(f.i)
+        if ve != nil {
+            // a nil own slot omits the element outright
+            if errors.is(ve, reflect.err_nil()) {
+                continue
+            }
+            return p, ve
+        }
+        if f.attr == 1 {
+            [s, se] = xscalar(fv)
+            if se != nil {
+                return p, se
+            }
+            p.attrs = p.attrs + " " + f.name + "=\"" + xescq(s) + "\""
+            continue
+        }
+        if f.chardata == 1 {
+            [s, se] = xscalar(fv)
+            if se != nil {
+                return p, se
+            }
+            p.text = s
+            continue
+        }
+        ft := fv.typ()
+        fk := ft.kind()
+        if fk == reflect.KindSlice() && !xis_bytes(ft) {
+            [n, le] = fv.len()
+            if le != nil {
+                return p, le
+            }
+            j := 0
+            for j < n {
+                [iv, ie] = fv.index(j)
+                if ie != nil {
+                    if errors.is(ie, reflect.err_nil()) {
+                        j = j + 1
+                        continue
+                    }
+                    return p, ie
+                }
+                [s, ee] = xemit(iv, f.name)
+                if ee != nil {
+                    return p, ee
+                }
+                p.kids = p.kids + s
+                j = j + 1
+            }
+            continue
+        }
+        [s, ee] = xemit(fv, f.name)
+        if ee != nil {
+            return p, ee
+        }
+        p.kids = p.kids + s
+    }
+    return p, nil
+}
+
+// xemit_enum renders <name>VariantName</name> for a unit variant and
+// <name><VariantName>payload…</VariantName></name> for a payload one —
+// payload slots emit under their declared (or synthesized fN) names.
+fn xemit_enum(v: reflect.Value, t: reflect.Type, name: str) -> [str, err] {
+    [tg, te] = v.tag()
+    if te != nil {
+        return "", te
+    }
+    [xv, ve] = t.variant(tg)
+    if ve != nil {
+        return "", ve
+    }
+    vn := xv.name()
+    nf := xv.nfields()
+    if nf == 0 {
+        return "<" + name + ">" + vn + "</" + name + ">", nil
+    }
+    inner := ""
+    i := 0
+    for i < nf {
+        [fnm, fe] = xv.fname(i)
+        if fe != nil {
+            return "", fe
+        }
+        [pfv, pe] = v.vfield(tg, i)
+        if pe != nil {
+            if errors.is(pe, reflect.err_nil()) {
+                i = i + 1
+                continue
+            }
+            return "", pe
+        }
+        [s, ee] = xemit(pfv, xname(fnm))
+        if ee != nil {
+            return "", ee
+        }
+        inner = inner + s
+        i = i + 1
+    }
+    return "<" + name + ">" + "<" + vn + ">" + inner + "</" + vn + ">" + "</" + name + ">", nil
+}
+
+/// marshal renders v as XML — the root element takes the (sanitized)
+/// descriptor name of T, fields route per `tag "xml:..."` metadata. A
+/// top-level non-byte slice emits repeated elements named for the
+/// element type. `v: T` receives the value — passing an own T moves
+/// it into the call, same as fmt.sprintv.
+fn marshal[T any](v: T) -> [str, err] {
+    c := new(v)
+    rv := value_of(c)
+    t := rv.typ()
+    if t.kind() == reflect.KindSlice() && !xis_bytes(t) {
+        [et, ee] = t.elem()
+        if ee != nil {
+            return "", ee
+        }
+        en := xname(et.name())
+        [n, le] = rv.len()
+        if le != nil {
+            return "", le
+        }
+        out := ""
+        i := 0
+        for i < n {
+            [iv, ie] = rv.index(i)
+            if ie != nil {
+                if errors.is(ie, reflect.err_nil()) {
+                    i = i + 1
+                    continue
+                }
+                return "", ie
+            }
+            [s, xe] = xemit(iv, en)
+            if xe != nil {
+                return "", xe
+            }
+            out = out + s
+            i = i + 1
+        }
+        return out, nil
+    }
+    return xemit(rv, xname(t.name()))
+}
+
+// ---------- parser ----------
+
+// XAttr is one attribute on a parsed element.
+struct XAttr { name: str, val: str, next: own XAttr }
+
+// XNode is one parsed element: tag name, the concatenated character
+// data it directly contains (entity- and CDATA-decoded), its
+// attribute list, and the child-element list.
+struct XNode {
+    name: str,
+    text: str,
+    attr: own XAttr,
+    child: own XNode,
+    next: own XNode,
+}
+
+// XCur is the cursor a parse carries — src, pos, and a sticky err.
+struct XCur { src: str, pos: int, err: int, depth: int }
+
+// xnamech reports whether c may sit inside an element/attribute name.
+fn xnamech(c: int) -> bool {
+    return c >= 65 && c <= 90 || c >= 97 && c <= 122 || c >= 48 && c <= 57 || c == 46 || c == 95 || c == 45 || c == 58
+}
+
+// xnamest reports whether c may START an element/attribute name —
+// the NameStartChar subset xname keeps (an ASCII letter or _). A
+// digit-, -, or .-led tag is malformed on the read side exactly as a
+// routed `xml:9x` name is on the write side.
+fn xnamest(c: int) -> bool {
+    return c >= 65 && c <= 90 || c >= 97 && c <= 122 || c == 95
+}
+
+fn xws(p: mut XCur) {
+    for p.pos < len(p.src) {
+        c := byteat(p.src, p.pos)
+        if c != 32 && c != 9 && c != 10 && c != 13 {
+            return
+        }
+        p.pos = p.pos + 1
+    }
+}
+
+fn xeat(p: mut XCur, s: str) -> bool {
+    if p.pos + len(s) > len(p.src) {
+        return false
+    }
+    if substr(p.src, p.pos, p.pos + len(s)) != s {
+        return false
+    }
+    p.pos = p.pos + len(s)
+    return true
+}
+
+// xnum parses the digit run at s[i]; base 10 when hex == 0. The
+// value saturates just past the Unicode ceiling so oversized refs
+// clamp to U+FFFD downstream instead of wrapping i64.
+fn xnum(s: str, i: int, hex: int) -> int {
+    v := 0
+    for i < len(s) {
+        c := byteat(s, i)
+        d := -1
+        if c >= 48 && c <= 57 {
+            d = c - 48
+        } else if hex == 1 && c >= 97 && c <= 102 {
+            d = c - 87
+        } else if hex == 1 && c >= 65 && c <= 70 {
+            d = c - 55
+        }
+        if d < 0 {
+            return v
+        }
+        if hex == 1 {
+            v = v * 16 + d
+        } else {
+            v = v * 10 + d
+        }
+        if v > 1114112 {
+            return 1114112
+        }
+        i = i + 1
+    }
+    return v
+}
+
+// xutf8 renders a code point as UTF-8 (built through mkbuf like
+// std/encoding/json — control bytes can't come from a literal).
+extern fn rt_free(p: own void)
+
+fn xutf8(cp: int) -> str {
+    if cp < 128 {
+        buf := mkbuf(1)
+        poke8(buf, 0, cp)
+        out := bufstr(buf, 1)
+        rt_free(buf)
+        return out
+    }
+    if cp < 2048 {
+        buf := mkbuf(2)
+        poke8(buf, 0, 192 + cp / 64)
+        poke8(buf, 1, 128 + cp % 64)
+        out := bufstr(buf, 2)
+        rt_free(buf)
+        return out
+    }
+    if cp < 65536 {
+        buf := mkbuf(3)
+        poke8(buf, 0, 224 + cp / 4096)
+        poke8(buf, 1, 128 + cp / 64 % 64)
+        poke8(buf, 2, 128 + cp % 64)
+        out := bufstr(buf, 3)
+        rt_free(buf)
+        return out
+    }
+    buf := mkbuf(4)
+    poke8(buf, 0, 240 + cp / 262144)
+    poke8(buf, 1, 128 + cp / 4096 % 64)
+    poke8(buf, 2, 128 + cp / 64 % 64)
+    poke8(buf, 3, 128 + cp % 64)
+    out := bufstr(buf, 4)
+    rt_free(buf)
+    return out
+}
+
+// xent decodes one &…; reference at p's position and advances past
+// the semicolon. Sets p.err on an unknown or unterminated entity.
+fn xent(p: mut XCur) -> str {
+    // p.pos sits on '&'
+    if xeat(p, "&lt;") {
+        return "<"
+    }
+    if xeat(p, "&gt;") {
+        return ">"
+    }
+    if xeat(p, "&amp;") {
+        return "&"
+    }
+    if xeat(p, "&quot;") {
+        return "\""
+    }
+    if xeat(p, "&apos;") {
+        return "'"
+    }
+    if p.pos + 1 < len(p.src) && byteat(p.src, p.pos + 1) == 35 {
+        // &#NN; / &#xNN;
+        j := p.pos + 2
+        hex := 0
+        if j < len(p.src) && (byteat(p.src, j) == 120 || byteat(p.src, j) == 88) {
+            hex = 1
+            j = j + 1
+        }
+        start := j
+        for j < len(p.src) && byteat(p.src, j) != 59 {
+            c := byteat(p.src, j)
+            ok := c >= 48 && c <= 57
+            if hex == 1 && (c >= 97 && c <= 102 || c >= 65 && c <= 70) {
+                ok = true
+            }
+            if !ok {
+                p.err = 1
+                return ""
+            }
+            j = j + 1
+        }
+        if j >= len(p.src) || j == start {
+            p.err = 1
+            return ""
+        }
+        cp := xnum(substr(p.src, start, j), 0, hex)
+        // non-scalars — surrogates, past U+10FFFF, the forbidden
+        // NUL — decode as U+FFFD rather than emitting invalid UTF-8
+        if cp <= 0 || cp > 1114111 || cp >= 55296 && cp <= 57343 {
+            cp = 65533
+        }
+        p.pos = j + 1
+        return xutf8(cp)
+    }
+    p.err = 1
+    return ""
+}
+
+// xtext consumes character data up to the next '<', decoding
+// entity/char references inline.
+fn xtext(p: mut XCur) -> str {
+    out := ""
+    for p.pos < len(p.src) {
+        c := byteat(p.src, p.pos)
+        if c == 60 {
+            return out
+        }
+        if c == 38 {
+            d := xent(p)
+            if p.err != 0 {
+                return out
+            }
+            out = out + d
+            continue
+        }
+        out = out + substr(p.src, p.pos, p.pos + 1)
+        p.pos = p.pos + 1
+    }
+    return out
+}
+
+// xqtext consumes a quoted attribute value — the quote char itself is
+// at p.pos on entry; entity references decode inside.
+fn xqtext(p: mut XCur) -> str {
+    q := byteat(p.src, p.pos)
+    p.pos = p.pos + 1
+    out := ""
+    for p.pos < len(p.src) {
+        c := byteat(p.src, p.pos)
+        if c == q {
+            p.pos = p.pos + 1
+            return out
+        }
+        if c == 60 {
+            // raw '<' inside an attribute value is malformed XML
+            p.err = 1
+            return out
+        }
+        if c == 38 {
+            d := xent(p)
+            if p.err != 0 {
+                return out
+            }
+            out = out + d
+            continue
+        }
+        out = out + substr(p.src, p.pos, p.pos + 1)
+        p.pos = p.pos + 1
+    }
+    p.err = 1
+    return out
+}
+
+// xskip_misc consumes everything that may legally sit outside the
+// root element: whitespace, <?…?> processing instructions, <!--…-->
+// comments, and <!…> declarations (DOCTYPE included — an internal
+// subset in brackets is not parsed and ends the declaration early).
+fn xskip_misc(p: mut XCur) {
+    // a UTF-8 BOM (EF BB BF) sits at byte 0 of many documents —
+    // consume it before the misc loop
+    if p.pos == 0 && len(p.src) >= 3 && byteat(p.src, 0) == 239 && byteat(p.src, 1) == 187 && byteat(p.src, 2) == 191 {
+        p.pos = 3
+    }
+    for p.pos < len(p.src) {
+        xws(p)
+        if xeat(p, "<?") {
+            for p.pos < len(p.src) && !xeat(p, "?>") {
+                p.pos = p.pos + 1
+            }
+            continue
+        }
+        if xeat(p, "<!--") {
+            for p.pos < len(p.src) && !xeat(p, "-->") {
+                p.pos = p.pos + 1
+            }
+            continue
+        }
+        if p.pos + 1 < len(p.src) && byteat(p.src, p.pos) == 60 && byteat(p.src, p.pos + 1) == 33 {
+            // <!…> declaration — scan to the closing '>'
+            p.pos = p.pos + 2
+            for p.pos < len(p.src) && byteat(p.src, p.pos) != 62 {
+                p.pos = p.pos + 1
+            }
+            if p.pos < len(p.src) {
+                p.pos = p.pos + 1
+            }
+            continue
+        }
+        return
+    }
+}
+
+/// xdepth bounds element nesting against the call stack.
+let MAX_XDEPTH = 256
+
+// xelem parses one element — name, attributes, then text/children
+// interleaved until the matching close tag. Text segments accumulate
+// into node.text in document order; a CDATA section appends raw.
+fn xelem(p: mut XCur) -> own XNode {
+    n := new(XNode)
+    if p.depth >= MAX_XDEPTH {
+        p.err = 1
+        return n
+    }
+    p.depth = p.depth + 1
+    // entry sits on '<' followed by a NameStartChar — a digit-, -,
+    // or .-led tag is malformed on the read side exactly as a routed
+    // `xml:9x` name is on the write side
+    p.pos = p.pos + 1
+    if p.pos >= len(p.src) || !xnamest(byteat(p.src, p.pos)) {
+        p.err = 1
+        p.depth = p.depth - 1
+        return n
+    }
+    start := p.pos
+    for p.pos < len(p.src) && xnamech(byteat(p.src, p.pos)) {
+        p.pos = p.pos + 1
+    }
+    n.name = substr(p.src, start, p.pos)
+    if len(n.name) == 0 {
+        p.err = 1
+        p.depth = p.depth - 1
+        return n
+    }
+    // attributes
+    for p.err == 0 {
+        xws(p)
+        if p.pos >= len(p.src) {
+            p.err = 1
+            p.depth = p.depth - 1
+            return n
+        }
+        c := byteat(p.src, p.pos)
+        if c == 47 || c == 62 {
+            break
+        }
+        if !xnamest(byteat(p.src, p.pos)) {
+            p.err = 1
+            p.depth = p.depth - 1
+            return n
+        }
+        astart := p.pos
+        for p.pos < len(p.src) && xnamech(byteat(p.src, p.pos)) {
+            p.pos = p.pos + 1
+        }
+        aname := substr(p.src, astart, p.pos)
+        if len(aname) == 0 {
+            p.err = 1
+            p.depth = p.depth - 1
+            return n
+        }
+        xws(p)
+        if p.pos >= len(p.src) || byteat(p.src, p.pos) != 61 {
+            p.err = 1
+            p.depth = p.depth - 1
+            return n
+        }
+        p.pos = p.pos + 1
+        xws(p)
+        if p.pos >= len(p.src) || byteat(p.src, p.pos) != 34 && byteat(p.src, p.pos) != 39 {
+            p.err = 1
+            p.depth = p.depth - 1
+            return n
+        }
+        aval := xqtext(p)
+        a := new(XAttr)
+        a.name = aname
+        a.val = aval
+        // newest-first prepend keeps the loop O(1); attribute order
+        // is not significant for the field-routing consumer
+        a.next = n.attr
+        n.attr = a
+    }
+    // empty element
+    if xeat(p, "/>") {
+        p.depth = p.depth - 1
+        return n
+    }
+    if !xeat(p, ">") {
+        p.err = 1
+        p.depth = p.depth - 1
+        return n
+    }
+    // content: text and children until </name>
+    let ctail: own XNode = nil
+    for p.err == 0 {
+        if p.pos >= len(p.src) {
+            p.err = 1
+            p.depth = p.depth - 1
+            return n
+        }
+        if byteat(p.src, p.pos) != 60 {
+            seg := xtext(p)
+            n.text = n.text + seg
+            continue
+        }
+        if xeat(p, "</") {
+            xws(p)
+            cstart := p.pos
+            for p.pos < len(p.src) && xnamech(byteat(p.src, p.pos)) {
+                p.pos = p.pos + 1
+            }
+            cname := substr(p.src, cstart, p.pos)
+            xws(p)
+            if cname != n.name || p.pos >= len(p.src) || byteat(p.src, p.pos) != 62 {
+                p.err = 1
+                p.depth = p.depth - 1
+                return n
+            }
+            p.pos = p.pos + 1
+            p.depth = p.depth - 1
+            return n
+        }
+        if xeat(p, "<!--") {
+            for p.pos < len(p.src) && !xeat(p, "-->") {
+                p.pos = p.pos + 1
+            }
+            if p.pos > len(p.src) {
+                p.err = 1
+            }
+            continue
+        }
+        if xeat(p, "<![CDATA[") {
+            cend := find(substr(p.src, p.pos, len(p.src)), "]]>")
+            if cend < 0 {
+                p.err = 1
+                p.depth = p.depth - 1
+                return n
+            }
+            n.text = n.text + substr(p.src, p.pos, p.pos + cend)
+            p.pos = p.pos + cend + 3
+            continue
+        }
+        if xeat(p, "<?") {
+            for p.pos < len(p.src) && !xeat(p, "?>") {
+                p.pos = p.pos + 1
+            }
+            continue
+        }
+        if p.pos + 1 < len(p.src) && byteat(p.src, p.pos + 1) == 33 {
+            // a stray <!…> inside content — skip it like a decl
+            p.pos = p.pos + 2
+            for p.pos < len(p.src) && byteat(p.src, p.pos) != 62 {
+                p.pos = p.pos + 1
+            }
+            if p.pos < len(p.src) {
+                p.pos = p.pos + 1
+            }
+            continue
+        }
+        kid := xelem(p)
+        if p.err != 0 {
+            p.depth = p.depth - 1
+            return n
+        }
+        if ctail == nil {
+            n.child = kid
+            ctail = n.child
+        } else {
+            ctail.next = kid
+            ctail = ctail.next
+        }
+    }
+    p.depth = p.depth - 1
+    return n
+}
+
+/// xparse builds the element tree for src — one root element, misc
+/// (prolog/comments/declarations) skipped around it. Malformed input
+/// reports err_syntax.
+fn xparse(src: str) -> [own XNode, err] {
+    p := new(XCur)
+    p.src = src
+    p.pos = 0
+    p.err = 0
+    p.depth = 0
+    xskip_misc(p)
+    if p.pos >= len(p.src) || byteat(p.src, p.pos) != 60 {
+        return nil, err_syntax()
+    }
+    root := xelem(p)
+    if p.err != 0 {
+        return nil, err_syntax()
+    }
+    xskip_misc(p)
+    if p.pos != len(p.src) {
+        return nil, err_syntax()
+    }
+    return root, nil
+}
+
+// ---------- unmarshal ----------
+
+// xset_scalar writes one element's text into a scalar Value — ints
+// and floats parse through strconv so malformed numerals report err,
+// bools take true/false/1/0, and str stores the text verbatim.
+fn xset_scalar(v: reflect.Value, text: str) -> err {
+    t2 := v.typ()
+    k := t2.kind()
+    t := strings.trim(text)
+    if k == reflect.KindInt() {
+        [x, e] = strconv.atoi(t)
+        if e != nil {
+            return e
+        }
+        return v.set_int(x)
+    }
+    if k == reflect.KindFloat() {
+        [x, e] = strconv.parsefloat(t)
+        if e != nil {
+            return e
+        }
+        return v.set_f64(x)
+    }
+    if k == reflect.KindBool() {
+        if t == "true" || t == "1" {
+            return v.set_bool(1)
+        }
+        if t == "false" || t == "0" || len(t) == 0 {
+            return v.set_bool(0)
+        }
+        return errors.new("xml: bad bool \"" + t + "\"")
+    }
+    if k == reflect.KindByte() {
+        [x, e] = strconv.atoi(t)
+        if e != nil {
+            return e
+        }
+        if x < 0 || x > 255 {
+            return errors.new("xml: byte out of range")
+        }
+        return v.set_byte(x)
+    }
+    if k == reflect.KindStr() {
+        return v.set_str(text)
+    }
+    return err_kind()
+}
+
+// xvar finds the variant index named `name` on enum descriptor t,
+// or -1.
+fn xvar(t: reflect.Type, name: str) -> int {
+    i := 0
+    for i < t.nvars() {
+        [nm, e] = t.varname(i)
+        if e == nil && nm == name {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// xfill_enum routes one field element onto an enum Value: bare text
+// naming a unit variant, or a child element whose name selects the
+// variant and whose own children fill its payload slots (declared
+// names or synthesized fN).
+fn xfill_enum(n: ref XNode, v: reflect.Value, t: reflect.Type) -> err {
+    txt := strings.trim(n.text)
+    if len(txt) > 0 {
+        vi := xvar(t, txt)
+        if vi >= 0 {
+            // bare text can only name a unit variant — a payload
+            // variant needs element children, so a bare name is
+            // malformed rather than a zero-payload accept
+            [xv0, xve0] = t.variant(vi)
+            if xve0 != nil {
+                return xve0
+            }
+            if xv0.nfields() > 0 {
+                return errors.new("xml: variant <" + txt + "> needs payload elements")
+            }
+            return v.set_tag(vi)
+        }
+    }
+    m := n.child
+    for m != nil {
+        vi := xvar(t, m.name)
+        if vi >= 0 {
+            [xv, xve] = t.variant(vi)
+            if xve != nil {
+                return xve
+            }
+            nf := xv.nfields()
+            if nf > 0 {
+                // a payload variant spelled without ≥1 child matching
+                // a payload slot name would silently mint all-zero
+                // slots — the fill loop below routes by the same
+                // name comparison
+                matched := 0
+                probe := m.child
+                for probe != nil && matched == 0 {
+                    pj := 0
+                    for pj < nf {
+                        [pfn, pfe] = xv.fname(pj)
+                        if pfe != nil {
+                            return pfe
+                        }
+                        if probe.name == pfn {
+                            matched = 1
+                        }
+                        pj = pj + 1
+                    }
+                    probe = probe.next
+                }
+                if matched == 0 {
+                    return errors.new("xml: variant <" + m.name + "> needs payload elements")
+                }
+            }
+            e := v.set_tag(vi)
+            if e != nil {
+                return e
+            }
+            fi := 0
+            for fi < nf {
+                [fnm, fe] = xv.fname(fi)
+                if fe != nil {
+                    return fe
+                }
+                inner := m.child
+                for inner != nil {
+                    if inner.name == fnm {
+                        [pfv, pfe] = v.vfield(vi, fi)
+                        if pfe != nil {
+                            // a nil own payload slot can't be minted —
+                            // there is no alloc_vfield lane
+                            return pfe
+                        }
+                        [pt, pte] = xv.ftyp(fi)
+                        if pte != nil {
+                            return pte
+                        }
+                        e2 := xfill_node(inner, pfv, pt)
+                        if e2 != nil {
+                            return e2
+                        }
+                    }
+                    inner = inner.next
+                }
+                fi = fi + 1
+            }
+            return nil
+        }
+        m = m.next
+    }
+    return errors.new("xml: no variant matches <" + n.name + ">")
+}
+
+// xfill_node fills v (typed t) from element n — dispatch on the
+// descriptor kind. Slices never arrive here: the field walker handles
+// them in bulk.
+fn xfill_node(n: ref XNode, v: reflect.Value, t: reflect.Type) -> err {
+    k := t.kind()
+    if k == reflect.KindStruct() {
+        return xfill_struct(n, v, t)
+    }
+    if k == reflect.KindEnum() {
+        return xfill_enum(n, v, t)
+    }
+    if k == reflect.KindSlice() {
+        // payload-slot slices have no alloc lane — marshal-only
+        return err_kind()
+    }
+    return xset_scalar(v, n.text)
+}
+
+// xfill_bytes decodes the first <name> element's base64 text into
+// field fi's freshly-minted []byte.
+fn xfill_bytes(v: reflect.Value, fi: int, n: ref XNode, name: str) -> err {
+    m := n.child
+    for m != nil {
+        if m.name == name {
+            [b, be] = base64.decode(strings.trim(m.text))
+            if be != nil {
+                return be
+            }
+            [sv, se] = v.alloc_slice(fi, len(b))
+            if se != nil {
+                return se
+            }
+            j := 0
+            for j < len(b) {
+                [iv, ie] = sv.index(j)
+                if ie != nil {
+                    return ie
+                }
+                e := iv.set_byte(b[j] as int)
+                if e != nil {
+                    return e
+                }
+                j = j + 1
+            }
+            return nil
+        }
+        m = m.next
+    }
+    return nil
+}
+
+// xfill_slice mints field fi's slice with cnt elements and fills
+// each from the j-th <name> child in document order — nil []own T
+// element slots mint through alloc_elem.
+fn xfill_slice(v: reflect.Value, fi: int, n: ref XNode, name: str, cnt: int) -> err {
+    [sv, se] = v.alloc_slice(fi, cnt)
+    if se != nil {
+        return se
+    }
+    j := 0
+    m := n.child
+    for m != nil && j < cnt {
+        if m.name == name {
+            [iv, ie] = sv.index(j)
+            if ie != nil && errors.is(ie, reflect.err_nil()) {
+                // []own T element slot — mint the pointee (rebind —
+                // a nested [v, e] destructure would shadow, not
+                // assign)
+                [iv2, ie2] = sv.alloc_elem(j)
+                iv = iv2
+                ie = ie2
+            }
+            if ie != nil {
+                return ie
+            }
+            it := iv.typ()
+            e := xfill_node(m, iv, it)
+            if e != nil {
+                return e
+            }
+            j = j + 1
+        }
+        m = m.next
+    }
+    return nil
+}
+
+// xfill_value fetches field i's Value from v, minting a nil own slot
+// through alloc_field.
+fn xfill_value(v: reflect.Value, i: int) -> [reflect.Value, err] {
+    [fv, ve] = v.field(i)
+    if ve != nil && errors.is(ve, reflect.err_nil()) {
+        return v.alloc_field(i)
+    }
+    return fv, ve
+}
+
+// xfill_struct walks n's attributes and child elements onto v's
+// fields: ,attr fields read attributes, ,chardata reads n's text,
+// element fields match children by routed name (first match wins for
+// scalars/structs/enums; slice fields gather every match in order and
+// alloc_slice the lot, []byte decoding the first match as base64).
+// Unmatched content is ignored, like Go.
+fn xfill_struct(n: ref XNode, v: reflect.Value, t: reflect.Type) -> err {
+    flds := xfields(t)
+    ncd := 0
+    i0 := 0
+    for i0 < len(flds) {
+        if flds[i0].skip == 0 && !xnameok(flds[i0].name) {
+            return errors.new("xml: tag name has illegal chars: " + flds[i0].name)
+        }
+        if flds[i0].skip == 0 && flds[i0].chardata == 1 {
+            ncd = ncd + 1
+            if ncd > 1 {
+                return errors.new("xml: multiple ,chardata fields")
+            }
+        }
+        i0 = i0 + 1
+    }
+    // attributes first — they route to ,attr fields only
+    a := n.attr
+    for a != nil {
+        fi := xfld_at(flds, a.name, 1)
+        if fi >= 0 {
+            [fv, ve] = xfill_value(v, flds[fi].i)
+            if ve != nil {
+                return ve
+            }
+            e := xset_scalar(fv, a.val)
+            if e != nil {
+                return e
+            }
+        }
+        a = a.next
+    }
+    i := 0
+    for i < len(flds) {
+        f := flds[i]
+        i = i + 1
+        if f.skip == 1 || f.attr == 1 {
+            continue
+        }
+        if f.chardata == 1 {
+            if len(n.text) > 0 {
+                [fv, ve] = xfill_value(v, f.i)
+                if ve != nil {
+                    return ve
+                }
+                e := xset_scalar(fv, n.text)
+                if e != nil {
+                    return e
+                }
+            }
+            continue
+        }
+        [tf, tfe] = t.field(f.i)
+        if tfe != nil {
+            return tfe
+        }
+        [ft, fte] = tf.typ()
+        if fte != nil {
+            return fte
+        }
+        fk := ft.kind()
+        if fk == reflect.KindSlice() {
+            // every matching child is one element — count, mint,
+            // fill in document order
+            cnt := 0
+            m := n.child
+            for m != nil {
+                if m.name == f.name {
+                    cnt = cnt + 1
+                }
+                m = m.next
+            }
+            if cnt == 0 {
+                continue
+            }
+            es := xfill_seq(v, f.i, n, f.name, ft, cnt)
+            if es != nil {
+                return es
+            }
+            continue
+        }
+        // scalar/struct/enum — first matching child wins
+        ef := xfill_first(v, f.i, ft, n, f.name)
+        if ef != nil {
+            return ef
+        }
+    }
+    return nil
+}
+
+// xfill_seq fills slice field fi: []byte base64s the first <name>
+// element; other slices mint cnt elements, one per <name> child.
+fn xfill_seq(v: reflect.Value, fi: int, n: ref XNode, name: str, ft: reflect.Type, cnt: int) -> err {
+    if xis_bytes(ft) {
+        return xfill_bytes(v, fi, n, name)
+    }
+    return xfill_slice(v, fi, n, name, cnt)
+}
+
+// xfill_first fills field fi (type ft) from the first <name> child.
+fn xfill_first(v: reflect.Value, fi: int, ft: reflect.Type, n: ref XNode, name: str) -> err {
+    m := n.child
+    for m != nil {
+        if m.name == name {
+            [fv, ve] = xfill_value(v, fi)
+            if ve != nil {
+                return ve
+            }
+            return xfill_node(m, fv, ft)
+        }
+        m = m.next
+    }
+    return nil
+}
+
+/// unmarshal parses src and routes it onto out (a mut T — callers
+/// pass an own handle: `p := new(Point)` then `unmarshal(s, p)`). The
+/// root element's own name is not checked; its attributes and child
+/// elements fill fields by routed xml name.
+fn unmarshal[T any](src: str, out: mut T) -> err {
+    [root, e] = xparse(src)
+    if e != nil {
+        return e
+    }
+    v := value_of_mut(out)
+    t := v.typ()
+    if t.kind() == reflect.KindSlice() {
+        return errors.new("xml: cannot unmarshal into a slice root")
+    }
+    return xfill_node(root, v, t)
+}

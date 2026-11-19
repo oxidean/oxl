@@ -7344,7 +7344,7 @@ fn lout_band(g: mut G, band: int) -> str {
 // fnv wraps, vtabs, drops, and oxl_main. Every emitted artifact then
 // goes through the shared G1 mark — the module prints only what a
 // live root chain spells (lout_band's filter, spec §8).
-fn emit_llvm(r: own check.CkRes, testm: int) -> str {
+fn emit_llvm(r: own check.CkRes, testm: int, abiov: int) -> str {
     g := new(G)
     g.ck = r.ck
     g.its = r.items
@@ -7413,6 +7413,10 @@ fn emit_llvm(r: own check.CkRes, testm: int) -> str {
     g.drop_word = 0
     g.drop_slice = 0
     g.labi = 0
+    // --triple's ABI pick lands before labi() caches — 0 = host auto
+    if abiov != 0 {
+        g.labi = abiov
+    }
     g.lreg = 0
     g.ldeadn = 0
     g.lterm = 0

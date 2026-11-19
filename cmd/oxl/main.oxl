@@ -310,7 +310,7 @@ fn compile_res(r: own check.CkRes, testm: int) -> own CRes {
         }
         res.c = codegen.emit_js(r, testm)
     } else if target_is_llvm() == 1 {
-        res.c = codegen.emit_llvm(r, testm)
+        res.c = codegen.emit_llvm(r, testm, llvm_triple_abi())
     } else {
         res.c = codegen.emit(r, testm)
     }
@@ -721,6 +721,26 @@ fn clang_major(line: str) -> int {
 // one shot), -O2 + the section-GC flags, the same emitted-text
 // feature scans (-DOXL_*/-l picks ride on llsrc), LANG_SQLITE_SRC/
 // LANG_LDFLAGS tail, and the .ll kept on failure like out.c.
+// --triple names the TARGET ABI the emitted .ll must spell its
+// C boundary for: arch picks aapcs64 for arm64, the windows tail
+// picks win64, everything else is sysv-x86_64. 0 keeps labi's host
+// autodetect. The .ll itself stays triple-neutral — only aggregate
+// param/ret spellings differ, and clang compiles both sides under
+// -target, so the pick must match the clang target.
+fn llvm_triple_abi() -> int {
+    t := flag_value("--triple")
+    if len(t) == 0 {
+        return 0
+    }
+    if strings.contains(t, "aarch64") || strings.contains(t, "arm64") || strings.contains(t, "armv7") || strings.contains(t, "armv8") {
+        return 2
+    }
+    if strings.contains(t, "windows") || strings.contains(t, "win64") || strings.contains(t, "mingw") {
+        return 3
+    }
+    return 1
+}
+
 // --triple passes through to `clang -target` for BOTH inputs — the
 // emitted .ll stays triple-neutral (no `target triple`/`datalayout`
 // lines) so clang supplies the datalayout each side compiles under.

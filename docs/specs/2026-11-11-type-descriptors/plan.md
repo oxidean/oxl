@@ -133,7 +133,7 @@ you want verdicted, and again after the last fix commit.
       `{{.Field}}`/`{{range}}`/`{{if}}` against descriptor names.
       `tests/enc_xml.oxl`, `tests/text_template.oxl`; wired into
       `tests/run.sh`.
-- [ ] **R6 — `database/sql` lite + closeout.** `scan[T any](rows,
+- [done] **R6 — `database/sql` lite + closeout.** `scan[T any](rows,
       out: mut []T)` column-order-onto-fields + `std/reflect`
       surface documented in `docs/` — `tests/db_sql.oxl`, wired
       into `tests/run.sh`; parked-stdlib.md re-measured

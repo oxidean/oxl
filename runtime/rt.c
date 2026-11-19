@@ -4190,6 +4190,73 @@ OxlStr rt_sqlite_query(void *db, const char *sql) {
 }
 void rt_sqlite_close(void *db) { sqlite3_close((sqlite3 *)db); }
 
+/* cursor lane for database/sql's descriptor-driven scan — a prepared
+ * stmt is the rows object: step/cols/col_* read the live row, reset
+ * rewinds for a second pass, finalize releases. */
+void *rt_sqlite_prepare(void *db, const char *sql) {
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2((sqlite3 *)db, sql, -1, &st, NULL) != SQLITE_OK)
+        return NULL;
+    return st;
+}
+int64_t rt_sqlite_step(void *st) {
+    int rc = sqlite3_step((sqlite3_stmt *)st);
+    if (rc == SQLITE_ROW) return 1;
+    if (rc == SQLITE_DONE) return 0;
+    return -rc; /* sqlite rcs are positive — negate so <0 reports error */
+}
+int64_t rt_sqlite_reset(void *st) { return sqlite3_reset((sqlite3_stmt *)st); }
+int64_t rt_sqlite_cols(void *st) { return sqlite3_column_count((sqlite3_stmt *)st); }
+int64_t rt_sqlite_col_type(void *st, int64_t i) {
+    return sqlite3_column_type((sqlite3_stmt *)st, (int)i);
+}
+int64_t rt_sqlite_col_int(void *st, int64_t i) {
+    return sqlite3_column_int64((sqlite3_stmt *)st, (int)i);
+}
+double rt_sqlite_col_f64(void *st, int64_t i) {
+    return sqlite3_column_double((sqlite3_stmt *)st, (int)i);
+}
+OxlStr rt_sqlite_col_text(void *st, int64_t i) {
+    /* sqlite3_column_text's buffer dies on the next step — scope-copy
+     * like rt_sqlite_query's row accumulation does */
+    const unsigned char *t = sqlite3_column_text((sqlite3_stmt *)st, (int)i);
+    size_t n;
+    char *p;
+    if (!t) return rt_str("");
+    n = strlen((const char *)t);
+    p = rt_alloc((int64_t)n + 1);
+    memcpy(p, t, n);
+    p[n] = 0;
+    return (OxlStr){ p, (int64_t)n };
+}
+void rt_sqlite_finalize(void *st) { sqlite3_finalize((sqlite3_stmt *)st); }
+OxlStr rt_sqlite_errstr(void *db) {
+    /* errmsg's buffer is sqlite-owned — scope-copy before the next db
+     * call can overwrite it */
+    const char *m = sqlite3_errmsg((sqlite3 *)db);
+    size_t n;
+    char *p;
+    if (!m) return rt_str("");
+    n = strlen(m);
+    p = rt_alloc((int64_t)n + 1);
+    memcpy(p, m, n);
+    p[n] = 0;
+    return (OxlStr){ p, (int64_t)n };
+}
+OxlStr rt_sqlite_errstr_rc(int64_t rc) {
+    /* sqlite3_errstr is process-global — no db handle needed, which is
+     * what lets Rows report step errors without carrying the db */
+    const char *m = sqlite3_errstr((int)rc);
+    size_t n;
+    char *p;
+    if (!m) return rt_str("");
+    n = strlen(m);
+    p = rt_alloc((int64_t)n + 1);
+    memcpy(p, m, n);
+    p[n] = 0;
+    return (OxlStr){ p, (int64_t)n };
+}
+
 #endif /* OXL_SQLITE */
 
 /* ---------------- S3: str ordering, platform probe, clock, libm ---- */

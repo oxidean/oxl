@@ -7,28 +7,37 @@ machinery they need.
 
 ## Needs reflection / `any` runtime values — the language lacks it
 
-**Partially un-parked → milestone R**
+**Un-parked → milestone R**
 (`docs/specs/2026-11-11-type-descriptors/`): compiler-emitted type
-descriptors land the machinery most of these packages waited on.
-Returning under R2–R6: `fmt` `%v`, `reflect` lite, `encoding/gob`,
-`encoding/xml`, `text/template`, and `database/sql`'s `scan[T]`
-half. Staying parked: `html/template` (out of R's scope) and
-`database/sql`'s driver-registry half (R6 ships the lite scan only).
+descriptors landed the machinery these packages waited on; R6 closed
+the milestone out. Returned under R2–R6: `fmt` `%v`, `reflect` lite,
+`encoding/gob`, `encoding/xml`, `text/template`, and `database/sql`'s
+`scan[T]` half. Staying parked: `html/template` (out of R's scope)
+and `database/sql`'s driver-registry half (R6 shipped the lite scan
+only — trigger: a second driver or `Scan(any)` consumer).
 
-- `fmt` `%v`-anything, `reflect`, `encoding/gob`, `encoding/xml`
-  (tagged-field driven), `database/sql` (driver-registry + `Scan(any)`)
-  — oxl's type system is static + generic with no runtime type
-  descriptors. `std/fmt` ships a bounded surface (S2). A `std/reflect`
-  lite or compiler-emitted type descriptors would unlock these —
-  its own milestone.
-- `html/template`, `text/template` — string-keyed `map[string]any`
-  pipelines; same bound.
+**Re-measured at R6 closeout** — the remaining descriptor-gated items,
+each with its own trigger rather than a blanket wait on reflection:
+
+- `runtime/pprof` — descriptors cover the type side, but a profiler
+  needs task/stack introspection the runtime doesn't expose. Trigger:
+  a real profiling consumer files the runtime-side surface it needs.
+- Plugin loading — needs dynamic symbol lookup + ABI descriptors
+  across a process boundary, not just type metadata. Trigger: an
+  embedding host that needs runtime-loaded modules.
+
+- `html/template` — string-keyed `map[string]any` pipelines; out of
+  milestone R's scope (its `text/template` sibling landed).
+- `database/sql` driver-registry + `Scan(any)` — R6's `scan[T]`
+  covers the descriptor half; the registry half waits on a second
+  driver or a heterogeneous-column consumer.
 
 ## Needs machinery the language doesn't have
 
-- Plugin loading, compiler-self packages (ast/parser/token class),
-  `runtime` internals,
-  `runtime/pprof` — runtime/codecs introspection doesn't exist.
+- Plugin loading and `runtime/pprof` — descriptor-gated, recorded
+  with their own triggers in the R6 re-measure above.
+- Compiler-self packages (ast/parser/token class),
+  `runtime` internals — runtime/codecs introspection doesn't exist.
 - `unsafe` in the memory-unsafe sense — oxl `unsafe` is a
   scoping-block marker that silences no checks (`docs/semantics/
   ownership.md`), not `Pointer` arithmetic.

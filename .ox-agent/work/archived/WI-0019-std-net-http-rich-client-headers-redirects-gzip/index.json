@@ -2,8 +2,9 @@
   "schema_version": 1,
   "id": "WI-0019",
   "title": "std/net/http rich client: headers, redirects, gzip, auth, proxy (issue #127)",
-  "state": "intake",
+  "state": "archived",
   "profile": "normal",
   "current_stage": "intake",
-  "created_at": "2026-11-17T16:00:53Z"
+  "created_at": "2026-11-17T16:00:53Z",
+  "updated_at": "2026-11-19T01:41:53Z"
 }

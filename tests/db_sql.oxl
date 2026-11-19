@@ -10,6 +10,7 @@ import "std/database/sql"
 import "std/errors"
 
 struct Item { id: int, name: str, price: float, active: bool, code: byte }
+
 struct Count { n: int }
 
 // a struct field outside the scalar lanes reports err_kind

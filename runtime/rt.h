@@ -201,6 +201,9 @@ struct RtScope {
  * around poll() so interleaved tasks on one worker keep their own chain */
 extern _Thread_local RtScope *tls_scope;
 
+/* opaque size for emitters that can't see RtScope's layout (the LLVM
+ * lane allocates scope storage as raw bytes in the entry block) */
+int64_t rt_scope_sizeof(void);
 void rt_scope_enter(RtScope *s);
 void rt_scope_leave(RtScope *s);
 int rt_scope_try(RtScope *s); /* join; return trap code without propagating */
@@ -517,6 +520,7 @@ int64_t rt_proc_run(RtSlice argv, RtSlice env);
 int64_t rt_proc_output(RtSlice argv, RtSlice env, RtSlice *out, RtSlice *errb);
 int64_t rt_str_cmp(OxlStr a, OxlStr b);      /* byte-lex order for str < str */
 int64_t rt_is_windows(void);                  /* 1 under _WIN32              */
+OxlStr  rt_host_arch(void);                   /* "x86_64" | "aarch64" | ...  */
 OxlStr  rt_timestr(void);                     /* "YYYY-MM-DD HH:MM:SS" local */
 double  rt_m_sqrt(double);
 double  rt_m_pow(double, double);

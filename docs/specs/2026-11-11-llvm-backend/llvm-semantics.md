@@ -34,7 +34,7 @@ Two layout domains with different rules:
 | `cstr` | `ptr` | NUL-terminated, extern-boundary only |
 | `[]T` | `%RtSlice = type { ptr, i64, i64, i64 }` | boundary — `{ptr,len,cap,heap}`, element type erased exactly like the C lane |
 | `struct` | `%o_s_<qn> = type { f0, f1, … }` | source field order, `f_<name>` order preserved; lane-owned layout |
-| `enum` | `%o_en_<qn> = type { i32, [4 x i8], <payloadTy> }` | lane-owned — §4 |
+| `enum` | `%o_en_<qn> = type { i32, [4 x i8], <payloadTy>, i64 }` | lane-owned — §4 |
 | `own T` / `ref T` / `mut T` | `ptr` | opaque pointers; borrow/move checks are rt.c calls, not types |
 | `chan` / `chan own T` | `ptr` | `RtChan*` opaque |
 | `shared` | `ptr` | `RtShared*` opaque |
@@ -162,7 +162,7 @@ define void @oxl_main() { … }
 - `%o_ret_<qn> = type { <val>, i64 }` — `val` then `err`, matching
   the C `{ <T> val; int64_t err; }` shape (lane-owned, but keeping
   C's order is free).
-- `%o_en_<qn> = type { i32, [4 x i8], <payloadTy> }` — the tagged
+- `%o_en_<qn> = type { i32, [4 x i8], <payloadTy>, i64 }` — the tagged
   union C emits `{ int tag; union {…} u; }`. IR has no union: the
   lane keeps `i32` tag at offset 0, one `[4 x i8]` pad, and a single
   payload field typed as the **largest variant** (`%o_s_<qn>.<V>`

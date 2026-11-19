@@ -142,6 +142,10 @@ void rt_free(void *obj) {
  * scope mu nested inside; never two scope mutexes under it. */
 static oxl_mutex_t link_mu = OXL_MUTEX_INIT;
 
+int64_t rt_scope_sizeof(void) {
+    return (int64_t)sizeof(RtScope);
+}
+
 void rt_scope_enter(RtScope *s) {
     memset(s, 0, sizeof *s);
     s->parent = tls_scope;
@@ -4209,6 +4213,23 @@ int64_t rt_is_windows(void) {
     return 1;
 #else
     return 0;
+#endif
+}
+
+/* host CPU arch — the llvm lane picks its C-boundary aggregate ABI
+ * spelling from this (byval stack copies only exist on SysV x86-64;
+ * AAPCS64 and win64 both pass a pointer to the composite). */
+OxlStr rt_host_arch(void) {
+#if defined(__x86_64__) || defined(_M_X64)
+    return rt_str("x86_64");
+#elif defined(__aarch64__) || defined(_M_ARM64)
+    return rt_str("aarch64");
+#elif defined(__arm__) || defined(_M_ARM)
+    return rt_str("arm");
+#elif defined(__i386__) || defined(_M_IX86)
+    return rt_str("x86");
+#else
+    return rt_str("unknown");
 #endif
 }
 

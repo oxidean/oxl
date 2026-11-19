@@ -17,7 +17,8 @@ package template
 // descriptor. render is the one-shot convenience. v1 limits: no
 // pipelines, functions, variables, or {{- -}} whitespace trimming;
 // field names are the declared names (struct tags are not consulted);
-// the if/range operand is a field path only, not a literal.
+// the if/range operand is a field path only, not a literal; and
+// {{else}} exists only on {{if}} (Go's range-else is unimplemented).
 import "std/errors"
 
 import "std/reflect"
@@ -83,11 +84,26 @@ fn taction(act: str) -> own Tpl {
     }
     kw := act
     rest := ""
-    sp := find(act, " ")
-    if sp < 0 {
-        sp = find(act, "\t")
+    // the keyword boundary is the first whitespace of ANY kind —
+    // space, tab, newline, CR all separate `if` from its operand
+    sp := len(act)
+    p := find(act, " ")
+    if p >= 0 && p < sp {
+        sp = p
     }
-    if sp >= 0 {
+    p = find(act, "\t")
+    if p >= 0 && p < sp {
+        sp = p
+    }
+    p = find(act, "\n")
+    if p >= 0 && p < sp {
+        sp = p
+    }
+    p = find(act, "\r")
+    if p >= 0 && p < sp {
+        sp = p
+    }
+    if sp < len(act) {
         kw = substr(act, 0, sp)
         rest = strings.trim(substr(act, sp + 1, len(act)))
     }
@@ -326,6 +342,13 @@ fn tval(v: reflect.Value) -> [str, err] {
             i = i + 1
         }
         return "{" + s + "}", nil
+    }
+    if k == reflect.KindErr() {
+        [x, e] = v.int()
+        if e != nil {
+            return "", e
+        }
+        return "err " + itoa(x), nil
     }
     return "", errors.new("template: cannot render kind " + itoa(k))
 }

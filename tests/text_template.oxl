@@ -21,6 +21,9 @@ struct Order {
     last: Item,
 }
 
+// an err-typed field renders like fmt's %v — "err <code>"
+struct WErr { e: err }
+
 fn fails(msg: str) {
     println("FAIL " + msg)
     exit(1)
@@ -103,6 +106,16 @@ fn main() {
     [_, e13] = template.render("{{range .count}}x{{end}}", o)
     if e13 == nil {
         fails("expected range-of-int err")
+    }
+    // newline also separates the keyword from its operand
+    [s14, e14] = template.render("{{if\n.rush}}R{{else}}S{{end}}", o)
+    if e14 != nil || s14 != "S" {
+        fails("ws keyword split: " + s14)
+    }
+    // err fields render "err <code>"
+    [s15, e15] = template.render("{{.e}}", WErr{e: errors.new("boom")})
+    if e15 != nil || find(s15, "err ") != 0 {
+        fails("err render: " + s15)
     }
     println("text_template ok")
 }

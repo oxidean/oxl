@@ -77,11 +77,23 @@ fn xtag(tg: str) -> XOpt {
     if ci >= 0 {
         o.name = substr(rest, 0, ci)
         opts := substr(rest, ci + 1, len(rest))
-        if find(opts, "attr") >= 0 {
-            o.attr = 1
-        }
-        if find(opts, "chardata") >= 0 {
-            o.chardata = 1
+        // options split on ',' and match whole tokens — a substring
+        // probe would route `xml:x,myattr` to the attribute lane
+        for len(opts) > 0 {
+            tok := opts
+            ci = find(opts, ",")
+            if ci >= 0 {
+                tok = substr(opts, 0, ci)
+                opts = substr(opts, ci + 1, len(opts))
+            } else {
+                opts = ""
+            }
+            if tok == "attr" {
+                o.attr = 1
+            }
+            if tok == "chardata" {
+                o.chardata = 1
+            }
         }
     }
     return o
@@ -130,7 +142,8 @@ fn xfld_at(fs: []XFld, name: str, attr: int) -> int {
 
 // ---------- output escaping ----------
 
-// xesc renders character data — & < > are the mandatory escapes.
+// xesc renders character data — & < > are the mandatory escapes,
+// plus \r (a literal CR would normalize to \n on re-parse).
 fn xesc(s: str) -> str {
     out := ""
     i := 0
@@ -142,6 +155,8 @@ fn xesc(s: str) -> str {
             out = out + "&lt;"
         } else if c == 62 {
             out = out + "&gt;"
+        } else if c == 13 {
+            out = out + "&#xD;"
         } else {
             out = out + substr(s, i, i + 1)
         }
@@ -164,12 +179,34 @@ fn xescq(s: str) -> str {
             out = out + "&gt;"
         } else if c == 34 {
             out = out + "&quot;"
+        } else if c == 9 {
+            out = out + "&#x9;"
+        } else if c == 10 {
+            out = out + "&#xA;"
+        } else if c == 13 {
+            out = out + "&#xD;"
         } else {
             out = out + substr(s, i, i + 1)
         }
         i = i + 1
     }
     return out
+}
+
+// xnameok reports whether s is already a legal XML name — the same
+// keep-set xname emits. Routed tag names must pass; anything else is
+// a malformed tag, not a name to sanitize silently.
+fn xnameok(s: str) -> bool {
+    i := 0
+    for i < len(s) {
+        c := byteat(s, i)
+        ok := c >= 97 && c <= 122 || c >= 65 && c <= 90 || c >= 48 && c <= 57
+        if !ok && c != 46 && c != 95 && c != 45 && c != 58 {
+            return false
+        }
+        i = i + 1
+    }
+    return len(s) > 0
 }
 
 // xname sanitizes a descriptor name into an XML element name — keeps
@@ -326,12 +363,22 @@ fn xemit(v: reflect.Value, name: str) -> [str, err] {
 fn xemit_struct(v: reflect.Value, t: reflect.Type) -> [XPart, err] {
     p := XPart{attrs: "", kids: "", text: ""}
     flds := xfields(t)
+    ncd := 0
     i := 0
     for i < len(flds) {
         f := flds[i]
         i = i + 1
         if f.skip == 1 {
             continue
+        }
+        if !xnameok(f.name) {
+            return p, errors.new("xml: tag name has illegal chars: " + f.name)
+        }
+        if f.chardata == 1 {
+            ncd = ncd + 1
+            if ncd > 1 {
+                return p, errors.new("xml: multiple ,chardata fields")
+            }
         }
         [fv, ve] = v.field(f.i)
         if ve != nil {
@@ -521,7 +568,9 @@ fn xeat(p: mut XCur, s: str) -> bool {
     return true
 }
 
-// xhexdig parses up to 4 hex digits at s[i]; base 10 when hex == 0.
+// xnum parses the digit run at s[i]; base 10 when hex == 0. The
+// value saturates just past the Unicode ceiling so oversized refs
+// clamp to U+FFFD downstream instead of wrapping i64.
 fn xnum(s: str, i: int, hex: int) -> int {
     v := 0
     for i < len(s) {
@@ -541,6 +590,9 @@ fn xnum(s: str, i: int, hex: int) -> int {
             v = v * 16 + d
         } else {
             v = v * 10 + d
+        }
+        if v > 1114112 {
+            return 1114112
         }
         i = i + 1
     }
@@ -631,6 +683,11 @@ fn xent(p: mut XCur) -> str {
             return ""
         }
         cp := xnum(substr(p.src, start, j), 0, hex)
+        // non-scalars — surrogates, past U+10FFFF, the forbidden
+        // NUL — decode as U+FFFD rather than emitting invalid UTF-8
+        if cp <= 0 || cp > 1114111 || cp >= 55296 && cp <= 57343 {
+            cp = 65533
+        }
         p.pos = j + 1
         return xutf8(cp)
     }
@@ -985,6 +1042,16 @@ fn xfill_enum(n: ref XNode, v: reflect.Value, t: reflect.Type) -> err {
     if len(txt) > 0 {
         vi := xvar(t, txt)
         if vi >= 0 {
+            // bare text can only name a unit variant — a payload
+            // variant needs element children, so a bare name is
+            // malformed rather than a zero-payload accept
+            [xv0, xve0] = t.variant(vi)
+            if xve0 != nil {
+                return xve0
+            }
+            if xv0.nfields() > 0 {
+                return errors.new("xml: variant <" + txt + "> needs payload elements")
+            }
             return v.set_tag(vi)
         }
     }
@@ -992,15 +1059,20 @@ fn xfill_enum(n: ref XNode, v: reflect.Value, t: reflect.Type) -> err {
     for m != nil {
         vi := xvar(t, m.name)
         if vi >= 0 {
-            e := v.set_tag(vi)
-            if e != nil {
-                return e
-            }
             [xv, xve] = t.variant(vi)
             if xve != nil {
                 return xve
             }
             nf := xv.nfields()
+            if nf > 0 && m.child == nil {
+                // a payload variant spelled with no child elements
+                // would silently mint all-zero payload slots
+                return errors.new("xml: variant <" + m.name + "> needs payload elements")
+            }
+            e := v.set_tag(vi)
+            if e != nil {
+                return e
+            }
             fi := 0
             for fi < nf {
                 [fnm, fe] = xv.fname(fi)
@@ -1141,6 +1213,20 @@ fn xfill_value(v: reflect.Value, i: int) -> [reflect.Value, err] {
 // Unmatched content is ignored, like Go.
 fn xfill_struct(n: ref XNode, v: reflect.Value, t: reflect.Type) -> err {
     flds := xfields(t)
+    ncd := 0
+    i0 := 0
+    for i0 < len(flds) {
+        if flds[i0].skip == 0 && !xnameok(flds[i0].name) {
+            return errors.new("xml: tag name has illegal chars: " + flds[i0].name)
+        }
+        if flds[i0].skip == 0 && flds[i0].chardata == 1 {
+            ncd = ncd + 1
+            if ncd > 1 {
+                return errors.new("xml: multiple ,chardata fields")
+            }
+        }
+        i0 = i0 + 1
+    }
     // attributes first — they route to ,attr fields only
     a := n.attr
     for a != nil {

@@ -31,6 +31,16 @@ struct Doc {
     listed: str,
 }
 
+// `,myattr` must not route to the attribute lane — options match
+// whole tokens, not substrings
+struct Marked { v: int tag "xml:\"x,myattr\"" }
+
+// a routed name with illegal XML chars is a malformed tag
+struct Bad { v: int tag "xml:\"a>b\"" }
+
+// two ,chardata fields are a type-analysis error
+struct Dbl { a: str tag "xml:\",chardata\"", b: str tag "xml:\",chardata\"" }
+
 fn fails(msg: str) {
     println("FAIL " + msg)
     exit(1)
@@ -152,6 +162,61 @@ fn main() {
     ue8 := xml.unmarshal("<Doc id=\"z\"></Doc>", d4)
     if ue8 == nil {
         fails("expected attr parse err")
+    }
+    // tag options match whole tokens — `,myattr` is not `,attr`
+    [ms, me] = xml.marshal(Marked{v: 3})
+    if me != nil {
+        fails("marshal tokens: " + errors.msg(me))
+    }
+    if ms != "<Marked><x>3</x></Marked>" {
+        fails("token option routing: " + ms)
+    }
+    // illegal routed names error on both lanes
+    [_, be1] = xml.marshal(Bad{v: 1})
+    if be1 == nil {
+        fails("expected illegal-name marshal err")
+    }
+    bd := new(Bad)
+    if xml.unmarshal("<Bad><a>1</a></Bad>", bd) == nil {
+        fails("expected illegal-name unmarshal err")
+    }
+    // two ,chardata fields error at type analysis
+    [_, dce] = xml.marshal(Dbl{a: "x", b: "y"})
+    if dce == nil {
+        fails("expected dup-chardata err")
+    }
+    // payload variants need element children — bare text or an empty
+    // element both err rather than mint zeroed slots
+    d5 := new(Doc)
+    if xml.unmarshal("<Doc><sh>Rect</sh></Doc>", d5) == nil {
+        fails("expected payload-variant bare-text err")
+    }
+    if xml.unmarshal("<Doc><sh><Circ>4</Circ></sh></Doc>", d5) == nil {
+        fails("expected payload-variant empty err")
+    }
+    // attr values escape \t \n \r; entity refs decode inside attrs
+    d.note = "a\tb\nc"
+    [s3, e3] = xml.marshal(d)
+    if e3 != nil || find(s3, "note=\"a&#x9;b&#xA;c\"") < 0 {
+        fails("attr ws escaping: " + s3)
+    }
+    d6 := new(Doc)
+    if xml.unmarshal("<Doc id=\"1\" note=\"p&#x9;q&#xA;r\">x</Doc>", d6) != nil || d6.note != "p\tq\nr" {
+        fails("attr entity decode")
+    }
+    // non-scalar char refs decode as U+FFFD (EF BF BD), never
+    // invalid UTF-8
+    d7 := new(Doc)
+    if xml.unmarshal("<Doc><name>&#xD800;&#99999999;</name></Doc>", d7) != nil {
+        fails("charref decode")
+    }
+    if len(d7.name) != 6 || byteat(d7.name, 0) != 239 {
+        fails("charref U+FFFD")
+    }
+    // CDATA decodes literally
+    d8 := new(Doc)
+    if xml.unmarshal("<Doc><name><![CDATA[a<b&c]]></name></Doc>", d8) != nil || d8.name != "a<b&c" {
+        fails("cdata lane: " + d8.name)
     }
     println("enc_xml ok")
 }

@@ -3422,7 +3422,15 @@ OxlStr rt_str_bytes(RtSlice b) {
 #define RT_ERR_BUCKETS 512
 #define RT_ERR_MAX 65536
 
-typedef struct { int64_t next; int64_t mlen; int64_t cause; char *msg; } RtErrEnt;
+typedef struct {
+    int64_t next;
+    int64_t mlen;
+    int64_t cause;
+    char *msg;
+    int64_t td;    /* descriptor index of the boxed payload, -1 elsewhere */
+    int64_t pdata; /* box payload — always a pointer; 0 for non-boxes
+                    * and after rt_err_as consumes it */
+} RtErrEnt;
 static RtErrEnt *rt_err_tab;
 static int64_t rt_err_n, rt_err_cap;
 static int64_t rt_err_ovf = -1;
@@ -3456,6 +3464,8 @@ static int64_t err_put_locked(OxlStr msg) {
     rt_err_tab[rt_err_n].mlen = msg.n;
     rt_err_tab[rt_err_n].cause = 0;
     rt_err_tab[rt_err_n].msg = m;
+    rt_err_tab[rt_err_n].td = -1;
+    rt_err_tab[rt_err_n].pdata = 0;
     rt_err_bkt[b] = rt_err_n + 1;
     return RT_ERR_BASE + rt_err_n++;
 }
@@ -3539,9 +3549,106 @@ int64_t rt_err_wrap(OxlStr msg, int64_t cause) {
     rt_err_tab[rt_err_n].mlen = msg.n;
     rt_err_tab[rt_err_n].cause = cause;
     rt_err_tab[rt_err_n].msg = m;
+    rt_err_tab[rt_err_n].td = -1;
+    rt_err_tab[rt_err_n].pdata = 0;
     int64_t code = RT_ERR_BASE + rt_err_n++;
     oxl_mu_unlock(&rt_err_mu);
     return code;
+}
+
+static const RtTypeDesc *desc_at(int64_t td); /* defined with the desc lane below */
+
+/* rt_err_box mints a typed-payload err — like rt_err_wrap it appends
+ * WITHOUT dedupe: each box is a distinct value even when the payload
+ * repeats. td is the payload type's descriptor index (folded by
+ * codegen at the box site); msg carries its name so errors.msg and
+ * the unwrap chain stay readable; next/cause stay sentinel-pinned.
+ * pdata is always a pointer the registry adopts: codegen heap-copies
+ * by-value payloads into an own-lane sizeof(T) block before the call
+ * and moves `own T` handles in raw — nothing here is freed, and
+ * rt_err_as clears the slots it consumes. A str payload's copied
+ * OxlStr header still names the boxer's scope-arena backing, which
+ * dies with that scope — upgrade it to an own copy now or the box
+ * dangles. */
+int64_t rt_err_box(int64_t td, int64_t pdata) {
+    const RtTypeDesc *d = desc_at(td);
+    OxlStr nm = { (char *)"", 0 };
+    if (d && d->name) {
+        nm = (OxlStr){ (char *)d->name, (int64_t)strlen(d->name) };
+    }
+    if (d && d->kind == 3 /* STR */ && pdata) {
+        OxlStr *s = (OxlStr *)(uintptr_t)pdata;
+        *s = rt_str_own(*s);
+    }
+    oxl_mu_lock(&rt_err_mu);
+    if (!rt_err_tab) {
+        for (size_t i = 0; i < sizeof(rt_err_seeds) / sizeof(*rt_err_seeds); i++)
+            err_put_locked((OxlStr){ (char *)rt_err_seeds[i],
+                                     (int64_t)strlen(rt_err_seeds[i]) });
+    }
+    if (rt_err_ovf >= 0) { oxl_mu_unlock(&rt_err_mu); return rt_err_ovf; }
+    if (rt_err_n == RT_ERR_MAX - 1) {
+        static const char om[] = "error registry full";
+        rt_err_ovf = err_put_locked((OxlStr){ (char *)om, sizeof(om) - 1 });
+        oxl_mu_unlock(&rt_err_mu);
+        return rt_err_ovf;
+    }
+    if (rt_err_n == rt_err_cap) {
+        rt_err_cap = rt_err_cap ? rt_err_cap * 2 : 64;
+        if (rt_err_cap > RT_ERR_MAX) rt_err_cap = RT_ERR_MAX;
+        rt_err_tab = realloc(rt_err_tab,
+                             (size_t)rt_err_cap * sizeof(RtErrEnt));
+        if (!rt_err_tab) { oxl_mu_unlock(&rt_err_mu); abort(); }
+    }
+    char *m = malloc((size_t)nm.n + 1);
+    if (!m) { oxl_mu_unlock(&rt_err_mu); abort(); }
+    memcpy(m, nm.p, (size_t)nm.n);
+    m[nm.n] = 0;
+    rt_err_tab[rt_err_n].next = 0; /* not hashed — never deduped */
+    rt_err_tab[rt_err_n].mlen = nm.n;
+    rt_err_tab[rt_err_n].cause = 0;
+    rt_err_tab[rt_err_n].msg = m;
+    rt_err_tab[rt_err_n].td = td;
+    rt_err_tab[rt_err_n].pdata = pdata;
+    int64_t code = RT_ERR_BASE + rt_err_n++;
+    oxl_mu_unlock(&rt_err_mu);
+    return code;
+}
+
+/* rt_err_as walks the cause chain like Go's errors.As: the first box
+ * whose stored td matches EXACTLY wins (no implementability walk —
+ * an iface-typed target matches only a box storing that same iface
+ * descriptor). On a match the payload copies out of pdata into the
+ * caller's writable slot — mv=1 writes the handle itself for
+ * `own`-bound outs — and the slot clears, so a given box answers
+ * exactly once; a consumed box contributes no match and the walk
+ * continues past it. Non-box entries (pdata == 0) are skipped; codes
+ * below RT_ERR_BASE and nil end the walk. */
+int64_t rt_err_as(int64_t code, int64_t td, int64_t addr, int64_t mv) {
+    for (;;) {
+        if (code == 0) return 0;
+        int64_t i = code - RT_ERR_BASE;
+        if (i < 0) return 0;
+        oxl_mu_lock(&rt_err_mu);
+        if (i >= rt_err_n) { oxl_mu_unlock(&rt_err_mu); return 0; }
+        RtErrEnt *e = &rt_err_tab[i];
+        int64_t cause = e->cause;
+        if (e->pdata && e->td == td) {
+            const RtTypeDesc *d = desc_at(td);
+            if (mv) {
+                *(void **)(uintptr_t)addr = (void *)(uintptr_t)e->pdata;
+            } else if (d && d->size > 0) {
+                memcpy((void *)(uintptr_t)addr, (void *)(uintptr_t)e->pdata,
+                       (size_t)d->size);
+            }
+            e->pdata = 0;
+            e->td = -1;
+            oxl_mu_unlock(&rt_err_mu);
+            return 1;
+        }
+        oxl_mu_unlock(&rt_err_mu);
+        code = cause;
+    }
 }
 
 int64_t rt_err_cause(int64_t code) {

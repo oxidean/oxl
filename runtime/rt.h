@@ -443,6 +443,16 @@ int64_t rt_err_new(OxlStr msg);        /* interned -> stable code   */
 int64_t rt_err_wrap(OxlStr msg, int64_t cause); /* distinct entry, cause chain */
 int64_t rt_err_cause(int64_t code);    /* 0 at chain end            */
 OxlStr  rt_err_msg(int64_t code);      /* "" for unknown/0          */
+/* R3 typed payloads — RtErrEnt extends with {td, pdata}: a box IS an
+ * err end to end (chains through wrap/unwrap/is untouched). pdata is
+ * always a pointer — codegen heap-copies by-value payloads into an
+ * own-lane sizeof(T) block; `own T` args move their handle in.
+ * rt_err_as walks the cause chain for the first box whose td matches
+ * exactly (no implementability walk), copies the payload into the
+ * caller's slot — mv=1 writes the handle itself for `own`-bound outs —
+ * and clears the slot: a box answers exactly once. */
+int64_t rt_err_box(int64_t td, int64_t pdata);
+int64_t rt_err_as(int64_t code, int64_t td, int64_t addr, int64_t mv);
 OxlStr rt_bufstr(void *buf, int64_t n);
 void rt_poke8(void *buf, int64_t off, int64_t v);
 void rt_poke16(void *buf, int64_t off, int64_t v);

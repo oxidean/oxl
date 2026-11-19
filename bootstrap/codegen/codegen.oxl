@@ -1119,6 +1119,9 @@ fn xty_call(g: mut G, f: ref parser.Node, args: ref parser.NList) -> int {
     if name == "value_of" || name == "value_of_mut" {
         return check.reflect_st(g.ck, "Value")
     }
+    if name == "box" {
+        return check.t_err(g.ck)
+    }
     if name == "push" && args != nil {
         return xty(g, args.v)
     }
@@ -3188,6 +3191,47 @@ fn gcall(g: mut G, f: ref parser.Node, args: ref parser.NList) -> str {
             w = "1LL"
         }
         return "(struct o_s_oxl_reflect_Value){ " + itoa(gdesc(g, base)) + "LL, (int64_t)(" + av + "), " + w + " }"
+    }
+    if qn == "box" && args != nil {
+        // R3 — `box[T any](v: T)` folds to rt_err_box: tdesc(T) is
+        // baked in as the registry entry's td. A bare `own` binding
+        // MOVES its handle into pdata (the checker marks it moved);
+        // every other shape heap-copies — ref/mut args and non-Name
+        // own exprs copy the pointee so the source keeps its value
+        // (fields can't take a move mark).
+        at := gsub(g, xty(g, args.v))
+        bv := argvs.v
+        bt := at
+        ak := check.nk(args.v)
+        if tyk(g, at) == check.k_own() && (ak == 2 || ak == 8) {
+            // move the handle — a Name binding is moved-marked by the
+            // checker; a Call arg is an unaliased rvalue temp
+            return "rt_err_box(" + itoa(gdesc(g, at)) + "LL, (int64_t)(" + bv + "))"
+        }
+        if tyk(g, at) == check.k_own() || tyk(g, at) == check.k_ref() || tyk(g, at) == check.k_mut() {
+            bt = tyi(g, at)
+            bv = "(*(" + bv + "))"
+        }
+        ct := gcty(g, bt)
+        return "({ " + ct + " *_bp = rt_alloc_own(sizeof(" + ct + ")); *_bp = " + bv + "; rt_err_box(" + itoa(gdesc(g, bt)) + "LL, (int64_t)_bp); })"
+    }
+    if qn == "errors.as" && args != nil && args.next != nil {
+        // R3 — errors.as stays a declared generic fn but folds at the
+        // call site like box: rt_err_as needs the bound T's descriptor
+        // index plus the writable *out address — a `mut T` param's C
+        // pointer IS that address. For `mut own T`-bound calls the
+        // slot carries a handle: mv=1 moves it into out instead of
+        // copying the pointee.
+        at := gsub(g, xty(g, args.next.v))
+        tt := at
+        if tyk(g, at) == check.k_own() || tyk(g, at) == check.k_ref() || tyk(g, at) == check.k_mut() {
+            tt = tyi(g, at)
+        }
+        mv := "0LL"
+        if tyk(g, tt) == check.k_own() || tyk(g, tt) == check.k_ref() || tyk(g, tt) == check.k_mut() {
+            mv = "1LL"
+        }
+        return "rt_err_as(" + argvs.v + ", " + itoa(gdesc(g, tt)) + "LL, (int64_t)(" + gav_at(argvs, 1) + "), " + mv + ") != 0"
     }
     if qn == "push" && args != nil {
         st := xty(g, args.v)

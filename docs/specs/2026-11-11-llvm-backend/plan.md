@@ -13,17 +13,17 @@ If W somehow lands after L starts, L3's dispatch extends the
 two-lane `compile_res` directly and the text reads the same with
 one fewer sibling.
 
-- [ ] **L0 — spec** — *(this PR)* — this directory, WI-0010
+- [x] **L0 — spec** — *(this PR)* — this directory, WI-0010
       artifacts, ADR-0013 for the spec-level forks, roadmap/parked
       annotations.
-- [ ] **L1 — `bootstrap/codegen/llvm.oxl`: IR skeleton +
+- [x] **L1 — `bootstrap/codegen/llvm.oxl`: IR skeleton +
       non-concurrency surface.**
-- [ ] **L2 — concurrency surface: frames + poll drivers + spawn/
+- [x] **L2 — concurrency surface: frames + poll drivers + spawn/
       chans/select/scopes.**
-- [ ] **L3 — driver lane: `--target llvm`, `emit_and_llvm`,
+- [x] **L3 — driver lane: `--target llvm`, `emit_and_llvm`,
       `--triple`, feature gates.**
-- [ ] **L4 — IR fixpoint + cross-lane parity gate.**
-- [ ] **L5 — docs + flag polish.**
+- [x] **L4 — IR fixpoint + cross-lane parity gate.**
+- [x] **L5 — docs + flag polish.**
 
 ## L0 — spec (this docset)
 

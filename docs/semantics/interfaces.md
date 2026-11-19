@@ -73,6 +73,17 @@ exercises the full pipeline today and keeps the backend swappable
 (`codegen/` is the only cc-aware module; an LLVM backend drops in behind
 the same `TAST → object` seam).
 
+The swap the paragraph above predicted is now real: three sibling
+emitters sit behind one `check.CkRes` seam — `codegen.oxl` emitting C
+`.c` (native, the default lane), `llvm.oxl` emitting LLVM `.ll`
+(`--target llvm` — `docs/llvm-target.md`), and `js.oxl` emitting an ES
+`.mjs` (`--target js` — `docs/web-target.md`). `cmd/oxl`'s `compile_res`
+picks the lane off `flag_value("--target")`; `check` itself stays
+target-agnostic (only the js lane adds a checker gate). All three share
+the `o_*` symbol scheme and the G1 reachability machinery, and both
+native lanes link the same `runtime/rt.c` — the runtime can't tell
+which emitter produced it.
+
 Emitted program links `runtime/rt.c` (committed under `runtime/`) which
 provides: arena alloc, ObjHdr checks, scope/trap machinery, executor
 pool, channels, and the `extern` FFI shim table.

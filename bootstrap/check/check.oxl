@@ -875,8 +875,9 @@ fn reflect_st(ck: mut Ck, b: str) -> int {
     collections.map_set(ck.structs, qn, len(ck.structsv))
     fl := fcons("td", t_int(ck), nil)
     if b == "Value" {
-        fl = fcons("w", t_int(ck), fl)
-        fl = fcons("addr", t_int(ck), fl)
+        // declaration order — fcons prepends, so cons w then addr
+        // to land [td, addr, w] like the synthesized decl
+        fl = fcons("td", t_int(ck), fcons("addr", t_int(ck), fcons("w", t_int(ck), nil)))
     }
     ck.structsv = push(ck.structsv, SEnt{n: qn, fields: fl})
     return tn(ck, k_struct(), qn)

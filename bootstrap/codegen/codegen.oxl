@@ -1910,7 +1910,7 @@ fn gcall_plan(g: mut G, f: ref parser.Node, args: ref parser.NList) -> own GCP {
         _ => {
         }
     }
-    if args != nil {
+    if args != nil && !check.is_builtin(name) {
         t0 := gsub(g, xty(g, args.v))
         if t0 >= 0 {
             mt := check.method_target(g.ck, t0, name)

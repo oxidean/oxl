@@ -137,6 +137,13 @@ fn main() {
     // value handles mint + stay opaque (fields exercised in R2)
     v := value_of(wo)
     vv := value_of_mut(wo)
+    // qualified T through a generic binding — the direct operands
+    // above pin constants; gdq(wo) pins substitution (last — the
+    // call moves wo)
+    if gdq(wo) != 1 {
+        println("BAD qualified fold")
+        exit(1)
+    }
     t := type_of(Point)
     println("count=" + itoa(rt_desc_count()))
     println("desc_parity ok")

@@ -290,10 +290,9 @@ int rt_select_poll(RtChan **chs, int n, int64_t tmo_ms, int has_else, RtTask *t)
 int64_t rt_select_arm(RtTask *t); /* cleanup parked waiters; returns arm */
 
 /* --- runtime type descriptors (R1) ---
- * codegen emits `const RtTypeDesc o_desc_tab[]` + `o_desc_tab_n`
- * demand-driven — only when a tdesc/type_of/value_of fold ran; rt.c
- * ships weak stubs so table-free programs link identically to today
- * and every accessor returns its sentinel. kind values are the frozen
+ * codegen always emits `const RtTypeDesc o_desc_tab[]` +
+ * `o_desc_tab_n` — a `{0}` stub row when no tdesc/type_of/value_of
+ * fold ran (rt.c explains why a weak stub cannot work). kind values are the frozen
  * order: INT FLOAT BOOL STR BYTE SLICE MAP STRUCT PTR CHAN IFACE FN
  * ERR ENUM VOID (MAP is reserved — no Ty produces it). `v_base`
  * extends the record for rt_desc_v_base: the codegen-pinned offsetof

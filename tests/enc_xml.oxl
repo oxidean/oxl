@@ -1,0 +1,279 @@
+package main
+
+// R5 fixture — std/encoding/xml marshal/unmarshal over the descriptor
+// lane: `tag "xml:..."` routing (names, ,attr, ,chardata, -), scalars,
+// nested structs, own fields, inline and own-element slices, []byte
+// base64, enums (unit and payload variants), and the parser's
+// malformed-input lane. Everything asserts in-process; the suite
+// checks the trailing ok line.
+import "std/encoding/xml"
+
+import "std/errors"
+
+struct Inner { v: int, s: str }
+
+enum Shape { Circ(int), Rect { w: int, h: int }, Empty, }
+
+struct Doc {
+    id: int tag "xml:id,attr",
+    name: str,
+    inner: Inner,
+    oi: own Inner,
+    xs: []int,
+    os: []own Inner,
+    raw: []byte,
+    b: bool,
+    f: float,
+    sh: Shape,
+    note: str tag "xml:\"note,attr\"",
+    body: str tag "xml:,chardata",
+    skip: int tag "xml:-",
+    listed: str,
+}
+
+// `,myattr` must not route to the attribute lane — options match
+// whole tokens, not substrings
+struct Marked { v: int tag "xml:\"x,myattr\"" }
+
+// a routed name with illegal XML chars is a malformed tag
+struct Bad { v: int tag "xml:\"a>b\"" }
+
+// two ,chardata fields are a type-analysis error
+struct Dbl { a: str tag "xml:\",chardata\"", b: str tag "xml:\",chardata\"" }
+
+// routed names must start with a letter or _ — digit- and dash-led
+// names are malformed on both lanes
+struct BadNum { v: int tag "xml:9x" }
+
+struct BadDash { v: int tag "xml:-x" }
+
+fn fails(msg: str) {
+    println("FAIL " + msg)
+    exit(1)
+}
+
+fn mkdoc() -> Doc {
+    i1 := new(Inner)
+    i1.v = 7
+    i1.s = "seven"
+    i2 := new(Inner)
+    i2.v = 8
+    i2.s = "eight"
+    d := Doc{id: 9, name: "doc&<>", inner: Inner{v: 1, s: "one"}, oi: i1, xs: mkslice(int, 0), os: mkslice(own Inner, 0), raw: mkslice(byte, 0), b: true, f: 1.5, sh: Shape.Rect{w: 3, h: 4}, note: "nb", body: "text", skip: 5, listed: "keep"}
+    d.xs = push(d.xs, 10)
+    d.xs = push(d.xs, 20)
+    d.os = push(d.os, i2)
+    d.raw = push(d.raw, 104)
+    d.raw = push(d.raw, 105)
+    return d
+}
+
+fn main() {
+    d := mkdoc()
+    [s, e] = xml.marshal(d)
+    if e != nil {
+        fails("marshal: " + errors.msg(e))
+    }
+    // exact emitted shape — attrs in the open tag, chardata inline,
+    // skipped field absent, []byte base64, enum wrapped in its
+    // variant element
+    want := "<Doc id=\"9\" note=\"nb\">text<name>doc&amp;&lt;&gt;</name><inner><v>1</v><s>one</s></inner><oi><v>7</v><s>seven</s></oi><xs>10</xs><xs>20</xs><os><v>8</v><s>eight</s></os><raw>aGk=</raw><b>true</b><f>1.5</f><sh><Rect><w>3</w><h>4</h></Rect></sh><listed>keep</listed></Doc>"
+    if s != want {
+        fails("marshal shape:\n" + s + "\nwant:\n" + want)
+    }
+    // round-trip — every lane lands
+    d2 := new(Doc)
+    ue := xml.unmarshal(s, d2)
+    if ue != nil {
+        fails("unmarshal: " + errors.msg(ue))
+    }
+    if d2.id != 9 || d2.name != "doc&<>" || d2.inner.v != 1 || d2.inner.s != "one" {
+        fails("scalar/struct fields")
+    }
+    if d2.oi == nil || d2.oi.v != 7 || d2.oi.s != "seven" {
+        fails("own field mint")
+    }
+    if len(d2.xs) != 2 || d2.xs[0] != 10 || d2.xs[1] != 20 {
+        fails("int slice")
+    }
+    if len(d2.os) != 1 || d2.os[0].v != 8 || d2.os[0].s != "eight" {
+        fails("own elem slice")
+    }
+    if len(d2.raw) != 2 || d2.raw[0] != 104 || d2.raw[1] != 105 {
+        fails("[]byte base64")
+    }
+    if !d2.b || d2.f != 1.5 || d2.note != "nb" || d2.body != "text" || d2.skip != 0 || d2.listed != "keep" {
+        fails("attr/chardata/skip lanes")
+    }
+    match d2.sh {
+        Shape.Rect{w, h} => {
+            if w != 3 || h != 4 {
+                fails("enum payload values")
+            }
+        }
+        _ => {
+            fails("enum variant")
+        }
+    }
+    // unit variant: bare text names it on both lanes
+    d.sh = Shape.Empty
+    [s2, e2] = xml.marshal(d)
+    if e2 != nil {
+        fails("marshal unit: " + errors.msg(e2))
+    }
+    if find(s2, "<sh>Empty</sh>") < 0 {
+        fails("unit variant form: " + s2)
+    }
+    d3 := new(Doc)
+    ue3 := xml.unmarshal(s2, d3)
+    if ue3 != nil {
+        fails("unmarshal unit: " + errors.msg(ue3))
+    }
+    if d3.sh.kind() != 2 {
+        fails("unit variant tag " + itoa(d3.sh.kind()))
+    }
+    // unmarshal ignores unknown elements and unordered children, and
+    // entities/char refs decode
+    d4 := new(Doc)
+    ue4 := xml.unmarshal("<?xml version=\"1.0\"?><!-- hi --><Doc id=\"1\"><name>a &lt;b&gt; &#65;</name><xs>5</xs><extra/><raw></raw><xs>6</xs><sh><Circ><f0>4</f0></Circ></sh></Doc>", d4)
+    if ue4 != nil {
+        fails("loose input: " + errors.msg(ue4))
+    }
+    if d4.id != 1 || d4.name != "a <b> A" || len(d4.xs) != 2 || d4.xs[1] != 6 {
+        fails("loose input fields: " + d4.name)
+    }
+    match d4.sh {
+        Shape.Circ(v) => {
+            if v != 4 {
+                fails("positional payload value")
+            }
+        }
+        _ => {
+            fails("positional payload variant")
+        }
+    }
+    // malformed input and a scalar type mismatch report err
+    ue5 := xml.unmarshal("<Doc><name>x", d4)
+    if ue5 == nil {
+        fails("expected syntax err")
+    }
+    ue6 := xml.unmarshal("<Doc><inner><v>z</v></inner></Doc>", d4)
+    if ue6 == nil {
+        fails("expected nested int parse err")
+    }
+    ue7 := xml.unmarshal("<Doc><xs>no</xs></Doc>", d4)
+    if ue7 == nil {
+        fails("expected int parse err")
+    }
+    ue8 := xml.unmarshal("<Doc id=\"z\"></Doc>", d4)
+    if ue8 == nil {
+        fails("expected attr parse err")
+    }
+    // tag options match whole tokens — `,myattr` is not `,attr`
+    [ms, me] = xml.marshal(Marked{v: 3})
+    if me != nil {
+        fails("marshal tokens: " + errors.msg(me))
+    }
+    if ms != "<Marked><x>3</x></Marked>" {
+        fails("token option routing: " + ms)
+    }
+    // illegal routed names error on both lanes
+    [_, be1] = xml.marshal(Bad{v: 1})
+    if be1 == nil {
+        fails("expected illegal-name marshal err")
+    }
+    bd := new(Bad)
+    if xml.unmarshal("<Bad><a>1</a></Bad>", bd) == nil {
+        fails("expected illegal-name unmarshal err")
+    }
+    // two ,chardata fields error at type analysis
+    [_, dce] = xml.marshal(Dbl{a: "x", b: "y"})
+    if dce == nil {
+        fails("expected dup-chardata err")
+    }
+    // payload variants need element children — bare text or an empty
+    // element both err rather than mint zeroed slots
+    d5 := new(Doc)
+    if xml.unmarshal("<Doc><sh>Rect</sh></Doc>", d5) == nil {
+        fails("expected payload-variant bare-text err")
+    }
+    if xml.unmarshal("<Doc><sh><Circ>4</Circ></sh></Doc>", d5) == nil {
+        fails("expected payload-variant empty err")
+    }
+    // attr values escape \t \n \r; entity refs decode inside attrs
+    d.note = "a\tb\nc"
+    [s3, e3] = xml.marshal(d)
+    if e3 != nil || find(s3, "note=\"a&#x9;b&#xA;c\"") < 0 {
+        fails("attr ws escaping: " + s3)
+    }
+    d6 := new(Doc)
+    if xml.unmarshal("<Doc id=\"1\" note=\"p&#x9;q&#xA;r\">x</Doc>", d6) != nil || d6.note != "p\tq\nr" {
+        fails("attr entity decode")
+    }
+    // non-scalar char refs decode as U+FFFD (EF BF BD), never
+    // invalid UTF-8
+    d7 := new(Doc)
+    if xml.unmarshal("<Doc><name>&#xD800;&#99999999;</name></Doc>", d7) != nil {
+        fails("charref decode")
+    }
+    if len(d7.name) != 6 || byteat(d7.name, 0) != 239 {
+        fails("charref U+FFFD")
+    }
+    // CDATA decodes literally
+    d8 := new(Doc)
+    if xml.unmarshal("<Doc><name><![CDATA[a<b&c]]></name></Doc>", d8) != nil || d8.name != "a<b&c" {
+        fails("cdata lane: " + d8.name)
+    }
+    // digit- and dash-led routed names error on both lanes — a
+    // NameStartChar gate on the tag keeps `<9x>` off the wire
+    [_, bn1] = xml.marshal(BadNum{v: 1})
+    if bn1 == nil {
+        fails("expected digit-name marshal err")
+    }
+    [_, bn2] = xml.marshal(BadDash{v: 1})
+    if bn2 == nil {
+        fails("expected dash-name marshal err")
+    }
+    bn := new(BadNum)
+    if xml.unmarshal("<BadNum><v>1</v></BadNum>", bn) == nil {
+        fails("expected digit-name unmarshal err")
+    }
+    bd2 := new(BadDash)
+    if xml.unmarshal("<BadDash><v>1</v></BadDash>", bd2) == nil {
+        fails("expected dash-name unmarshal err")
+    }
+    // the parser applies the same gate — a digit-led element is
+    // malformed XML at the root and nested
+    if xml.unmarshal("<9x></9x>", d4) == nil {
+        fails("expected digit-element parse err")
+    }
+    d9 := new(Doc)
+    if xml.unmarshal("<Doc><listed><9x/></listed></Doc>", d9) == nil {
+        fails("expected nested digit-element parse err")
+    }
+    // a UTF-8 BOM prefixes many documents — built byte-wise (there is
+    // no \x escape lane) and consumed before the misc scan
+    bom := mkbuf(3)
+    poke8(bom, 0, 239)
+    poke8(bom, 1, 187)
+    poke8(bom, 2, 191)
+    d10 := new(Doc)
+    if xml.unmarshal(bufstr(bom, 3) + "<Doc><name>bom</name></Doc>", d10) != nil || d10.name != "bom" {
+        fails("bom document")
+    }
+    // a payload variant whose children all miss the payload slot
+    // names still errs — zeroed slots must not mint silently
+    if xml.unmarshal("<Doc><sh><Circ><other/></Circ></sh></Doc>", d5) == nil {
+        fails("expected payload-variant unmatched-child err")
+    }
+    // scalar text trims — padded numerals parse; an xml:"-" field
+    // ignores a matching element on the unmarshal lane too
+    d11 := new(Doc)
+    if xml.unmarshal("<Doc><inner><v> 5 </v></inner><skip>9</skip></Doc>", d11) != nil {
+        fails("padded numeral")
+    }
+    if d11.inner.v != 5 || d11.skip != 0 {
+        fails("padded numeral / skip lane")
+    }
+    println("enc_xml ok")
+}

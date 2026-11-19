@@ -6854,7 +6854,7 @@ fn run() {
         exit(1)
     }
     if lvm == 1 {
-        print(emit_llvm(r, testm))
+        print(emit_llvm(r, testm, 0))
     } else if jsm == 1 {
         check.js_gate(r.ck, r.items)
         if len(r.ck.diags) > 0 {

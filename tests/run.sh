@@ -1971,6 +1971,35 @@ printf 'package main\nfn main() { assert(false) }\n' > "$scratch/trap.oxl"
 "$SEEDOXL" run "$scratch/trap.oxl" >/dev/null 2>&1 && seed_rc=0 || seed_rc=$?
 "$SELFOXL" run "$scratch/trap.oxl" >/dev/null 2>&1 && self_rc=0 || self_rc=$?
 [ "$seed_rc" = "$self_rc" ] || { echo "FAIL driver trap parity: $seed_rc vs $self_rc"; exit 1; }
+# R1: the descriptor lane is codegen-emitted, so index order, offsets,
+# kind codes, and variant metadata must be byte-identical through both
+# drivers — the fixture prints the whole table digest
+seed_out=$("$SEEDOXL" run tests/desc_parity.oxl 2>&1) && seed_rc=0 || seed_rc=$?
+self_out=$("$SELFOXL" run tests/desc_parity.oxl 2>&1) && self_rc=0 || self_rc=$?
+if [ "$seed_out" != "$self_out" ] || [ "$seed_rc" != "$self_rc" ]; then
+    echo "FAIL driver parity tests/desc_parity.oxl"
+    echo "-- seed ($seed_rc) --"; printf '%s
+' "$seed_out"
+    echo "-- self ($self_rc) --"; printf '%s
+' "$self_out"
+    exit 1
+fi
+grep -q 'desc_parity ok' <<<"$self_out" || { echo "FAIL desc_parity output"; printf '%s
+' "$self_out"; exit 1; }
+# and the js lane rejects every R1 surface identically on both drivers
+seed_out=$("$SEEDOXL" build tests/desc_parity.oxl --target js -o "$scratch/descjs" 2>&1 | sed 's/^[^:]*:[0-9][0-9]*:[0-9][0-9]*: //') && seed_rc=0 || seed_rc=$?
+self_out=$("$SELFOXL" build tests/desc_parity.oxl --target js -o "$scratch/descjs2" 2>&1 | sed 's/^[^:]*:[0-9][0-9]*:[0-9][0-9]*: //') && self_rc=0 || self_rc=$?
+if [ "$seed_rc" = 0 ] || [ "$self_rc" = 0 ]; then
+    echo "FAIL --target js accepted the descriptor lane"; exit 1
+fi
+if [ "$seed_out" != "$self_out" ] || [ "$seed_rc" != "$self_rc" ]; then
+    echo "FAIL driver parity desc --target js"
+    echo "-- seed --"; printf '%s
+' "$seed_out"
+    echo "-- self --"; printf '%s
+' "$self_out"
+    exit 1
+fi
 # the self driver covers the suite's core sections end to end —
 # build, run with args, test, and the sqlite/net feature gates
 out=$("$SELFOXL" run examples/hello.oxl)

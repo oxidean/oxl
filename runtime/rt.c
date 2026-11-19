@@ -4740,6 +4740,123 @@ int64_t rt_proc_output(RtSlice argv, RtSlice env, RtSlice *out, RtSlice *errb) {
 }
 #endif /* _WIN32 */
 
+/* ---------------- runtime type descriptors (R1) ---------------- */
+/* codegen always emits `o_desc_tab`/`o_desc_tab_n` — a {0}-row stub
+ * when no tdesc fold ran, so rt_desc_count() -> 0 makes every td arg
+ * below out-of-bounds and table-free programs behave identically to
+ * today. (A same-object weak stub here does NOT work: rt.o's own
+ * references bind section-locally to it at assemble time, so
+ * --gc-sections would strip the generated emit's strong table.) */
+
+static const RtTypeDesc *desc_at(int64_t td) {
+    if (td < 0 || td >= o_desc_tab_n) return 0;
+    return &o_desc_tab[td];
+}
+static const RtFieldDesc *desc_f_at(int64_t td, int64_t i) {
+    const RtTypeDesc *d = desc_at(td);
+    if (!d || i < 0 || i >= d->nfields) return 0;
+    return &d->fields[i];
+}
+static const RtVariantDesc *desc_v_at(int64_t td, int64_t vi) {
+    const RtTypeDesc *d = desc_at(td);
+    if (!d || vi < 0 || vi >= d->nvars) return 0;
+    return &d->vars[vi];
+}
+static const RtFieldDesc *desc_vf_at(int64_t td, int64_t vi, int64_t fi) {
+    const RtVariantDesc *v = desc_v_at(td, vi);
+    if (!v || fi < 0 || fi >= v->nfields) return 0;
+    return &v->fields[fi];
+}
+
+/* --- field reads --- */
+int64_t rt_field_i64(int64_t a) { return *(int64_t *)(uintptr_t)a; }
+int64_t rt_field_i32(int64_t a) { return *(int32_t *)(uintptr_t)a; }
+int64_t rt_field_u8(int64_t a) { return *(uint8_t *)(uintptr_t)a; }
+double rt_field_f64(int64_t a) { return *(double *)(uintptr_t)a; }
+OxlStr rt_field_str(int64_t a) { return *(OxlStr *)(uintptr_t)a; }
+OxlStr rt_field_cstr(int64_t a) {
+    const char *p = *(const char **)(uintptr_t)a;
+    return p ? rt_str(p) : rt_str("");
+}
+int64_t rt_field_ptr(int64_t a) { return (int64_t)(uintptr_t)*(void **)(uintptr_t)a; }
+
+/* --- field writes --- */
+void rt_field_set_i64(int64_t a, int64_t v) { *(int64_t *)(uintptr_t)a = v; }
+void rt_field_set_i32(int64_t a, int64_t v) { *(int32_t *)(uintptr_t)a = (int32_t)v; }
+void rt_field_set_u8(int64_t a, int64_t v) { *(uint8_t *)(uintptr_t)a = (uint8_t)v; }
+void rt_field_set_f64(int64_t a, double v) { *(double *)(uintptr_t)a = v; }
+void rt_field_set_str(int64_t a, OxlStr v) { *(OxlStr *)(uintptr_t)a = v; }
+void rt_field_set_ptr(int64_t a, int64_t v) { *(void **)(uintptr_t)a = (void *)(uintptr_t)v; }
+void rt_field_set_slice(int64_t a, int64_t hdr) { *(RtSlice *)(uintptr_t)a = *(RtSlice *)(uintptr_t)hdr; }
+
+/* --- descriptor accessors --- */
+int64_t rt_desc_count(void) { return o_desc_tab_n; }
+OxlStr rt_desc_name(int64_t td) {
+    const RtTypeDesc *d = desc_at(td);
+    return d && d->name ? rt_str(d->name) : rt_str("");
+}
+int64_t rt_desc_kind(int64_t td) { const RtTypeDesc *d = desc_at(td); return d ? d->kind : -1; }
+int64_t rt_desc_size(int64_t td) { const RtTypeDesc *d = desc_at(td); return d ? d->size : -1; }
+int64_t rt_desc_align(int64_t td) { const RtTypeDesc *d = desc_at(td); return d ? d->align : -1; }
+int64_t rt_desc_nfields(int64_t td) { const RtTypeDesc *d = desc_at(td); return d ? d->nfields : -1; }
+int64_t rt_desc_elem(int64_t td) { const RtTypeDesc *d = desc_at(td); return d ? d->elem : -1; }
+int64_t rt_desc_elem_ptr(int64_t td) { const RtTypeDesc *d = desc_at(td); return d ? d->elem_ptr : -1; }
+int64_t rt_desc_nvars(int64_t td) { const RtTypeDesc *d = desc_at(td); return d ? d->nvars : -1; }
+OxlStr rt_desc_v_name(int64_t td, int64_t vi) {
+    const RtVariantDesc *v = desc_v_at(td, vi);
+    return v && v->name ? rt_str(v->name) : rt_str("");
+}
+int64_t rt_desc_v_nfields(int64_t td, int64_t vi) { const RtVariantDesc *v = desc_v_at(td, vi); return v ? v->nfields : -1; }
+OxlStr rt_desc_v_f_name(int64_t td, int64_t vi, int64_t fi) {
+    const RtFieldDesc *f = desc_vf_at(td, vi, fi);
+    return f && f->name ? rt_str(f->name) : rt_str("");
+}
+int64_t rt_desc_v_f_td(int64_t td, int64_t vi, int64_t fi) { const RtFieldDesc *f = desc_vf_at(td, vi, fi); return f ? f->td : -1; }
+int64_t rt_desc_v_f_off(int64_t td, int64_t vi, int64_t fi) { const RtFieldDesc *f = desc_vf_at(td, vi, fi); return f ? f->off : -1; }
+int64_t rt_desc_v_f_ptr(int64_t td, int64_t vi, int64_t fi) { const RtFieldDesc *f = desc_vf_at(td, vi, fi); return f ? f->ptr : -1; }
+int64_t rt_desc_v_base(int64_t td) { const RtTypeDesc *d = desc_at(td); return d ? d->v_base : -1; }
+OxlStr rt_desc_f_sname(int64_t td, int64_t i) {
+    const RtFieldDesc *f = desc_f_at(td, i);
+    return f && f->name ? rt_str(f->name) : rt_str("");
+}
+int64_t rt_desc_f_off(int64_t td, int64_t i) { const RtFieldDesc *f = desc_f_at(td, i); return f ? f->off : -1; }
+int64_t rt_desc_f_td(int64_t td, int64_t i) { const RtFieldDesc *f = desc_f_at(td, i); return f ? f->td : -1; }
+OxlStr rt_desc_f_tag(int64_t td, int64_t i) {
+    const RtFieldDesc *f = desc_f_at(td, i);
+    return f && f->tag ? rt_str(f->tag) : rt_str("");
+}
+int64_t rt_desc_f_ptr(int64_t td, int64_t i) { const RtFieldDesc *f = desc_f_at(td, i); return f ? f->ptr : -1; }
+
+int64_t rt_desc_alloc(int64_t td) {
+    const RtTypeDesc *d = desc_at(td);
+    int64_t sz;
+    void *p;
+    if (!d) return -1;
+    sz = d->size > 0 ? d->size : 1;
+    p = rt_alloc_own(sz);
+    memset(p, 0, (size_t)sz);
+    return (int64_t)(uintptr_t)p;
+}
+
+/* decode lane for SLICE fields: td is the ELEMENT descriptor — mints
+ * a live RtSlice{ptr,len,cap,heap} header + n*elem-size backing on the
+ * own lane; callers store it per FieldDesc.ptr (rt_field_set_ptr for
+ * `own []T`, rt_field_set_slice for inline `[]T`) */
+int64_t rt_desc_alloc_slice(int64_t td, int64_t n) {
+    const RtTypeDesc *d = desc_at(td);
+    RtSlice *h;
+    int64_t esz;
+    if (!d || n < 0) return -1;
+    h = rt_alloc_own(sizeof *h);
+    esz = d->size > 0 ? d->size : 1;
+    h->ptr = rt_alloc_own(esz * (n > 0 ? n : 1));
+    memset(h->ptr, 0, (size_t)(esz * n));
+    h->len = n;
+    h->cap = n;
+    h->heap = 1;
+    return (int64_t)(uintptr_t)h;
+}
+
 /* ---------------- entry ---------------- */
 
 int main(int argc, char **argv) {

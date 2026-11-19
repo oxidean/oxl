@@ -1,0 +1,143 @@
+package main
+
+// R1 milestone parity fixture — tests/run.sh runs this under both the
+// stage0 (snapshot) driver and the self-compiled driver and requires
+// byte-identical output. Every line is derived from the compiler-
+// emitted descriptor table through the rt_desc_* ABI, so any codegen
+// drift between drivers shows up here.
+struct Point { x: int, y: int tag "unit:mm" }
+
+struct Node { v: int, next: own Node, tags: []str }
+
+enum Shape { Circle(int), Rect(int, int), Empty, }
+
+extern fn rt_desc_count() -> int
+
+extern fn rt_desc_name(td: int) -> str
+
+extern fn rt_desc_kind(td: int) -> int
+
+extern fn rt_desc_size(td: int) -> int
+
+extern fn rt_desc_nfields(td: int) -> int
+
+extern fn rt_desc_elem(td: int) -> int
+
+extern fn rt_desc_elem_ptr(td: int) -> int
+
+extern fn rt_desc_nvars(td: int) -> int
+
+extern fn rt_desc_v_name(td: int, i: int) -> str
+
+extern fn rt_desc_v_nfields(td: int, vi: int) -> int
+
+extern fn rt_desc_v_f_name(td: int, vi: int, fi: int) -> str
+
+extern fn rt_desc_v_f_td(td: int, vi: int, fi: int) -> int
+
+extern fn rt_desc_v_f_off(td: int, vi: int, fi: int) -> int
+
+extern fn rt_desc_v_base(td: int) -> int
+
+extern fn rt_desc_f_sname(td: int, i: int) -> str
+
+extern fn rt_desc_f_off(td: int, i: int) -> int
+
+extern fn rt_desc_f_td(td: int, i: int) -> int
+
+extern fn rt_desc_f_tag(td: int, i: int) -> str
+
+extern fn rt_desc_f_ptr(td: int, i: int) -> int
+
+fn dump(td: int) {
+    println(rt_desc_name(td) + " k=" + itoa(rt_desc_kind(td)) + " sz=" + itoa(rt_desc_size(td)) + " nf=" + itoa(rt_desc_nfields(td)))
+    i := 0
+    for i < rt_desc_nfields(td) {
+        println("  f " + rt_desc_f_sname(td, i) + " off=" + itoa(rt_desc_f_off(td, i)) + " td=" + itoa(rt_desc_f_td(td, i)) + " tag=" + rt_desc_f_tag(td, i) + " ptr=" + itoa(rt_desc_f_ptr(td, i)))
+        i = i + 1
+    }
+    i = 0
+    for i < rt_desc_nvars(td) {
+        println("  v " + rt_desc_v_name(td, i) + " nf=" + itoa(rt_desc_v_nfields(td, i)))
+        j := 0
+        for j < rt_desc_v_nfields(td, i) {
+            println("    pf " + rt_desc_v_f_name(td, i, j) + " td=" + itoa(rt_desc_v_f_td(td, i, j)) + " off=" + itoa(rt_desc_v_f_off(td, i, j)))
+            j = j + 1
+        }
+        i = i + 1
+    }
+}
+
+// generic-fold: tdesc(T)/tqual(T) resolve at instantiation, so these
+// must land on the same index as the concrete mentions below
+fn gd[T any](x: T) -> int {
+    return tdesc(T)
+}
+
+fn gdq[T any](x: T) -> int {
+    return tqual(T)
+}
+
+fn gds[T any](x: T) -> int {
+    return tdesc([]T)
+}
+
+fn gdc[T any](x: T) -> int {
+    return tdesc(chan own T)
+}
+
+fn gdt[T any](x: T) -> int {
+    t := type_of(T)
+    return 1
+}
+
+fn main() {
+    pd := tdesc(Point)
+    dump(pd)
+    if pd != 0 {
+        println("BAD first index " + itoa(pd))
+        exit(1)
+    }
+    nd := tdesc(Node)
+    dump(nd)
+    if rt_desc_f_ptr(nd, 1) != 1 {
+        println("BAD own-field ptr")
+        exit(1)
+    }
+    ed := tdesc(Shape)
+    dump(ed)
+    if rt_desc_v_base(ed) < 0 {
+        println("BAD v_base")
+        exit(1)
+    }
+    sd := tdesc([]byte)
+    println("slice " + rt_desc_name(sd) + " elem=" + rt_desc_name(rt_desc_elem(sd)) + " eptr=" + itoa(rt_desc_elem_ptr(sd)))
+    os := tdesc([]own Point)
+    println("ownslice elem=" + rt_desc_name(rt_desc_elem(os)) + " eptr=" + itoa(rt_desc_elem_ptr(os)))
+    if rt_desc_elem_ptr(os) != 1 {
+        println("BAD []own elem_ptr")
+        exit(1)
+    }
+    // dedup: same type identity, same index — direct and via generics
+    if tdesc(int) != rt_desc_f_td(pd, 0) {
+        println("BAD int dedup")
+        exit(1)
+    }
+    w := Point{x: 0, y: 0}
+    wo := new(Point{x: 0, y: 0})
+    if gd(w) != pd {
+        println("BAD generic fold")
+        exit(1)
+    }
+    println("gd=" + rt_desc_name(gd(w)) + " gdq=" + itoa(gdq(w)) + " gds=" + rt_desc_name(gds(0)) + " gdc=" + rt_desc_name(gdc(w)) + " gdt=" + itoa(gdt(w)))
+    // qualifier folds
+    println("tq=" + itoa(tqual(Point)) + itoa(tqual(own Point)) + itoa(tqual(ref Point)) + itoa(tqual(mut Point)))
+    // chan/fn/err kind lanes
+    println("misc " + rt_desc_name(tdesc(chan own Point)) + " " + rt_desc_name(tdesc(fn(int) -> str)) + " " + rt_desc_name(tdesc(err)))
+    // value handles mint + stay opaque (fields exercised in R2)
+    v := value_of(wo)
+    vv := value_of_mut(wo)
+    t := type_of(Point)
+    println("count=" + itoa(rt_desc_count()))
+    println("desc_parity ok")
+}

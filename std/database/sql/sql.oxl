@@ -10,6 +10,9 @@ package sql
 // The rt_sqlite_* shims compile only under -DOXL_SQLITE, which the
 // driver adds (with -lsqlite3 or the LANG_SQLITE_SRC amalgamation)
 // whenever the emitted program references them — native lane only.
+// exec_bind is the only parameter binder in the lite surface — query
+// takes raw SQL, so reads that need parameters build them via exec_bind
+// or wait for the full driver-registry surface.
 //
 // Handles spell `own byte`: an extern `own`-of-scalar param emits a
 // bare `void*` with no borrow marks (a `ref`/`mut` arg would emit
@@ -214,6 +217,9 @@ fn set_col(fv: reflect.Value, rows: Rows, j: int) -> err {
 /// statements sqlite3_stmt_readonly reports true — RETURNING writes get
 /// an error, not a silent double-execution.
 fn scan[T any](rows: Rows, out: mut []T) -> err {
+    if rows.st == nil {
+        return errors.new("sql: scan: statement is nil")
+    }
     t := type_of(T)
     if t.kind() != reflect.KindStruct() {
         return errors.new("sql: scan target " + t.name() + " is not a struct")

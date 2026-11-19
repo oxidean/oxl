@@ -1,0 +1,9 @@
+package main
+
+import "reflectesc/reflect"
+
+fn use(v: reflect.Value) -> reflect.Value {
+    return v
+}
+
+fn main() {}

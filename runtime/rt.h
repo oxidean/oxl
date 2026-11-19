@@ -110,6 +110,11 @@ typedef struct {
 } OxlStr;
 
 typedef struct RtScope RtScope;
+/* Placement invariant: objects carrying an ObjHdr never relocate —
+ * rt_alloc_own returns a stable address valid until the death path
+ * (rt_free, drop_elem teardown, scope close, or process exit). FFI
+ * consumers may borrow that address for the call's duration only;
+ * checked retention is the parked `pin` primitive. */
 typedef struct ObjHdr {
     uint32_t gen;
     uint8_t borrow; /* advisory last-seen mode — the borrow
@@ -291,6 +296,85 @@ int rt_msleep_poll(int64_t ms, RtTask *t);   /* ms-granularity suspend */
 #define RT_SEL_ELSE (-3)
 int rt_select_poll(RtChan **chs, int n, int64_t tmo_ms, int has_else, RtTask *t);
 int64_t rt_select_arm(RtTask *t); /* cleanup parked waiters; returns arm */
+
+/* --- runtime type descriptors (R1) ---
+ * codegen always emits `const RtTypeDesc o_desc_tab[]` +
+ * `o_desc_tab_n` — a `{0}` stub row when no tdesc/type_of/value_of
+ * fold ran (rt.c explains why a weak stub cannot work). kind values are the frozen
+ * order: INT FLOAT BOOL STR BYTE SLICE MAP STRUCT PTR CHAN IFACE FN
+ * ERR ENUM VOID (MAP is reserved — no Ty produces it). `v_base`
+ * extends the record for rt_desc_v_base: the codegen-pinned offsetof
+ * of an enum's union blob (-1 elsewhere). */
+typedef struct {
+    const char *name;
+    int64_t off;
+    int64_t td;
+    const char *tag;
+    int64_t ptr;
+} RtFieldDesc;
+typedef struct {
+    const char *name;
+    int64_t nfields;
+    const RtFieldDesc *fields;
+} RtVariantDesc;
+typedef struct {
+    const char *name;
+    uint8_t kind;
+    int64_t size;
+    int64_t align;
+    int64_t nfields;
+    const RtFieldDesc *fields;
+    int64_t elem;
+    int64_t elem_ptr;
+    int64_t nvars;
+    const RtVariantDesc *vars;
+    int64_t v_base;
+} RtTypeDesc;
+extern const RtTypeDesc o_desc_tab[];
+extern const int64_t o_desc_tab_n;
+
+/* field reads — C loads interpreting `addr` per the desc's kind */
+int64_t rt_field_i64(int64_t addr);      /* INT + ERR lane (8B) */
+int64_t rt_field_i32(int64_t addr);      /* BOOL + enum tag lane (C int) */
+int64_t rt_field_u8(int64_t addr);       /* BYTE lane */
+double  rt_field_f64(int64_t addr);
+OxlStr  rt_field_str(int64_t addr);      /* borrow — same lifetime as v */
+OxlStr  rt_field_cstr(int64_t addr);     /* PTR lane — rt_str over char* */
+int64_t rt_field_ptr(int64_t addr);      /* the pointer stored in the slot */
+/* field writes — the decode lane */
+void rt_field_set_i64(int64_t addr, int64_t v);
+void rt_field_set_i32(int64_t addr, int64_t v);
+void rt_field_set_u8(int64_t addr, int64_t v);
+void rt_field_set_f64(int64_t addr, double v);
+void rt_field_set_str(int64_t addr, OxlStr v); /* caller passes rt_str_own backing */
+void rt_field_set_ptr(int64_t addr, int64_t v);
+void rt_field_set_slice(int64_t addr, int64_t hdr); /* copies the RtSlice header at hdr */
+/* descriptor accessors — every index arg bounds-checked; sentinels
+ * are -1 for ints and "" for strs (rt_desc_count() -> 0 on the stub
+ * table, so every td arg below oobs) */
+int64_t rt_desc_count(void);
+OxlStr  rt_desc_name(int64_t td);
+int64_t rt_desc_kind(int64_t td);
+int64_t rt_desc_size(int64_t td);
+int64_t rt_desc_align(int64_t td);
+int64_t rt_desc_nfields(int64_t td);
+int64_t rt_desc_elem(int64_t td);        /* -1 when absent */
+int64_t rt_desc_elem_ptr(int64_t td);    /* 1 when the elem SLOT is a ptr ([]own T) */
+int64_t rt_desc_nvars(int64_t td);
+OxlStr  rt_desc_v_name(int64_t td, int64_t i);
+int64_t rt_desc_v_nfields(int64_t td, int64_t vi);
+OxlStr  rt_desc_v_f_name(int64_t td, int64_t vi, int64_t fi); /* fN synthesized names */
+int64_t rt_desc_v_f_td(int64_t td, int64_t vi, int64_t fi);
+int64_t rt_desc_v_f_off(int64_t td, int64_t vi, int64_t fi);
+int64_t rt_desc_v_f_ptr(int64_t td, int64_t vi, int64_t fi);
+int64_t rt_desc_v_base(int64_t td);      /* codegen-pinned union-blob offsetof */
+OxlStr  rt_desc_f_sname(int64_t td, int64_t i);
+int64_t rt_desc_f_off(int64_t td, int64_t i);
+int64_t rt_desc_f_td(int64_t td, int64_t i);
+OxlStr  rt_desc_f_tag(int64_t td, int64_t i);  /* "" when absent */
+int64_t rt_desc_f_ptr(int64_t td, int64_t i);  /* 1: slot is a ptr */
+int64_t rt_desc_alloc(int64_t td);       /* zeroed pointee mint — rt_alloc_own */
+int64_t rt_desc_alloc_slice(int64_t td, int64_t n); /* live RtSlice header + own backing */
 
 /* --- slices: {ptr,len,cap,heap} fat header, erased element type ---
  * borrow-slice backing comes from rt_alloc (scope arena when inside a

@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "id": "WI-0019",
+  "title": "iface-boxed borrow escape — asreader() dangle (issue #138)",
+  "state": "archived",
+  "profile": "normal",
+  "current_stage": "intake",
+  "created_at": "2026-11-17T19:37:17Z",
+  "updated_at": "2026-11-19T01:41:53Z"
+}

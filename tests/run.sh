@@ -1099,7 +1099,7 @@ for f in tests/diag/*.oxl; do
     # both checkers must reject every fixture (pipefail carries the
     # build's nonzero status through the sed) — and their diagnostics
     # must be identical. A fixture either side accepts is a test bug.
-    if seed=$("$SEEDOXL" build "$f" -o "$scratch/diagbin" 2>&1 | sed 's/^[^:]*:[0-9][0-9]*:[0-9][0-9]*: //'); then
+    if seed=$("$SEEDOXL" build "$f" -o "$scratch/diagbin" 2>&1 | sed -E 's/^([A-Za-z]:)?[^:]*:[0-9]+:[0-9]+: //'); then
         echo "FAIL diag parity $f: seed checker accepted"; exit 1
     fi
     if self=$("$scratch/selfcheck$EXE" "$f" 2>&1); then
@@ -1130,7 +1130,7 @@ mkdir -p "$scratch/oxlmodcache"
 export OXLMODCACHE="$scratch/oxlmodcache"
 for f in tests/mod/*/; do
     case "$f" in tests/mod/widget/|tests/mod/intmod/) continue ;; esac
-    seed_out=$("$SEEDOXL" build "$f" -o "$scratch/modbin" 2>&1 | sed 's/^[^:]*:[0-9][0-9]*:[0-9][0-9]*: //') && seed_rc=0 || seed_rc=1
+    seed_out=$("$SEEDOXL" build "$f" -o "$scratch/modbin" 2>&1 | sed -E 's/^([A-Za-z]:)?[^:]*:[0-9]+:[0-9]+: //') && seed_rc=0 || seed_rc=1
     self_out=$("$scratch/selfcheck$EXE" "$f" 2>&1) && self_rc=0 || self_rc=1
     if [ "$(cat "$f/expected")" = ok ]; then
         if [ "$seed_rc" != 0 ]; then
@@ -1161,7 +1161,7 @@ done
 # the local import must fail identically on both checkers.
 mkdir -p "$scratch/modoff"
 printf 'package main\n\nimport "localpkg"\n\nfn main() {}\n' > "$scratch/modoff/main.oxl"
-seed_out=$("$SEEDOXL" build "$scratch/modoff" -o "$scratch/modbin" 2>&1 | sed 's/^[^:]*:[0-9][0-9]*:[0-9][0-9]*: //') && seed_rc=0 || seed_rc=1
+seed_out=$("$SEEDOXL" build "$scratch/modoff" -o "$scratch/modbin" 2>&1 | sed -E 's/^([A-Za-z]:)?[^:]*:[0-9]+:[0-9]+: //') && seed_rc=0 || seed_rc=1
 self_out=$("$scratch/selfcheck$EXE" "$scratch/modoff" 2>&1) && self_rc=0 || self_rc=1
 if [ "$seed_rc" = 0 ] || [ "$self_rc" = 0 ] || [ "$seed_out" != "$self_out" ]; then
     echo "FAIL module-off parity"
@@ -1176,7 +1176,7 @@ fi
 mkdir -p "$scratch/workfm"
 printf 'oxlwork 0.3\nuse ./nonexistent\n' > "$scratch/workfm/oxl.work"
 printf 'package main\n\nfn main() {}\n' > "$scratch/workfm/main.oxl"
-seed_out=$("$SEEDOXL" build "$scratch/workfm/main.oxl" -o "$scratch/workfmbin" 2>&1 | sed 's/^[^:]*:[0-9][0-9]*:[0-9][0-9]*: //') && seed_rc=0 || seed_rc=1
+seed_out=$("$SEEDOXL" build "$scratch/workfm/main.oxl" -o "$scratch/workfmbin" 2>&1 | sed -E 's/^([A-Za-z]:)?[^:]*:[0-9]+:[0-9]+: //') && seed_rc=0 || seed_rc=1
 self_out=$("$scratch/selfcheck$EXE" "$scratch/workfm/main.oxl" 2>&1) && self_rc=0 || self_rc=1
 if [ "$seed_rc" != 0 ] || [ "$self_rc" != 0 ] || [ "$self_out" != ok ]; then
     echo "FAIL work-filemode: work file not ignored"
@@ -1195,7 +1195,7 @@ mkdir -p "$scratch/workdangle/app"
 printf 'module local/dangle\noxl 0.3\n' > "$scratch/workdangle/oxl.mod"
 printf 'package main\nfn main() {}\n' > "$scratch/workdangle/app/main.oxl"
 ln -s "$scratch/workdangle/no-such-target" "$scratch/workdangle/oxl.work"
-seed_out=$("$SEEDOXL" build "$scratch/workdangle/app" -o "$scratch/danglebin" 2>&1 | sed 's/^[^:]*:[0-9][0-9]*:[0-9][0-9]*: //') && seed_rc=0 || seed_rc=1
+seed_out=$("$SEEDOXL" build "$scratch/workdangle/app" -o "$scratch/danglebin" 2>&1 | sed -E 's/^([A-Za-z]:)?[^:]*:[0-9]+:[0-9]+: //') && seed_rc=0 || seed_rc=1
 self_out=$("$scratch/selfcheck$EXE" "$scratch/workdangle/app" 2>&1) && self_rc=0 || self_rc=1
 if [ "$seed_rc" != 0 ] || [ "$self_rc" != 0 ] || [ "$self_out" != ok ]; then
     echo "FAIL work-dangle: dangling oxl.work not treated as absent"
@@ -1214,7 +1214,7 @@ mkdir -p "$scratch/workbadutf8/app"
 printf 'module local/badutf8\noxl 0.3\n' > "$scratch/workbadutf8/oxl.mod"
 printf 'package main\nfn main() {}\n' > "$scratch/workbadutf8/app/main.oxl"
 printf 'oxlwork 0.3\n// \xff\xfe\nuse ./app\n' > "$scratch/workbadutf8/oxl.work"
-seed_out=$("$SEEDOXL" build "$scratch/workbadutf8/app" -o "$scratch/utf8bin" 2>&1 | sed 's/^[^:]*:[0-9][0-9]*:[0-9][0-9]*: //') && seed_rc=0 || seed_rc=1
+seed_out=$("$SEEDOXL" build "$scratch/workbadutf8/app" -o "$scratch/utf8bin" 2>&1 | sed -E 's/^([A-Za-z]:)?[^:]*:[0-9]+:[0-9]+: //') && seed_rc=0 || seed_rc=1
 self_out=$("$scratch/selfcheck$EXE" "$scratch/workbadutf8/app" 2>&1) && self_rc=0 || self_rc=1
 if [ "$seed_rc" = 0 ] || [ "$self_rc" = 0 ]; then
     echo "FAIL work-badutf8: invalid UTF-8 accepted"
@@ -1911,8 +1911,8 @@ mp_out=$("$SELFOXL" test "$scratch/mp/a" --target c "$scratch/mp/b" 2>&1) && mp_
 # emit + cc): every fixture must fail identically on both drivers —
 # same text, same exit code, and neither side may accept
 for f in tests/diag/*.oxl; do
-    seed_out=$("$SEEDOXL" build "$f" -o "$scratch/drvbin" 2>&1 | sed 's/^[^:]*:[0-9][0-9]*:[0-9][0-9]*: //') && seed_rc=0 || seed_rc=$?
-    self_out=$("$SELFOXL" build "$f" -o "$scratch/drvbin2" 2>&1 | sed 's/^[^:]*:[0-9][0-9]*:[0-9][0-9]*: //') && self_rc=0 || self_rc=$?
+    seed_out=$("$SEEDOXL" build "$f" -o "$scratch/drvbin" 2>&1 | sed -E 's/^([A-Za-z]:)?[^:]*:[0-9]+:[0-9]+: //') && seed_rc=0 || seed_rc=$?
+    self_out=$("$SELFOXL" build "$f" -o "$scratch/drvbin2" 2>&1 | sed -E 's/^([A-Za-z]:)?[^:]*:[0-9]+:[0-9]+: //') && self_rc=0 || self_rc=$?
     if [ "$seed_rc" = 0 ] || [ "$self_rc" = 0 ]; then
         echo "FAIL driver corpus $f: a driver accepted"; exit 1
     fi
@@ -1931,8 +1931,8 @@ mkdir -p "$scratch/oxlmodcache-drv"
 export OXLMODCACHE="$scratch/oxlmodcache-drv"
 for f in tests/mod/*/; do
     case "$f" in tests/mod/widget/|tests/mod/intmod/) continue ;; esac
-    seed_out=$("$SEEDOXL" build "$f" -o "$scratch/drvbin" 2>&1 | sed 's/^[^:]*:[0-9][0-9]*:[0-9][0-9]*: //') && seed_rc=0 || seed_rc=$?
-    self_out=$("$SELFOXL" build "$f" -o "$scratch/drvbin2" 2>&1) && self_rc=0 || self_rc=$?
+    seed_out=$("$SEEDOXL" build "$f" -o "$scratch/drvbin" 2>&1 | sed -E 's/^([A-Za-z]:)?[^:]*:[0-9]+:[0-9]+: //') && seed_rc=0 || seed_rc=$?
+    self_out=$("$SELFOXL" build "$f" -o "$scratch/drvbin2" 2>&1 | sed -E 's/^([A-Za-z]:)?[^:]*:[0-9]+:[0-9]+: //') && self_rc=0 || self_rc=$?
     if [ "$(cat "$f/expected")" = ok ]; then
         if [ "$seed_rc" != 0 ] || [ "$self_rc" != 0 ]; then
             echo "FAIL driver module $f: a driver rejected (seed=$seed_rc self=$self_rc)"
@@ -1984,7 +1984,7 @@ if [ "$seed_out" != "$self_out" ] || [ "$seed_rc" != "$self_rc" ]; then
     echo "-- self ($self_rc) --"; printf '%s\n' "$self_out"
     exit 1
 fi
-seed_out=$("$SEEDOXL" build "$scratch/flist/m.oxl" "$scratch/flother/o.oxl" -o "$scratch/flbin" 2>&1 | sed 's/^[^:]*:[0-9][0-9]*:[0-9][0-9]*: //') && seed_rc=0 || seed_rc=$?
+seed_out=$("$SEEDOXL" build "$scratch/flist/m.oxl" "$scratch/flother/o.oxl" -o "$scratch/flbin" 2>&1 | sed -E 's/^([A-Za-z]:)?[^:]*:[0-9]+:[0-9]+: //') && seed_rc=0 || seed_rc=$?
 self_out=$("$SELFOXL" build "$scratch/flist/m.oxl" "$scratch/flother/o.oxl" -o "$scratch/flbin2" 2>&1) && self_rc=0 || self_rc=$?
 if [ "$seed_out" != "$self_out" ] || [ "$seed_rc" != "$self_rc" ]; then
     echo "FAIL driver one-directory parity"
@@ -2003,6 +2003,73 @@ printf 'package main\nfn main() { assert(false) }\n' > "$scratch/trap.oxl"
 "$SEEDOXL" run "$scratch/trap.oxl" >/dev/null 2>&1 && seed_rc=0 || seed_rc=$?
 "$SELFOXL" run "$scratch/trap.oxl" >/dev/null 2>&1 && self_rc=0 || self_rc=$?
 [ "$seed_rc" = "$self_rc" ] || { echo "FAIL driver trap parity: $seed_rc vs $self_rc"; exit 1; }
+# R1: the descriptor lane is codegen-emitted, so index order, offsets,
+# kind codes, and variant metadata must be byte-identical through both
+# drivers — the fixture prints the whole table digest
+seed_out=$("$SEEDOXL" run tests/desc_parity.oxl 2>&1 | sed -E 's/^([A-Za-z]:)?[^:]*:[0-9]+:[0-9]+: //' | sed -E 's/^([A-Za-z]:)?[^:]*:[0-9]+:[0-9]+: //') && seed_rc=0 || seed_rc=$?
+self_out=$("$SELFOXL" run tests/desc_parity.oxl 2>&1 | sed -E 's/^([A-Za-z]:)?[^:]*:[0-9]+:[0-9]+: //' | sed -E 's/^([A-Za-z]:)?[^:]*:[0-9]+:[0-9]+: //') && self_rc=0 || self_rc=$?
+# matching failure IS a failure — both runs must exit 0, not just agree
+if [ "$seed_rc" != 0 ] || [ "$self_rc" != 0 ]; then
+    echo "FAIL tests/desc_parity.oxl native run: seed rc=$seed_rc self rc=$self_rc"
+    echo "-- seed --"; printf '%s
+' "$seed_out"
+    echo "-- self --"; printf '%s
+' "$self_out"
+    exit 1
+fi
+if [ "$seed_out" != "$self_out" ] || [ "$seed_rc" != "$self_rc" ]; then
+    echo "FAIL driver parity tests/desc_parity.oxl"
+    echo "-- seed ($seed_rc) --"; printf '%s
+' "$seed_out"
+    echo "-- self ($self_rc) --"; printf '%s
+' "$self_out"
+    exit 1
+fi
+grep -q 'desc_parity ok' <<<"$self_out" || { echo "FAIL desc_parity output"; printf '%s
+' "$self_out"; exit 1; }
+# and the js lane rejects every R1 surface identically on both drivers
+seed_out=$("$SEEDOXL" build tests/desc_parity.oxl --target js -o "$scratch/descjs" 2>&1 | sed -E 's/^([A-Za-z]:)?[^:]*:[0-9]+:[0-9]+: //') && seed_rc=0 || seed_rc=$?
+self_out=$("$SELFOXL" build tests/desc_parity.oxl --target js -o "$scratch/descjs2" 2>&1 | sed -E 's/^([A-Za-z]:)?[^:]*:[0-9]+:[0-9]+: //') && self_rc=0 || self_rc=$?
+if [ "$seed_rc" = 0 ] || [ "$self_rc" = 0 ]; then
+    echo "FAIL --target js accepted the descriptor lane"; exit 1
+fi
+if [ "$seed_out" != "$self_out" ] || [ "$seed_rc" != "$self_rc" ]; then
+    echo "FAIL driver parity desc --target js"
+    echo "-- seed --"; printf '%s
+' "$seed_out"
+    echo "-- self --"; printf '%s
+' "$self_out"
+    exit 1
+fi
+# the descriptor runtime lane — elem_ptr on borrow-qualified slots,
+# double-handle value_of loads, reflect handles embedded in pair
+# aggregates, and the rt_desc_alloc* overflow guards
+seed_out=$("$SEEDOXL" run tests/desc_rt.oxl 2>&1 | sed -E 's/^([A-Za-z]:)?[^:]*:[0-9]+:[0-9]+: //' | sed -E 's/^([A-Za-z]:)?[^:]*:[0-9]+:[0-9]+: //') && seed_rc=0 || seed_rc=$?
+self_out=$("$SELFOXL" run tests/desc_rt.oxl 2>&1 | sed -E 's/^([A-Za-z]:)?[^:]*:[0-9]+:[0-9]+: //' | sed -E 's/^([A-Za-z]:)?[^:]*:[0-9]+:[0-9]+: //') && self_rc=0 || self_rc=$?
+if [ "$seed_rc" != 0 ] || [ "$self_rc" != 0 ]; then
+    echo "FAIL tests/desc_rt.oxl native run: seed rc=$seed_rc self rc=$self_rc"
+    echo "-- seed --"; printf '%s
+' "$seed_out"
+    echo "-- self --"; printf '%s
+' "$self_out"
+    exit 1
+fi
+if [ "$seed_out" != "$self_out" ]; then
+    echo "FAIL driver parity tests/desc_rt.oxl"
+    echo "-- seed --"; printf '%s
+' "$seed_out"
+    echo "-- self --"; printf '%s
+' "$self_out"
+    exit 1
+fi
+grep -q 'desc_rt ok' <<<"$self_out" || { echo "FAIL desc_rt output"; printf '%s
+' "$self_out"; exit 1; }
+# a local fn value shadowing an intrinsic name is NOT the resolved
+# intrinsic — the --target js gate keys on resolved call sites, so the
+# shadow must build cleanly on both drivers
+printf 'package main\n\nfn add1(x: int) -> int {\n    return x + 1\n}\n\nfn main() {\n    value_of := add1\n    println(itoa(value_of(41)))\n}\n' > "$scratch/jsshadow.oxl"
+"$SEEDOXL" build "$scratch/jsshadow.oxl" --target js -o "$scratch/jsshad" >/dev/null 2>&1 || { echo "FAIL --target js shadowed value_of: seed rejected"; exit 1; }
+"$SELFOXL" build "$scratch/jsshadow.oxl" --target js -o "$scratch/jsshad2" >/dev/null 2>&1 || { echo "FAIL --target js shadowed value_of: self rejected"; exit 1; }
 # the self driver covers the suite's core sections end to end —
 # build, run with args, test, and the sqlite/net feature gates
 out=$("$SELFOXL" run examples/hello.oxl)

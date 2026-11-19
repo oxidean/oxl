@@ -200,6 +200,8 @@ struct G {
     inst_done: own collections.Map, // mangled inst name -> 1
     vtabs: own GVU, // materialized (iface, impl) pairs, newest first
     vtab_set: own collections.Map, // "w|impl" -> 1 dedup
+    descs: []GD, // R1 — descriptor records in first-mention order
+    dmap: own collections.Map, // canonical ty name -> descs idx
     vout: []str, // vtab thunks + arrays (emitted after out)
     cur: str, // current fn's qualified name
     inframe: int,
@@ -1138,6 +1140,15 @@ fn xty_call(g: mut G, f: ref parser.Node, args: ref parser.NList) -> int {
         }
         return check.ti(g.ck, check.k_slice(), et)
     }
+    if name == "tdesc" || name == "tqual" {
+        return check.t_int(g.ck)
+    }
+    if name == "type_of" {
+        return check.reflect_st(g.ck, "Type")
+    }
+    if name == "value_of" || name == "value_of_mut" {
+        return check.reflect_st(g.ck, "Value")
+    }
     if name == "push" && args != nil {
         return xty(g, args.v)
     }
@@ -1391,6 +1402,205 @@ fn gsub(g: mut G, t: int) -> int {
         return t
     }
     return check.subst_ty(g.ck, t, g.subst)
+}
+
+// ---------- R1: runtime type descriptors ----------
+struct GD { t: int }
+
+fn gdesc_base(g: mut G, t: int) -> int {
+    for tyk(g, t) == check.k_own() || tyk(g, t) == check.k_ref() || tyk(g, t) == check.k_mut() {
+        t = tyi(g, t)
+    }
+    return t
+}
+
+// descriptor index for `t` — dedup'd by canonical ty name (the
+// checker's identity rule: nominal for named types, structural for
+// composites); indices assign in first-mention order. Reference
+// expansion is deferred to gemit_descs so a later tdesc mention still
+// takes the next index in emission-traversal order.
+fn gdesc(g: mut G, t: int) -> int {
+    t = gsub(g, t)
+    t = gdesc_base(g, t)
+    key := check.ty_name(g.ck, t)
+    if collections.map_has(g.dmap, key) {
+        [v, err] = collections.map_get(g.dmap, key)
+        if err == nil {
+            return v
+        }
+    }
+    idx := len(g.descs)
+    g.descs = push(g.descs, GD{t: t})
+    collections.map_set(g.dmap, key, idx)
+    return idx
+}
+
+// frozen kind order — stable ABI surface (MAP reserved: no Ty produces it)
+fn gdesc_kind(ck: ref check.Ck, t: int) -> int {
+    k := ck.tyv[t].k
+    if k == check.k_int() {
+        return 0
+    }
+    if k == check.k_float() {
+        return 1
+    }
+    if k == check.k_bool() {
+        return 2
+    }
+    if k == check.k_str() {
+        return 3
+    }
+    if k == check.k_byte() {
+        return 4
+    }
+    if k == check.k_slice() {
+        return 5
+    }
+    if k == check.k_struct() {
+        return 7
+    }
+    if k == check.k_cstr() {
+        return 8
+    }
+    if k == check.k_chan() {
+        return 9
+    }
+    if k == check.k_iface() {
+        return 10
+    }
+    if k == check.k_fn() {
+        return 11
+    }
+    if k == check.k_err() {
+        return 12
+    }
+    if k == check.k_enum() {
+        return 13
+    }
+    return 14 // VOID — Scope/shared and unreachable leftovers
+}
+
+// emit the FieldDesc/VariantDesc arrays + the table itself. Worklist
+// order: walking descs[i]'s references appends new records, so the
+// table lists each type's transitive deps after it — a descriptor
+// naming a type keeps that type emitted through the sizeof/offsetof
+// spellings (the G1 textual-edge reachability).
+fn gemit_descs(g: mut G) {
+    rows := ""
+    i := 0
+    for i < len(g.descs) {
+        t := g.descs[i].t
+        k := tyk(g, t)
+        cty := gcty(g, t)
+        nf := 0
+        fp := "0"
+        el := -1
+        ep := 0
+        nv := 0
+        vp := "0"
+        vb := "-1"
+        if k == check.k_struct() {
+            sn := g.ck.tyv[t].name
+            if collections.map_has(g.ck.structs, sn) {
+                [si, serr] = collections.map_get(g.ck.structs, sn)
+                if serr == nil {
+                    fl := g.ck.structsv[si].fields
+                    if fl != nil {
+                        lines := ""
+                        for fl != nil {
+                            fe := fl.v
+                            ftd := gdesc(g, fe.t)
+                            ptr := 0
+                            if tyk(g, fe.t) == check.k_own() {
+                                ptr = 1
+                            }
+                            tag := "0"
+                            if len(fe.tag) > 0 {
+                                tag = "\"" + fe.tag + "\""
+                            }
+                            lines = lines + "    { \"" + fe.n + "\", offsetof(" + cty + ", f_" + fe.n + "), " + itoa(ftd) + ", " + tag + ", " + itoa(ptr) + " },\n"
+                            nf = nf + 1
+                            fl = fl.next
+                        }
+                        g.head = push(g.head, "static const RtFieldDesc o_df_" + itoa(i) + "[] = {\n" + lines + "};\n")
+                        fp = "o_df_" + itoa(i)
+                    }
+                }
+            }
+        }
+        if k == check.k_slice() {
+            et := tyi(g, t)
+            if et >= 0 {
+                ek := tyk(g, et)
+                if ek == check.k_own() || ek == check.k_ref() || ek == check.k_mut() {
+                    // `[]own T` / `[]ref T` / `[]mut T` — the element
+                    // slot is a pointer to T's layout; elem_ptr marks
+                    // the deref-once contract ([]byte stays inline)
+                    ep = 1
+                    el = gdesc(g, tyi(g, et))
+                } else {
+                    el = gdesc(g, et)
+                }
+            }
+        }
+        if k == check.k_chan() {
+            et := tyi(g, t)
+            if et >= 0 {
+                el = gdesc(g, et)
+            }
+        }
+        if k == check.k_enum() {
+            en := g.ck.tyv[t].name
+            vb = "offsetof(" + cty + ", u)"
+            if collections.map_has(g.ck.enums, en) {
+                [ei, eerr] = collections.map_get(g.ck.enums, en)
+                if eerr == nil {
+                    vl := g.ck.enumsv[ei].vars
+                    vi := 0
+                    vlines := ""
+                    for vl != nil {
+                        vfp := "0"
+                        vnf := 0
+                        if vl.v.fields != nil {
+                            fl2 := vl.v.fields
+                            lines := ""
+                            for fl2 != nil {
+                                fe := fl2.v
+                                ftd := gdesc(g, fe.t)
+                                pk := tyk(g, fe.t)
+                                ptr := 0
+                                if pk == check.k_own() || pk == check.k_ref() || pk == check.k_mut() {
+                                    ptr = 1
+                                }
+                                // payload offs are relative to the
+                                // union blob's base, never absolute
+                                lines = lines + "    { \"" + fe.n + "\", offsetof(" + cty + ", u.v" + itoa(vi) + ".f_" + fe.n + ") - offsetof(" + cty + ", u), " + itoa(ftd) + ", 0, " + itoa(ptr) + " },\n"
+                                vnf = vnf + 1
+                                fl2 = fl2.next
+                            }
+                            g.head = push(g.head, "static const RtFieldDesc o_dvf_" + itoa(i) + "_" + itoa(vi) + "[] = {\n" + lines + "};\n")
+                            vfp = "o_dvf_" + itoa(i) + "_" + itoa(vi)
+                        }
+                        vlines = vlines + "    { \"" + vl.v.n + "\", " + itoa(vnf) + ", " + vfp + " },\n"
+                        nv = nv + 1
+                        vi = vi + 1
+                        vl = vl.next
+                    }
+                    g.head = push(g.head, "static const RtVariantDesc o_dv_" + itoa(i) + "[] = {\n" + vlines + "};\n")
+                    vp = "o_dv_" + itoa(i)
+                }
+            }
+        }
+        rows = rows + "    { \"" + check.ty_name(g.ck, t) + "\", " + itoa(gdesc_kind(g.ck, t)) + ", sizeof(" + cty + "), _Alignof(" + cty + "), " + itoa(nf) + ", " + fp + ", " + itoa(el) + ", " + itoa(ep) + ", " + itoa(nv) + ", " + vp + ", " + vb + " },\n"
+        i = i + 1
+    }
+    if len(rows) == 0 {
+        // no tdesc fold ran — emit the zero-row stub so the externs
+        // still resolve; rt_desc_count() reads o_desc_tab_n = 0
+        rows = "    { 0 },\n"
+    }
+    g.head = push(g.head, "const RtTypeDesc o_desc_tab[] = {\n" + rows + "};\n")
+    g.head = push(g.head, "const int64_t o_desc_tab_n = " + itoa(len(g.descs)) + ";\n")
 }
 
 // ty -> C-identifier fragment for inst names (seed mangle_ty)
@@ -1730,7 +1940,7 @@ fn gcall_plan(g: mut G, f: ref parser.Node, args: ref parser.NList) -> own GCP {
         _ => {
         }
     }
-    if args != nil {
+    if args != nil && !check.is_builtin(name) {
         t0 := gsub(g, xty(g, args.v))
         if t0 >= 0 {
             mt := check.method_target(g.ck, t0, name)
@@ -2943,6 +3153,71 @@ fn gcall(g: mut G, f: ref parser.Node, args: ref parser.NList) -> str {
             n = gav_at(argvs, 1)
         }
         return "rt_mkslice(" + n + ", sizeof(" + gcty(g, et) + "))"
+    }
+    if qn == "tdesc" || qn == "tqual" || qn == "type_of" {
+        // R1 folds — the operand is a type in mkslice's arg0 grammar;
+        // inside an inst the active subst makes `T` concrete, so the
+        // index is a compile-time constant
+        et := check.t_unk(g.ck)
+        if args != nil {
+            if check.nk(args.v) == 2 || check.nk(args.v) == 9 {
+                an := check.callee_name(args.v)
+                if len(an) > 0 {
+                    et = check.ty_parse(g.ck, an)
+                }
+            }
+            if check.nk(args.v) == 3 {
+                et = gty(g, args.v)
+            }
+        }
+        et = gsub(g, et)
+        if qn == "tqual" {
+            qk := tyk(g, et)
+            c := "0LL"
+            if qk == check.k_own() {
+                c = "1LL"
+            }
+            if qk == check.k_ref() {
+                c = "2LL"
+            }
+            if qk == check.k_mut() {
+                c = "3LL"
+            }
+            return c
+        }
+        di := itoa(gdesc(g, et))
+        if qn == "type_of" {
+            return "(struct o_s_oxl_reflect_Type){ " + di + "LL }"
+        }
+        return di + "LL"
+    }
+    if qn == "value_of" || qn == "value_of_mut" {
+        if args == nil {
+            return "(struct o_s_oxl_reflect_Value){ 0LL, 0LL, 0LL }"
+        }
+        at := gsub(g, xty(g, args.v))
+        ak := tyk(g, at)
+        base := at
+        av := argvs.v
+        if ak == check.k_own() || ak == check.k_ref() || ak == check.k_mut() {
+            base = tyi(g, at)
+            bk := tyk(g, base)
+            // qualified-T binding: the reference lands on the handle
+            // slot — load the handle once so addr names the described
+            // layout, not the slot. The slot holds a `gcty(base)` handle
+            // (void* for primitive handles) — cast before the deref so
+            // a `new(new(1))`-style double handle reads the inner
+            // pointer instead of dereferencing `void*`
+            if bk == check.k_own() || bk == check.k_ref() || bk == check.k_mut() {
+                av = "(*(" + gcty(g, base) + "*)(" + av + "))"
+                base = tyi(g, base)
+            }
+        }
+        w := "0LL"
+        if qn == "value_of_mut" {
+            w = "1LL"
+        }
+        return "(struct o_s_oxl_reflect_Value){ " + itoa(gdesc(g, base)) + "LL, (int64_t)(" + av + "), " + w + " }"
     }
     if qn == "push" && args != nil {
         st := xty(g, args.v)
@@ -5944,6 +6219,19 @@ fn genall(g: mut G) -> str {
     g.dpos = collections.map_new()
     g.dchain = mkslice(int, 0)
     uof := collections.map_new() // item idx (itoa) -> unit idx, globals
+    // R1 — synthesized reflect handle structs: the compound literals
+    // type_of/value_of emit spell `o_s_oxl_reflect_*`, pulling these
+    // decls live through the same textual edge everything else uses.
+    // Declared before every other unit: pair-ret aggregates
+    // (o_vret_*/o_ret_*) embed the handles BY VALUE, so the struct
+    // must be complete at that point in the emitted file
+    rui := gubegin(g)
+    rs := gusnap(g)
+    g.head = push(g.head, "struct o_s_oxl_reflect_Type { int64_t f_td; };\n")
+    g.head = push(g.head, "struct o_s_oxl_reflect_Value { int64_t f_td; int64_t f_addr; int64_t f_w; };\n")
+    gudrain(g, rui, rs)
+    gdef(g, rui, "o_s_oxl_reflect_Type")
+    gdef(g, rui, "o_s_oxl_reflect_Value")
     // enum defs first: variant payload structs + the tagged union —
     // a user struct or another variant may embed an enum by value
     i := 0
@@ -6166,6 +6454,17 @@ fn genall(g: mut G) -> str {
         gdef(g, ui, "o_vt_" + cname(vu.w) + "_" + gvtkey(vu.impl))
         vu = vu.next
     }
+    // R1 — the descriptor table's RECORDS are demand-driven (emitted
+    // only for tdesc'd types), but the two symbols always exist: rt.c
+    // externs them and --gc-sections binds rt.o's refs to whatever def
+    // it finds, so a missing emit would leave the accessors undefined
+    dui := gubegin(g)
+    ds := gusnap(g)
+    gemit_descs(g)
+    gudrain(g, dui, ds)
+    gdef(g, dui, "o_desc_tab")
+    gdef(g, dui, "o_desc_tab_n")
+    g.units[dui].root = 1
     // oxl_main — the root unit. Its text spells `o_f_main` / the test
     // runner's `o_f_test_*` (+ `o_frm_*`/`o_poll_*` for susp entries)
     // so entries mark through ordinary use edges; the @@GLOBALS@@
@@ -6175,7 +6474,7 @@ fn genall(g: mut G) -> str {
     if g.testm == 1 {
         // test mode: scope-wrap each top-level test_ fn; any FAIL
         // traps the process nonzero once the whole suite has run
-        tb := "void oxl_main(void) {\n@@GLOBALS@@    int64_t _fails = 0;\n"
+        tb := "void oxl_main(void) {\n@@GLOBALS@@        int64_t _fails = 0;\n"
         i = 0
         id := 0
         for i < len(g.its) {
@@ -6208,10 +6507,10 @@ fn genall(g: mut G) -> str {
         g.units[ru].ob = push(g.units[ru].ob, tb + "    if (_fails != 0) { rt_exit(1LL); }\n}\n")
     }
     if g.testm == 0 && g.maink == 1 {
-        g.units[ru].ob = push(g.units[ru].ob, "void oxl_main(void) {\n@@GLOBALS@@    struct o_frm_main *_rt = (struct o_frm_main *)rt_task_new(o_poll_main, (int64_t)sizeof(struct o_frm_main));\n    rt_run_root((RtFrame *)_rt); }\n")
+        g.units[ru].ob = push(g.units[ru].ob, "void oxl_main(void) {\n@@GLOBALS@@        struct o_frm_main *_rt = (struct o_frm_main *)rt_task_new(o_poll_main, (int64_t)sizeof(struct o_frm_main));\n    rt_run_root((RtFrame *)_rt); }\n")
     }
     if g.testm == 0 && g.maink == 2 {
-        g.units[ru].ob = push(g.units[ru].ob, "void oxl_main(void) {\n@@GLOBALS@@    o_f_main(); }\n")
+        g.units[ru].ob = push(g.units[ru].ob, "void oxl_main(void) {\n@@GLOBALS@@        o_f_main(); }\n")
     }
     gemit_drops(g, ru)
     // mark: from the root seeds over use edges until fixpoint
@@ -6427,6 +6726,8 @@ fn emit(r: own check.CkRes, testm: int) -> str {
     g.inframe = 0
     g.maink = 0
     g.testm = testm
+    g.descs = mkslice(GD, 0)
+    g.dmap = collections.map_new()
     g.units = mkslice(GUnit, 0)
     g.dpos = collections.map_new()
     g.dchain = mkslice(int, 0)
@@ -6483,6 +6784,16 @@ fn run() {
     if lvm == 1 {
         print(emit_llvm(r, testm))
     } else if jsm == 1 {
+        check.js_gate(r.ck, r.items)
+        if len(r.ck.diags) > 0 {
+            i := 0
+            for i < len(r.ck.diags) {
+                d := r.ck.diags[i]
+                println("error [" + d.kind + "] " + d.msg)
+                i = i + 1
+            }
+            exit(1)
+        }
         print(emit_js(r, testm))
     } else {
         print(emit(r, testm))

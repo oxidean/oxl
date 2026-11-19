@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "id": "WI-0022",
+  "title": "milestone L impl — LLVM emit lane",
+  "state": "implementing",
+  "profile": "normal",
+  "current_stage": "implementation",
+  "created_at": "2026-11-19T01:44:19Z",
+  "updated_at": "2026-11-19T01:44:36Z"
+}

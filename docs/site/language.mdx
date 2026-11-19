@@ -36,7 +36,10 @@ fn main() {
   char-literal sugar and `as` conversions.
 - **Ownership**: `own T` / `ref T` / `mut T` handles with runtime borrow
   checks and compile-time move tracking; `defer` for cleanup; `extern fn`
-  for C FFI.
+  for C FFI. Extern pointer parameters are borrow-for-duration: the
+  callee may use the pointer for the call and must not retain it —
+  retention is a contract violation until the parked `pin` primitive
+  lands (`docs/specs/2026-11-11-pin-primitive/`).
 - **Errors**: `[v, err]` returns; a dropped error is a compile error.
   Errors carry text through an interned message registry
   (`errors.new(msg)`, `errors.msg(e)`, `errors.code(e)`).

@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "id": "WI-0018",
+  "title": "Fix open compiler/stdlib bugs — issues #131 #136 #137 (+ #135 investigation)",
+  "state": "archived",
+  "profile": "normal",
+  "current_stage": "intake",
+  "created_at": "2026-11-17T17:20:51Z",
+  "updated_at": "2026-11-19T01:41:53Z"
+}

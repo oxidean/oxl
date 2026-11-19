@@ -367,6 +367,7 @@ int64_t rt_desc_v_f_td(int64_t td, int64_t vi, int64_t fi);
 int64_t rt_desc_v_f_off(int64_t td, int64_t vi, int64_t fi);
 int64_t rt_desc_v_f_ptr(int64_t td, int64_t vi, int64_t fi);
 int64_t rt_desc_v_base(int64_t td);      /* codegen-pinned union-blob offsetof */
+void    rt_desc_zero_payload(int64_t td, int64_t addr); /* enum re-tag scrub — memset [addr+v_base, addr+size) */
 OxlStr  rt_desc_f_sname(int64_t td, int64_t i);
 int64_t rt_desc_f_off(int64_t td, int64_t i);
 int64_t rt_desc_f_td(int64_t td, int64_t i);

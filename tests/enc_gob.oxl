@@ -59,6 +59,18 @@ struct Bytes { bs: []own byte }
 // decode target for the hand-rolled malformed wires
 struct Sc { b: bool, y: byte, n: int }
 
+// mixed payload shapes for the enum re-decode lane: variant I leaves
+// scalar bytes exactly where P's `own` slot lands
+enum PE { I(int), P { p: own Inner, n: int }, }
+
+// slice-typed payload slot for the remaining err_unsupported lane —
+// a nil/short slot can't fill in place at a mismatched wire length
+enum SE { A([]int), B, }
+
+// self-referential chain for the depth-cap checks — each `own` edge
+// is one nested delta stream on the wire
+struct Node { next: own Node, v: int }
+
 // szero is the all-zero S — struct literals are exhaustive, so the
 // zero/sparse cases spell every field once here and reuse it.
 fn szero() -> S {
@@ -98,6 +110,14 @@ fn g_type() -> err {
 
 fn g_unsupported() -> err {
     return errors.new("gob: unsupported shape")
+}
+
+fn g_depth() -> err {
+    return errors.new("gob: depth limit exceeded")
+}
+
+fn g_nil() -> err {
+    return errors.new("gob: nil root value")
 }
 
 // w1 appends one byte to a hand-rolled wire
@@ -324,14 +344,21 @@ fn main() {
         fails("nested own pointee lost")
     }
     // `own` payload slots on variant 0 and on a non-0 variant ride
-    // the wire even with all-zero pointees. Decode can't mint an
-    // `own` payload slot on a nil local slot — the documented
-    // err_unsupported limit — so a fresh target reports while a
-    // pre-minted slot fills in place and keeps its pointee.
+    // the wire even with all-zero pointees. Decode mints a nil slot
+    // through alloc_vfield — a fresh target fills it the same as a
+    // pre-minted slot that keeps its existing pointee.
     oea := OE.A(new(Inner))
     [oab, oame] = gob.marshal(oea)
     want_ok(oame, "marshal OE.A own")
-    want_err(gob.unmarshal(oab, new(OE.A(nil))), g_unsupported(), "OE.A own payload fresh")
+    // a nil `own` payload slot mints through alloc_vfield — a fresh
+    // target decodes it the same as a pre-minted one
+    oaf := new(OE.A(nil))
+    oafe := gob.unmarshal(oab, oaf)
+    want_ok(oafe, "unmarshal OE.A own fresh mint")
+    oafv := oaf as OE.A
+    if oafv.f0 == nil || oafv.f0.v != 0 {
+        fails("OE.A own payload fresh mint")
+    }
     oap := new(OE.A(new(Inner)))
     oaue := gob.unmarshal(oab, oap)
     want_ok(oaue, "unmarshal OE.A pre-minted")
@@ -342,7 +369,13 @@ fn main() {
     oeb := OE.B{p: new(Inner), n: 0}
     [obb, obme] = gob.marshal(oeb)
     want_ok(obme, "marshal OE.B own")
-    want_err(gob.unmarshal(obb, new(OE.A(nil))), g_unsupported(), "OE.B own payload fresh")
+    obf := new(OE.A(nil))
+    obfe := gob.unmarshal(obb, obf)
+    want_ok(obfe, "unmarshal OE.B own fresh mint")
+    obfv := obf as OE.B
+    if obfv.p == nil {
+        fails("OE.B own payload fresh mint")
+    }
     obp := new(OE.B{p: new(Inner), n: 0})
     obue := gob.unmarshal(obb, obp)
     want_ok(obue, "unmarshal OE.B pre-minted")
@@ -356,7 +389,13 @@ fn main() {
     hoe := HasOE{e: OE.A(new(Inner)), k: 0}
     [hob, home] = gob.marshal(hoe)
     want_ok(home, "marshal HasOE")
-    want_err(gob.unmarshal(hob, new(HasOE)), g_unsupported(), "HasOE own payload fresh")
+    hof := new(HasOE)
+    hofe := gob.unmarshal(hob, hof)
+    want_ok(hofe, "unmarshal HasOE own fresh mint")
+    hofv := hof.e as OE.A
+    if hofv.f0 == nil {
+        fails("HasOE own payload fresh mint")
+    }
     hop := new(HasOE{e: OE.A(new(Inner)), k: 0})
     houe := gob.unmarshal(hob, hop)
     want_ok(houe, "unmarshal HasOE pre-minted")
@@ -464,5 +503,139 @@ fn main() {
     oet = w1(oet, 0)
     oet = w1(oet, 5)
     want_err(gob.unmarshal(oet, new(E.C)), g_malformed(), "oob enum tag")
+    // --- enum re-tag into the same var: decode a scalar-payload
+    // variant, then a ptr-payload variant into the SAME enum. The
+    // stale int bits land exactly where the `own` slot reads —
+    // set_tag must zero the union region or vfield would hand out
+    // the int as a wild pointer. Decode must not crash and must
+    // produce the new variant's payload.
+    pe := new(PE.I(0))
+    [pib, pime] = gob.marshal(PE.I(2000000000))
+    want_ok(pime, "marshal PE.I")
+    piue := gob.unmarshal(pib, pe)
+    want_ok(piue, "unmarshal PE.I")
+    ppi := new(Inner)
+    ppi.v = 5
+    pp := PE.P{p: ppi, n: 9}
+    [ppb, ppme] = gob.marshal(pp)
+    want_ok(ppme, "marshal PE.P")
+    ppue := gob.unmarshal(ppb, pe)
+    want_ok(ppue, "unmarshal PE.P over I")
+    if pe.kind() != 1 {
+        fails("PE tag after re-decode")
+    }
+    ppv := pe as PE.P
+    if ppv.p == nil || ppv.p.v != 5 || ppv.n != 9 {
+        fails("PE.P payload after re-decode")
+    }
+    // and back the other way — ptr variant then scalar variant:
+    // the zeroed union leaves I's slot clean
+    pque := gob.unmarshal(pib, pe)
+    want_ok(pque, "unmarshal PE.I over P")
+    pqv := pe as PE.I
+    if pqv.f0 != 2000000000 {
+        fails("PE.I payload after re-decode")
+    }
+    // --- depth cap: DEPTHMAX (10000) nesting levels. Hand-rolled
+    // Node wire: each `01` opens a nested `next` delta stream, each
+    // `00` closes one — ~11k levels in ~22k bytes must fail with
+    // err_depth instead of exhausting the C stack.
+    dn := mkslice(byte, 0)
+    dn = w1(dn, 1)
+    dn = w1(dn, 4)
+    dn = w1(dn, 78)
+    dn = w1(dn, 111)
+    dn = w1(dn, 100)
+    dn = w1(dn, 101)
+    dn = w1(dn, 7)
+    dn = w1(dn, 2)
+    dn = w1(dn, 4)
+    dn = w1(dn, 110)
+    dn = w1(dn, 101)
+    dn = w1(dn, 120)
+    dn = w1(dn, 116)
+    dn = w1(dn, 7)
+    dn = w1(dn, 1)
+    dn = w1(dn, 0)
+    dn = w1(dn, 1)
+    dn = w1(dn, 118)
+    dn = w1(dn, 0)
+    dn = w1(dn, 0)
+    dn = w1(dn, 0)
+    di := 0
+    for di < 11000 {
+        dn = w1(dn, 1)
+        di = di + 1
+    }
+    di = 0
+    for di < 11000 {
+        dn = w1(dn, 0)
+        di = di + 1
+    }
+    want_err(gob.unmarshal(dn, new(Node)), g_depth(), "depth cap decode")
+    // and the encode lane — an 11k-deep own chain marshals into
+    // err_depth rather than recursing off the stack
+    nrt := new(Node)
+    ni := 0
+    for ni < 11000 {
+        np := new(Node)
+        np.next = nrt
+        nrt = np
+        ni = ni + 1
+    }
+    [_db, dme] = gob.marshal(nrt)
+    want_err(dme, g_depth(), "depth cap encode")
+    // a shallow chain still round-trips under the cap
+    nrt2 := new(Node)
+    nrt2.v = 1
+    ni = 0
+    for ni < 100 {
+        np2 := new(Node)
+        np2.next = nrt2
+        nrt2 = np2
+        ni = ni + 1
+    }
+    [sb, sme] = gob.marshal(nrt2)
+    want_ok(sme, "marshal shallow chain")
+    sn := new(Node)
+    sue := gob.unmarshal(sb, sn)
+    want_ok(sue, "unmarshal shallow chain")
+    snd := 0
+    snw := sn
+    for snw.next != nil {
+        snd = snd + 1
+        snw = snw.next
+    }
+    if snd != 100 {
+        fails("shallow chain depth " + itoa(snd))
+    }
+    // --- nil `own` roots: marshal mints Value{addr:0}, unmarshal's
+    // mut borrow lands at address 0 — both must err cleanly, never
+    // walk the null
+    let qn: own Sc = nil
+    [_qb, qme] = gob.marshal(qn)
+    want_err(qme, g_nil(), "marshal nil own root")
+    let qu: own Sc = nil
+    want_err(gob.unmarshal(bs, qu), g_nil(), "unmarshal nil own target")
+    // trailing garbage past a complete message is malformed
+    tgb := mkslice(byte, 0)
+    bi2 := 0
+    for bi2 < len(bs) {
+        tgb = push(tgb, bs[bi2])
+        bi2 = bi2 + 1
+    }
+    tgb = w1(tgb, 0)
+    want_err(gob.unmarshal(tgb, new(S)), g_malformed(), "trailing garbage")
+    // a slice payload slot only fills in place at matching length —
+    // a nil slot against a 3-element wire field still reports
+    // err_unsupported (the reflect mints don't resize enum slots)
+    xs3 := mkslice(int, 0)
+    xs3 = push(xs3, 1)
+    xs3 = push(xs3, 2)
+    xs3 = push(xs3, 3)
+    se3 := SE.A(xs3)
+    [seb, seme] = gob.marshal(se3)
+    want_ok(seme, "marshal SE.A")
+    want_err(gob.unmarshal(seb, new(SE.A(nil))), g_unsupported(), "SE.A slice payload nil slot")
     println("enc_gob ok")
 }

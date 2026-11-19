@@ -22,20 +22,31 @@ package gob
 // delta stream over that variant's payload slots. `own` fields are
 // flattened like Go: the pointee's bytes ride under the field number,
 // a nil pointee is just an absent field; decode mints through
-// alloc_field/alloc_slice/alloc_elem. PTR(cstr)/CHAN/IFACE/FN/VOID
-// fields are unencodable and stay out of preamble and numbering on
-// both sides. Decode limits: enum payload slots that need a mint
-// (`own` payloads) report err_unsupported on a nil slot, slice-typed
-// payload slots and nested slices only fill in place when the existing
-// length matches — the reflect mints are struct-field scoped.
+// alloc_field/alloc_slice/alloc_elem, and a nil `own` enum payload
+// slot mints through alloc_vfield. The mints are arena-scoped:
+// alloc_field/alloc_slice/alloc_vfield/set_str overwrite a live slot
+// WITHOUT dropping the old pointee/backing — a re-decode into the
+// same target accumulates allocations until scope leave, bounded by
+// the scope's lifetime. PTR(cstr)/MAP/CHAN/IFACE/FN/VOID fields are
+// unencodable and stay out of preamble and numbering on both sides.
+// Decode limits: slice-typed payload slots and nested slices only
+// fill in place when the existing length matches — the reflect mints
+// reach struct fields and `own` enum payload slots, not slice
+// resizing (err_unsupported). Both lanes cap nesting at DEPTHMAX on
+// the enc/dec state — a deeper wire body or value reports err_depth
+// rather than exhausting the fixed C stack (attacker input costs
+// ~4 bytes per level). Skip-zero reads -0.0 as zero (iszero's
+// x == 0.0), so -0.0 stays off the wire and decodes back as +0.0 —
+// the one scalar that doesn't bit-round-trip.
 //
 // gob-shaped, not Go-compatible: the uvarint count byte is 255-n
 // where Go's encoding/gob writes 256-n, and the signed lane is
 // ^x|top-bit rather than Go's (^x<<1)|1 — nothing here interoperates
 // with Go on the wire. Cycles: wwalk terminates on cyclic TYPES (a
-// recursive descriptor is collected once), but cyclic VALUES — `own`
-// back-edges closing a data cycle — recurse forever on encode, the
-// same limit Go's gob documents.
+// recursive descriptor is collected once), while cyclic VALUES —
+// `own` back-edges closing a data cycle — hit DEPTHMAX on encode and
+// report err_depth; Go's gob documents the same limit as unbounded
+// recursion.
 import "std/errors"
 
 import "std/reflect"
@@ -58,8 +69,26 @@ fn err_unsupported() -> err {
     return errors.new("gob: unsupported shape")
 }
 
+/// err_depth reports a wire body or value nested past DEPTHMAX —
+/// the recursion cap that keeps hostile input off the fixed C stack.
+fn err_depth() -> err {
+    return errors.new("gob: depth limit exceeded")
+}
+
+/// err_nil reports a nil qualified root: marshal on a nil `own` or
+/// unmarshal through a nil `own` target mints Value{addr:0} and the
+/// walks would dereference address 0.
+fn err_nil() -> err {
+    return errors.new("gob: nil root value")
+}
+
 // -9223372036854775808 — the literal can't be spelled in one token
 let MININT = 0 - 9223372036854775807 - 1
+
+// DEPTHMAX caps encoder/decoder recursion: each nested composite
+// level (struct field, enum payload, slice element) charges one unit
+// on enc.depth/dec.depth; past the cap the lane reports err_depth.
+let DEPTHMAX = 10000
 
 fn p256(i: int) -> int {
     p := 1
@@ -77,7 +106,13 @@ fn p256(i: int) -> int {
 // count of records already emitted on the second pass. reflect.Type
 // handles are scope-bound and can't ride in a heap slice, so the two
 // passes re-walk the descriptor graph instead of storing the handles.
-struct enc { out: []byte, tn: []str, tk: []int, em: int }
+struct enc { out: []byte, tn: []str, tk: []int, em: int, depth: int }
+
+// leave returns the depth unit charged at each composite encoder's
+// entry — deferred there so every return path decrements.
+fn (e mut enc) leave() {
+    e.depth = e.depth - 1
+}
 
 fn (e mut enc) ubyte(b: int) {
     e.out = push(e.out, b & 255)
@@ -343,7 +378,15 @@ fn (e mut enc) erec(t: reflect.Type) {
 // slot reads zero by absence, but a READABLE `own` slot (field/vfield
 // returned the pointee) is non-zero on presence alone — nil-ness is
 // what absence means, not zero-ness.
-fn iszero(v: reflect.Value) -> bool {
+fn (e mut enc) iszero(v: reflect.Value) -> bool {
+    if e.depth >= DEPTHMAX {
+        // a bool can't report — judge over-deep as non-zero so the
+        // field stays on the wire and eval reaches the real cap
+        // (which returns err_depth) instead of silently dropping it
+        return false
+    }
+    e.depth = e.depth + 1
+    defer e.leave()
     t := v.typ()
     k := t.kind()
     if k == reflect.KindInt() || k == reflect.KindErr() {
@@ -388,7 +431,7 @@ fn iszero(v: reflect.Value) -> bool {
                         // a successful read on an `own` slot means
                         // non-nil — presence is non-zero even when the
                         // pointee reads all-zero
-                        if f.ptr() == 1 || !iszero(fv) {
+                        if f.ptr() == 1 || !e.iszero(fv) {
                             return false
                         }
                     }
@@ -418,7 +461,7 @@ fn iszero(v: reflect.Value) -> bool {
                     if fpe == nil && fp == 1 {
                         return false
                     }
-                    if !iszero(fv) {
+                    if !e.iszero(fv) {
                         return false
                     }
                 }
@@ -434,6 +477,11 @@ fn iszero(v: reflect.Value) -> bool {
 // in the preamble field list (encodable, unhidden fields in decl
 // order), 0 terminates.
 fn (e mut enc) estruct(v: reflect.Value) -> err {
+    if e.depth >= DEPTHMAX {
+        return err_depth()
+    }
+    e.depth = e.depth + 1
+    defer e.leave()
     t := v.typ()
     last := -1
     wn := -1
@@ -461,7 +509,7 @@ fn (e mut enc) estruct(v: reflect.Value) -> err {
             i = i + 1
             continue
         }
-        if f.ptr() == 0 && iszero(fv) {
+        if f.ptr() == 0 && e.iszero(fv) {
             i = i + 1
             continue
         }
@@ -481,6 +529,11 @@ fn (e mut enc) estruct(v: reflect.Value) -> err {
 // variant's encodable payload slots, numbered as the preamble lists
 // them.
 fn (e mut enc) eenum(v: reflect.Value) -> err {
+    if e.depth >= DEPTHMAX {
+        return err_depth()
+    }
+    e.depth = e.depth + 1
+    defer e.leave()
     [tg, te] = v.tag()
     if te != nil {
         return te
@@ -518,7 +571,7 @@ fn (e mut enc) eenum(v: reflect.Value) -> err {
         }
         // a non-nil `own` payload slot is present regardless of the
         // pointee's zero-ness — nil slots never reach here (err_nil)
-        if fp == 0 && iszero(fv) {
+        if fp == 0 && e.iszero(fv) {
             i = i + 1
             continue
         }
@@ -538,6 +591,11 @@ fn (e mut enc) eenum(v: reflect.Value) -> err {
 // presence uvarint + value for elem_ptr slices ([]own T keeps its
 // nils), bare values otherwise.
 fn (e mut enc) eslice(v: reflect.Value) -> err {
+    if e.depth >= DEPTHMAX {
+        return err_depth()
+    }
+    e.depth = e.depth + 1
+    defer e.leave()
     [n, ne] = v.len()
     if ne != nil {
         return ne
@@ -665,16 +723,23 @@ fn (e mut enc) eval(v: reflect.Value) -> err {
 /// the pair is symmetric where the reflect mints reach (STRUCT/ENUM
 /// roots are the covered case).
 fn marshal[T any](v: T) -> [[]byte, err] {
-    e := enc{out: mkslice(byte, 0), tn: mkslice(str, 0), tk: mkslice(int, 0), em: 0}
+    e := enc{out: mkslice(byte, 0), tn: mkslice(str, 0), tk: mkslice(int, 0), em: 0, depth: 0}
     c := new(v)
     rv := value_of(c)
+    // a nil qualified root (`own T` — tqual(T) marks it) mints
+    // Value{addr:0}; the walks below would dereference address 0
+    if rv.isnull() {
+        return nil, err_nil()
+    }
     t := rv.typ()
     e.wwalk(t, 0)
     e.uvar(len(e.tn))
     e.wwalk(t, 1)
     e2 := e.eval(rv)
     if e2 != nil {
-        return e.out, e2
+        // no partial output on error — the prefix could pass for a
+        // complete message if a caller ignored err
+        return nil, e2
     }
     return e.out, nil
 }
@@ -700,7 +765,13 @@ struct wt {
     et: int,
 }
 
-struct dec { b: []byte, pos: int }
+struct dec { b: []byte, pos: int, depth: int }
+
+// leave returns the depth unit charged at each composite decoder's
+// entry — deferred there so every return path decrements.
+fn (d mut dec) leave() {
+    d.depth = d.depth - 1
+}
 
 fn (d mut dec) uvar() -> [int, err] {
     if d.pos >= len(d.b) {
@@ -873,6 +944,11 @@ fn (d mut dec) dparse() -> [[]wt, err] {
 // dskip consumes a wire value by its slot metadata — the tolerance
 // lane for fields the local type lacks or names differently.
 fn (d mut dec) dskip(ws: wslot, ts: []wt) -> err {
+    if d.depth >= DEPTHMAX {
+        return err_depth()
+    }
+    d.depth = d.depth + 1
+    defer d.leave()
     k := ws.kind
     if k == reflect.KindInt() || k == reflect.KindErr() || k == reflect.KindFloat() || k == reflect.KindBool() || k == reflect.KindByte() {
         [_u, e] = d.uvar()
@@ -998,6 +1074,11 @@ fn (d mut dec) dskip(ws: wslot, ts: []wt) -> err {
 // elements — shared by the field-mint path and the in-place fills
 // (existing enum payload slots, nested slices) where len must match.
 fn (d mut dec) dsliceinto(w: wt, sv: reflect.Value, n: int, ts: []wt) -> err {
+    if d.depth >= DEPTHMAX {
+        return err_depth()
+    }
+    d.depth = d.depth + 1
+    defer d.leave()
     es := wslot{name: "", kind: w.ek, ptr: w.ep, tid: w.et}
     st := sv.typ()
     [et, ee] = st.elem()
@@ -1194,6 +1275,11 @@ fn (d mut dec) dslicefield(ws: wslot, v: reflect.Value, li: int, ts: []wt) -> er
 // decoder's own fields map through their gob: tags), a match decodes,
 // a miss skips.
 fn (d mut dec) dsstruct(w: wt, v: reflect.Value, ts: []wt) -> err {
+    if d.depth >= DEPTHMAX {
+        return err_depth()
+    }
+    d.depth = d.depth + 1
+    defer d.leave()
     lt := v.typ()
     last := -1
     for true {
@@ -1275,12 +1361,19 @@ fn (d mut dec) dsstruct(w: wt, v: reflect.Value, ts: []wt) -> err {
 }
 
 // dsenum reads the wire tag, binds the variant by NAME (reader and
-// writer variant orders may differ), sets the local tag, then runs
-// the payload delta stream with the same name-match/skip rule as
-// structs. Payload slots that need a mint — a nil `own` slot, or a
-// slice slot at the wrong length — report err_unsupported: the
-// reflect mints only reach through struct fields.
+// writer variant orders may differ), sets the local tag — which
+// zeroes the union region when the variant actually changes so a
+// previous variant's bytes can't masquerade as a live slot — then
+// runs the payload delta stream with the same name-match/skip rule
+// as structs. A nil `own` payload slot mints through alloc_vfield;
+// the remaining unsupported shapes are slice slots at the wrong
+// length and kinds that never reach the wire (err_unsupported).
 fn (d mut dec) dsenum(w: wt, v: reflect.Value, ts: []wt) -> err {
+    if d.depth >= DEPTHMAX {
+        return err_depth()
+    }
+    d.depth = d.depth + 1
+    defer d.leave()
     [tg, e] = d.uvar()
     if e != nil {
         return e
@@ -1361,10 +1454,16 @@ fn (d mut dec) dsenum(w: wt, v: reflect.Value, ts: []wt) -> err {
         }
         [fv, fe] = v.vfield(li, fi)
         if fe != nil {
-            if errors.is(fe, reflect.err_nil()) {
-                return err_unsupported()
+            if !errors.is(fe, reflect.err_nil()) {
+                return fe
             }
-            return fe
+            // nil `own` payload slot — mint the pointee in place and
+            // fill it like a struct field's alloc_field
+            [av, ae] = v.alloc_vfield(li, fi)
+            if ae != nil {
+                return ae
+            }
+            fv = av
         }
         e5 := d.dsval(ws, fv, ts)
         if e5 != nil {
@@ -1378,12 +1477,17 @@ fn (d mut dec) dsenum(w: wt, v: reflect.Value, ts: []wt) -> err {
 /// name against the preamble. Wire fields out lacks are skipped,
 /// fields out has that the wire doesn't keep their existing value.
 fn unmarshal[T any](b: []byte, out: mut T) -> err {
-    d := dec{b: b, pos: 0}
+    d := dec{b: b, pos: 0, depth: 0}
     [ts, e] = d.dparse()
     if e != nil {
         return e
     }
     v := value_of_mut(out)
+    // a nil `own` target reaches value_of_mut through the mut borrow
+    // as Value{addr:0} — writes would land at address 0
+    if v.isnull() {
+        return err_nil()
+    }
     lt := v.typ()
     lk := lt.kind()
     if ts[0].kind != lk {

@@ -4924,6 +4924,20 @@ int64_t rt_desc_v_f_td(int64_t td, int64_t vi, int64_t fi) { const RtFieldDesc *
 int64_t rt_desc_v_f_off(int64_t td, int64_t vi, int64_t fi) { const RtFieldDesc *f = desc_vf_at(td, vi, fi); return f ? f->off : -1; }
 int64_t rt_desc_v_f_ptr(int64_t td, int64_t vi, int64_t fi) { const RtFieldDesc *f = desc_vf_at(td, vi, fi); return f ? f->ptr : -1; }
 int64_t rt_desc_v_base(int64_t td) { const RtTypeDesc *d = desc_at(td); return d ? d->v_base : -1; }
+
+/* enum re-tag scrub: zero the union payload region
+ * [addr+v_base, addr+size) so a variant switch can't reinterpret the
+ * previous variant's scalar bytes as a live pointer slot. The tag
+ * word sits below v_base and is never touched; bad td / null addr /
+ * non-positive span no-op like the other desc helpers' sentinels. */
+void rt_desc_zero_payload(int64_t td, int64_t addr) {
+    const RtTypeDesc *d = desc_at(td);
+    int64_t n;
+    if (!d || addr == 0 || d->v_base < 0) return;
+    n = d->size - d->v_base;
+    if (n <= 0) return;
+    memset((void *)(uintptr_t)(addr + d->v_base), 0, (size_t)n);
+}
 OxlStr rt_desc_f_sname(int64_t td, int64_t i) {
     const RtFieldDesc *f = desc_f_at(td, i);
     return f && f->name ? rt_str(f->name) : rt_str("");

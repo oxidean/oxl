@@ -113,6 +113,7 @@ export function install(api) {
     rt_sqlite_prepare: trap21,
     rt_sqlite_step: trap21,
     rt_sqlite_reset: trap21,
+    rt_sqlite_readonly: trap21,
     rt_sqlite_cols: trap21,
     rt_sqlite_col_type: trap21,
     rt_sqlite_col_int: trap21,

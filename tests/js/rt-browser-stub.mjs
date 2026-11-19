@@ -86,7 +86,7 @@ const trappers = [
   'rt_set_sndtimo', 'rt_lookup_start',
   'rt_sqlite_open', 'rt_sqlite_exec', 'rt_sqlite_query',
   'rt_sqlite_close', 'rt_sqlite_exec_bind',
-  'rt_sqlite_prepare', 'rt_sqlite_step', 'rt_sqlite_reset',
+  'rt_sqlite_prepare', 'rt_sqlite_step', 'rt_sqlite_reset', 'rt_sqlite_readonly',
   'rt_sqlite_cols', 'rt_sqlite_col_type', 'rt_sqlite_col_int',
   'rt_sqlite_col_f64', 'rt_sqlite_col_text', 'rt_sqlite_finalize',
   'rt_sqlite_errstr', 'rt_sqlite_errstr_rc',

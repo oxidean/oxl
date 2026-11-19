@@ -13,7 +13,7 @@ package gob
 // field list, 0 terminates; only non-zero fields ride the wire, so a
 // skipped field IS the zero value on decode.
 //
-// Kind lanes: INT/ERR -> signed varint (gob's ^x + top-bit form),
+// Kind lanes: INT/ERR -> signed varint (^x with the top bit set),
 // FLOAT -> uvarint of the IEEE bits (reflect.fbits — decimal text
 // would lose precision), BOOL/BYTE -> uvarint, STR -> uvarint len +
 // bytes, []byte -> len + raw bytes, other slices -> len + elements
@@ -28,6 +28,14 @@ package gob
 // (`own` payloads) report err_unsupported on a nil slot, slice-typed
 // payload slots and nested slices only fill in place when the existing
 // length matches — the reflect mints are struct-field scoped.
+//
+// gob-shaped, not Go-compatible: the uvarint count byte is 255-n
+// where Go's encoding/gob writes 256-n, and the signed lane is
+// ^x|top-bit rather than Go's (^x<<1)|1 — nothing here interoperates
+// with Go on the wire. Cycles: wwalk terminates on cyclic TYPES (a
+// recursive descriptor is collected once), but cyclic VALUES — `own`
+// back-edges closing a data cycle — recurse forever on encode, the
+// same limit Go's gob documents.
 import "std/errors"
 
 import "std/reflect"
@@ -75,10 +83,12 @@ fn (e mut enc) ubyte(b: int) {
     e.out = push(e.out, b & 255)
 }
 
-// uvar writes u gob-style: one byte for u <= 127, else 0xFF-n then the
-// n significant big-endian bytes. u is the raw 64-bit pattern — a
-// negative i64 carries a set top bit and always takes 8 bytes. lo masks
-// that bit off so the byte extraction below never divides a negative.
+// uvar writes u gob-style: one byte for u <= 127, else 255-n then the
+// n significant big-endian bytes (Go's encoding/gob writes 256-n —
+// the streams are shaped alike but not byte-compatible). u is the raw
+// 64-bit pattern — a negative i64 carries a set top bit and always
+// takes 8 bytes. lo masks that bit off so the byte extraction below
+// never divides a negative.
 fn (e mut enc) uvar(u: int) {
     if u >= 0 && u < 128 {
         e.out = push(e.out, u)
@@ -108,6 +118,8 @@ fn (e mut enc) uvar(u: int) {
 
 // svar writes a signed int gob-style: negative x rides as (^x) with
 // the top bit set (^x spelled 0-x-1 — the language has no unary ~).
+// Go's encoding/gob maps negatives to (^x<<1)|1 instead — same idea,
+// different bits.
 fn (e mut enc) svar(x: int) {
     u := x
     if x < 0 {
@@ -328,7 +340,9 @@ fn (e mut enc) erec(t: reflect.Type) {
 
 // iszero reports whether v reads as its kind's zero — skipped fields
 // never ride the wire. Unencodable kinds count as zero; a nil `own`
-// slot reads zero by absence (its pointee never reached iszero).
+// slot reads zero by absence, but a READABLE `own` slot (field/vfield
+// returned the pointee) is non-zero on presence alone — nil-ness is
+// what absence means, not zero-ness.
 fn iszero(v: reflect.Value) -> bool {
     t := v.typ()
     k := t.kind()
@@ -370,8 +384,13 @@ fn iszero(v: reflect.Value) -> bool {
                 [ft, f2] = f.typ()
                 if f2 == nil && encodable(ft) && lwname(f) != "-" {
                     [fv, f3] = v.field(i)
-                    if f3 == nil && !iszero(fv) {
-                        return false
+                    if f3 == nil {
+                        // a successful read on an `own` slot means
+                        // non-nil — presence is non-zero even when the
+                        // pointee reads all-zero
+                        if f.ptr() == 1 || !iszero(fv) {
+                            return false
+                        }
                     }
                 }
             }
@@ -393,8 +412,15 @@ fn iszero(v: reflect.Value) -> bool {
             [pt, pe] = x.ftyp(i)
             if pe == nil && encodable(pt) {
                 [fv, fe] = v.vfield(0, i)
-                if fe == nil && !iszero(fv) {
-                    return false
+                if fe == nil {
+                    // `own` payload slot read OK → non-nil → present
+                    [fp, fpe] = x.fptr(i)
+                    if fpe == nil && fp == 1 {
+                        return false
+                    }
+                    if !iszero(fv) {
+                        return false
+                    }
                 }
             }
             i = i + 1
@@ -486,7 +512,13 @@ fn (e mut enc) eenum(v: reflect.Value) -> err {
             i = i + 1
             continue
         }
-        if iszero(fv) {
+        [fp, fpe] = x.fptr(i)
+        if fpe != nil {
+            return fpe
+        }
+        // a non-nil `own` payload slot is present regardless of the
+        // pointee's zero-ness — nil slots never reach here (err_nil)
+        if fp == 0 && iszero(fv) {
             i = i + 1
             continue
         }
@@ -516,7 +548,10 @@ fn (e mut enc) eslice(v: reflect.Value) -> err {
     if ee != nil {
         return ee
     }
-    if et.kind() == reflect.KindByte() {
+    ep := t.elemptr()
+    // raw bytes only for inline []byte — []own byte rides the generic
+    // lane so each element carries a presence uvarint and nils survive
+    if et.kind() == reflect.KindByte() && ep == 0 {
         i := 0
         for i < n {
             [ev, e2] = v.index(i)
@@ -532,7 +567,6 @@ fn (e mut enc) eslice(v: reflect.Value) -> err {
         }
         return nil
     }
-    ep := t.elemptr()
     i := 0
     for i < n {
         if ep == 1 {
@@ -570,6 +604,11 @@ fn (e mut enc) eval(v: reflect.Value) -> err {
     t := v.typ()
     k := t.kind()
     if k == reflect.KindInt() || k == reflect.KindErr() {
+        // an err serializes as its raw int64 code — the registry is
+        // process-local and interned per binary, so a code decoded in
+        // a different binary is a foreign code: errors.msg yields ""
+        // and errors.is never matches. Wire-stable within one
+        // binary's registry only.
         [x, xe] = v.int()
         if xe != nil {
             return xe
@@ -924,7 +963,7 @@ fn (d mut dec) dskip(ws: wslot, ts: []wt) -> err {
         if n < 0 {
             return err_malformed()
         }
-        if w.ek == reflect.KindByte() {
+        if w.ek == reflect.KindByte() && w.ep == 0 {
             if n > len(d.b) - d.pos {
                 return err_malformed()
             }
@@ -965,17 +1004,30 @@ fn (d mut dec) dsliceinto(w: wt, sv: reflect.Value, n: int, ts: []wt) -> err {
     if ee != nil {
         return ee
     }
-    if w.ek == reflect.KindByte() {
-        // the encode lane writes []byte raw — n bytes, no per-element
-        // uvarint — mirroring dskip's BYTE fast path
-        if d.pos + n > len(d.b) {
+    if w.ek == reflect.KindByte() && w.ep == 0 {
+        // the encode lane writes inline []byte raw — n bytes, no
+        // per-element uvarint — mirroring dskip's BYTE fast path. A
+        // wire ep of 1 ([]own byte) rides the generic lane below.
+        if n > len(d.b) - d.pos {
             return err_malformed()
         }
         i := 0
         for i < n {
-            [ev, xe] = sv.index(i)
-            if xe != nil {
-                return xe
+            // a local []own byte mints per element — index errs
+            // err_nil on freshly-allocated nil slots
+            ev := sv
+            if st.elemptr() == 1 {
+                [av, ae] = sv.alloc_elem(i)
+                if ae != nil {
+                    return ae
+                }
+                ev = av
+            } else {
+                [xv, xe] = sv.index(i)
+                if xe != nil {
+                    return xe
+                }
+                ev = xv
             }
             be := ev.set_byte(d.b[d.pos])
             if be != nil {
@@ -1058,12 +1110,18 @@ fn (d mut dec) dsval(ws: wslot, v: reflect.Value, ts: []wt) -> err {
         if e != nil {
             return e
         }
+        if u < 0 || u > 1 {
+            return err_malformed()
+        }
         return v.set_bool(u)
     }
     if k == reflect.KindByte() {
         [u, e] = d.uvar()
         if e != nil {
             return e
+        }
+        if u < 0 || u > 255 {
+            return err_malformed()
         }
         return v.set_byte(u)
     }

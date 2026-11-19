@@ -41,6 +41,24 @@ struct Tagged { keep: int, drop: int tag "gob:-", ren: str tag "gob:wire" }
 
 struct Renamed { keep: int, wire: str }
 
+// nested own-presence shapes: an `own` to an all-zero struct inside
+// an inline struct field, and `own` enum payload slots on variant 0
+// and on a non-0 variant
+struct Box { p: own Inner }
+
+struct Wrap { w: Box }
+
+enum OE { A(own Inner), B { p: own Inner, n: int }, C, }
+
+struct HasOE { e: OE, k: int }
+
+// []own byte rides the presence-coded element lane, not the []byte
+// fast path
+struct Bytes { bs: []own byte }
+
+// decode target for the hand-rolled malformed wires
+struct Sc { b: bool, y: byte, n: int }
+
 // szero is the all-zero S — struct literals are exhaustive, so the
 // zero/sparse cases spell every field once here and reuse it.
 fn szero() -> S {
@@ -65,6 +83,54 @@ fn want_err(e: err, sentinel: err, msg: str) {
     if !errors.is(e, sentinel) {
         fails(msg + " — wrong sentinel: " + errors.msg(e))
     }
+}
+
+// gob's sentinels are unexported, but errors.new interns by message
+// text — re-spelling the same text yields the same code, so
+// errors.is distinguishes malformed/type/unsupported here.
+fn g_malformed() -> err {
+    return errors.new("gob: malformed input")
+}
+
+fn g_type() -> err {
+    return errors.new("gob: type mismatch")
+}
+
+fn g_unsupported() -> err {
+    return errors.new("gob: unsupported shape")
+}
+
+// w1 appends one byte to a hand-rolled wire
+fn w1(b: []byte, x: int) -> []byte {
+    return push(b, x as byte)
+}
+
+// sc_wire is a hand-rolled preamble binding Sc{b:bool, y:byte,
+// n:int} — record 0 is the root; callers append a delta-coded body.
+fn sc_wire() -> []byte {
+    b := mkslice(byte, 0)
+    b = w1(b, 1)
+    b = w1(b, 2)
+    b = w1(b, 83)
+    b = w1(b, 99)
+    b = w1(b, 7)
+    b = w1(b, 3)
+    b = w1(b, 1)
+    b = w1(b, 98)
+    b = w1(b, 2)
+    b = w1(b, 0)
+    b = w1(b, 0)
+    b = w1(b, 1)
+    b = w1(b, 121)
+    b = w1(b, 4)
+    b = w1(b, 0)
+    b = w1(b, 0)
+    b = w1(b, 1)
+    b = w1(b, 110)
+    b = w1(b, 0)
+    b = w1(b, 0)
+    b = w1(b, 0)
+    return b
 }
 
 fn main() {
@@ -241,13 +307,157 @@ fn main() {
     // truncated input and a wrong-kind root both report, never panic
     if len(bs) > 4 {
         e12 := gob.unmarshal(bs[0:4], o)
-        if e12 == nil {
-            fails("truncated accepted")
+        want_err(e12, g_malformed(), "truncated")
+    }
+    want_err(gob.unmarshal(wb, new(0)), g_type(), "wrong-kind root")
+    // --- own-presence in nested containers: a non-nil `own` slot
+    // whose pointee reads all-zero is PRESENT, never zero — one
+    // level down from the zown case.
+    // own-to-zero-struct nested inside an inline struct field.
+    wr := Wrap{w: Box{p: new(Inner)}}
+    [wrb, wrme] = gob.marshal(wr)
+    want_ok(wrme, "marshal wrap")
+    owr := new(Wrap)
+    wrue := gob.unmarshal(wrb, owr)
+    want_ok(wrue, "unmarshal wrap")
+    if owr.w.p == nil || owr.w.p.v != 0 {
+        fails("nested own pointee lost")
+    }
+    // `own` payload slots on variant 0 and on a non-0 variant ride
+    // the wire even with all-zero pointees. Decode can't mint an
+    // `own` payload slot on a nil local slot — the documented
+    // err_unsupported limit — so a fresh target reports while a
+    // pre-minted slot fills in place and keeps its pointee.
+    oea := OE.A(new(Inner))
+    [oab, oame] = gob.marshal(oea)
+    want_ok(oame, "marshal OE.A own")
+    want_err(gob.unmarshal(oab, new(OE.A(nil))), g_unsupported(), "OE.A own payload fresh")
+    oap := new(OE.A(new(Inner)))
+    oaue := gob.unmarshal(oab, oap)
+    want_ok(oaue, "unmarshal OE.A pre-minted")
+    oav := oap as OE.A
+    if oav.f0 == nil || oav.f0.v != 0 {
+        fails("OE.A own payload lost")
+    }
+    oeb := OE.B{p: new(Inner), n: 0}
+    [obb, obme] = gob.marshal(oeb)
+    want_ok(obme, "marshal OE.B own")
+    want_err(gob.unmarshal(obb, new(OE.A(nil))), g_unsupported(), "OE.B own payload fresh")
+    obp := new(OE.B{p: new(Inner), n: 0})
+    obue := gob.unmarshal(obb, obp)
+    want_ok(obue, "unmarshal OE.B pre-minted")
+    obv := obp as OE.B
+    if obv.p == nil || obv.p.v != 0 {
+        fails("OE.B own payload lost")
+    }
+    // an enum FIELD at tag 0 with a non-nil `own` payload slot is
+    // present even when the pointee is all-zero — the nested iszero
+    // judges the slot, not just the pointee.
+    hoe := HasOE{e: OE.A(new(Inner)), k: 0}
+    [hob, home] = gob.marshal(hoe)
+    want_ok(home, "marshal HasOE")
+    want_err(gob.unmarshal(hob, new(HasOE)), g_unsupported(), "HasOE own payload fresh")
+    hop := new(HasOE{e: OE.A(new(Inner)), k: 0})
+    houe := gob.unmarshal(hob, hop)
+    want_ok(houe, "unmarshal HasOE pre-minted")
+    hov := hop.e as OE.A
+    if hov.f0 == nil {
+        fails("HasOE enum payload lost")
+    }
+    // []own byte rides the presence-coded element lane — nils
+    // survive and decode re-mints through alloc_elem.
+    by := Bytes{bs: mkslice(own byte, 0)}
+    by.bs = push(by.bs, new(9 as byte))
+    by.bs = push(by.bs, nil)
+    by.bs = push(by.bs, new(250 as byte))
+    [byb, byme] = gob.marshal(by)
+    want_ok(byme, "marshal []own byte")
+    oby := new(Bytes)
+    byue := gob.unmarshal(byb, oby)
+    want_ok(byue, "unmarshal []own byte")
+    if len(oby.bs) != 3 || oby.bs[0] == nil || oby.bs[1] != nil || oby.bs[2] == nil {
+        fails("[]own byte presence")
+    }
+    [byb2, byre] = gob.marshal(oby)
+    want_ok(byre, "remarshal []own byte")
+    if len(byb2) != len(byb) {
+        fails("[]own byte remarshal len")
+    }
+    bi := 0
+    for bi < len(byb) {
+        if byb2[bi] != byb[bi] {
+            fails("[]own byte remarshal bytes")
         }
+        bi = bi + 1
     }
-    e13 := gob.unmarshal(wb, new(0))
-    if e13 == nil {
-        fails("wrong-kind root accepted")
+    // --- malformed wire shapes report, never panic: scalar range
+    // checks, negative deltas, out-of-bounds tids and tags, and
+    // giant field/type counts that must hit end-of-input.
+    badb := sc_wire()
+    badb = w1(badb, 1)
+    badb = w1(badb, 2)
+    badb = w1(badb, 0)
+    want_err(gob.unmarshal(badb, new(Sc)), g_malformed(), "bool slot 2")
+    bady := sc_wire()
+    bady = w1(bady, 2)
+    bady = w1(bady, 253)
+    bady = w1(bady, 1)
+    bady = w1(bady, 44)
+    bady = w1(bady, 0)
+    want_err(gob.unmarshal(bady, new(Sc)), g_malformed(), "byte slot 300")
+    // a negative field delta — the 9-byte uvarint carrying -1
+    neg := sc_wire()
+    neg = w1(neg, 247)
+    nj := 0
+    for nj < 8 {
+        neg = w1(neg, 255)
+        nj = nj + 1
     }
+    want_err(gob.unmarshal(neg, new(Sc)), g_malformed(), "negative delta")
+    // a struct slot tid past the preamble record count — an
+    // unmatched name hits the check through dskip
+    oob := mkslice(byte, 0)
+    oob = w1(oob, 1)
+    oob = w1(oob, 2)
+    oob = w1(oob, 83)
+    oob = w1(oob, 99)
+    oob = w1(oob, 7)
+    oob = w1(oob, 1)
+    oob = w1(oob, 1)
+    oob = w1(oob, 122)
+    oob = w1(oob, 7)
+    oob = w1(oob, 0)
+    oob = w1(oob, 7)
+    oob = w1(oob, 1)
+    want_err(gob.unmarshal(oob, new(Sc)), g_malformed(), "oob tid")
+    // giant nf/nt counts — the record loops hit end-of-input rather
+    // than looping on a fabricated length
+    gnf := mkslice(byte, 0)
+    gnf = w1(gnf, 1)
+    gnf = w1(gnf, 2)
+    gnf = w1(gnf, 83)
+    gnf = w1(gnf, 99)
+    gnf = w1(gnf, 7)
+    gnf = w1(gnf, 253)
+    gnf = w1(gnf, 255)
+    gnf = w1(gnf, 255)
+    want_err(gob.unmarshal(gnf, new(Sc)), g_malformed(), "giant nf")
+    gnt := mkslice(byte, 0)
+    gnt = w1(gnt, 253)
+    gnt = w1(gnt, 255)
+    gnt = w1(gnt, 255)
+    want_err(gob.unmarshal(gnt, new(Sc)), g_malformed(), "giant nt")
+    // an enum tag past the wire variant list
+    oet := mkslice(byte, 0)
+    oet = w1(oet, 1)
+    oet = w1(oet, 1)
+    oet = w1(oet, 69)
+    oet = w1(oet, 13)
+    oet = w1(oet, 1)
+    oet = w1(oet, 1)
+    oet = w1(oet, 65)
+    oet = w1(oet, 0)
+    oet = w1(oet, 5)
+    want_err(gob.unmarshal(oet, new(E.C)), g_malformed(), "oob enum tag")
     println("enc_gob ok")
 }

@@ -1786,6 +1786,19 @@ want=$("$OXL" run bootstrap/cmd/check -- tests/diag/own_use_moved.oxl || true)
 "$OXL" run bootstrap/cmd/codegen -- examples/hello.oxl > "$cgen_dir/direct.c"
 cmp "$cgen_dir/chain.c" "$cgen_dir/direct.c" || { echo "FAIL bootstrap chain"; exit 1; }
 
+echo "== llvm lane (l1) =="
+# the emitted .ll + the rt.h-offset shim must agree on every boundary
+# type — a drifted %OxlStr/%RtSlice/%RtFnv/%RtIface decl turns the
+# shim's reads to garbage. Gated on clang (the lane's only consumer).
+if command -v clang >/dev/null 2>&1; then
+    "$OXL" run bootstrap/cmd/codegen -- --emit llvm tests/llvm_abi_check.oxl > "$scratch/abi.ll" || { echo "FAIL llvm emit"; exit 1; }
+    clang -O0 -Iruntime "$scratch/abi.ll" tests/llvm_abi_shim.c runtime/rt.c -o "$scratch/abi_check$EXE" || { echo "FAIL llvm abi cc"; exit 1; }
+    out=$("$scratch/abi_check$EXE")
+    grep -q "llvm_abi_check ok" <<<"$out" || { echo "FAIL llvm abi: $out"; exit 1; }
+else
+    echo "  clang not found — skipping llvm abi probe"
+fi
+
 echo "== toolchain driver in .oxl (t2) =="
 # cmd/oxl is the product driver ported to .oxl — argv dispatch, the
 # pkg-args/file-list rule, compile orchestration over bootstrap/check +

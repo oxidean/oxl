@@ -768,9 +768,10 @@ fn lrt_sig(name: str) -> str {
         d = "void @free(ptr)"
     }
     if len(d) == 0 {
-        // unregistered name — i64 word default keeps the module
-        // assembled; the verifier still cross-checks call spellings
-        d = "i64 @" + name + "(i64)"
+        // unregistered name — declare under a deliberately
+        // unresolvable spelling so a missing table entry fails the
+        // link loudly rather than guessing a signature
+        d = "i64 @__oxl_missing_rt_sig_" + name + "(i64)"
     }
     return "declare " + d + "\n"
 }
@@ -792,12 +793,12 @@ fn lgepi(g: mut G, tyn: str, base: str, idx: str) -> str {
 
 fn lload(g: mut G, tyn: str, p: str) -> str {
     v := lreg(g)
-    lw(g, v + " = load " + tyn + ", ptr " + p + ", align 8")
+    lw(g, v + " = load " + tyn + ", ptr " + p)
     return v
 }
 
 fn lstore(g: mut G, tyn: str, v: str, p: str) {
-    lw(g, "store " + tyn + " " + v + ", ptr " + p + ", align 8")
+    lw(g, "store " + tyn + " " + v + ", ptr " + p)
 }
 
 fn lexv(g: mut G, tyn: str, agg: str, i: int) -> str {
@@ -2153,6 +2154,12 @@ fn larm(g: mut G, pat: ref parser.Node, mb: str, sv: str, st: int) -> LArm {
                     lw(g, c + " = icmp ne i32 " + s + ", 0")
                     r.has = 1
                     r.cond = c
+                } else if tyk(g, st2) == check.k_float() {
+                    lv = lfit(g, lv, xty(g, v), st2)
+                    c := lreg(g)
+                    lw(g, c + " = fcmp oeq double " + sv + ", " + lv)
+                    r.has = 1
+                    r.cond = c
                 } else {
                     w := lty(g, st2)
                     lv = lfit(g, lv, xty(g, v), st2)
@@ -2760,6 +2767,10 @@ fn lspawn(g: mut G, sc: ref parser.Node, e: ref parser.Node, blocking: bool) {
         return
     }
     qn := check.resolve_named(g.ck, cn)
+    if check.sl_has(g.ck.susp, qn) {
+        ltrapu(g)
+        return
+    }
     fi := gfn(g, cn)
     if fi < 0 {
         ltrapu(g)

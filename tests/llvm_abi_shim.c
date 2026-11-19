@@ -34,3 +34,10 @@ typedef int64_t (*abi_fnv_fp)(void *, int64_t);
 int64_t abi_probe_fnv(RtFnv f, int64_t x) {
     return ((abi_fnv_fp)f.fp)(f.env, x);
 }
+
+/* RtIface {data, vtab}: vtab[i] is (void *data, args...) — tag takes
+ * no args, so slot 0 is (void *data) -> int64_t. A swapped pair reads
+ * the object as a vtab array and the call lands on garbage. */
+int64_t abi_probe_iface(RtIface i) {
+    return ((int64_t (*)(void *))i.vtab[0])(i.data);
+}

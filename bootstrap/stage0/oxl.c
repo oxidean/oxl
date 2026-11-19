@@ -239,7 +239,7 @@ struct o_s_codegen_GVU {    OxlStr f_w;    OxlStr f_impl;    struct o_s_codegen_
 struct o_s_codegen_GCP {    int64_t f_k;    int64_t f_dotted;    OxlStr f_q;    OxlStr f_w;    int64_t f_midx;    OxlStr f_mname;    struct o_s_check_IList* f_ps;    int64_t f_rk;    int64_t f_r1;};
 struct o_s_codegen_GArgOut {    OxlStr f_v;    OxlStr f_pre;    OxlStr f_post;};
 struct o_s_codegen_GPair {    OxlStr f_tag;    int64_t f_vt;};
-struct o_s_codegen_G {    struct o_s_check_Ck* f_ck;    RtSlice f_its;    struct o_s_collections_Map* f_fidx;    struct o_s_check_Env* f_env;    struct o_s_check_Env* f_benv;    struct o_s_check_Env* f_fsl;    RtSlice f_w;    struct o_s_codegen_WStk* f_wst;    RtSlice f_wlast;    RtSlice f_head;    RtSlice f_out;    RtSlice f_tramp;    RtSlice f_fhead;    RtSlice f_fbody;    RtSlice f_clpro;    RtSlice f_clbod;    RtSlice f_ginit;    int64_t f_maink;    int64_t f_testm;    struct o_s_parser_NList* f_defers;    struct o_s_check_SList* f_fnv;    RtSlice f_fdecls;    RtSlice f_sdecls;    RtSlice f_vdecls;    RtSlice f_states;    RtSlice f_loops;    RtSlice f_sopen;    int64_t f_tmpn;    int64_t f_scopen;    int64_t f_cln;    int64_t f_staten;    int64_t f_vsdn;    int64_t f_labeln;    int64_t f_hoistn;    int64_t f_retk;    int64_t f_cret;    struct o_s_collections_Map* f_subst;    RtSlice f_drop_tys;    int64_t f_drop_word;    int64_t f_drop_slice;    struct o_s_codegen_GInst* f_insts;    struct o_s_collections_Map* f_inst_done;    struct o_s_codegen_GVU* f_vtabs;    struct o_s_collections_Map* f_vtab_set;    RtSlice f_descs;    struct o_s_collections_Map* f_dmap;    RtSlice f_vout;    OxlStr f_cur;    int64_t f_inframe;    RtSlice f_units;    struct o_s_collections_Map* f_dpos;    RtSlice f_dchain;    RtSlice f_uhits;    RtSlice f_live;    int64_t f_labi;    int64_t f_lreg;    int64_t f_ldeadn;    int64_t f_lterm;    int64_t f_lfn;    RtSlice f_lall;    RtSlice f_lallg;    struct o_s_collections_Map* f_lstrs;    int64_t f_lstrn;    struct o_s_collections_Map* f_lrtd;    RtSlice f_lrtl;    OxlStr f_lscsz;    OxlStr f_ldmark;    int64_t f_ltsd;    int64_t f_dwrapn;    int64_t f_spn;    RtSlice f_dpro;    RtSlice f_dbod;    RtSlice f_spro;    RtSlice f_spbod;    RtSlice f_ltys;    RtSlice f_lglob;    RtSlice f_lext;    RtSlice f_lbody;    RtSlice f_lwrap;    RtSlice f_lvtb;    RtSlice f_ldrp;    RtSlice f_liret;};
+struct o_s_codegen_G {    struct o_s_check_Ck* f_ck;    RtSlice f_its;    struct o_s_collections_Map* f_fidx;    struct o_s_check_Env* f_env;    struct o_s_check_Env* f_benv;    struct o_s_check_Env* f_fsl;    RtSlice f_w;    struct o_s_codegen_WStk* f_wst;    RtSlice f_wlast;    RtSlice f_head;    RtSlice f_out;    RtSlice f_tramp;    RtSlice f_fhead;    RtSlice f_fbody;    RtSlice f_clpro;    RtSlice f_clbod;    RtSlice f_ginit;    int64_t f_maink;    int64_t f_testm;    struct o_s_parser_NList* f_defers;    struct o_s_check_SList* f_fnv;    RtSlice f_fdecls;    RtSlice f_sdecls;    RtSlice f_vdecls;    RtSlice f_states;    RtSlice f_loops;    RtSlice f_sopen;    int64_t f_tmpn;    int64_t f_scopen;    int64_t f_cln;    int64_t f_staten;    int64_t f_vsdn;    int64_t f_labeln;    int64_t f_hoistn;    int64_t f_retk;    int64_t f_cret;    struct o_s_collections_Map* f_subst;    RtSlice f_drop_tys;    int64_t f_drop_word;    int64_t f_drop_slice;    struct o_s_codegen_GInst* f_insts;    struct o_s_collections_Map* f_inst_done;    struct o_s_codegen_GVU* f_vtabs;    struct o_s_collections_Map* f_vtab_set;    RtSlice f_descs;    struct o_s_collections_Map* f_dmap;    RtSlice f_vout;    OxlStr f_cur;    int64_t f_inframe;    RtSlice f_units;    struct o_s_collections_Map* f_dpos;    RtSlice f_dchain;    RtSlice f_uhits;    RtSlice f_live;    int64_t f_labi;    int64_t f_lreg;    int64_t f_ldeadn;    int64_t f_lterm;    int64_t f_lfn;    RtSlice f_lall;    RtSlice f_lallg;    struct o_s_collections_Map* f_lstrs;    int64_t f_lstrn;    struct o_s_collections_Map* f_lrtd;    RtSlice f_lrtl;    OxlStr f_lscsz;    OxlStr f_ldmark;    int64_t f_ltsd;    int64_t f_dwrapn;    int64_t f_spn;    RtSlice f_dpro;    RtSlice f_dbod;    RtSlice f_spro;    RtSlice f_spbod;    RtSlice f_ltys;    RtSlice f_lglob;    RtSlice f_lext;    RtSlice f_lbody;    RtSlice f_lwrap;    RtSlice f_lvtb;    RtSlice f_ldrp;    RtSlice f_liret;    RtSlice f_lub;};
 struct o_s_codegen_WStk {    RtSlice f_w;    struct o_s_codegen_WStk* f_next;};
 struct o_s_codegen_GAv {    OxlStr f_v;    OxlStr f_pre;    OxlStr f_post;    struct o_s_codegen_GAv* f_next;};
 struct o_s_codegen_GD {    int64_t f_t;};
@@ -35418,8 +35418,8 @@ OxlStr o_f_codegen_jx(struct o_s_codegen_G* g, struct o_en_parser_Node* e) {
 void o_f_eprint(OxlStr s) {
     RtDefer *_dmark = rt_defer_mark();
     struct o_s_os_File f = ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_os_stderr }; ((struct o_s_os_File (*)(void*))_fv.fp)(_fv.env); });
-    struct o_ret_os_File_write _r2088 = o_f_os_File_write((&f), rt_bytes_str(s));
-    int64_t e = _r2088.err;
+    struct o_ret_os_File_write _r2124 = o_f_os_File_write((&f), rt_bytes_str(s));
+    int64_t e = _r2124.err;
     if ((e != 0)) {
     rt_exit(1LL);
     }
@@ -35803,9 +35803,9 @@ OxlStr o_f_pick_cc(void) {
     int64_t i = 0LL;
     while ((i < (cands).len)) {
     struct o_s_exec_Cmd probe = ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_exec_cmd }; ((struct o_s_exec_Cmd (*)(void*, OxlStr, RtSlice))_fv.fp)(_fv.env, (*({ RtSlice _ms = cands; int64_t _mi = i; if (_mi < 0 || _mi >= _ms.len) rt_trap(10); (OxlStr*)_ms.ptr + _mi; })), ver); });
-    struct o_ret_exec_Cmd_output _r2089 = o_f_exec_Cmd_output(probe);
-    struct o_s_exec_Out o = _r2089.val;
-    int64_t e = _r2089.err;
+    struct o_ret_exec_Cmd_output _r2125 = o_f_exec_Cmd_output(probe);
+    struct o_s_exec_Out o = _r2125.val;
+    int64_t e = _r2125.err;
     if (((e == 0) && (o.f_status == 0LL))) {
     rt_defer_drain_to(_dmark);
     return (*({ RtSlice _ms = cands; int64_t _mi = i; if (_mi < 0 || _mi >= _ms.len) rt_trap(10); (OxlStr*)_ms.ptr + _mi; }));
@@ -35865,9 +35865,9 @@ int64_t o_f_is_macos(void) {
     RtSlice ua = rt_mkslice(0LL, sizeof(OxlStr));
     ua = ({ OxlStr _pv = rt_str_lit("-s"); rt_slice_push(ua, sizeof(OxlStr), &_pv); });
     struct o_s_exec_Cmd un = ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_exec_cmd }; ((struct o_s_exec_Cmd (*)(void*, OxlStr, RtSlice))_fv.fp)(_fv.env, rt_str_lit("uname"), ua); });
-    struct o_ret_exec_Cmd_output _r2090 = o_f_exec_Cmd_output(un);
-    struct o_s_exec_Out o = _r2090.val;
-    int64_t e = _r2090.err;
+    struct o_ret_exec_Cmd_output _r2126 = o_f_exec_Cmd_output(un);
+    struct o_s_exec_Out o = _r2126.val;
+    int64_t e = _r2126.err;
     if ((e != 0)) {
     rt_defer_drain_to(_dmark);
     return 0LL;
@@ -35992,9 +35992,9 @@ int64_t o_f_emit_and_cc(OxlStr csrc, OxlStr out, OxlStr entry) {
     }
     }
     struct o_s_exec_Cmd ccp = ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_exec_cmd }; ((struct o_s_exec_Cmd (*)(void*, OxlStr, RtSlice))_fv.fp)(_fv.env, cc, args); });
-    struct o_ret_exec_Cmd_run _r2091 = o_f_exec_Cmd_run(ccp);
-    int64_t st = _r2091.val;
-    int64_t e = _r2091.err;
+    struct o_ret_exec_Cmd_run _r2127 = o_f_exec_Cmd_run(ccp);
+    int64_t st = _r2127.val;
+    int64_t e = _r2127.err;
     if (((e == 0) && (st == 0LL))) {
     ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_os_remove_all }; ((int64_t (*)(void*, OxlStr))_fv.fp)(_fv.env, dir); });
     rt_defer_drain_to(_dmark);
@@ -36229,9 +36229,9 @@ void o_f_cmd_run(void) {
     i = ((int64_t)((uint64_t)(i) + (uint64_t)(1LL)));
     }
     struct o_s_exec_Cmd child = ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_exec_cmd }; ((struct o_s_exec_Cmd (*)(void*, OxlStr, RtSlice))_fv.fp)(_fv.env, rt_str_lit("node"), nc); });
-    struct o_ret_exec_Cmd_run _r2092 = o_f_exec_Cmd_run(child);
-    int64_t st = _r2092.val;
-    int64_t e = _r2092.err;
+    struct o_ret_exec_Cmd_run _r2128 = o_f_exec_Cmd_run(child);
+    int64_t st = _r2128.val;
+    int64_t e = _r2128.err;
     if ((e != 0)) {
     o_f_eprintln(rt_strcat(rt_str_lit("node exec failed: "), ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_errors_msg }; ((OxlStr (*)(void*, int64_t))_fv.fp)(_fv.env, e); })));
     }
@@ -36239,9 +36239,9 @@ void o_f_cmd_run(void) {
     rt_exit(o_f_child_code(st, e));
     }
     struct o_s_exec_Cmd child = ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_exec_cmd }; ((struct o_s_exec_Cmd (*)(void*, OxlStr, RtSlice))_fv.fp)(_fv.env, out, cargs); });
-    struct o_ret_exec_Cmd_run _r2093 = o_f_exec_Cmd_run(child);
-    int64_t st = _r2093.val;
-    int64_t e = _r2093.err;
+    struct o_ret_exec_Cmd_run _r2129 = o_f_exec_Cmd_run(child);
+    int64_t st = _r2129.val;
+    int64_t e = _r2129.err;
     ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_os_remove_all }; ((int64_t (*)(void*, OxlStr))_fv.fp)(_fv.env, dir); });
     rt_exit(o_f_child_code(st, e));
     rt_defer_drain_to(_dmark);
@@ -36296,9 +36296,9 @@ int64_t o_f_test_one(struct o_s_PkgSrc src, struct o_s_CRes* res) {
     RtSlice nargs = rt_mkslice(0LL, sizeof(OxlStr));
     nargs = ({ OxlStr _pv = out; rt_slice_push(nargs, sizeof(OxlStr), &_pv); });
     struct o_s_exec_Cmd child = ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_exec_cmd }; ((struct o_s_exec_Cmd (*)(void*, OxlStr, RtSlice))_fv.fp)(_fv.env, rt_str_lit("node"), nargs); });
-    struct o_ret_exec_Cmd_run _r2094 = o_f_exec_Cmd_run(child);
-    int64_t st = _r2094.val;
-    int64_t e = _r2094.err;
+    struct o_ret_exec_Cmd_run _r2130 = o_f_exec_Cmd_run(child);
+    int64_t st = _r2130.val;
+    int64_t e = _r2130.err;
     if ((e != 0)) {
     o_f_eprintln(rt_strcat(rt_str_lit("node exec failed: "), ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_errors_msg }; ((OxlStr (*)(void*, int64_t))_fv.fp)(_fv.env, e); })));
     }
@@ -36312,9 +36312,9 @@ int64_t o_f_test_one(struct o_s_PkgSrc src, struct o_s_CRes* res) {
     return 1LL;
     }
     struct o_s_exec_Cmd child = ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_exec_cmd }; ((struct o_s_exec_Cmd (*)(void*, OxlStr, RtSlice))_fv.fp)(_fv.env, out, rt_mkslice(0LL, sizeof(OxlStr))); });
-    struct o_ret_exec_Cmd_run _r2095 = o_f_exec_Cmd_run(child);
-    int64_t st = _r2095.val;
-    int64_t e = _r2095.err;
+    struct o_ret_exec_Cmd_run _r2131 = o_f_exec_Cmd_run(child);
+    int64_t st = _r2131.val;
+    int64_t e = _r2131.err;
     ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_os_remove_all }; ((int64_t (*)(void*, OxlStr))_fv.fp)(_fv.env, dir); });
     rt_defer_drain_to(_dmark);
     return o_f_child_code(st, e);
@@ -36350,7 +36350,7 @@ void o_f_cmd_list(void) {
     o_f_eprintln(rt_strcat(rt_str_lit("error [check] not a module — no oxl.mod found above "), ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_check_native_path }; ((OxlStr (*)(void*, OxlStr))_fv.fp)(_fv.env, cwd); })));
     rt_exit(1LL);
     }
-    ({ struct o_s_check_Ck* _ba2096 = ck; rt_borrow_read(_ba2096); o_f_print_build_list(_ba2096); rt_unborrow(_ba2096); });
+    ({ struct o_s_check_Ck* _ba2132 = ck; rt_borrow_read(_ba2132); o_f_print_build_list(_ba2132); rt_unborrow(_ba2132); });
     rt_defer_drain_to(_dmark);
 }
 

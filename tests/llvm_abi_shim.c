@@ -15,6 +15,17 @@ int64_t abi_probe_str(OxlStr s) {
     return v;
 }
 
+/* SysV eightbyte budget: five i64 params spend five GP regs, so a
+ * 16-byte OxlStr's first eightbyte could split across the last reg
+ * while its tail rides the stack — SysV says an aggregate that
+ * doesn't fit wholly in registers goes to memory, which means the
+ * emitted call must pass it indirectly. Summing the ints + the
+ * length catches a misplaced tail. */
+int64_t abi_probe_eb(int64_t a, int64_t b, int64_t c, int64_t d,
+                     int64_t e, OxlStr s) {
+    return a + b + c + d + e + s.n * 1000;
+}
+
 /* RtSlice {ptr, len, cap, heap} of i64 elements: every field rides
  * the encoding, and the element walk catches a ptr-field drift. */
 int64_t abi_slice_len(RtSlice s) { return s.len; }

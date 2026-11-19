@@ -475,6 +475,192 @@ fn lagsz(tyn: str) -> int {
     return 0
 }
 
+// SysV register budget for one call's arg list: INTEGER eightbytes
+// share six GP regs (di,si,dx,cx,r8,r9), SSE eightbytes eight xmm
+// regs — an aggregate only stays in registers while enough of its
+// class remain; otherwise the whole object goes to memory (the
+// backend splits eightbytes independently, so raw emission misplaces
+// the tail — the probe: a str after five ints lands half in r9)
+struct LEb { gp: int, sse: int }
+
+// scalar/composite type kind check for the SysV plan — composites are
+// structs, enums, and the boundary aggregates
+fn labi_composite(g: mut G, t: int) -> bool {
+    k := tyk(g, t)
+    return k == check.k_struct() || k == check.k_enum() || k == check.k_str() || k == check.k_fn() || k == check.k_iface() || k == check.k_slice()
+}
+
+// mark every eightbyte window `t` occupies at byte offset `off` —
+// `ws` is two class slots packed as ws[0], ws[1] (0 unused, 1 INTEGER,
+// 2 SSE); INTEGER wins on merge per the SysV rule
+fn labi_eb_at(g: mut G, t: int, off: int, ws: mut LEb) {
+    t = gsub(g, t)
+    k := tyk(g, t)
+    if k == check.k_struct() {
+        if collections.map_has(g.ck.structs, g.ck.tyv[t].name) {
+            [si, err] = collections.map_get(g.ck.structs, g.ck.tyv[t].name)
+            if err == nil {
+                fof := 0
+                fl := g.ck.structsv[si].fields
+                for fl != nil {
+                    fof = lalign_up(fof, lalign(g, fl.v.t))
+                    labi_eb_at(g, fl.v.t, off + fof, ws)
+                    fof = fof + lsize(g, fl.v.t)
+                    fl = fl.next
+                }
+                return
+            }
+        }
+    }
+    if k == check.k_enum() {
+        // { i32, [4 x i8], payload, i64 }: INTEGER header, the largest
+        // variant's fields at 8, the INTEGER anchor at the tail
+        leb_span(ws, off, 8, 1)
+        en := g.ck.tyv[t].name
+        if collections.map_has(g.ck.enums, en) {
+            [ei, err] = collections.map_get(g.ck.enums, en)
+            if err == nil {
+                // the payload member spells the largest variant —
+                // find it, then classify its fields at +8 (the borrow
+                // of enumsv stays inside this frame)
+                psz := 0
+                let bv: ref check.FList = nil
+                vl := g.ck.enumsv[ei].vars
+                for vl != nil {
+                    if vl.v.fields != nil {
+                        vs := lsize_fields(g, vl.v.fields)
+                        if vs > psz {
+                            psz = vs
+                            bv = vl.v.fields
+                        }
+                    }
+                    vl = vl.next
+                }
+                fof := 0
+                fl := bv
+                for fl != nil {
+                    fof = lalign_up(fof, lalign(g, fl.v.t))
+                    labi_eb_at(g, fl.v.t, off + 8 + fof, ws)
+                    fof = fof + lsize(g, fl.v.t)
+                    fl = fl.next
+                }
+            }
+        }
+        psz2 := lenum_payload(g, g.ck.tyv[t].name)
+        leb_span(ws, off + lalign_up(8 + psz2, 8), 8, 1)
+        return
+    }
+    cl := 1
+    if k == check.k_float() {
+        cl = 2
+    }
+    leb_span(ws, off, lsize(g, t), cl)
+}
+
+// mark windows [off, off+sz) with class `cl` — INTEGER wins
+fn leb_span(ws: mut LEb, off: int, sz: int, cl: int) {
+    if sz < 1 {
+        return
+    }
+    w := off / 8
+    w2 := (off + sz - 1) / 8
+    for w <= w2 && w < 2 {
+        if w == 0 {
+            if ws.gp != 1 {
+                ws.gp = cl
+            }
+        }
+        if w == 1 {
+            if ws.sse != 1 {
+                ws.sse = cl
+            }
+        }
+        w = w + 1
+    }
+}
+
+// SysV eightbyte needs of a param ty — [gp regs, sse regs] the value
+// occupies while it stays in registers (scalars take their class;
+// boundary aggregates and int-family scalars are all-INTEGER). Only
+// meaningful for tys the lane keeps raw (see lextern_plan)
+fn labi_eb(g: mut G, t: int) -> own LEb {
+    ws := new(LEb)
+    t = gsub(g, t)
+    k := tyk(g, t)
+    if k == check.k_float() {
+        ws.sse = 1
+        return ws
+    }
+    if k == check.k_struct() || k == check.k_enum() {
+        // field-level classification — a mixed {i64, double} spends
+        // one reg of each class
+        cls := new(LEb)
+        labi_eb_at(g, t, 0, cls)
+        if cls.gp == 1 {
+            ws.gp = ws.gp + 1
+        }
+        if cls.gp == 2 {
+            ws.sse = ws.sse + 1
+        }
+        if cls.sse == 1 {
+            ws.gp = ws.gp + 1
+        }
+        if cls.sse == 2 {
+            ws.sse = ws.sse + 1
+        }
+        return ws
+    }
+    // int-family, ptr kinds, and the all-INTEGER boundary aggregates —
+    // ceil(size/8) INTEGER eightbytes
+    ws.gp = lalign_up(lsize(g, t), 8) / 8
+    if ws.gp < 1 {
+        ws.gp = 1
+    }
+    return ws
+}
+
+// per-param indirect plan for one extern signature — SysV keeps a
+// ≤16B aggregate in registers only while its eightbytes fit the
+// remaining budget; over-budget and >16B params pass by stack copy,
+// and the declare and every call site must agree. `gp0` seeds the
+// budget when an sret out-pointer leads the list. Non-SysV ABIs keep
+// the per-arg size rule.
+fn lextern_plan(g: mut G, params: ref check.IList, bind: ref collections.Map, gp0: int) -> []int {
+    plan := mkslice(int, 0)
+    gp := gp0
+    sse := 0
+    pl := params
+    for pl != nil {
+        pt := gsub(g, pl.v)
+        if bind != nil {
+            pt = gsub(g, check.subst_ty(g.ck, pt, bind))
+        }
+        ind := 0
+        if labi(g) == 1 {
+            if lsize(g, pt) > 16 {
+                ind = 1
+            } else if labi_composite(g, pt) {
+                eb := labi_eb(g, pt)
+                if gp + eb.gp > 6 || sse + eb.sse > 8 {
+                    ind = 1
+                } else {
+                    gp = gp + eb.gp
+                    sse = sse + eb.sse
+                }
+            } else if tyk(g, pt) == check.k_float() {
+                sse = sse + 1
+            } else {
+                gp = gp + 1
+            }
+        } else if lsize(g, pt) > laggt(g) {
+            ind = 1
+        }
+        plan = push(plan, ind)
+        pl = pl.next
+    }
+    return plan
+}
+
 // split a typed call-arg string on top-level commas — constant
 // operands like getelementptr(...) nest commas inside parens
 fn lsplit_args(a: str) -> []str {
@@ -517,7 +703,7 @@ fn lagg_copy(g: mut G, tyn: str, v: str) -> str {
 // one typed call arg ("<ty>[ <attr>…] <val>") → boundary spelling;
 // emits the materializing store for indirect aggregates and strips a
 // `byval` attr where the ABI takes a plain pointer instead
-fn labi_arg(g: mut G, arg: str) -> str {
+fn labi_arg(g: mut G, arg: str, m: mut LEb) -> str {
     arg = strings.trim(arg)
     sp := -1
     i := 0
@@ -533,32 +719,56 @@ fn labi_arg(g: mut G, arg: str) -> str {
     }
     ty := substr(arg, 0, sp)
     rest := substr(arg, sp + 1, len(arg))
+    if ty == "ptr" {
+        if strings.startswith(rest, "byval(") {
+            if labi(g) == 1 {
+                // stack copy — MEMORY class, no registers consumed
+                return arg
+            }
+            // byval is the SysV spelling — strip the attr elsewhere;
+            // the last token is the pointer operand (attrs carry the
+            // spaces)
+            j := len(arg) - 1
+            for j > 0 {
+                if byteat(arg, j) == 32 {
+                    break
+                }
+                j = j - 1
+            }
+            return "ptr " + substr(arg, j + 1, len(arg))
+        }
+        // sret out-pointers and plain ptr args ride one GP reg
+        m.gp = m.gp + 1
+        return arg
+    }
+    if labi(g) == 1 && lagsz(ty) > 0 {
+        // a boundary aggregate kept raw: INTEGER eightbytes only —
+        // over-budget means the callee reads it from the stack
+        if lagsz(ty) > 16 || m.gp + lagsz(ty) / 8 > 6 {
+            return lagg_copy(g, ty, rest)
+        }
+        m.gp = m.gp + lagsz(ty) / 8
+        return arg
+    }
     if lagsz(ty) > laggt(g) {
         return lagg_copy(g, ty, rest)
     }
-    if ty == "ptr" && strings.startswith(rest, "byval(") {
-        if labi(g) == 1 {
-            return arg
-        }
-        // byval is the SysV spelling — strip the attr elsewhere; the
-        // last token is the pointer operand (attrs carry the spaces)
-        j := len(arg) - 1
-        for j > 0 {
-            if byteat(arg, j) == 32 {
-                break
-            }
-            j = j - 1
-        }
-        return "ptr " + substr(arg, j + 1, len(arg))
+    if ty == "double" {
+        m.sse = m.sse + 1
+    } else {
+        m.gp = m.gp + 1
     }
     return arg
 }
 
-// rewrite a whole boundary-call arg string for the host ABI
-fn labi_args(g: mut G, a: str) -> str {
+// rewrite a whole boundary-call arg string for the host ABI — `gp0`
+// seeds the SysV budget when a hidden sret pointer leads the list
+fn labi_args(g: mut G, a: str, gp0: int) -> str {
     if len(a) == 0 {
         return a
     }
+    m := new(LEb)
+    m.gp = gp0
     ps := lsplit_args(a)
     out := ""
     i := 0
@@ -566,16 +776,16 @@ fn labi_args(g: mut G, a: str) -> str {
         if i > 0 {
             out = out + ", "
         }
-        out = out + labi_arg(g, ps[i])
+        out = out + labi_arg(g, ps[i], m)
         i = i + 1
     }
     return out
 }
 
-// declare-side param spelling: attrs ride the call site, so `ptr`
-// alone covers every indirect class; bare aggregates over the
-// threshold become `ptr`
-fn labi_sig_pt(g: mut G, p: str) -> str {
+// declare-side param spelling under the same SysV budget the call
+// args walk — attrs ride the call site, so `ptr` alone covers every
+// indirect class; a kept-raw aggregate over budget becomes `ptr`
+fn labi_sig_pt(g: mut G, p: str, m: mut LEb) -> str {
     p = strings.trim(p)
     sp := 0
     for sp < len(p) {
@@ -586,13 +796,31 @@ fn labi_sig_pt(g: mut G, p: str) -> str {
     }
     ty := substr(p, 0, sp)
     if ty == "ptr" {
-        if strings.startswith(substr(p, sp, len(p)), " sret(") {
+        rest := substr(p, sp, len(p))
+        if strings.startswith(rest, " byval(") {
+            // MEMORY class — no registers on the boundary either
+            return "ptr"
+        }
+        m.gp = m.gp + 1
+        if strings.startswith(rest, " sret(") {
             return p
         }
         return "ptr"
     }
+    if labi(g) == 1 && lagsz(ty) > 0 {
+        if lagsz(ty) > 16 || m.gp + lagsz(ty) / 8 > 6 {
+            return "ptr"
+        }
+        m.gp = m.gp + lagsz(ty) / 8
+        return p
+    }
     if lagsz(ty) > laggt(g) {
         return "ptr"
+    }
+    if ty == "double" {
+        m.sse = m.sse + 1
+    } else {
+        m.gp = m.gp + 1
     }
     return p
 }
@@ -634,13 +862,14 @@ fn labi_sig(g: mut G, d: str) -> str {
     params := substr(d, lp + 1, rp)
     np := ""
     if len(params) > 0 {
+        m := new(LEb)
         ps := lsplit_args(params)
         i = 0
         for i < len(ps) {
             if i > 0 {
                 np = np + ", "
             }
-            np = np + labi_sig_pt(g, ps[i])
+            np = np + labi_sig_pt(g, ps[i], m)
             i = i + 1
         }
     }
@@ -666,7 +895,10 @@ fn lrtuse(g: mut G, name: str) {
         return
     }
     collections.map_set(g.lrtd, name, 1)
-    g.lrtl = push(g.lrtl, name)
+    // declare text is a unit — the G1 mark keeps only the rt_* names
+    // live bodies actually spell
+    d := labi_sig(g, lrt_sig(name))
+    lunit(g, 14, d, name)
 }
 
 fn lrt_sig(name: str) -> str {
@@ -1087,7 +1319,7 @@ fn lbyval_slice(g: mut G, v: str) -> str {
 
 fn lcallrt(g: mut G, rt: str, name: str, a: str) -> str {
     lrtuse(g, name)
-    a = labi_args(g, a)
+    a = labi_args(g, a, 0)
     if lagsz(rt) > laggt(g) {
         dst := lalloc(g, rt)
         sep := ""
@@ -1112,13 +1344,13 @@ fn lcallrt_sret(g: mut G, tyn: str, name: str, a: str) -> str {
     if a != "" {
         sep = ", "
     }
-    lcallv(g, "@" + name, "ptr sret(" + tyn + ") " + dst + sep + labi_args(g, a))
+    lcallv(g, "@" + name, "ptr sret(" + tyn + ") " + dst + sep + labi_args(g, a, 1))
     return lload(g, tyn, dst)
 }
 
 fn lcallrtv(g: mut G, name: str, a: str) {
     lrtuse(g, name)
-    lcallv(g, "@" + name, labi_args(g, a))
+    lcallv(g, "@" + name, labi_args(g, a, 0))
 }
 
 // ---------- width / representation normalization ----------
@@ -1382,6 +1614,34 @@ fn lindex_ptr(g: mut G, obj: ref parser.Node, idx: ref parser.Node) -> str {
     lw(g, cb + " = or i1 " + c1 + ", " + c2)
     ltrapc(g, cb, 10)
     return lgepi(g, lty(g, el), sp, iv)
+}
+
+// drop the innermost dynamic scope mark — balances the Scope push
+fn lpop_sopen(g: mut G) {
+    n := len(g.sopen)
+    if n == 0 {
+        return
+    }
+    ys := mkslice(int, n - 1)
+    i := 0
+    for i < n - 1 {
+        ys[i] = g.sopen[i]
+        i = i + 1
+    }
+    g.sopen = ys
+}
+
+// leave every dynamic scope open at stack depth `from`, innermost
+// first — break/continue/return exits route the branch past the
+// scope's tail, and a skipped rt_scope_leave leaves the runtime
+// treating the (entry-hoisted) slot as current: `continue` would
+// re-enter a scope it never left (seed gfscope_drain)
+fn lscope_drain(g: mut G, from: int) {
+    j := len(g.sopen) - 1
+    for j >= from {
+        lcallrtv(g, "rt_scope_leave", "ptr %sc" + itoa(g.sopen[j]))
+        j = j - 1
+    }
 }
 
 // slice header as a %RtSlice operand — own/ref/mut headers load
@@ -1839,7 +2099,9 @@ fn lxbin(g: mut G, op: str, l: ref parser.Node, r: ref parser.Node, e: ref parse
         if op == "==" || op == "!=" || op == "<" || op == "<=" || op == ">" || op == ">=" {
             pr := "oeq"
             if op == "!=" {
-                pr = "one"
+                // une, not one: NaN must satisfy x != x (unordered
+                // counts as unequal — one would answer false)
+                pr = "une"
             }
             if op == "<" {
                 pr = "olt"
@@ -2054,19 +2316,22 @@ fn lconv(g: mut G, e: ref parser.Node, want: int) -> str {
     return lconv_v(g, e, lx(g, e), want)
 }
 
-// receiver arg adapted to the method's receiver ty (seed adapt_recv)
-fn ladapt_v(g: mut G, e: ref parser.Node, ev: str, want: int) -> str {
+// receiver arg adapted to the method's receiver ty (seed adapt_recv).
+// Evaluates `e` exactly once along every path: a callsite lx() plus
+// an laddr() fallback re-runs call-valued receivers (ladapt_v did —
+// `mkNode().m()` invoked mkNode twice)
+fn ladapt_e(g: mut G, e: ref parser.Node, want: int) -> str {
     got := gsub(g, xty(g, e))
     w := gsub(g, want)
     wk := tyk(g, w)
     gk := tyk(g, got)
     if (wk == check.k_struct() || wk == check.k_enum()) && (gk == check.k_own() || gk == check.k_ref() || gk == check.k_mut()) {
-        return lload(g, lty(g, w), ev)
+        return lload(g, lty(g, w), lx(g, e))
     }
     if (wk == check.k_own() || wk == check.k_ref() || wk == check.k_mut()) && (gk == check.k_struct() || gk == check.k_enum()) {
         return laddr(g, e)
     }
-    return ev
+    return lx(g, e)
 }
 
 // own->mut/ref borrow marks — pre/post strings carry a one-char op
@@ -2280,7 +2545,7 @@ fn lclosure(g: mut G, params: ref parser.NList, body: ref parser.Node) -> str {
             cp = cp.next
         }
     }
-    g.clpro = push(g.clpro, envty + " = type { " + envf + " }\n")
+    lunit(g, 7, envty + " = type { " + envf + " }\n", substr(envty, 1, len(envty)))
     // wrapper body — its own fn context (slots/allocs are per-define)
     save_lall := g.lall
     save_term := g.lterm
@@ -2292,11 +2557,13 @@ fn lclosure(g: mut G, params: ref parser.NList, body: ref parser.Node) -> str {
     save_ret := g.retk
     save_cret := g.cret
     save_cur := g.cur
+    save_sopen := g.sopen
     g.lall = mkslice(str, 0)
     g.lterm = 0
     g.fdecls = mkslice(str, 0)
     g.lfn = 1
     g.lscsz = ""
+    g.sopen = mkslice(int, 0)
     g.defers = nil
     g.retk = 0
     g.cret = cret
@@ -2341,7 +2608,7 @@ fn lclosure(g: mut G, params: ref parser.NList, body: ref parser.Node) -> str {
     g.w[aidx] = wjoin(g.lall)
     wln(g, "}\n")
     wpop(g)
-    g.clbod = push(g.clbod, wjoin(g.wlast))
+    lunit(g, 8, wjoin(g.wlast), "o_cl_" + sid)
     g.lall = save_lall
     g.lterm = save_term
     g.lfn = save_lfn
@@ -2352,6 +2619,7 @@ fn lclosure(g: mut G, params: ref parser.NList, body: ref parser.Node) -> str {
     g.retk = save_ret
     g.cret = save_cret
     g.cur = save_cur
+    g.sopen = save_sopen
     // the value: heap env + fat pair
     ep := lcallrt(g, "ptr", "rt_alloc_own", "i64 ptrtoint (ptr getelementptr (" + envty + ", ptr null, i64 1) to i64)")
     i = 0
@@ -2706,6 +2974,7 @@ fn ls(g: mut G, s: ref parser.Node) {
             ldefer(g, call)
         }
         parser.Node.Ret{vals} => {
+            lscope_drain(g, 0)
             ldefers(g)
             if vals == nil {
                 lt(g, "ret void")
@@ -2773,7 +3042,7 @@ fn ls(g: mut G, s: ref parser.Node) {
             c := lcond(g, cond)
             lt(g, "br i1 " + c + ", label %" + bd + ", label %" + en)
             llb(g, bd)
-            g.loops = push(g.loops, GLab{c: h, b: en, d: 0})
+            g.loops = push(g.loops, GLab{c: h, b: en, d: len(g.sopen)})
             lenv_push(g)
             lblk(g, body)
             lenv_pop(g)
@@ -2783,11 +3052,13 @@ fn ls(g: mut G, s: ref parser.Node) {
         }
         parser.Node.Break => {
             if len(g.loops) > 0 {
+                lscope_drain(g, g.loops[len(g.loops) - 1].d)
                 lt(g, "br label %" + g.loops[len(g.loops) - 1].b)
             }
         }
         parser.Node.Continue => {
             if len(g.loops) > 0 {
+                lscope_drain(g, g.loops[len(g.loops) - 1].d)
                 lt(g, "br label %" + g.loops[len(g.loops) - 1].c)
             }
         }
@@ -2796,9 +3067,11 @@ fn ls(g: mut G, s: ref parser.Node) {
             g.scopen = g.scopen + 1
             sp := lscope_alloc(g, id)
             lcallrtv(g, "rt_scope_enter", "ptr " + sp)
+            g.sopen = push(g.sopen, id)
             lenv_push(g)
             lblk(g, body)
             lenv_pop(g)
+            lpop_sopen(g)
             lcallrtv(g, "rt_scope_leave", "ptr " + sp)
         }
         parser.Node.Spawn{e} => {
@@ -2930,7 +3203,7 @@ fn ldefer(g: mut G, call: own parser.Node) {
             cp = cp.next
         }
     }
-    g.dpro = push(g.dpro, denv + " = type { " + envf + " }\n")
+    lunit(g, 9, denv + " = type { " + envf + " }\n", substr(denv, 1, len(denv)))
     save_lall := g.lall
     save_lfn := g.lfn
     save_term := g.lterm
@@ -2941,11 +3214,13 @@ fn ldefer(g: mut G, call: own parser.Node) {
     save_ret := g.retk
     save_cret := g.cret
     save_cur := g.cur
+    save_sopen := g.sopen
     g.lall = mkslice(str, 0)
     g.lfn = 1
     g.lterm = 0
     g.fdecls = mkslice(str, 0)
     g.lscsz = ""
+    g.sopen = mkslice(int, 0)
     g.defers = nil
     g.retk = 0
     g.cret = check.tk(g.ck, check.k_void())
@@ -2972,12 +3247,13 @@ fn ldefer(g: mut G, call: own parser.Node) {
     g.w[aidx] = wjoin(g.lall)
     wln(g, "}\n")
     wpop(g)
-    g.dbod = push(g.dbod, wjoin(g.wlast))
+    lunit(g, 10, wjoin(g.wlast), thunk)
     g.lall = save_lall
     g.lfn = save_lfn
     g.lterm = save_term
     g.fdecls = save_fdecls
     g.lscsz = save_scsz
+    g.sopen = save_sopen
     g.ldmark = save_dmark
     g.defers = save_def
     g.retk = save_ret
@@ -3056,7 +3332,7 @@ fn lspawn(g: mut G, sc: ref parser.Node, e: ref parser.Node, blocking: bool) {
     if len(envf) == 0 {
         envf = "i8"
     }
-    g.spro = push(g.spro, "%o_spenv_" + sid + " = type { " + envf + " }\n")
+    lunit(g, 11, "%o_spenv_" + sid + " = type { " + envf + " }\n", "o_spenv_" + sid)
     save_lall := g.lall
     save_lfn := g.lfn
     save_term := g.lterm
@@ -3067,11 +3343,13 @@ fn lspawn(g: mut G, sc: ref parser.Node, e: ref parser.Node, blocking: bool) {
     save_ret := g.retk
     save_cret := g.cret
     save_cur := g.cur
+    save_sopen := g.sopen
     g.lall = mkslice(str, 0)
     g.lfn = 1
     g.lterm = 0
     g.fdecls = mkslice(str, 0)
     g.lscsz = ""
+    g.sopen = mkslice(int, 0)
     g.defers = nil
     g.retk = 0
     g.cret = sig.ret1
@@ -3129,12 +3407,13 @@ fn lspawn(g: mut G, sc: ref parser.Node, e: ref parser.Node, blocking: bool) {
     g.w[aidx] = wjoin(g.lall)
     wln(g, "}\n")
     wpop(g)
-    g.spbod = push(g.spbod, wjoin(g.wlast))
+    lunit(g, 12, wjoin(g.wlast), "o_sp_" + sid)
     g.lall = save_lall
     g.lfn = save_lfn
     g.lterm = save_term
     g.fdecls = save_fdecls
     g.lscsz = save_scsz
+    g.sopen = save_sopen
     g.ldmark = save_dmark
     g.defers = save_def
     g.retk = save_ret
@@ -3353,6 +3632,12 @@ fn lcall(g: mut G, f: ref parser.Node, args: ref parser.NList) -> str {
             sfx = "f64"
             at = "double"
         }
+        if sfx == "i64" && at != "i64" {
+            // bool/byte args spell narrower types — rt_println_i64's
+            // signature is fixed, so widen before the call
+            a = lfit(g, a, t, check.t_int(g.ck))
+            at = "i64"
+        }
         lcallrtv(g, "rt_" + name + "_" + sfx, at + " " + a)
         return "0"
     }
@@ -3543,7 +3828,7 @@ fn lcall(g: mut G, f: ref parser.Node, args: ref parser.NList) -> str {
         match f {
             parser.Node.Field{obj} => {
                 c := new(GAv)
-                c.v = ladapt_v(g, obj, lx(g, obj), pt)
+                c.v = ladapt_e(g, obj, pt)
                 raw := gsub(g, xty(g, obj))
                 if tyk(g, raw) == check.k_own() {
                     pk := tyk(g, pt)
@@ -3586,11 +3871,27 @@ fn lcall(g: mut G, f: ref parser.Node, args: ref parser.NList) -> str {
         al = al.next
         av = av.next
     }
+    rt1 := sig.ret1
+    if bind != nil {
+        rt1 = check.subst_ty(g.ck, rt1, bind)
+    }
+    rt1 = gsub(g, rt1)
+    // extern boundary: which params cross indirectly — SysV plans
+    // the whole arg list's eightbyte budget, not just each size
+    plan := mkslice(int, 0)
+    if sig.is_extern == 1 {
+        gp0 := 0
+        if sig.retk == 1 && len(lsret_ty(g, rt1)) > 0 {
+            gp0 = 1
+        }
+        plan = lextern_plan(g, sig.params, bind, gp0)
+    }
     // typed arg text: receiver + params take the declared (subst'd) tys
     tys := sig.params
     a := ""
     cav := coerced
     til := tys
+    pnum := 0
     for cav != nil {
         pt := -1
         if til != nil {
@@ -3605,10 +3906,10 @@ fn lcall(g: mut G, f: ref parser.Node, args: ref parser.NList) -> str {
             a = a + ", "
         }
         if pt >= 0 {
-            if sig.is_extern == 1 && lsize(g, pt) > laggt(g) {
-                // composites over the host threshold cross indirectly
-                // — a bare aggregate arg decomposes element-wise and
-                // the callee reads the wrong slots
+            if sig.is_extern == 1 && pnum < len(plan) && plan[pnum] == 1 {
+                // indirect composite — a bare aggregate arg
+                // decomposes element-wise and the callee reads the
+                // wrong slots
                 a = a + lagg_copy(g, lty(g, pt), cav.v)
             } else {
                 a = a + lty(g, pt) + " " + cav.v
@@ -3617,12 +3918,8 @@ fn lcall(g: mut G, f: ref parser.Node, args: ref parser.NList) -> str {
             a = a + "i64 " + cav.v
         }
         cav = cav.next
+        pnum = pnum + 1
     }
-    rt1 := sig.ret1
-    if bind != nil {
-        rt1 = check.subst_ty(g.ck, rt1, bind)
-    }
-    rt1 = gsub(g, rt1)
     if sig.typarams != nil {
         ginst_queue(g, eq, sig.typarams, bind)
     }
@@ -3795,9 +4092,11 @@ fn lbuiltin(g: mut G, name: str, args: ref parser.NList, argvs: ref GAv) -> str 
         lcallrtv(g, "rt_" + name, "ptr " + a0 + ", i64 " + lfit(g, a1, xty(g, args.next.v), check.t_int(g.ck)) + ", i64 " + lfit(g, a2, xty(g, args.next.next.v), check.t_int(g.ck)))
         return "0"
     }
-    if name == "sqlite_exec" || name == "sqlite_query" {
-        lcallrtv(g, "rt_" + name, "ptr " + a0 + ", ptr " + a1)
-        return "0"
+    if name == "sqlite_exec" {
+        return lcallrt(g, "i64", "rt_sqlite_exec", "ptr " + a0 + ", ptr " + a1)
+    }
+    if name == "sqlite_query" {
+        return lcallrt(g, "%OxlStr", "rt_sqlite_query", "ptr " + a0 + ", ptr " + a1)
     }
     if name == "atoi" {
         return lcallrt(g, "i64", "rt_atoi", "%OxlStr " + a0)
@@ -3932,9 +4231,12 @@ fn ldrop_sym(g: mut G, payload: int) -> str {
         tk := tyk(g, t)
         if tk == check.k_struct() || tk == check.k_enum() {
             n := g.ck.tyv[t].name
-            if !sl_has_str(g.drop_tys, n) {
-                g.drop_tys = push(g.drop_tys, n)
+            if sl_has_str(g.drop_tys, n) {
+                // already registered — re-walking its fields loops on
+                // recursive shapes (struct Node { next: own Node })
+                continue
             }
+            g.drop_tys = push(g.drop_tys, n)
         } else {
             g.drop_word = 1
         }
@@ -4011,10 +4313,10 @@ fn lemit_drops(g: mut G) {
     }
     lrtuse(g, "rt_free")
     if g.drop_word == 1 {
-        g.ldrp = push(g.ldrp, "define void @o_drop_word(i64 %v) {\n  %p = inttoptr i64 %v to ptr\n  call void @rt_free(ptr %p)\n  ret void\n}\n")
+        lunit(g, 6, "define void @o_drop_word(i64 %v) {\n  %p = inttoptr i64 %v to ptr\n  call void @rt_free(ptr %p)\n  ret void\n}\n", "o_drop_word")
     }
     if g.drop_slice == 1 {
-        g.ldrp = push(g.ldrp, "define void @o_drop_slice(i64 %v) {\n  %s = inttoptr i64 %v to ptr\n  %nul = icmp eq ptr %s, null\n  br i1 %nul, label %done, label %go\ngo:\n  %b = load %RtSlice, ptr %s\n  %bp = extractvalue %RtSlice %b, 0\n  call void @rt_free(ptr %bp)\n  call void @rt_free(ptr %s)\n  br label %done\ndone:\n  ret void\n}\n")
+        lunit(g, 6, "define void @o_drop_slice(i64 %v) {\n  %s = inttoptr i64 %v to ptr\n  %nul = icmp eq ptr %s, null\n  br i1 %nul, label %done, label %go\ngo:\n  %b = load %RtSlice, ptr %s\n  %bp = extractvalue %RtSlice %b, 0\n  call void @rt_free(ptr %bp)\n  call void @rt_free(ptr %s)\n  br label %done\ndone:\n  ret void\n}\n", "o_drop_slice")
     }
     i := 0
     for i < len(g.drop_tys) {
@@ -4067,10 +4369,18 @@ fn lemit_drops(g: mut G) {
                             body = body + "  %is" + itoa(vi) + "_" + itoa(fi) + " = icmp eq i32 %tg, " + itoa(vi) + "\n  br i1 %is" + itoa(vi) + "_" + itoa(fi) + ", label %c" + itoa(vi) + "_" + itoa(fi) + ", label %c" + itoa(vi) + "_" + itoa(fi) + "d\nc" + itoa(vi) + "_" + itoa(fi) + ":\n  %fp" + itoa(vi) + "_" + itoa(fi) + " = getelementptr %o_s_" + cname(n + "." + vn) + ", ptr %pp, i32 0, i32 " + itoa(fi) + "\n  %fw" + itoa(vi) + "_" + itoa(fi) + " = load ptr, ptr %fp" + itoa(vi) + "_" + itoa(fi) + "\n"
                             if ik == check.k_struct() || ik == check.k_enum() {
                                 body = body + "  %fw64_" + itoa(vi) + "_" + itoa(fi) + " = ptrtoint ptr %fw" + itoa(vi) + "_" + itoa(fi) + " to i64\n  call void @o_drop_" + cname(g.ck.tyv[it].name) + "(i64 %fw64_" + itoa(vi) + "_" + itoa(fi) + ")\n"
+                                body = body + "  br label %c" + itoa(vi) + "_" + itoa(fi) + "d\nc" + itoa(vi) + "_" + itoa(fi) + "d:\n"
+                            } else if ik == check.k_slice() {
+                                // own []T payload: the box holds an
+                                // %RtSlice whose ptr backing was
+                                // allocated separately — free both,
+                                // tolerating a null header (the
+                                // struct-field shape above)
+                                body = body + "  %nzw" + itoa(vi) + "_" + itoa(fi) + " = icmp ne ptr %fw" + itoa(vi) + "_" + itoa(fi) + ", null\n  br i1 %nzw" + itoa(vi) + "_" + itoa(fi) + ", label %cs" + itoa(vi) + "_" + itoa(fi) + ", label %c" + itoa(vi) + "_" + itoa(fi) + "d\ncs" + itoa(vi) + "_" + itoa(fi) + ":\n  %sv" + itoa(vi) + "_" + itoa(fi) + " = load %RtSlice, ptr %fw" + itoa(vi) + "_" + itoa(fi) + "\n  %sp" + itoa(vi) + "_" + itoa(fi) + " = extractvalue %RtSlice %sv" + itoa(vi) + "_" + itoa(fi) + ", 0\n  call void @rt_free(ptr %sp" + itoa(vi) + "_" + itoa(fi) + ")\n  call void @rt_free(ptr %fw" + itoa(vi) + "_" + itoa(fi) + ")\n  br label %c" + itoa(vi) + "_" + itoa(fi) + "d\nc" + itoa(vi) + "_" + itoa(fi) + "d:\n"
                             } else {
                                 body = body + "  call void @rt_free(ptr %fw" + itoa(vi) + "_" + itoa(fi) + ")\n"
+                                body = body + "  br label %c" + itoa(vi) + "_" + itoa(fi) + "d\nc" + itoa(vi) + "_" + itoa(fi) + "d:\n"
                             }
-                            body = body + "  br label %c" + itoa(vi) + "_" + itoa(fi) + "d\nc" + itoa(vi) + "_" + itoa(fi) + "d:\n"
                         }
                         fi = fi + 1
                         fl = fl.next
@@ -4081,7 +4391,7 @@ fn lemit_drops(g: mut G) {
             }
         }
         body = body + "  call void @rt_free(ptr %p)\n  br label %done\ndone:\n  ret void\n}\n"
-        g.ldrp = push(g.ldrp, body)
+        lunit(g, 6, body, "o_drop_" + cn)
         i = i + 1
     }
 }
@@ -4112,7 +4422,7 @@ fn lemit_struct_ty(g: mut G, i: int) {
             if len(members) == 0 {
                 members = "i8"
             }
-            g.ltys = push(g.ltys, "%o_s_" + cname(qn) + " = type { " + members + " }\n")
+            lunit(g, 0, "%o_s_" + cname(qn) + " = type { " + members + " }\n", "o_s_" + cname(qn))
         }
         _ => {
         }
@@ -4147,7 +4457,7 @@ fn lemit_enum_ty(g: mut G, i: int) {
                                         members = members + lty(g, fl.v.t)
                                         fl = fl.next
                                     }
-                                    g.ltys = push(g.ltys, "%o_s_" + cname(sn) + " = type { " + members + " }\n")
+                                    lunit(g, 0, "%o_s_" + cname(sn) + " = type { " + members + " }\n", "o_s_" + cname(sn))
                                     vs := lsize_fields(g, fields)
                                     if vs > psz {
                                         psz = vs
@@ -4163,7 +4473,7 @@ fn lemit_enum_ty(g: mut G, i: int) {
                 vi = vi + 1
                 vl = vl.next
             }
-            g.ltys = push(g.ltys, "%o_en_" + cname(qn) + " = type { i32, [4 x i8], " + pty + ", i64 }\n")
+            lunit(g, 0, "%o_en_" + cname(qn) + " = type { i32, [4 x i8], " + pty + ", i64 }\n", "o_en_" + cname(qn))
         }
         _ => {
         }
@@ -4177,7 +4487,8 @@ fn lemit_vret_tys(g: mut G) {
         ml := g.ck.ifacesv[i].methods
         for ml != nil {
             if ml.v.retk == 2 {
-                g.ltys = push(g.ltys, "%o_vret_" + cname(g.ck.ifacesv[i].n) + "_" + cname(ml.v.n) + " = type { " + lty(g, ml.v.ret1) + ", i64 }\n")
+                vrt := lty(g, ml.v.ret1)
+                lunit(g, 0, "%o_vret_" + cname(g.ck.ifacesv[i].n) + "_" + cname(ml.v.n) + " = type { " + vrt + ", i64 }\n", "o_vret_" + cname(g.ck.ifacesv[i].n) + "_" + cname(ml.v.n))
             }
             ml = ml.next
         }
@@ -4197,7 +4508,8 @@ fn lemit_ret_ty(g: mut G, i: int) {
             }
             gset_ctx(g, i)
             qn := check.fn_qname(g.ck, g.its[i].mod, recv, name)
-            g.ltys = push(g.ltys, "%o_ret_" + cname(qn) + " = type { " + lty(g, gsub(g, gret1(g, ret))) + ", i64 }\n")
+            rtt := lty(g, gsub(g, gret1(g, ret)))
+            lunit(g, 0, "%o_ret_" + cname(qn) + " = type { " + rtt + ", i64 }\n", "o_ret_" + cname(qn))
         }
         _ => {
         }
@@ -4205,7 +4517,8 @@ fn lemit_ret_ty(g: mut G, i: int) {
 }
 
 fn lemit_inst_ret_ty(g: mut G, m: str, ret1: int) {
-    g.ltys = push(g.ltys, "%o_ret_" + cname(m) + " = type { " + lty(g, gsub(g, ret1)) + ", i64 }\n")
+    irt := lty(g, gsub(g, ret1))
+    lunit(g, 0, "%o_ret_" + cname(m) + " = type { " + irt + ", i64 }\n", "o_ret_" + cname(m))
 }
 
 // extern fn decl — `declare` with the sig as written
@@ -4227,8 +4540,26 @@ fn lemit_extern(g: mut G, i: int) {
             if rk == 2 {
                 rty = "i64"
             }
+            // indirect-aggregate boundary — the declare and every
+            // call site must agree on lowered param types, so both
+            // walk the same SysV eightbyte plan (an sret out-pointer
+            // spends one GP reg ahead of the list)
+            gp0 := 0
+            if len(srt) > 0 {
+                gp0 = 1
+            }
+            let eparams: ref check.IList = nil
+            qnx := check.qname(g.its[i].mod, name)
+            if collections.map_has(g.ck.fns, qnx) {
+                [efx, efe] = collections.map_get(g.ck.fns, qnx)
+                if efe == nil {
+                    eparams = g.ck.fnsv[efx].params
+                }
+            }
+            plan := lextern_plan(g, eparams, nil, gp0)
             ps := ""
             pl := params
+            pnum := 0
             for pl != nil {
                 match pl.v {
                     parser.Node.Param{ty} => {
@@ -4236,10 +4567,7 @@ fn lemit_extern(g: mut G, i: int) {
                             ps = ps + ", "
                         }
                         pt := gty(g, ty)
-                        if lsize(g, gsub(g, pt)) > laggt(g) {
-                            // indirect-aggregate boundary — the call
-                            // carries the per-ABI spelling; the
-                            // declare carries the lowered param type
+                        if pnum < len(plan) && plan[pnum] == 1 {
                             ps = ps + "ptr"
                         } else {
                             ps = ps + lty(g, pt)
@@ -4248,6 +4576,7 @@ fn lemit_extern(g: mut G, i: int) {
                     _ => {
                     }
                 }
+                pnum = pnum + 1
                 pl = pl.next
             }
             if len(srt) > 0 {
@@ -4255,9 +4584,9 @@ fn lemit_extern(g: mut G, i: int) {
                 if len(ps) > 0 {
                     dp = dp + ", " + ps
                 }
-                g.lext = push(g.lext, "declare void @" + name + "(" + dp + ")\n")
+                lunit(g, 13, "declare void @" + name + "(" + dp + ")\n", name)
             } else {
-                g.lext = push(g.lext, "declare " + rty + " @" + name + "(" + ps + ")\n")
+                lunit(g, 13, "declare " + rty + " @" + name + "(" + ps + ")\n", name)
             }
         }
         _ => {
@@ -4277,7 +4606,8 @@ fn lemit_global(g: mut G, i: int) {
             if ty == nil {
                 t = xty(g, init)
             }
-            g.lglob = push(g.lglob, "@o_g_" + cname(check.qname(g.ck.cur_mod, name)) + " = global " + lty(g, t) + " zeroinitializer\n")
+            gty_s := lty(g, t)
+            lunit(g, 2, "@o_g_" + cname(check.qname(g.ck.cur_mod, name)) + " = global " + gty_s + " zeroinitializer\n", "o_g_" + cname(check.qname(g.ck.cur_mod, name)))
         }
         _ => {
         }
@@ -4360,10 +4690,11 @@ fn lemit_named_fn(g: mut G, i: int, qn: str, base: str) {
             g.cret = gsub(g, gret1(g, ret))
             g.defers = nil
             if check.sl_has(g.ck.susp, base) && qn == "main" {
-                // susp main runs as a direct call in L1 — blocking
-                // susp builtins (msleep et al) behave; susp calls and
-                // select trap at their site
-                g.maink = 2
+                // susp main is a suspension entrypoint: L1 marks it
+                // distinct from an ordinary main so oxl_main lands
+                // trap 21 instead of calling @o_f_main (the poll
+                // driver is L2)
+                g.maink = 3
             }
             g.lfn = 1
             g.lall = mkslice(str, 0)
@@ -4372,6 +4703,7 @@ fn lemit_named_fn(g: mut G, i: int, qn: str, base: str) {
             g.lterm = 0
             g.lreg = 0
             g.loops = mkslice(GLab, 0)
+            g.sopen = mkslice(int, 0)
             wpush(g)
             wln(g, "define " + lret_ty(g, ret, qn) + " @o_f_" + cname(qn) + "(" + lparams(g, recv, params) + ") {")
             aidx := len(g.w)
@@ -4413,9 +4745,11 @@ fn lemit_named_fn(g: mut G, i: int, qn: str, base: str) {
             g.w[aidx] = wjoin(g.lall)
             wln(g, "}\n")
             wpop(g)
-            g.lbody = push(g.lbody, wjoin(g.wlast))
+            lunit(g, 3, wjoin(g.wlast), "o_f_" + cname(qn))
             if qn == "main" {
-                g.maink = 2
+                if g.maink != 3 {
+                    g.maink = 2
+                }
             }
         }
         _ => {
@@ -4482,13 +4816,21 @@ fn lemit_fnv_one(g: mut G, n: str) {
     argl := ""
     cargl := ""
     cpre := ""
+    wplan := mkslice(int, 0)
+    if sig.is_extern == 1 {
+        wgp0 := 0
+        if sig.retk == 1 && len(lsret_ty(g, gsub(g, sig.ret1))) > 0 {
+            wgp0 = 1
+        }
+        wplan = lextern_plan(g, sig.params, nil, wgp0)
+    }
     il := sig.params
     i := 0
     for il != nil {
         t := lty(g, gsub(g, il.v))
         psig = psig + ", " + t + " %a" + itoa(i)
         argl = argl + ", " + t + " %a" + itoa(i)
-        if sig.is_extern == 1 && lsize(g, gsub(g, il.v)) > laggt(g) {
+        if sig.is_extern == 1 && i < len(wplan) && wplan[i] == 1 {
             // extern boundary — materialize per-ABI and point the call
             // at the copy
             cpre = cpre + "  %_c" + itoa(i) + " = alloca " + t + ", align 8\n  store " + t + " %a" + itoa(i) + ", ptr %_c" + itoa(i) + "\n"
@@ -4525,7 +4867,7 @@ fn lemit_fnv_one(g: mut G, n: str) {
     } else {
         b = b + "  call void " + callee + "(" + substr(cargl, 2, len(cargl)) + ")\n  ret void\n}\n"
     }
-    g.lwrap = push(g.lwrap, b)
+    lunit(g, 4, b, "o_fnv_wrap_" + cname(n))
 }
 
 // vtab thunk `o_vtt_<w>_<impl>_<i>` — normalizes the erased data ptr
@@ -4643,7 +4985,7 @@ fn lemvtab_one(g: mut G, vu: ref GVU) {
                 b = b + "  %r = call %o_ret_" + rtag + " " + callee + "(" + cargs + ")\n  %tmp = alloca " + ret_c + "\n  store %o_ret_" + rtag + " %r, ptr %tmp\n  %rr = load " + ret_c + ", ptr %tmp\n  ret " + ret_c + " %rr\n}\n"
             }
         }
-        g.lvtb = push(g.lvtb, b)
+        lunit(g, 5, b, tname)
         if len(slots) > 0 {
             slots = slots + ", "
         }
@@ -4651,7 +4993,7 @@ fn lemvtab_one(g: mut G, vu: ref GVU) {
         ml = ml.next
         i = i + 1
     }
-    g.lvtb = push(g.lvtb, "@o_vt_" + cname(w) + "_" + gvtkey(impl) + " = global [" + itoa(i) + " x ptr] [" + slots + "]\n")
+    lunit(g, 5, "@o_vt_" + cname(w) + "_" + gvtkey(impl) + " = global [" + itoa(i) + " x ptr] [" + slots + "]\n", "o_vt_" + cname(w) + "_" + gvtkey(impl))
 }
 
 // an inst's pair-ret named type (the LLVM ginst_head analogue — types
@@ -4669,11 +5011,189 @@ fn linst_head(g: mut G, q: str, m: str, bind: ref collections.Map) {
     }
     sig := g.ck.fnsv[fi]
     if sig.retk == 2 {
-        g.liret = push(g.liret, "%o_ret_" + cname(m) + " = type { " + lty(g, check.subst_ty(g.ck, sig.ret1, bind)) + ", i64 }\n")
+        irt2 := lty(g, check.subst_ty(g.ck, sig.ret1, bind))
+        lunit(g, 1, "%o_ret_" + cname(m) + " = type { " + irt2 + ", i64 }\n", "o_ret_" + cname(m))
     }
 }
 
 // ---------- module assembly ----------
+// One emitted artifact's home — which output band holds its text and
+// at what index. Every .ll fragment a reachability pass can drop is
+// recorded via lunit so the G1 mark (spec §8's seam, finally wired)
+// maps live units back to band entries; unconditional text (string
+// literals, the fixed type prelude, oxl_main itself) needs no unit.
+struct LB { band: int, idx: int }
+
+// band numbers: 0 ltys · 1 liret · 2 lglob · 3 lbody · 4 lwrap
+// 5 lvtb · 6 ldrp · 7 clpro · 8 clbod · 9 dpro · 10 dbod
+// 11 spro · 12 spbod · 13 lext · 14 lrtl (declare text)
+fn lband_put(g: mut G, band: int, s: str) {
+    if band == 0 {
+        g.ltys = push(g.ltys, s)
+    }
+    if band == 1 {
+        g.liret = push(g.liret, s)
+    }
+    if band == 2 {
+        g.lglob = push(g.lglob, s)
+    }
+    if band == 3 {
+        g.lbody = push(g.lbody, s)
+    }
+    if band == 4 {
+        g.lwrap = push(g.lwrap, s)
+    }
+    if band == 5 {
+        g.lvtb = push(g.lvtb, s)
+    }
+    if band == 6 {
+        g.ldrp = push(g.ldrp, s)
+    }
+    if band == 7 {
+        g.clpro = push(g.clpro, s)
+    }
+    if band == 8 {
+        g.clbod = push(g.clbod, s)
+    }
+    if band == 9 {
+        g.dpro = push(g.dpro, s)
+    }
+    if band == 10 {
+        g.dbod = push(g.dbod, s)
+    }
+    if band == 11 {
+        g.spro = push(g.spro, s)
+    }
+    if band == 12 {
+        g.spbod = push(g.spbod, s)
+    }
+    if band == 13 {
+        g.lext = push(g.lext, s)
+    }
+    if band == 14 {
+        g.lrtl = push(g.lrtl, s)
+    }
+}
+
+fn lband_at(g: mut G, band: int, idx: int) -> str {
+    if band == 0 {
+        return g.ltys[idx]
+    }
+    if band == 1 {
+        return g.liret[idx]
+    }
+    if band == 2 {
+        return g.lglob[idx]
+    }
+    if band == 3 {
+        return g.lbody[idx]
+    }
+    if band == 4 {
+        return g.lwrap[idx]
+    }
+    if band == 5 {
+        return g.lvtb[idx]
+    }
+    if band == 6 {
+        return g.ldrp[idx]
+    }
+    if band == 7 {
+        return g.clpro[idx]
+    }
+    if band == 8 {
+        return g.clbod[idx]
+    }
+    if band == 9 {
+        return g.dpro[idx]
+    }
+    if band == 10 {
+        return g.dbod[idx]
+    }
+    if band == 11 {
+        return g.spro[idx]
+    }
+    if band == 12 {
+        return g.spbod[idx]
+    }
+    if band == 13 {
+        return g.lext[idx]
+    }
+    return g.lrtl[idx]
+}
+
+fn lband_len(g: mut G, band: int) -> int {
+    if band == 0 {
+        return len(g.ltys)
+    }
+    if band == 1 {
+        return len(g.liret)
+    }
+    if band == 2 {
+        return len(g.lglob)
+    }
+    if band == 3 {
+        return len(g.lbody)
+    }
+    if band == 4 {
+        return len(g.lwrap)
+    }
+    if band == 5 {
+        return len(g.lvtb)
+    }
+    if band == 6 {
+        return len(g.ldrp)
+    }
+    if band == 7 {
+        return len(g.clpro)
+    }
+    if band == 8 {
+        return len(g.clbod)
+    }
+    if band == 9 {
+        return len(g.dpro)
+    }
+    if band == 10 {
+        return len(g.dbod)
+    }
+    if band == 11 {
+        return len(g.spro)
+    }
+    if band == 12 {
+        return len(g.spbod)
+    }
+    if band == 13 {
+        return len(g.lext)
+    }
+    return len(g.lrtl)
+}
+
+// record `text` as one artifact in `band` defining `sym` — returns
+// the unit index. An artifact with no defs would be unmarkable, so
+// every caller passes the symbol its users spell
+fn lunit(g: mut G, band: int, text: str, sym: str) -> int {
+    u := gubegin(g)
+    g.lub = push(g.lub, LB{band: band, idx: lband_len(g, band)})
+    lband_put(g, band, text)
+    if len(sym) > 0 {
+        gdef(g, u, sym)
+    }
+    return u
+}
+
+// emit one band's live artifacts in unit order — dead bodies/types/
+// declares vanish here (the lane's G1 payoff)
+fn lout_band(g: mut G, band: int) -> str {
+    out := ""
+    i := 0
+    for i < len(g.units) {
+        if g.live[i] != 0 && g.lub[i].band == band {
+            out = out + lband_at(g, band, g.lub[i].idx)
+        }
+        i = i + 1
+    }
+    return out
+}
+
 // One pass: named types first (enums before structs — a struct member
 // can be an enum), then globals, externs, fn bodies, the inst drain
 // (a co-fixpoint with vtab-seeded method insts, same as the C lane),
@@ -4761,6 +5281,13 @@ fn emit_llvm(r: own check.CkRes, testm: int) -> str {
     g.lrtd = collections.map_new()
     g.lrtl = mkslice(str, 0)
     g.lscsz = ""
+    // G1 unit machinery — the .ll lane registers every band artifact
+    // as a unit now, so the shared fields need their C-lane inits
+    g.units = mkslice(GUnit, 0)
+    g.dpos = collections.map_new()
+    g.dchain = mkslice(int, 0)
+    g.uhits = mkslice(int, 0)
+    g.lub = mkslice(LB, 0)
 
     // mark every extern spelling before any emission pass — type/ret-ty/
     // global/fn emission can lrtuse() the same name (e.g. rt_free in
@@ -4874,29 +5401,22 @@ fn emit_llvm(r: own check.CkRes, testm: int) -> str {
             progress = true
         }
     }
-    // fnv wraps + vtabs + drops — all uses recorded during body emission
-    fl := g.fnv
-    for fl != nil {
-        lemit_fnv_one(g, fl.v)
-        fl = fl.next
-    }
-    vu := g.vtabs
-    for vu != nil {
-        lemvtab_one(g, vu)
-        vu = vu.next
-    }
-    lemit_drops(g)
-
-    // oxl_main — globals init, then either the test runner or main.
-    // ginit text was emitted earlier so its rt/str uses registered;
-    // it splices in right after the alloca band.
+    // oxl_main — globals init first: their emission can queue generic
+    // insts / conv vtabs / fnv uses / drops nothing else referenced,
+    // so the second drain runs here, before the runner tail splices
+    // in (the C lane drains after ginit for the same reason)
     g.lfn = 1
     g.lall = mkslice(str, 0)
     g.fdecls = mkslice(str, 0)
+    g.sdecls = mkslice(str, 0)
+    g.vdecls = mkslice(str, 0)
+    g.states = mkslice(int, 0)
+    g.defers = nil
     g.lscsz = ""
     g.lterm = 0
     g.lreg = 0
     g.loops = mkslice(GLab, 0)
+    g.sopen = mkslice(int, 0)
     wpush(g)
     wln(g, "define void @oxl_main() {")
     aidx := len(g.w)
@@ -4909,6 +5429,72 @@ fn emit_llvm(r: own check.CkRes, testm: int) -> str {
         }
         i = i + 1
     }
+
+    // ginit drain + fnv wraps + vtabs + drops — park oxl_main's
+    // fn-level state while helper bodies own it, restore for the tail
+    sv_lall := g.lall
+    sv_fdecls := g.fdecls
+    sv_sdecls := g.sdecls
+    sv_vdecls := g.vdecls
+    sv_states := g.states
+    sv_defers := g.defers
+    sv_lscsz := g.lscsz
+    sv_lterm := g.lterm
+    sv_lreg := g.lreg
+    sv_loops := g.loops
+    sv_sopen := g.sopen
+    sv_retk := g.retk
+    sv_cret := g.cret
+    sv_subst := g.subst
+    sv_cur := g.cur
+    sv_inframe := g.inframe
+    sv_ldmark := g.ldmark
+    g.lfn = 0
+    g.defers = nil
+    g.subst = nil
+    progress = true
+    for progress {
+        progress = false
+        for g.insts != nil {
+            in := g.insts
+            g.insts = in.next
+            progress = true
+            linst_head(g, in.q, in.mangled, in.bind)
+            lfunc_inst(g, in.q, in.mangled, in.bind)
+        }
+        if gseed_vtab_insts(g) > 0 {
+            progress = true
+        }
+    }
+    fl := g.fnv
+    for fl != nil {
+        lemit_fnv_one(g, fl.v)
+        fl = fl.next
+    }
+    vu := g.vtabs
+    for vu != nil {
+        lemvtab_one(g, vu)
+        vu = vu.next
+    }
+    lemit_drops(g)
+    g.lall = sv_lall
+    g.fdecls = sv_fdecls
+    g.sdecls = sv_sdecls
+    g.vdecls = sv_vdecls
+    g.states = sv_states
+    g.defers = sv_defers
+    g.lscsz = sv_lscsz
+    g.lterm = sv_lterm
+    g.lreg = sv_lreg
+    g.loops = sv_loops
+    g.sopen = sv_sopen
+    g.retk = sv_retk
+    g.cret = sv_cret
+    g.subst = sv_subst
+    g.cur = sv_cur
+    g.inframe = sv_inframe
+    g.ldmark = sv_ldmark
+    g.lfn = 1
     if g.testm == 1 {
         // test mode: scope-wrap each top-level test_ fn; any FAIL
         // traps the process nonzero once the suite has run (C lane's
@@ -4922,10 +5508,18 @@ fn emit_llvm(r: own check.CkRes, testm: int) -> str {
                     parser.Node.Fn{ex, name, recv, typarams} => {
                         if !ex && recv == nil && typarams == nil && len(name) > 5 && substr(name, 0, 5) == "test_" {
                             qn := check.qname(g.its[i].mod, name)
+                            cn := cname(qn)
+                            // run the test on a spawned task — a trap
+                            // inside (assert, bounds) marks the scope
+                            // and the join below reads the code; a
+                            // direct call would hit rt_trap's non-task
+                            // path and abort the whole suite
+                            tn := "o_test_" + cn
+                            lunit(g, 3, "define ptr @" + tn + "(ptr %_e) {\n  call void @o_f_" + cn + "()\n  ret ptr null\n}\n", tn)
                             sc := lscope_alloc(g, g.scopen)
                             g.scopen = g.scopen + 1
                             lcallrtv(g, "rt_scope_enter", "ptr " + sc)
-                            lcallv(g, "@o_f_" + cname(qn), "")
+                            lcallrtv(g, "rt_spawn", "ptr @" + tn + ", ptr null")
                             e := lcallrt(g, "i32", "rt_scope_try", "ptr " + sc)
                             // hoist the lstr_op calls — a nested `g` call
                             // inside a `g`-taking call's args double mut-
@@ -4972,12 +5566,56 @@ fn emit_llvm(r: own check.CkRes, testm: int) -> str {
     if g.testm == 0 && g.maink == 2 {
         lcallv(g, "@o_f_main", "")
     }
+    if g.testm == 0 && g.maink == 3 {
+        // susp main: suspension entrypoints trap in L1
+        ltrapu(g)
+    }
     lenv_pop(g)
     lt(g, "ret void")
     g.w[aidx] = wjoin(g.lall)
     wln(g, "}\n")
     wpop(g)
     main_txt := wjoin(g.wlast)
+
+    // ---------- G1 mark ----------
+    // every emitted artifact registered its defs via lunit; the root
+    // text is oxl_main plus the unconditional header bands — any
+    // o_*/rt_*/extern token spelled live marks its unit, then use
+    // edges propagate over artifact text (C lane parity)
+    g.live = mkslice(int, len(g.units))
+    work := mkslice(int, 0)
+    g.uhits = mkslice(int, 0)
+    gscan(g, main_txt)
+    i = 0
+    for i < len(g.head) {
+        gscan(g, g.head[i])
+        i = i + 1
+    }
+    j := 0
+    for j < len(g.uhits) {
+        h := g.uhits[j]
+        if g.live[h] == 0 {
+            g.live[h] = 1
+            work = push(work, h)
+        }
+        j = j + 1
+    }
+    for len(work) > 0 {
+        t := work[len(work) - 1]
+        work = work[0:len(work) - 1]
+        g.uhits = mkslice(int, 0)
+        utxt := lband_at(g, g.lub[t].band, g.lub[t].idx)
+        gscan(g, utxt)
+        j = 0
+        for j < len(g.uhits) {
+            h := g.uhits[j]
+            if g.live[h] == 0 {
+                g.live[h] = 1
+                work = push(work, h)
+            }
+            j = j + 1
+        }
+    }
 
     // ---------- module text ----------
     out := "; oxl — llvm lane\n"
@@ -4990,90 +5628,30 @@ fn emit_llvm(r: own check.CkRes, testm: int) -> str {
     out = out + "%RtTypeDesc = type { ptr, i8, i64, i64, i64, ptr, i64, i64, i64, ptr, i64 }\n"
     out = out + "@o_desc_tab = constant [0 x %RtTypeDesc] zeroinitializer\n"
     out = out + "@o_desc_tab_n = constant i64 0\n"
-    i = 0
-    for i < len(g.ltys) {
-        out = out + g.ltys[i]
-        i = i + 1
-    }
-    i = 0
-    for i < len(g.liret) {
-        out = out + g.liret[i]
-        i = i + 1
-    }
-    i = 0
-    for i < len(g.lglob) {
-        out = out + g.lglob[i]
-        i = i + 1
-    }
+    out = out + lout_band(g, 0)
+    out = out + lout_band(g, 1)
+    out = out + lout_band(g, 2)
     // string literals collected during emission (g.head holds them)
     i = 0
     for i < len(g.head) {
         out = out + g.head[i]
         i = i + 1
     }
-    // declares: extern decls first, then the rt_* table entries
-    // actually spelled, in first-use order — deterministic per program
-    i = 0
-    for i < len(g.lext) {
-        out = out + g.lext[i]
-        i = i + 1
-    }
-    i = 0
-    for i < len(g.lrtl) {
-        out = out + labi_sig(g, lrt_sig(g.lrtl[i]))
-        i = i + 1
-    }
+    // declares + bodies + helpers — all band-filtered by the mark,
+    // so only artifacts a live root chain spells reach the module
+    out = out + lout_band(g, 13)
+    out = out + lout_band(g, 14)
     out = out + "\n"
-    i = 0
-    for i < len(g.clpro) {
-        out = out + g.clpro[i]
-        i = i + 1
-    }
-    i = 0
-    for i < len(g.dpro) {
-        out = out + g.dpro[i]
-        i = i + 1
-    }
-    i = 0
-    for i < len(g.spro) {
-        out = out + g.spro[i]
-        i = i + 1
-    }
-    i = 0
-    for i < len(g.lbody) {
-        out = out + g.lbody[i]
-        i = i + 1
-    }
-    i = 0
-    for i < len(g.lwrap) {
-        out = out + g.lwrap[i]
-        i = i + 1
-    }
-    i = 0
-    for i < len(g.clbod) {
-        out = out + g.clbod[i]
-        i = i + 1
-    }
-    i = 0
-    for i < len(g.dbod) {
-        out = out + g.dbod[i]
-        i = i + 1
-    }
-    i = 0
-    for i < len(g.spbod) {
-        out = out + g.spbod[i]
-        i = i + 1
-    }
-    i = 0
-    for i < len(g.lvtb) {
-        out = out + g.lvtb[i]
-        i = i + 1
-    }
-    i = 0
-    for i < len(g.ldrp) {
-        out = out + g.ldrp[i]
-        i = i + 1
-    }
+    out = out + lout_band(g, 7)
+    out = out + lout_band(g, 9)
+    out = out + lout_band(g, 11)
+    out = out + lout_band(g, 3)
+    out = out + lout_band(g, 4)
+    out = out + lout_band(g, 8)
+    out = out + lout_band(g, 10)
+    out = out + lout_band(g, 12)
+    out = out + lout_band(g, 5)
+    out = out + lout_band(g, 6)
     out = out + main_txt
     return out
 }

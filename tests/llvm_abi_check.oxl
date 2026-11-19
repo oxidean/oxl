@@ -6,6 +6,8 @@ package main
 // a drifted %OxlStr/%RtSlice/%RtFnv decl turns these calls to garbage.
 extern fn abi_probe_str(s: str) -> int
 
+extern fn abi_probe_eb(a: int, b: int, c: int, d: int, e: int, s: str) -> int
+
 extern fn abi_slice_len(s: []int) -> int
 
 extern fn abi_slice_cap(s: []int) -> int
@@ -54,6 +56,15 @@ fn main() {
     rs := abi_ret_slice(4)
     if len(rs) != 4 || abi_slice_sum(rs) != 42 {
         println("FAIL abi sret")
+        exit(1)
+    }
+    // SysV split eightbytes: five GP args ahead of a 16-byte str
+    // leaves one reg — the aggregate would split eightbyte-across
+    // r9/stack raw while the callee reads it whole from memory, so
+    // the lane must pass it indirectly; a per-arg size check misses
+    // this (the probe returned garbage before the budget walk)
+    if abi_probe_eb(1, 2, 3, 4, 5, "eb") != 2015 {
+        println("FAIL abi eb")
         exit(1)
     }
     // RtFnv: 5*3+7 = 22 through the {env, fp} pair

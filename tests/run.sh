@@ -1809,13 +1809,17 @@ if command -v clang >/dev/null 2>&1; then
     case "$(uname -s)" in
         MINGW*|MSYS*|CYGWIN*) abilibs="-ladvapi32 -lshell32" ;;
     esac
-    "$OXL" run bootstrap/cmd/codegen -- --emit llvm tests/llvm_abi_check.oxl > "$scratch/abi.ll" || { echo "FAIL llvm emit"; exit 1; }
+    # pin the emit-side ABI guess: a stale OXL_LLVM_ABI in the env
+    # would spell the wrong boundary while the shim below is always
+    # the host build
+    OXL_LLVM_ABI= "$OXL" run bootstrap/cmd/codegen -- --emit llvm tests/llvm_abi_check.oxl > "$scratch/abi.ll" || { echo "FAIL llvm emit"; exit 1; }
     echo "  llvm abi: emitted"
-    clang -O0 -Iruntime "$scratch/abi.ll" tests/llvm_abi_shim.c runtime/rt.c $abilibs -o "$scratch/abi_check$EXE" || { echo "FAIL llvm abi cc"; exit 1; }
+    clang -O0 $THREAD_FLAG -Iruntime "$scratch/abi.ll" tests/llvm_abi_shim.c runtime/rt.c $abilibs -o "$scratch/abi_check$EXE" || { echo "FAIL llvm abi cc"; exit 1; }
     echo "  llvm abi: built"
     out=$("$scratch/abi_check$EXE" 2>&1) || {
         rc=$?
         echo "FAIL llvm abi run rc=$rc"
+        printf '%s\n' "$out"
         # on a segfault, dump the backtrace — x86_64 can't reproduce
         if command -v lldb >/dev/null 2>&1; then
             lldb -b -o run -o "bt all" -o quit -- "$scratch/abi_check$EXE" 2>&1 | tail -50

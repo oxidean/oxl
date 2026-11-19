@@ -611,6 +611,7 @@ void o_f_check_env_taint_clear(struct o_s_check_Env* e, OxlStr n);
 int o_f_check_is_vbound(struct o_s_check_Ck* ck, OxlStr name);
 int o_f_check_ty_vbound(struct o_s_check_Ck* ck, int64_t t);
 int o_f_check_ty_vaddr(struct o_s_check_Ck* ck, int64_t t);
+int o_f_check_ty_carries_vbound(struct o_s_check_Ck* ck, int64_t t);
 int64_t o_f_check_reflect_st(struct o_s_check_Ck* ck, OxlStr b);
 int64_t o_f_check_env_vprov(struct o_s_check_Env* e, OxlStr n);
 void o_f_check_env_vprov_set(struct o_s_check_Env* e, OxlStr n, int64_t p);
@@ -9200,9 +9201,45 @@ int o_f_check_ty_vbound(struct o_s_check_Ck* ck, int64_t t) {
 
 int o_f_check_ty_vaddr(struct o_s_check_Ck* ck, int64_t t) {
     RtDefer *_dmark = rt_defer_mark();
+    if ((t < 0LL)) {
+    rt_defer_drain_to(_dmark);
+    return 0;
+    }
     OxlStr n = (*({ RtSlice _ms = ck->f_tyv; int64_t _mi = t; if (_mi < 0 || _mi >= _ms.len) rt_trap(10); (struct o_s_check_T*)_ms.ptr + _mi; })).f_name;
     rt_defer_drain_to(_dmark);
     return ((o_f_check_ty_vbound(ck, t) && (rt_len(n) >= 6LL)) && (rt_streq(rt_substr(n, ((int64_t)((uint64_t)(rt_len(n)) - (uint64_t)(6LL))), rt_len(n)), rt_str_lit(".Value"))));
+    rt_defer_drain_to(_dmark);
+}
+
+int o_f_check_ty_carries_vbound(struct o_s_check_Ck* ck, int64_t t) {
+    RtDefer *_dmark = rt_defer_mark();
+    if ((t < 0LL)) {
+    rt_defer_drain_to(_dmark);
+    return 0;
+    }
+    if (o_f_check_ty_vbound(ck, t)) {
+    rt_defer_drain_to(_dmark);
+    return 1;
+    }
+    int64_t k = (*({ RtSlice _ms = ck->f_tyv; int64_t _mi = t; if (_mi < 0 || _mi >= _ms.len) rt_trap(10); (struct o_s_check_T*)_ms.ptr + _mi; })).f_k;
+    if ((((k == o_f_check_k_own()) || (k == o_f_check_k_slice())) || (k == o_f_check_k_chan()))) {
+    rt_defer_drain_to(_dmark);
+    return o_f_check_ty_carries_vbound(ck, (*({ RtSlice _ms = ck->f_tyv; int64_t _mi = t; if (_mi < 0 || _mi >= _ms.len) rt_trap(10); (struct o_s_check_T*)_ms.ptr + _mi; })).f_i);
+    }
+    if ((k == o_f_check_k_fn())) {
+    struct o_s_check_IList* al = (*({ RtSlice _ms = ck->f_tyv; int64_t _mi = t; if (_mi < 0 || _mi >= _ms.len) rt_trap(10); (struct o_s_check_T*)_ms.ptr + _mi; })).f_args;
+    while ((al != 0)) {
+    if (o_f_check_ty_carries_vbound(ck, al->f_v)) {
+    rt_defer_drain_to(_dmark);
+    return 1;
+    }
+    al = al->f_next;
+    }
+    rt_defer_drain_to(_dmark);
+    return o_f_check_ty_carries_vbound(ck, (*({ RtSlice _ms = ck->f_tyv; int64_t _mi = t; if (_mi < 0 || _mi >= _ms.len) rt_trap(10); (struct o_s_check_T*)_ms.ptr + _mi; })).f_r);
+    }
+    rt_defer_drain_to(_dmark);
+    return 0;
     rt_defer_drain_to(_dmark);
 }
 
@@ -11866,6 +11903,9 @@ int64_t o_f_check_call_iface(struct o_s_check_Ck* ck, struct o_s_check_IList* ps
     if ((((wk3 == o_f_check_k_slice()) || (wk3 == o_f_check_k_ref())) || (wk3 == o_f_check_k_mut()))) {
     o_f_check_diag(ck, rt_str_lit("check"), rt_str_lit("`spawn` arg of `[]T`/`ref`/`mut` escapes into the task — the backing dies with the scope; pass `own` or a value"));
     }
+    if (o_f_check_ty_carries_vbound(ck, gt)) {
+    o_f_check_diag(ck, rt_str_lit("check"), rt_str_lit("`spawn` arg of `reflect.Value` escapes into the task — scope-bound handles may not be sent to spawn"));
+    }
     if ((at >= 0LL)) {
     o_f_check_diag(ck, rt_str_lit("check"), rt_strcat(rt_strcat(rt_str_lit("`spawn` arg carries a borrow of local `"), o_f_check_taint_src(ck, at)), rt_str_lit("` — it escapes into the task")));
     }
@@ -12366,7 +12406,12 @@ void o_f_check_assignable(struct o_s_check_Ck* ck, int64_t want, int64_t got) {
     ok = (((gi >= 0LL) && ((*({ RtSlice _ms = ck->f_tyv; int64_t _mi = gi; if (_mi < 0 || _mi >= _ms.len) rt_trap(10); (struct o_s_check_T*)_ms.ptr + _mi; })).f_k == o_f_check_k_slice())) && o_f_check_ty_eq(ck, (*({ RtSlice _ms = ck->f_tyv; int64_t _mi = want; if (_mi < 0 || _mi >= _ms.len) rt_trap(10); (struct o_s_check_T*)_ms.ptr + _mi; })).f_i, (*({ RtSlice _ms = ck->f_tyv; int64_t _mi = gi; if (_mi < 0 || _mi >= _ms.len) rt_trap(10); (struct o_s_check_T*)_ms.ptr + _mi; })).f_i));
     }
     if (((!ok) && (wk == o_f_check_k_iface()))) {
+    if (o_f_check_ty_carries_vbound(ck, got)) {
+    o_f_check_diag(ck, rt_str_lit("check"), rt_strcat(rt_strcat(rt_strcat(rt_strcat(rt_str_lit("boxing `"), o_f_check_ty_name(ck, got)), rt_str_lit("` into iface `")), o_f_check_ty_name(ck, want)), rt_str_lit("` — `reflect.Value` is scope-bound and may not be stored in heap shapes")));
+    ok = 1;
+    } else {
     ok = o_f_check_iface_ok(ck, want, got);
+    }
     }
     if ((!ok)) {
     o_f_check_diag(ck, rt_str_lit("type"), rt_strcat(rt_strcat(rt_strcat(rt_strcat(rt_str_lit("expected `"), o_f_check_ty_name(ck, want)), rt_str_lit("`, found `")), o_f_check_ty_name(ck, got)), rt_str_lit("`")));
@@ -12867,10 +12912,18 @@ void o_f_check_reg_variant(struct o_s_check_Ck* ck, OxlStr en, int64_t ei, struc
     struct o_s_parser_NList* al = args;
     while ((al != 0)) {
     if ((({ int64_t __rc; struct o_en_parser_Node* _ba292 = al->f_v; rt_borrow_read(_ba292); __rc = o_f_check_nk(_ba292); rt_unborrow(_ba292); __rc; }) == 5LL)) {
-    ({ struct o_en_parser_Node* _ms = al->f_v; if ((*_ms).tag == 6) { struct o_en_parser_Node* ty = (*_ms).u.v6.f_ty; OxlStr name = (*_ms).u.v6.f_name;     fields = o_f_check_fcons(name, o_f_check_ty_parse(ck, ({ OxlStr __rc; struct o_en_parser_Node* _ba293 = ty; rt_borrow_read(_ba293); __rc = o_f_check_ty_str(_ba293); rt_unborrow(_ba293); __rc; })), fields);
+    ({ struct o_en_parser_Node* _ms = al->f_v; if ((*_ms).tag == 6) { struct o_en_parser_Node* ty = (*_ms).u.v6.f_ty; OxlStr name = (*_ms).u.v6.f_name;     int64_t pt2 = o_f_check_ty_parse(ck, ({ OxlStr __rc; struct o_en_parser_Node* _ba293 = ty; rt_borrow_read(_ba293); __rc = o_f_check_ty_str(_ba293); rt_unborrow(_ba293); __rc; }));
+    if (o_f_check_ty_carries_vbound(ck, pt2)) {
+    o_f_check_diag(ck, rt_str_lit("check"), rt_strcat(rt_strcat(rt_strcat(rt_strcat(rt_str_lit("variant field `"), name), rt_str_lit("` stores a scope-bound `")), o_f_check_ty_name(ck, pt2)), rt_str_lit("` in a heap shape — `reflect.Value` may not be stored")));
+    }
+    fields = o_f_check_fcons(name, pt2, fields);
 } else { } });
     } else {
-    fields = o_f_check_fcons(rt_strcat(rt_str_lit("f"), rt_itoa(fi)), o_f_check_ty_parse(ck, ({ OxlStr __rc; struct o_en_parser_Node* _ba294 = al->f_v; rt_borrow_read(_ba294); __rc = o_f_check_ty_str(_ba294); rt_unborrow(_ba294); __rc; })), fields);
+    int64_t pt3 = o_f_check_ty_parse(ck, ({ OxlStr __rc; struct o_en_parser_Node* _ba294 = al->f_v; rt_borrow_read(_ba294); __rc = o_f_check_ty_str(_ba294); rt_unborrow(_ba294); __rc; }));
+    if (o_f_check_ty_carries_vbound(ck, pt3)) {
+    o_f_check_diag(ck, rt_str_lit("check"), rt_strcat(rt_strcat(rt_strcat(rt_strcat(rt_str_lit("variant field `f"), rt_itoa(fi)), rt_str_lit("` stores a scope-bound `")), o_f_check_ty_name(ck, pt3)), rt_str_lit("` in a heap shape — `reflect.Value` may not be stored")));
+    }
+    fields = o_f_check_fcons(rt_strcat(rt_str_lit("f"), rt_itoa(fi)), pt3, fields);
     }
     fi = ((int64_t)((uint64_t)(fi) + (uint64_t)(1LL)));
     al = al->f_next;
@@ -12916,7 +12969,7 @@ void o_f_check_reg_struct(struct o_s_check_Ck* ck, OxlStr sn, int64_t si, struct
     if (((tk2 == o_f_check_k_ref()) || (tk2 == o_f_check_k_mut()))) {
     o_f_check_diag(ck, rt_str_lit("own"), rt_str_lit("borrowed refs may not be stored in heap objects (v0)"));
     }
-    if (((((tk2 == o_f_check_k_own()) && ((*({ RtSlice _ms = ck->f_tyv; int64_t _mi = t; if (_mi < 0 || _mi >= _ms.len) rt_trap(10); (struct o_s_check_T*)_ms.ptr + _mi; })).f_i >= 0LL)) && o_f_check_ty_vbound(ck, (*({ RtSlice _ms = ck->f_tyv; int64_t _mi = t; if (_mi < 0 || _mi >= _ms.len) rt_trap(10); (struct o_s_check_T*)_ms.ptr + _mi; })).f_i)) || o_f_check_ty_vbound(ck, t))) {
+    if (o_f_check_ty_carries_vbound(ck, t)) {
     o_f_check_diag(ck, rt_str_lit("check"), rt_strcat(rt_strcat(rt_strcat(rt_strcat(rt_str_lit("field `"), name), rt_str_lit("` stores a scope-bound `")), o_f_check_ty_name(ck, t)), rt_str_lit("` in a heap shape — `reflect.Value` may not be stored")));
     }
     struct o_s_check_FList* fe = o_f_check_fcons(name, t, out);
@@ -13026,6 +13079,9 @@ struct o_s_check_CRet* o_f_check_ret_sig(struct o_s_check_Ck* ck, struct o_en_pa
     if (((rk2 == o_f_check_k_ref()) || (rk2 == o_f_check_k_mut()))) {
     o_f_check_diag(ck, rt_str_lit("own"), rt_str_lit("borrowed refs may not be returned (v0)"));
     }
+    if ((o_f_check_ty_carries_vbound(ck, cr->f_r1) && (!o_f_check_ty_vbound(ck, cr->f_r1)))) {
+    o_f_check_diag(ck, rt_str_lit("check"), rt_strcat(rt_strcat(rt_str_lit("return type `"), o_f_check_ty_name(ck, cr->f_r1)), rt_str_lit("` carries a `reflect.Value` — scope-bound handles may not be stored in heap shapes")));
+    }
     }
     rt_defer_drain_to(_dmark);
     return cr;
@@ -13063,7 +13119,11 @@ void o_f_check_reg_iface(struct o_s_check_Ck* ck, int64_t ii, struct o_s_parser_
     OxlStr pst = rt_str_lit("");
     struct o_s_parser_NList* pl = params;
     while ((pl != 0)) {
-    ({ struct o_en_parser_Node* _ms = pl->f_v; if ((*_ms).tag == 6) { struct o_en_parser_Node* ty = (*_ms).u.v6.f_ty; OxlStr name = (*_ms).u.v6.f_name;     ps = o_f_check_icons(o_f_check_ty_parse(ck, ({ OxlStr __rc; struct o_en_parser_Node* _ba306 = ty; rt_borrow_read(_ba306); __rc = o_f_check_ty_str(_ba306); rt_unborrow(_ba306); __rc; })), ps);
+    ({ struct o_en_parser_Node* _ms = pl->f_v; if ((*_ms).tag == 6) { struct o_en_parser_Node* ty = (*_ms).u.v6.f_ty; OxlStr name = (*_ms).u.v6.f_name;     int64_t pt = o_f_check_ty_parse(ck, ({ OxlStr __rc; struct o_en_parser_Node* _ba306 = ty; rt_borrow_read(_ba306); __rc = o_f_check_ty_str(_ba306); rt_unborrow(_ba306); __rc; }));
+    if ((o_f_check_ty_carries_vbound(ck, pt) && (!o_f_check_ty_vbound(ck, pt)))) {
+    o_f_check_diag(ck, rt_str_lit("check"), rt_strcat(rt_strcat(rt_strcat(rt_strcat(rt_str_lit("parameter `"), name), rt_str_lit("` of `")), o_f_check_ty_name(ck, pt)), rt_str_lit("` carries a `reflect.Value` — scope-bound handles may not be stored in heap shapes")));
+    }
+    ps = o_f_check_icons(pt, ps);
     if ((rt_len(pst) > 0LL)) {
     pst = rt_strcat(pst, rt_str_lit(", "));
     }
@@ -13175,7 +13235,11 @@ void o_f_check_reg_fn(struct o_s_check_Ck* ck, OxlStr mod, int ex, OxlStr name, 
     }
     struct o_s_parser_NList* pl = params;
     while ((pl != 0)) {
-    ({ struct o_en_parser_Node* _ms = pl->f_v; if ((*_ms).tag == 6) { struct o_en_parser_Node* ty = (*_ms).u.v6.f_ty; OxlStr name = (*_ms).u.v6.f_name;     ps = o_f_check_icons(o_f_check_ty_parse(ck, ({ OxlStr __rc; struct o_en_parser_Node* _ba321 = ty; rt_borrow_read(_ba321); __rc = o_f_check_ty_str(_ba321); rt_unborrow(_ba321); __rc; })), ps);
+    ({ struct o_en_parser_Node* _ms = pl->f_v; if ((*_ms).tag == 6) { struct o_en_parser_Node* ty = (*_ms).u.v6.f_ty; OxlStr name = (*_ms).u.v6.f_name;     int64_t pt = o_f_check_ty_parse(ck, ({ OxlStr __rc; struct o_en_parser_Node* _ba321 = ty; rt_borrow_read(_ba321); __rc = o_f_check_ty_str(_ba321); rt_unborrow(_ba321); __rc; }));
+    if ((o_f_check_ty_carries_vbound(ck, pt) && (!o_f_check_ty_vbound(ck, pt)))) {
+    o_f_check_diag(ck, rt_str_lit("check"), rt_strcat(rt_strcat(rt_strcat(rt_strcat(rt_str_lit("parameter `"), name), rt_str_lit("` of `")), o_f_check_ty_name(ck, pt)), rt_str_lit("` carries a `reflect.Value` — scope-bound handles may not be stored in heap shapes")));
+    }
+    ps = o_f_check_icons(pt, ps);
 } else { } });
     pl = pl->f_next;
     }
@@ -13226,7 +13290,7 @@ void o_f_check_reg_global(struct o_s_check_Ck* ck, OxlStr name, struct o_en_pars
     o_f_check_assignable(ck, want, it);
     t = want;
     }
-    if (o_f_check_ty_vbound(ck, t)) {
+    if (o_f_check_ty_carries_vbound(ck, t)) {
     o_f_check_diag(ck, rt_str_lit("check"), rt_strcat(rt_strcat(rt_str_lit("global `"), name), rt_str_lit("` stores a `reflect.Value` — Values are scope-bound and may not live in file-scope storage")));
     }
     OxlStr gq = o_f_check_qname(ck->f_cur_mod, name);
@@ -14392,6 +14456,9 @@ int64_t o_f_check_call(struct o_s_check_Ck* ck, struct o_en_parser_Node* f, stru
     o_f_check_diag(ck, rt_str_lit("check"), rt_strcat(rt_strcat(rt_str_lit("`"), qn), rt_str_lit("` takes too many args")));
     }
     if ((payload >= 0LL)) {
+    if (o_f_check_ty_carries_vbound(ck, payload)) {
+    o_f_check_diag(ck, rt_str_lit("check"), rt_strcat(rt_strcat(rt_str_lit("`"), qn), rt_str_lit("` of `reflect.Value` — scope-bound handles may not be stored in heap shapes")));
+    }
     rt_defer_drain_to(_dmark);
     return o_f_check_ti(ck, o_f_check_k_chan(), payload);
     }
@@ -14408,6 +14475,13 @@ int64_t o_f_check_call(struct o_s_check_Ck* ck, struct o_en_parser_Node* f, stru
     }
     int64_t vt = ({ int64_t __rc; struct o_en_parser_Node* _ba411 = args->f_next->f_v; rt_borrow_read(_ba411); __rc = o_f_check_expr(ck, _ba411, env); rt_unborrow(_ba411); __rc; });
     int64_t vat = ck->f_et;
+    int64_t vvp = ck->f_vp;
+    if ((((ct >= 0LL) && ((*({ RtSlice _ms = ck->f_tyv; int64_t _mi = ct; if (_mi < 0 || _mi >= _ms.len) rt_trap(10); (struct o_s_check_T*)_ms.ptr + _mi; })).f_k == o_f_check_k_chan())) && o_f_check_ty_carries_vbound(ck, ct))) {
+    o_f_check_diag(ck, rt_str_lit("check"), rt_strcat(rt_strcat(rt_str_lit("`"), qn), rt_str_lit("` on a channel carrying `reflect.Value` — scope-bound handles may not be stored in heap shapes")));
+    }
+    if ((o_f_check_ty_vaddr(ck, vt) && (vvp != 1LL))) {
+    o_f_check_diag(ck, rt_str_lit("check"), rt_strcat(rt_strcat(rt_str_lit("`"), qn), rt_str_lit("` of `reflect.Value` — only a Value derived from a `ref`/`mut`/`Value` parameter may escape")));
+    }
     if ((((ct >= 0LL) && ((*({ RtSlice _ms = ck->f_tyv; int64_t _mi = ct; if (_mi < 0 || _mi >= _ms.len) rt_trap(10); (struct o_s_check_T*)_ms.ptr + _mi; })).f_k == o_f_check_k_chan())) && ((*({ RtSlice _ms = ck->f_tyv; int64_t _mi = ct; if (_mi < 0 || _mi >= _ms.len) rt_trap(10); (struct o_s_check_T*)_ms.ptr + _mi; })).f_i >= 0LL))) {
     o_f_check_assignable(ck, (*({ RtSlice _ms = ck->f_tyv; int64_t _mi = ct; if (_mi < 0 || _mi >= _ms.len) rt_trap(10); (struct o_s_check_T*)_ms.ptr + _mi; })).f_i, vt);
     } else     if ((!o_f_check_is_word(ck, vt))) {
@@ -14499,7 +14573,7 @@ int64_t o_f_check_call(struct o_s_check_Ck* ck, struct o_en_parser_Node* f, stru
     int64_t t = ({ int64_t __rc; struct o_en_parser_Node* _ba418 = a; rt_borrow_read(_ba418); __rc = o_f_check_expr(ck, _ba418, env); rt_unborrow(_ba418); __rc; });
     int64_t nt = ck->f_et;
     int64_t rt = o_f_check_ti(ck, o_f_check_k_own(), t);
-    if (o_f_check_ty_vbound(ck, t)) {
+    if (o_f_check_ty_carries_vbound(ck, t)) {
     o_f_check_diag(ck, rt_str_lit("check"), rt_str_lit("`new` on `reflect.Value` — scope-bound handles may not be stored in heap shapes"));
     }
     if (((nt >= 0LL) && (o_f_check_taint_may(ck, rt) == 1LL))) {
@@ -14579,7 +14653,7 @@ int64_t o_f_check_call(struct o_s_check_Ck* ck, struct o_en_parser_Node* f, stru
     } else {
     o_f_check_diag(ck, rt_str_lit("check"), rt_str_lit("`mkslice` takes (T, n)"));
     }
-    if (o_f_check_ty_vbound(ck, et)) {
+    if (o_f_check_ty_carries_vbound(ck, et)) {
     o_f_check_diag(ck, rt_str_lit("check"), rt_str_lit("`mkslice` of `reflect.Value` — scope-bound handles may not be stored in heap shapes"));
     }
     rt_defer_drain_to(_dmark);
@@ -14619,6 +14693,21 @@ int64_t o_f_check_call(struct o_s_check_Ck* ck, struct o_en_parser_Node* f, stru
     if (((!ok) && (ak != o_f_check_k_unk()))) {
     o_f_check_diag(ck, rt_str_lit("type"), rt_strcat(rt_strcat(rt_strcat(rt_strcat(rt_str_lit("`"), qn), rt_str_lit("` takes a `ref`/`mut` reference — got `")), o_f_check_ty_name(ck, at)), rt_str_lit("`")));
     }
+    if (ok) {
+    int64_t d2 = (*({ RtSlice _ms = ck->f_tyv; int64_t _mi = at; if (_mi < 0 || _mi >= _ms.len) rt_trap(10); (struct o_s_check_T*)_ms.ptr + _mi; })).f_i;
+    if ((d2 >= 0LL)) {
+    int64_t dk2 = (*({ RtSlice _ms = ck->f_tyv; int64_t _mi = d2; if (_mi < 0 || _mi >= _ms.len) rt_trap(10); (struct o_s_check_T*)_ms.ptr + _mi; })).f_k;
+    if ((((dk2 == o_f_check_k_own()) || (dk2 == o_f_check_k_ref())) || (dk2 == o_f_check_k_mut()))) {
+    int64_t d3 = (*({ RtSlice _ms = ck->f_tyv; int64_t _mi = d2; if (_mi < 0 || _mi >= _ms.len) rt_trap(10); (struct o_s_check_T*)_ms.ptr + _mi; })).f_i;
+    if ((d3 >= 0LL)) {
+    int64_t dk3 = (*({ RtSlice _ms = ck->f_tyv; int64_t _mi = d3; if (_mi < 0 || _mi >= _ms.len) rt_trap(10); (struct o_s_check_T*)_ms.ptr + _mi; })).f_k;
+    if ((((dk3 == o_f_check_k_own()) || (dk3 == o_f_check_k_ref())) || (dk3 == o_f_check_k_mut()))) {
+    o_f_check_diag(ck, rt_str_lit("check"), rt_strcat(rt_strcat(rt_str_lit("`"), qn), rt_str_lit("` argument nests 3+ reference levels — the handle peel supports at most two")));
+    }
+    }
+    }
+    }
+    }
     int64_t prov = 2LL;
     OxlStr rn = ({ OxlStr __rc; struct o_en_parser_Node* _ba430 = args->f_v; rt_borrow_read(_ba430); __rc = o_f_check_taint_root(_ba430); rt_unborrow(_ba430); __rc; });
     if (((rt_len(rn) > 0LL) && (o_f_check_env_vprov(env, rn) == 1LL))) {
@@ -14642,6 +14731,9 @@ int64_t o_f_check_call(struct o_s_check_Ck* ck, struct o_en_parser_Node* f, stru
     if (((args->f_next != 0) && (args->f_next->f_next == 0))) {
     int64_t vt = ({ int64_t __rc; struct o_en_parser_Node* _ba432 = args->f_next->f_v; rt_borrow_read(_ba432); __rc = o_f_check_expr(ck, _ba432, env); rt_unborrow(_ba432); __rc; });
     int64_t vat = ck->f_et;
+    if (o_f_check_ty_carries_vbound(ck, vt)) {
+    o_f_check_diag(ck, rt_str_lit("check"), rt_str_lit("`push` of `reflect.Value` — scope-bound handles may not be stored in heap shapes"));
+    }
     o_f_check_assignable(ck, (*({ RtSlice _ms = ck->f_tyv; int64_t _mi = st; if (_mi < 0 || _mi >= _ms.len) rt_trap(10); (struct o_s_check_T*)_ms.ptr + _mi; })).f_i, vt);
     int64_t pt = (-1LL);
     if (((vat >= 0LL) && (o_f_check_taint_may(ck, (*({ RtSlice _ms = ck->f_tyv; int64_t _mi = st; if (_mi < 0 || _mi >= _ms.len) rt_trap(10); (struct o_s_check_T*)_ms.ptr + _mi; })).f_i) == 1LL))) {
@@ -14948,7 +15040,7 @@ int64_t o_f_check_call(struct o_s_check_Ck* ck, struct o_en_parser_Node* f, stru
     if ((((wk2 == o_f_check_k_slice()) || (wk2 == o_f_check_k_ref())) || (wk2 == o_f_check_k_mut()))) {
     o_f_check_diag(ck, rt_str_lit("check"), rt_str_lit("`spawn` arg of `[]T`/`ref`/`mut` escapes into the task — the backing dies with the scope; pass `own` or a value"));
     }
-    if (o_f_check_ty_vbound(ck, got)) {
+    if (o_f_check_ty_carries_vbound(ck, got)) {
     o_f_check_diag(ck, rt_str_lit("check"), rt_str_lit("`spawn` arg of `reflect.Value` escapes into the task — scope-bound handles may not be sent to spawn"));
     }
     if ((rt0 >= 0LL)) {
@@ -14986,7 +15078,7 @@ int64_t o_f_check_call(struct o_s_check_Ck* ck, struct o_en_parser_Node* f, stru
     if ((((wk3 == o_f_check_k_slice()) || (wk3 == o_f_check_k_ref())) || (wk3 == o_f_check_k_mut()))) {
     o_f_check_diag(ck, rt_str_lit("check"), rt_str_lit("`spawn` arg of `[]T`/`ref`/`mut` escapes into the task — the backing dies with the scope; pass `own` or a value"));
     }
-    if (o_f_check_ty_vbound(ck, gt)) {
+    if (o_f_check_ty_carries_vbound(ck, gt)) {
     o_f_check_diag(ck, rt_str_lit("check"), rt_str_lit("`spawn` arg of `reflect.Value` escapes into the task — scope-bound handles may not be sent to spawn"));
     }
     if ((at >= 0LL)) {
@@ -15092,6 +15184,9 @@ int64_t o_f_check_call_fnvalue(struct o_s_check_Ck* ck, struct o_s_check_IList* 
     if ((sp != 0LL)) {
     if ((((wk4 == o_f_check_k_slice()) || (wk4 == o_f_check_k_ref())) || (wk4 == o_f_check_k_mut()))) {
     o_f_check_diag(ck, rt_str_lit("check"), rt_str_lit("`spawn` arg of `[]T`/`ref`/`mut` escapes into the task — the backing dies with the scope; pass `own` or a value"));
+    }
+    if (o_f_check_ty_carries_vbound(ck, gt)) {
+    o_f_check_diag(ck, rt_str_lit("check"), rt_str_lit("`spawn` arg of `reflect.Value` escapes into the task — scope-bound handles may not be sent to spawn"));
     }
     if ((at >= 0LL)) {
     o_f_check_diag(ck, rt_str_lit("check"), rt_strcat(rt_strcat(rt_str_lit("`spawn` arg carries a borrow of local `"), o_f_check_taint_src(ck, at)), rt_str_lit("` — it escapes into the task")));
@@ -15264,7 +15359,7 @@ void o_f_check_stmt(struct o_s_check_Ck* ck, struct o_en_parser_Node* s, struct 
     }
     } else {
     o_f_check_clear_moved(env, idn);
-    if (((o_f_check_scope_of(env, idn) < 0LL) && o_f_check_ty_vbound(ck, vt))) {
+    if (((o_f_check_scope_of(env, idn) < 0LL) && o_f_check_ty_carries_vbound(ck, vt))) {
     o_f_check_diag(ck, rt_str_lit("check"), rt_strcat(rt_strcat(rt_str_lit("assignment to `"), idn), rt_str_lit("` stores a `reflect.Value` in a file-scope global — Values may not be stored")));
     }
     if ((((o_f_check_scope_of(env, idn) < 0LL) && (!rt_streq(ck->f_cur_fn, rt_str_lit("")))) && (vtaint >= 0LL))) {
@@ -15296,6 +15391,12 @@ void o_f_check_stmt(struct o_s_check_Ck* ck, struct o_en_parser_Node* s, struct 
     int64_t t0 = o_f_check_t_void(ck);
     if ((n0 == 1LL)) {
     t0 = ({ int64_t __rc; struct o_en_parser_Node* _ba493 = vals->f_v; rt_borrow_read(_ba493); __rc = o_f_check_expr(ck, _ba493, env); rt_unborrow(_ba493); __rc; });
+    if ((o_f_check_ty_vaddr(ck, t0) && (ck->f_vp != 1LL))) {
+    o_f_check_diag(ck, rt_str_lit("check"), rt_str_lit("`return` of `reflect.Value` — only a Value derived from a `ref`/`mut`/`Value` parameter may escape"));
+    }
+    if ((o_f_check_ty_carries_vbound(ck, t0) && (!o_f_check_ty_vbound(ck, t0)))) {
+    o_f_check_diag(ck, rt_str_lit("check"), rt_strcat(rt_strcat(rt_str_lit("`return` of `"), o_f_check_ty_name(ck, t0)), rt_str_lit("` carries a `reflect.Value` — scope-bound handles may not be stored in heap shapes")));
+    }
     if ((ck->f_et >= 0LL)) {
     o_f_check_diag(ck, rt_str_lit("check"), rt_strcat(rt_strcat(rt_str_lit("`return` escapes a borrow of local `"), o_f_check_taint_src(ck, ck->f_et)), rt_str_lit("` — the boxed value dangles when the closure's scope ends")));
     }
@@ -15322,6 +15423,9 @@ void o_f_check_stmt(struct o_s_check_Ck* ck, struct o_en_parser_Node* s, struct 
     if ((o_f_check_ty_vaddr(ck, t) && (ck->f_vp != 1LL))) {
     o_f_check_diag(ck, rt_str_lit("check"), rt_str_lit("`return` of `reflect.Value` — only a Value derived from a `ref`/`mut`/`Value` parameter may escape"));
     }
+    if ((o_f_check_ty_carries_vbound(ck, t) && (!o_f_check_ty_vbound(ck, t)))) {
+    o_f_check_diag(ck, rt_str_lit("check"), rt_strcat(rt_strcat(rt_str_lit("`return` of `"), o_f_check_ty_name(ck, t)), rt_str_lit("` carries a `reflect.Value` — scope-bound handles may not be stored in heap shapes")));
+    }
     if ((ck->f_et >= 0LL)) {
     o_f_check_diag(ck, rt_str_lit("check"), rt_strcat(rt_strcat(rt_str_lit("`return` escapes a borrow of local `"), o_f_check_taint_src(ck, ck->f_et)), rt_str_lit("` — the boxed value dangles when this scope ends; heap-allocate the receiver or use an `into_*` owned variant")));
     }
@@ -15331,6 +15435,9 @@ void o_f_check_stmt(struct o_s_check_Ck* ck, struct o_en_parser_Node* s, struct 
     int64_t t = ({ int64_t __rc; struct o_en_parser_Node* _ba496 = vals->f_v; rt_borrow_read(_ba496); __rc = o_f_check_expr(ck, _ba496, env); rt_unborrow(_ba496); __rc; });
     if ((o_f_check_ty_vaddr(ck, t) && (ck->f_vp != 1LL))) {
     o_f_check_diag(ck, rt_str_lit("check"), rt_str_lit("`return` of `reflect.Value` — only a Value derived from a `ref`/`mut`/`Value` parameter may escape"));
+    }
+    if ((o_f_check_ty_carries_vbound(ck, t) && (!o_f_check_ty_vbound(ck, t)))) {
+    o_f_check_diag(ck, rt_str_lit("check"), rt_strcat(rt_strcat(rt_str_lit("`return` of `"), o_f_check_ty_name(ck, t)), rt_str_lit("` carries a `reflect.Value` — scope-bound handles may not be stored in heap shapes")));
     }
     if ((ck->f_et >= 0LL)) {
     o_f_check_diag(ck, rt_str_lit("check"), rt_strcat(rt_strcat(rt_str_lit("`return` escapes a borrow of local `"), o_f_check_taint_src(ck, ck->f_et)), rt_str_lit("` — the boxed value dangles when this scope ends; heap-allocate the receiver or use an `into_*` owned variant")));
@@ -15348,6 +15455,9 @@ void o_f_check_stmt(struct o_s_check_Ck* ck, struct o_en_parser_Node* s, struct 
     int64_t rt1x = ({ int64_t __rc; struct o_en_parser_Node* _ba500 = vals->f_v; rt_borrow_read(_ba500); __rc = o_f_check_call_ret1(ck, _ba500, env); rt_unborrow(_ba500); __rc; });
     if ((o_f_check_ty_vaddr(ck, rt1x) && (vpf != 1LL))) {
     o_f_check_diag(ck, rt_str_lit("check"), rt_str_lit("`return` of `reflect.Value` — only a Value derived from a `ref`/`mut`/`Value` parameter may escape"));
+    }
+    if ((o_f_check_ty_carries_vbound(ck, rt1x) && (!o_f_check_ty_vbound(ck, rt1x)))) {
+    o_f_check_diag(ck, rt_str_lit("check"), rt_strcat(rt_strcat(rt_str_lit("`return` of `"), o_f_check_ty_name(ck, rt1x)), rt_str_lit("` carries a `reflect.Value` — scope-bound handles may not be stored in heap shapes")));
     }
     }
     if ((bs >= 0LL)) {
@@ -15773,7 +15883,11 @@ int64_t o_f_check_closure_expr(struct o_s_check_Ck* ck, struct o_s_parser_NList*
     struct o_s_check_SList* pnames = 0;
     struct o_s_parser_NList* pl = params;
     while ((pl != 0)) {
-    ({ struct o_en_parser_Node* _ms = pl->f_v; if ((*_ms).tag == 6) { struct o_en_parser_Node* ty = (*_ms).u.v6.f_ty; OxlStr name = (*_ms).u.v6.f_name;     ps = o_f_check_icons(o_f_check_ty_parse(ck, ({ OxlStr __rc; struct o_en_parser_Node* _ba593 = ty; rt_borrow_read(_ba593); __rc = o_f_check_ty_str(_ba593); rt_unborrow(_ba593); __rc; })), ps);
+    ({ struct o_en_parser_Node* _ms = pl->f_v; if ((*_ms).tag == 6) { struct o_en_parser_Node* ty = (*_ms).u.v6.f_ty; OxlStr name = (*_ms).u.v6.f_name;     int64_t pt = o_f_check_ty_parse(ck, ({ OxlStr __rc; struct o_en_parser_Node* _ba593 = ty; rt_borrow_read(_ba593); __rc = o_f_check_ty_str(_ba593); rt_unborrow(_ba593); __rc; }));
+    if ((o_f_check_ty_carries_vbound(ck, pt) && (!o_f_check_ty_vbound(ck, pt)))) {
+    o_f_check_diag(ck, rt_str_lit("check"), rt_strcat(rt_strcat(rt_strcat(rt_strcat(rt_str_lit("parameter `"), name), rt_str_lit("` of `")), o_f_check_ty_name(ck, pt)), rt_str_lit("` carries a `reflect.Value` — scope-bound handles may not be stored in heap shapes")));
+    }
+    ps = o_f_check_icons(pt, ps);
     pnames = o_f_check_scons(name, pnames);
 } else { } });
     pl = pl->f_next;
@@ -15816,7 +15930,7 @@ int64_t o_f_check_closure_expr(struct o_s_check_Ck* ck, struct o_s_parser_NList*
     if (((cvk == o_f_check_k_ref()) || (cvk == o_f_check_k_mut()))) {
     o_f_check_diag(ck, rt_str_lit("check"), rt_strcat(rt_strcat(rt_strcat(rt_strcat(rt_str_lit("closure captures `"), cn), rt_str_lit("` (`")), o_f_check_ty_name(ck, cvt)), rt_str_lit("`) — borrowed refs may not be stored in heap objects (v0)")));
     }
-    if (o_f_check_ty_vbound(ck, cvt)) {
+    if (o_f_check_ty_carries_vbound(ck, cvt)) {
     o_f_check_diag(ck, rt_str_lit("check"), rt_strcat(rt_strcat(rt_strcat(rt_strcat(rt_str_lit("closure captures `"), cn), rt_str_lit("` (`")), o_f_check_ty_name(ck, cvt)), rt_str_lit("`) — scope-bound reflect handles may not outlive their source scope")));
     }
     int64_t cit = o_f_check_env_taint(env, cm);
@@ -15844,6 +15958,10 @@ int64_t o_f_check_closure_expr(struct o_s_check_Ck* ck, struct o_s_parser_NList*
     while (((pl != 0) && (wl != 0))) {
     ({ struct o_en_parser_Node* _ms = pl->f_v; if ((*_ms).tag == 6) { int64_t hi = (*_ms).u.v6.f_hi; int64_t lo = (*_ms).u.v6.f_lo; struct o_en_parser_Node* ty = (*_ms).u.v6.f_ty; OxlStr name = (*_ms).u.v6.f_name;     o_f_check_env_set(env, name, wl->f_v, lo, ((int64_t)((uint64_t)(lo) + (uint64_t)(rt_len(name)))));
     o_f_check_rec_local(ck, lo, ((int64_t)((uint64_t)(lo) + (uint64_t)(rt_len(name)))), name, wl->f_v, env);
+    int64_t pk = (*({ RtSlice _ms = ck->f_tyv; int64_t _mi = wl->f_v; if (_mi < 0 || _mi >= _ms.len) rt_trap(10); (struct o_s_check_T*)_ms.ptr + _mi; })).f_k;
+    if ((((pk == o_f_check_k_ref()) || (pk == o_f_check_k_mut())) || o_f_check_ty_vbound(ck, wl->f_v))) {
+    o_f_check_env_vprov_set(env, name, 1LL);
+    }
 } else { } });
     wl = wl->f_next;
     pl = pl->f_next;

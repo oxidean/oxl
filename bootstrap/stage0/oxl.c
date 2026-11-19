@@ -237,7 +237,7 @@ struct o_s_codegen_GVU {    OxlStr f_w;    OxlStr f_impl;    struct o_s_codegen_
 struct o_s_codegen_GCP {    int64_t f_k;    int64_t f_dotted;    OxlStr f_q;    OxlStr f_w;    int64_t f_midx;    OxlStr f_mname;    struct o_s_check_IList* f_ps;    int64_t f_rk;    int64_t f_r1;};
 struct o_s_codegen_GArgOut {    OxlStr f_v;    OxlStr f_pre;    OxlStr f_post;};
 struct o_s_codegen_GPair {    OxlStr f_tag;    int64_t f_vt;};
-struct o_s_codegen_G {    struct o_s_check_Ck* f_ck;    RtSlice f_its;    struct o_s_collections_Map* f_fidx;    struct o_s_check_Env* f_env;    struct o_s_check_Env* f_benv;    struct o_s_check_Env* f_fsl;    RtSlice f_w;    struct o_s_codegen_WStk* f_wst;    RtSlice f_wlast;    RtSlice f_head;    RtSlice f_out;    RtSlice f_tramp;    RtSlice f_fhead;    RtSlice f_fbody;    RtSlice f_clpro;    RtSlice f_clbod;    RtSlice f_ginit;    int64_t f_maink;    int64_t f_testm;    struct o_s_parser_NList* f_defers;    struct o_s_check_SList* f_fnv;    RtSlice f_fdecls;    RtSlice f_sdecls;    RtSlice f_vdecls;    RtSlice f_states;    RtSlice f_loops;    RtSlice f_sopen;    int64_t f_tmpn;    int64_t f_scopen;    int64_t f_cln;    int64_t f_staten;    int64_t f_vsdn;    int64_t f_labeln;    int64_t f_hoistn;    int64_t f_retk;    int64_t f_cret;    struct o_s_collections_Map* f_subst;    RtSlice f_drop_tys;    int64_t f_drop_word;    int64_t f_drop_slice;    struct o_s_codegen_GInst* f_insts;    struct o_s_collections_Map* f_inst_done;    struct o_s_codegen_GVU* f_vtabs;    struct o_s_collections_Map* f_vtab_set;    RtSlice f_vout;    OxlStr f_cur;    int64_t f_inframe;    RtSlice f_units;    struct o_s_collections_Map* f_dpos;    RtSlice f_dchain;    RtSlice f_uhits;    RtSlice f_live;};
+struct o_s_codegen_G {    struct o_s_check_Ck* f_ck;    RtSlice f_its;    struct o_s_collections_Map* f_fidx;    struct o_s_check_Env* f_env;    struct o_s_check_Env* f_benv;    struct o_s_check_Env* f_fsl;    RtSlice f_w;    struct o_s_codegen_WStk* f_wst;    RtSlice f_wlast;    RtSlice f_head;    RtSlice f_out;    RtSlice f_tramp;    RtSlice f_fhead;    RtSlice f_fbody;    RtSlice f_clpro;    RtSlice f_clbod;    RtSlice f_ginit;    int64_t f_maink;    int64_t f_testm;    struct o_s_parser_NList* f_defers;    struct o_s_check_SList* f_fnv;    RtSlice f_fdecls;    RtSlice f_sdecls;    RtSlice f_vdecls;    RtSlice f_states;    RtSlice f_loops;    RtSlice f_sopen;    int64_t f_tmpn;    int64_t f_scopen;    int64_t f_cln;    int64_t f_staten;    int64_t f_vsdn;    int64_t f_labeln;    int64_t f_hoistn;    int64_t f_retk;    int64_t f_cret;    struct o_s_collections_Map* f_subst;    RtSlice f_drop_tys;    int64_t f_drop_word;    int64_t f_drop_slice;    struct o_s_codegen_GInst* f_insts;    struct o_s_collections_Map* f_inst_done;    struct o_s_codegen_GVU* f_vtabs;    struct o_s_collections_Map* f_vtab_set;    RtSlice f_vout;    OxlStr f_cur;    int64_t f_inframe;    RtSlice f_units;    struct o_s_collections_Map* f_dpos;    RtSlice f_dchain;    RtSlice f_uhits;    RtSlice f_live;    int64_t f_lreg;    int64_t f_ldeadn;    int64_t f_lterm;    int64_t f_lfn;    RtSlice f_lall;    RtSlice f_lallg;    struct o_s_collections_Map* f_lstrs;    int64_t f_lstrn;    struct o_s_collections_Map* f_lrtd;    RtSlice f_lrtl;    OxlStr f_lscsz;    OxlStr f_ldmark;    int64_t f_ltsd;    int64_t f_dwrapn;    int64_t f_spn;    RtSlice f_dpro;    RtSlice f_dbod;    RtSlice f_spro;    RtSlice f_spbod;    RtSlice f_ltys;    RtSlice f_lglob;    RtSlice f_lext;    RtSlice f_lbody;    RtSlice f_lwrap;    RtSlice f_lvtb;    RtSlice f_ldrp;    RtSlice f_liret;};
 struct o_s_codegen_WStk {    RtSlice f_w;    struct o_s_codegen_WStk* f_next;};
 struct o_s_codegen_GAv {    OxlStr f_v;    OxlStr f_pre;    OxlStr f_post;    struct o_s_codegen_GAv* f_next;};
 struct o_s_codegen_GS {    struct o_s_check_SList* f_l;    struct o_s_check_SList* f_binds;};
@@ -34096,8 +34096,8 @@ OxlStr o_f_codegen_jx(struct o_s_codegen_G* g, struct o_en_parser_Node* e) {
 void o_f_eprint(OxlStr s) {
     RtDefer *_dmark = rt_defer_mark();
     struct o_s_os_File f = ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_os_stderr }; ((struct o_s_os_File (*)(void*))_fv.fp)(_fv.env); });
-    struct o_ret_os_File_write _r1709 = o_f_os_File_write((&f), rt_bytes_str(s));
-    int64_t e = _r1709.err;
+    struct o_ret_os_File_write _r1985 = o_f_os_File_write((&f), rt_bytes_str(s));
+    int64_t e = _r1985.err;
     if ((e != 0)) {
     rt_exit(1LL);
     }
@@ -34475,9 +34475,9 @@ OxlStr o_f_pick_cc(void) {
     int64_t i = 0LL;
     while ((i < (cands).len)) {
     struct o_s_exec_Cmd probe = ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_exec_cmd }; ((struct o_s_exec_Cmd (*)(void*, OxlStr, RtSlice))_fv.fp)(_fv.env, (*({ RtSlice _ms = cands; int64_t _mi = i; if (_mi < 0 || _mi >= _ms.len) rt_trap(10); (OxlStr*)_ms.ptr + _mi; })), ver); });
-    struct o_ret_exec_Cmd_output _r1710 = o_f_exec_Cmd_output(probe);
-    struct o_s_exec_Out o = _r1710.val;
-    int64_t e = _r1710.err;
+    struct o_ret_exec_Cmd_output _r1986 = o_f_exec_Cmd_output(probe);
+    struct o_s_exec_Out o = _r1986.val;
+    int64_t e = _r1986.err;
     if (((e == 0) && (o.f_status == 0LL))) {
     rt_defer_drain_to(_dmark);
     return (*({ RtSlice _ms = cands; int64_t _mi = i; if (_mi < 0 || _mi >= _ms.len) rt_trap(10); (OxlStr*)_ms.ptr + _mi; }));
@@ -34537,9 +34537,9 @@ int64_t o_f_is_macos(void) {
     RtSlice ua = rt_mkslice(0LL, sizeof(OxlStr));
     ua = ({ OxlStr _pv = rt_str_lit("-s"); rt_slice_push(ua, sizeof(OxlStr), &_pv); });
     struct o_s_exec_Cmd un = ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_exec_cmd }; ((struct o_s_exec_Cmd (*)(void*, OxlStr, RtSlice))_fv.fp)(_fv.env, rt_str_lit("uname"), ua); });
-    struct o_ret_exec_Cmd_output _r1711 = o_f_exec_Cmd_output(un);
-    struct o_s_exec_Out o = _r1711.val;
-    int64_t e = _r1711.err;
+    struct o_ret_exec_Cmd_output _r1987 = o_f_exec_Cmd_output(un);
+    struct o_s_exec_Out o = _r1987.val;
+    int64_t e = _r1987.err;
     if ((e != 0)) {
     rt_defer_drain_to(_dmark);
     return 0LL;
@@ -34664,9 +34664,9 @@ int64_t o_f_emit_and_cc(OxlStr csrc, OxlStr out, OxlStr entry) {
     }
     }
     struct o_s_exec_Cmd ccp = ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_exec_cmd }; ((struct o_s_exec_Cmd (*)(void*, OxlStr, RtSlice))_fv.fp)(_fv.env, cc, args); });
-    struct o_ret_exec_Cmd_run _r1712 = o_f_exec_Cmd_run(ccp);
-    int64_t st = _r1712.val;
-    int64_t e = _r1712.err;
+    struct o_ret_exec_Cmd_run _r1988 = o_f_exec_Cmd_run(ccp);
+    int64_t st = _r1988.val;
+    int64_t e = _r1988.err;
     if (((e == 0) && (st == 0LL))) {
     ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_os_remove_all }; ((int64_t (*)(void*, OxlStr))_fv.fp)(_fv.env, dir); });
     rt_defer_drain_to(_dmark);
@@ -34901,9 +34901,9 @@ void o_f_cmd_run(void) {
     i = ((int64_t)((uint64_t)(i) + (uint64_t)(1LL)));
     }
     struct o_s_exec_Cmd child = ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_exec_cmd }; ((struct o_s_exec_Cmd (*)(void*, OxlStr, RtSlice))_fv.fp)(_fv.env, rt_str_lit("node"), nc); });
-    struct o_ret_exec_Cmd_run _r1713 = o_f_exec_Cmd_run(child);
-    int64_t st = _r1713.val;
-    int64_t e = _r1713.err;
+    struct o_ret_exec_Cmd_run _r1989 = o_f_exec_Cmd_run(child);
+    int64_t st = _r1989.val;
+    int64_t e = _r1989.err;
     if ((e != 0)) {
     o_f_eprintln(rt_strcat(rt_str_lit("node exec failed: "), ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_errors_msg }; ((OxlStr (*)(void*, int64_t))_fv.fp)(_fv.env, e); })));
     }
@@ -34911,9 +34911,9 @@ void o_f_cmd_run(void) {
     rt_exit(o_f_child_code(st, e));
     }
     struct o_s_exec_Cmd child = ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_exec_cmd }; ((struct o_s_exec_Cmd (*)(void*, OxlStr, RtSlice))_fv.fp)(_fv.env, out, cargs); });
-    struct o_ret_exec_Cmd_run _r1714 = o_f_exec_Cmd_run(child);
-    int64_t st = _r1714.val;
-    int64_t e = _r1714.err;
+    struct o_ret_exec_Cmd_run _r1990 = o_f_exec_Cmd_run(child);
+    int64_t st = _r1990.val;
+    int64_t e = _r1990.err;
     ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_os_remove_all }; ((int64_t (*)(void*, OxlStr))_fv.fp)(_fv.env, dir); });
     rt_exit(o_f_child_code(st, e));
     rt_defer_drain_to(_dmark);
@@ -34968,9 +34968,9 @@ int64_t o_f_test_one(struct o_s_PkgSrc src, struct o_s_CRes* res) {
     RtSlice nargs = rt_mkslice(0LL, sizeof(OxlStr));
     nargs = ({ OxlStr _pv = out; rt_slice_push(nargs, sizeof(OxlStr), &_pv); });
     struct o_s_exec_Cmd child = ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_exec_cmd }; ((struct o_s_exec_Cmd (*)(void*, OxlStr, RtSlice))_fv.fp)(_fv.env, rt_str_lit("node"), nargs); });
-    struct o_ret_exec_Cmd_run _r1715 = o_f_exec_Cmd_run(child);
-    int64_t st = _r1715.val;
-    int64_t e = _r1715.err;
+    struct o_ret_exec_Cmd_run _r1991 = o_f_exec_Cmd_run(child);
+    int64_t st = _r1991.val;
+    int64_t e = _r1991.err;
     if ((e != 0)) {
     o_f_eprintln(rt_strcat(rt_str_lit("node exec failed: "), ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_errors_msg }; ((OxlStr (*)(void*, int64_t))_fv.fp)(_fv.env, e); })));
     }
@@ -34984,9 +34984,9 @@ int64_t o_f_test_one(struct o_s_PkgSrc src, struct o_s_CRes* res) {
     return 1LL;
     }
     struct o_s_exec_Cmd child = ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_exec_cmd }; ((struct o_s_exec_Cmd (*)(void*, OxlStr, RtSlice))_fv.fp)(_fv.env, out, rt_mkslice(0LL, sizeof(OxlStr))); });
-    struct o_ret_exec_Cmd_run _r1716 = o_f_exec_Cmd_run(child);
-    int64_t st = _r1716.val;
-    int64_t e = _r1716.err;
+    struct o_ret_exec_Cmd_run _r1992 = o_f_exec_Cmd_run(child);
+    int64_t st = _r1992.val;
+    int64_t e = _r1992.err;
     ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_os_remove_all }; ((int64_t (*)(void*, OxlStr))_fv.fp)(_fv.env, dir); });
     rt_defer_drain_to(_dmark);
     return o_f_child_code(st, e);
@@ -35022,7 +35022,7 @@ void o_f_cmd_list(void) {
     o_f_eprintln(rt_strcat(rt_str_lit("error [check] not a module — no oxl.mod found above "), ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_check_native_path }; ((OxlStr (*)(void*, OxlStr))_fv.fp)(_fv.env, cwd); })));
     rt_exit(1LL);
     }
-    ({ struct o_s_check_Ck* _ba1717 = ck; rt_borrow_read(_ba1717); o_f_print_build_list(_ba1717); rt_unborrow(_ba1717); });
+    ({ struct o_s_check_Ck* _ba1993 = ck; rt_borrow_read(_ba1993); o_f_print_build_list(_ba1993); rt_unborrow(_ba1993); });
     rt_defer_drain_to(_dmark);
 }
 

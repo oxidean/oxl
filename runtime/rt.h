@@ -371,7 +371,7 @@ int64_t rt_desc_f_td(int64_t td, int64_t i);
 OxlStr  rt_desc_f_tag(int64_t td, int64_t i);  /* "" when absent */
 int64_t rt_desc_f_ptr(int64_t td, int64_t i);  /* 1: slot is a ptr */
 int64_t rt_desc_alloc(int64_t td);       /* zeroed pointee mint — rt_alloc_own */
-int64_t rt_desc_alloc_slice(int64_t td, int64_t n); /* live RtSlice header + own backing */
+int64_t rt_desc_alloc_slice(int64_t std, int64_t n); /* live RtSlice header + own backing — arg is the SLICE descriptor (elem stride derives from elem_ptr) */
 
 /* --- slices: {ptr,len,cap,heap} fat header, erased element type ---
  * borrow-slice backing comes from rt_alloc (scope arena when inside a

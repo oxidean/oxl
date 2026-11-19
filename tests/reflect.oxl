@@ -12,6 +12,8 @@ import "std/errors"
 
 struct Inner { v: int }
 
+struct Sm { y: byte }
+
 struct S {
     n: int,
     f: float,
@@ -22,6 +24,7 @@ struct S {
     xs: []int,
     ox: []own Inner,
     c: cstr,
+    sx: []own Sm,
 }
 
 enum E { A(int), B { x: int, s: str }, C, }
@@ -66,7 +69,7 @@ fn main() {
     if t.size() < 40 {
         fails("type size")
     }
-    if t.nfields() != 9 {
+    if t.nfields() != 10 {
         fails("nfields " + itoa(t.nfields()))
     }
     [f0, fe0] = t.field(0)
@@ -383,6 +386,20 @@ fn main() {
     [emf, emfe] = em0.field(0)
     want_ok(emfe, "alloc_elem field")
     want_ok(emf.set_int(19), "alloc_elem set")
+    // []own T stride is sizeof(ptr) — a sub-8-byte pointee (Sm{byte})
+    // must still mint n full slots, not n*sizeof(T) bytes
+    [sv4, sv4e] = v2.alloc_slice(9, 2)
+    want_ok(sv4e, "alloc_slice small-own")
+    [el1, el1e] = sv4.index(1)
+    want_err(el1e, reflect.err_nil(), "nil small-own elem")
+    [em1, em1e] = sv4.alloc_elem(1)
+    want_ok(em1e, "alloc_elem small-own")
+    [eyf, eyfe] = em1.field(0)
+    want_ok(eyfe, "small-own field")
+    want_ok(eyf.set_byte(9), "small-own set")
+    if s2.sx[1].y != 9 {
+        fails("alloc_slice small-own did not land")
+    }
     if s2.ox[0].v != 19 {
         fails("alloc_elem did not land")
     }

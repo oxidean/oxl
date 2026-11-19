@@ -614,7 +614,7 @@ fn (v Value) alloc_slice(i: int, n: int) -> [Value, err] {
     if etd < 0 {
         return f, err_kind()
     }
-    h := rt_desc_alloc_slice(etd, n)
+    h := rt_desc_alloc_slice(ftd, n)
     if h < 0 {
         return f, err_kind()
     }

@@ -28,6 +28,19 @@ int64_t abi_slice_sum(RtSlice s) {
     return t;
 }
 
+/* >16B aggregate return: clang lowers a 32-byte RtSlice through the
+ * hidden sret pointer (x8 on arm64, rdi slot on SysV); an IR call site
+ * spelled as a direct %RtSlice return expects x0-x3 registers instead
+ * and the callee stores its result through garbage. The returned
+ * header + elements must decode correctly on every platform. */
+RtSlice abi_ret_slice(int64_t n) {
+    static int64_t backing[8];
+    for (int64_t i = 0; i < n && i < 8; i++)
+        backing[i] = i * 7;
+    RtSlice s = { backing, n, n, 0 };
+    return s;
+}
+
 /* RtFnv {env, fp}: the call only lands if env and fp stay unswapped;
  * fp's ABI sig is (void *env, int64_t x) -> int64_t. */
 typedef int64_t (*abi_fnv_fp)(void *, int64_t);

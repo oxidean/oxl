@@ -16,6 +16,8 @@ extern fn abi_slice_sum(s: []int) -> int
 
 extern fn abi_probe_fnv(f: fn(int) -> int, x: int) -> int
 
+extern fn abi_ret_slice(n: int) -> []int
+
 interface Speaker { tag() -> int }
 
 struct Dog { v: int }
@@ -46,6 +48,14 @@ fn main() {
     }
     // heap is informational — print, don't assert (alloc lane detail)
     println("slice.heap=" + itoa(abi_slice_heap(xs)))
+    // >16B aggregate return — sret boundary: externs returning []T
+    // (and rt_mkslice under the hood) come back through the hidden
+    // out-pointer; header fields + element walk decode the slots.
+    rs := abi_ret_slice(4)
+    if len(rs) != 4 || abi_slice_sum(rs) != 42 {
+        println("FAIL abi sret")
+        exit(1)
+    }
     // RtFnv: 5*3+7 = 22 through the {env, fp} pair
     if abi_probe_fnv(addmul, 5) != 22 {
         println("FAIL abi fnv")

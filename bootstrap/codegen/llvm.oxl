@@ -276,6 +276,17 @@ fn lsizeof(g: mut G, t: int) -> str {
     return "ptrtoint (ptr getelementptr (" + lty(g, t) + ", ptr null, i64 1) to i64)"
 }
 
+// extern-boundary sret rule: composite rets over 16 B ride the
+// hidden out-pointer (arm64 x8 / SysV rdi); <=16 B stays in registers
+// on both ABIs. Returns the aggregate spelling to sret, else "".
+fn lsret_ty(g: mut G, t: int) -> str {
+    t = gsub(g, t)
+    if lsize(g, t) <= 16 {
+        return ""
+    }
+    return lty(g, t)
+}
+
 // positional index of field `fname` inside struct `sname` (LLVM
 // member geps are numeric; the C lane's `f_<name>` order is the
 // FieldDef order)
@@ -580,10 +591,10 @@ fn lrt_sig(name: str) -> str {
     }
     // — slices / buffers --
     if name == "rt_mkslice" {
-        d = "%RtSlice @rt_mkslice(i64, i64)"
+        d = "void @rt_mkslice(ptr sret(%RtSlice), i64, i64)"
     }
     if name == "rt_slice_push" {
-        d = "%RtSlice @rt_slice_push(ptr, i64, ptr)"
+        d = "void @rt_slice_push(ptr sret(%RtSlice), ptr byval(%RtSlice), i64, ptr)"
     }
     if name == "rt_slice_own" {
         d = "ptr @rt_slice_own(ptr, i64)"
@@ -604,7 +615,7 @@ fn lrt_sig(name: str) -> str {
         d = "void @rt_poke32(ptr, i64, i64)"
     }
     if name == "rt_bytes_str" {
-        d = "%RtSlice @rt_bytes_str(%OxlStr)"
+        d = "void @rt_bytes_str(ptr sret(%RtSlice), %OxlStr)"
     }
     if name == "rt_str_bytes" {
         d = "%OxlStr @rt_str_bytes(ptr)"
@@ -841,6 +852,22 @@ fn lbyval_slice(g: mut G, v: str) -> str {
 fn lcallrt(g: mut G, rt: str, name: str, a: str) -> str {
     lrtuse(g, name)
     return lcallr(g, rt, "@" + name, a)
+}
+
+// >16-byte aggregate returns ride the C ABI's hidden out-pointer:
+// a plain `call %RtSlice @rt_*` lowers to an x0–x3 register return
+// on arm64 while the rt.c build expects the x8 indirect slot, so the
+// callee stores through garbage. sret pins both sides to the same
+// convention (and stays identical to the old lowering on x86-64).
+fn lcallrt_sret(g: mut G, tyn: str, name: str, a: str) -> str {
+    lrtuse(g, name)
+    dst := lalloc(g, tyn)
+    sep := ""
+    if a != "" {
+        sep = ", "
+    }
+    lcallv(g, "@" + name, "ptr sret(" + tyn + ") " + dst + sep + a)
+    return lload(g, tyn, dst)
 }
 
 fn lcallrtv(g: mut G, name: str, a: str) {
@@ -1305,7 +1332,7 @@ fn lxas(g: mut G, inner: ref parser.Node, ty: ref parser.Node) -> str {
     bok := tyk(g, gsub(g, bt))
     wk := tyk(g, gsub(g, wt))
     if bok == check.k_str() && wk == check.k_slice() && tyk(g, tyi(g, wt)) == check.k_byte() {
-        return lcallrt(g, "%RtSlice", "rt_bytes_str", "%OxlStr " + iv)
+        return lcallrt_sret(g, "%RtSlice", "rt_bytes_str", "%OxlStr " + iv)
     }
     if bok == check.k_slice() && tyk(g, tyi(g, bt)) == check.k_byte() && wk == check.k_str() {
         sv := iv
@@ -3150,7 +3177,7 @@ fn lcall(g: mut G, f: ref parser.Node, args: ref parser.NList) -> str {
         if args.next != nil {
             n = lfit(g, gav_at(argvs, 1), xty(g, args.next.v), check.t_int(g.ck))
         }
-        return lcallrt(g, "%RtSlice", "rt_mkslice", "i64 " + n + ", i64 " + lsizeof(g, et))
+        return lcallrt_sret(g, "%RtSlice", "rt_mkslice", "i64 " + n + ", i64 " + lsizeof(g, et))
     }
     if qn == "push" && args != nil {
         st := xty(g, args.v)
@@ -3174,7 +3201,7 @@ fn lcall(g: mut G, f: ref parser.Node, args: ref parser.NList) -> str {
         v = lconv_v(g, args.next.v, v, el)
         ep := lalloc(g, lty(g, el))
         lstore(g, lty(g, el), v, ep)
-        return lcallrt(g, "%RtSlice", "rt_slice_push", lbyval_slice(g, sv) + ", i64 " + lsizeof(g, el) + ", ptr " + ep)
+        return lcallrt_sret(g, "%RtSlice", "rt_slice_push", lbyval_slice(g, sv) + ", i64 " + lsizeof(g, el) + ", ptr " + ep)
     }
     if qn == "len" && args != nil {
         st := gdt(g, xty(g, args.v))
@@ -3379,7 +3406,24 @@ fn lcall(g: mut G, f: ref parser.Node, args: ref parser.NList) -> str {
             rty = "%o_ret_" + cname(mangled)
         }
     }
-    v := lcallr(g, rty, callee, a)
+    v := ""
+    sreted := 0
+    if sig.is_extern == 1 {
+        st := lsret_ty(g, rt1)
+        if len(st) > 0 {
+            sreted = 1
+            dst := lalloc(g, st)
+            sep := ""
+            if len(a) > 0 {
+                sep = ", "
+            }
+            lcallv(g, callee, "ptr sret(" + st + ") " + dst + sep + a)
+            v = lload(g, st, dst)
+        }
+    }
+    if sreted == 0 {
+        v = lcallr(g, rty, callee, a)
+    }
     lav_marks(g, coerced, 1)
     return v
 }
@@ -3941,8 +3985,11 @@ fn lemit_extern(g: mut G, i: int) {
             gset_ctx(g, i)
             rty := "void"
             rk := gretdk(g, ret)
+            srt := ""
             if rk == 1 {
-                rty = lty(g, gsub(g, gret1(g, ret)))
+                rt1 := gsub(g, gret1(g, ret))
+                srt = lsret_ty(g, rt1)
+                rty = lty(g, rt1)
             }
             if rk == 2 {
                 rty = "i64"
@@ -3970,7 +4017,15 @@ fn lemit_extern(g: mut G, i: int) {
                 }
                 pl = pl.next
             }
-            g.lext = push(g.lext, "declare " + rty + " @" + name + "(" + ps + ")\n")
+            if len(srt) > 0 {
+                dp := "ptr sret(" + srt + ")"
+                if len(ps) > 0 {
+                    dp = dp + ", " + ps
+                }
+                g.lext = push(g.lext, "declare void @" + name + "(" + dp + ")\n")
+            } else {
+                g.lext = push(g.lext, "declare " + rty + " @" + name + "(" + ps + ")\n")
+            }
         }
         _ => {
         }
@@ -4207,7 +4262,19 @@ fn lemit_fnv_one(g: mut G, n: str) {
     }
     b := "define " + ret_c + " @o_fnv_wrap_" + cname(n) + "(ptr %_e" + psig + ") {\n"
     if sig.retk == 1 {
-        b = b + "  %r = call " + ret_c + " " + callee + "(" + substr(argl, 2, len(argl)) + ")\n  ret " + ret_c + " %r\n}\n"
+        st := ""
+        if sig.is_extern == 1 {
+            st = lsret_ty(g, gsub(g, sig.ret1))
+        }
+        if len(st) > 0 {
+            sargs := "ptr sret(" + st + ") %_d"
+            if len(argl) > 0 {
+                sargs = sargs + ", " + substr(argl, 2, len(argl))
+            }
+            b = b + "  %_d = alloca " + st + ", align 8\n  call void " + callee + "(" + sargs + ")\n  %r = load " + st + ", ptr %_d\n  ret " + ret_c + " %r\n}\n"
+        } else {
+            b = b + "  %r = call " + ret_c + " " + callee + "(" + substr(argl, 2, len(argl)) + ")\n  ret " + ret_c + " %r\n}\n"
+        }
     } else {
         b = b + "  call void " + callee + "(" + substr(argl, 2, len(argl)) + ")\n  ret void\n}\n"
     }

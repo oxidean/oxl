@@ -345,11 +345,20 @@ struct LL { names: own SList, next: own LL }
 // select/match arm end-states awaiting the fall-through merge
 struct ArmSt { mv: own LL, ft: int, next: own ArmSt }
 
-// select-arm borrow end-states awaiting the fall-through merge
-struct BArmSt { st: own LL, sr: own SalIAS, next: own BArmSt }
+// select-arm borrow end-states awaiting the fall-through merge — `vp`
+// is the arm's Value-provenance end-state, `ft` whether the arm falls
+// through to the join (R1 must-merge)
+struct BArmSt {
+    st: own LL,
+    sr: own SalIAS,
+    vp: own LL,
+    ft: int,
+    next: own BArmSt,
+}
 
-// break/continue borrow snapshots for the innermost loop
-struct SnapL { s: own LL, sr: own SalIAS, next: own SnapL }
+// break/continue borrow snapshots for the innermost loop — `vp` is the
+// same exit's Value-provenance state (R1 must-merge at loop joins)
+struct SnapL { s: own LL, sr: own SalIAS, vp: own LL, next: own SnapL }
 
 struct LoopSt { brk: own SnapL, cont: own SnapL, next: own LoopSt }
 
@@ -494,6 +503,7 @@ struct Ck {
     vbound: own SList, // scope-bound struct names (std/reflect Value/Type/Field/Variant + internal handles, R1)
     vp: int, // Value provenance of the most recently checked expr — 0 none, 1 param-derived, 2 local-derived
     vpt: int, // pending provenance a node helper leaves for expr() to publish as vp
+    jsintr: own SList, // "file|lo|name" — call sites resolved to the R1 intrinsics; the --target js gate reads these, not the spelling
 }
 
 // E1/LSP index: a use-site record mapping (file, [lo,hi)) to the decl it
@@ -893,6 +903,30 @@ fn env_vprov_set(e: mut Env, n: str, p: int) {
     }
     e.scopes[i].vpr = borr_del(e.scopes[i].vpr, n)
     e.scopes[i].vpr = scons(n + "|" + itoa(p), e.scopes[i].vpr)
+}
+
+// record a resolved R1 intrinsic call site for the --target js gate —
+// the caller only reaches this after name resolution picked the
+// builtin, so a shadowing same-named local never lands here
+fn jsintr_rec(ck: mut Ck, f: ref parser.Node, qn: str) {
+    k := ck.cur_file + "|" + itoa(parser.nlo(f)) + "|" + qn
+    if !sl_has(ck.jsintr, k) {
+        ck.jsintr = scons(k, ck.jsintr)
+    }
+}
+
+// intrinsic name recorded for this callee site ("" when none — the
+// call resolved to a user fn or a shadowing local instead)
+fn jsintr_name(ck: ref Ck, file: str, lo: int) -> str {
+    pre := file + "|" + itoa(lo) + "|"
+    l := ck.jsintr
+    for l != nil {
+        if len(l.v) > len(pre) && substr(l.v, 0, len(pre)) == pre {
+            return substr(l.v, len(pre), len(l.v))
+        }
+        l = l.next
+    }
+    return ""
 }
 
 // may a value of type `t` carry a borrow of local storage? Deep enough
@@ -1583,6 +1617,142 @@ fn borr_union(ck: mut Ck, e: mut Env, other: ref LL) {
         o = o.next
         i = i + 1
     }
+}
+
+// ---------- Value provenance snapshots (R1) ----------
+// Scope.vpr entries are "name|prov" like borr's — prov 1 param-derived,
+// 2 local-derived, 0 no derivation. The joins are must-analysis: a
+// binding is param-derived after a branch only when EVERY path that can
+// reach the join says so, so the merge is borr's shape with an
+// all-paths-1 rule instead of the taint union.
+fn vpr_save(e: ref Env) -> own LL {
+    let out: own LL = nil
+    i := len(e.scopes) - 1
+    for i >= 0 {
+        c := new(LL)
+        c.names = sl_clone(e.scopes[i].vpr)
+        c.next = out
+        out = c
+        i = i - 1
+    }
+    return out
+}
+
+fn vpr_restore(e: mut Env, s: own LL) {
+    i := 0
+    for i < len(e.scopes) && s != nil {
+        e.scopes[i].vpr = s.names
+        s = s.next
+        i = i + 1
+    }
+}
+
+fn vpr_clear_all(e: mut Env) {
+    i := 0
+    for i < len(e.scopes) {
+        e.scopes[i].vpr = nil
+        i = i + 1
+    }
+}
+
+// provenance merge of two paths: 1 survives only when both sides say 1;
+// agreeing 0s stay 0; anything else collapses to 2 — the binding may
+// hold a non-param derivation on some path, so it is not returnable
+fn vpr_merge_p(a: int, b: int) -> int {
+    if a == 1 && b == 1 {
+        return 1
+    }
+    if a == 0 && b == 0 {
+        return 0
+    }
+    return 2
+}
+
+// merge `name|prov` into one scope's vpr list under vpr_merge_p
+fn vpr_merge_entry(l: ref SList, n: str, p: int) -> own SList {
+    cur := borr_get(l, n)
+    if cur < 0 {
+        cur = 0
+    }
+    mi := vpr_merge_p(cur, p)
+    pre := n + "|"
+    let out: own SList = nil
+    q := l
+    for q != nil {
+        if !(len(q.v) > len(pre) && substr(q.v, 0, len(pre)) == pre) {
+            out = scons(q.v, out)
+        }
+        q = q.next
+    }
+    return scons(n + "|" + itoa(mi), out)
+}
+
+// fold `other` into env: names on both sides merge under vpr_merge_p;
+// a name only on the env side merges against a path that carries no
+// derivation for it (prov 0) — 1 cannot survive a missing path either
+fn vpr_union(e: mut Env, other: ref LL) {
+    i := 0
+    o := other
+    for i < len(e.scopes) && o != nil {
+        l := o.names
+        for l != nil {
+            di := find(l.v, "|")
+            if di >= 0 {
+                e.scopes[i].vpr = vpr_merge_entry(e.scopes[i].vpr, substr(l.v, 0, di), atoi(substr(l.v, di + 1, len(l.v))))
+            }
+            l = l.next
+        }
+        let dn: own SList = nil
+        l2 := e.scopes[i].vpr
+        for l2 != nil {
+            di2 := find(l2.v, "|")
+            if di2 >= 0 {
+                nm2 := substr(l2.v, 0, di2)
+                if atoi(substr(l2.v, di2 + 1, len(l2.v))) == 1 && borr_get(o.names, nm2) < 0 {
+                    dn = scons(nm2, dn)
+                }
+            }
+            l2 = l2.next
+        }
+        for dn != nil {
+            e.scopes[i].vpr = borr_del(e.scopes[i].vpr, dn.v)
+            e.scopes[i].vpr = scons(dn.v + "|2", e.scopes[i].vpr)
+            dn = dn.next
+        }
+        o = o.next
+        i = i + 1
+    }
+}
+
+// fixpoint test for the loop head: the merged head's "name|prov"
+// entries are exactly `head`'s, scope level by scope level — merging
+// is monotone toward prov 2, so set equality means another pass
+// changes nothing
+fn vpr_ll_eq(nh: ref LL, head: ref LL) -> int {
+    a := nh
+    b := head
+    for a != nil && b != nil {
+        l := a.names
+        for l != nil {
+            if !sl_has(b.names, l.v) {
+                return 0
+            }
+            l = l.next
+        }
+        l = b.names
+        for l != nil {
+            if !sl_has(a.names, l.v) {
+                return 0
+            }
+            l = l.next
+        }
+        a = a.next
+        b = b.next
+    }
+    if a != nil || b != nil {
+        return 0
+    }
+    return 1
 }
 
 // a taint idx may name several borrow sources — `borrn` entries are
@@ -3274,6 +3444,8 @@ fn call_iface(ck: mut Ck, ps: ref IList, retk: int, ret1: int, args: ref parser.
         diag(ck, "check", "method takes " + itoa(ilen(ps)) + " args, got " + itoa(nl_len(args)))
     }
     atain := -1
+    cand := 0
+    cok := 1
     wl := ps
     al := args
     for al != nil && wl != nil {
@@ -3281,14 +3453,21 @@ fn call_iface(ck: mut Ck, ps: ref IList, retk: int, ret1: int, args: ref parser.
         ck.in_spawn = 0
         gt := expr(ck, al.v, env)
         at := ck.et
+        avp := ck.vp
         ck.in_spawn = sp
+        wk3 := ck.tyv[wl.v].k
+        if wk3 == k_ref() || wk3 == k_mut() || ty_vbound(ck, wl.v) {
+            cand = cand + 1
+            if avp != 1 {
+                cok = 0
+            }
+        }
         assignable(ck, wl.v, gt)
         move_for(ck, al.v, wl.v, env)
         if at >= 0 {
             atain = taint_merge(ck, atain, at)
         }
         if sp != 0 {
-            wk3 := ck.tyv[wl.v].k
             if wk3 == k_slice() || wk3 == k_ref() || wk3 == k_mut() {
                 diag(ck, "check", "`spawn` arg of `[]T`/`ref`/`mut` escapes into the task — the backing dies with the scope; pass `own` or a value")
             }
@@ -3298,6 +3477,13 @@ fn call_iface(ck: mut Ck, ps: ref IList, retk: int, ret1: int, args: ref parser.
         }
         wl = wl.next
         al = al.next
+    }
+    if retk != 0 && ty_vbound(ck, ret1) {
+        pv := 2
+        if cand > 0 && cok == 1 {
+            pv = 1
+        }
+        ck.vpt = pv
     }
     if retk != 0 && ret1 >= 0 && taint_may(ck, ret1) == 1 && atain >= 0 {
         ck.ptaint = atain
@@ -4756,14 +4942,6 @@ fn expr(ck: mut Ck, e: ref parser.Node, env: mut Env) -> int {
             parser.Node.Name{n} => {
                 ck.vpt = env_vprov(env, n)
             }
-            parser.Node.Call{f, args} => {
-                if ty_vbound(ck, t) {
-                    // a callee can only return param-derived Values —
-                    // treat its result as derived (the fn's own check
-                    // is what holds the line)
-                    ck.vpt = 1
-                }
-            }
             _ => {
             }
         }
@@ -5368,17 +5546,21 @@ fn match_expr(ck: mut Ck, scrut: ref parser.Node, arms: ref parser.NList, env: m
     n_expr := 0
     n_block := 0
     mtaint := -1
+    mvp := -1
     // arms are alternative paths — merge `moved` like if/else
     pre := moved_save(env)
     bpre := borr_save(env)
+    vpre := vpr_save(env)
     spre := sal_clone(ck.srep)
     let armst: own ArmSt = nil
     let btail: own SList = nil
     let sjoin: own SalIAS = nil
+    let varm: own BArmSt = nil
     a := arms
     for a != nil {
         moved_restore(env, ll_clone(pre))
         borr_restore(env, ll_clone(bpre))
+        vpr_restore(env, ll_clone(vpre))
         ck.srep = sal_clone(spre)
         match a.v {
             parser.Node.MArm{pat, body, lo, hi} => {
@@ -5449,6 +5631,13 @@ fn match_expr(ck: mut Ck, scrut: ref parser.Node, arms: ref parser.NList, env: m
                             srcs = srcs.next
                         }
                     }
+                    // provenance is must-analysis — the result derives
+                    // from a param only when EVERY arm's value does
+                    if mvp < 0 {
+                        mvp = ck.vp
+                    } else {
+                        mvp = vpr_merge_p(mvp, ck.vp)
+                    }
                     if result < 0 {
                         result = bt
                     } else {
@@ -5456,7 +5645,17 @@ fn match_expr(ck: mut Ck, scrut: ref parser.Node, arms: ref parser.NList, env: m
                     }
                 }
                 sjoin = sal_absorb_to(sjoin, ck.srep)
+                // arm end-state for the vpr join — only arms that reach
+                // it (a `return` arm's leftovers can't poison the join)
+                aft := node_ft(body)
                 env_pop_ck(ck, env)
+                if aft {
+                    va := new(BArmSt)
+                    va.vp = vpr_save(env)
+                    va.ft = 1
+                    va.next = varm
+                    varm = va
+                }
                 // taint is may-analysis across arms — collect every
                 // binding any arm left borrow-carrying, re-apply after
                 bi := 0
@@ -5484,6 +5683,19 @@ fn match_expr(ck: mut Ck, scrut: ref parser.Node, arms: ref parser.NList, env: m
             env_taint_merge(ck, env, nm, atoi(substr(bl3.v, di2 + 1, len(bl3.v))))
         }
         bl3 = bl3.next
+    }
+    // vpr join — a binding keeps param-derived provenance only when
+    // every fallthrough arm's end-state says so; when no arm reaches
+    // the join the pre-state stands (the match diverged anyway)
+    if varm != nil {
+        vpr_restore(env, ll_clone(varm.vp))
+        varm = varm.next
+        for varm != nil {
+            vpr_union(env, varm.vp)
+            varm = varm.next
+        }
+    } else {
+        vpr_restore(env, vpre)
     }
     if sjoin != nil {
         ck.srep = sjoin
@@ -5520,6 +5732,9 @@ fn match_expr(ck: mut Ck, scrut: ref parser.Node, arms: ref parser.NList, env: m
     }
     if n_expr > 0 {
         ck.ptaint = mtaint
+        if mvp >= 0 {
+            ck.vpt = mvp
+        }
         if result < 0 {
             return t_void(ck)
         }
@@ -5873,6 +6088,17 @@ fn call(ck: mut Ck, f: ref parser.Node, args: ref parser.NList, env: mut Env) ->
                 an := callee_name(a)
                 if len(an) > 0 {
                     sn := resolve_named(ck, an)
+                    // the scope-bound rule covers the type-name path
+                    // too — `new(reflect.Value)` is the same heap
+                    // store `new(<value-of-Value>)` rejects below.
+                    // Before the map_has gate: the internal
+                    // `oxl.reflect.*` structs register lazily on
+                    // intrinsic use, so an unprimed spelling must not
+                    // slip past into the expr path
+                    if is_vbound(ck, sn) {
+                        diag(ck, "check", "`new` on `reflect.Value` — scope-bound handles may not be stored in heap shapes")
+                        return t_unk(ck)
+                    }
                     // `E.V` registers a struct for `as` payloads — but in
                     // `new(...)` a dotted arg naming a variant is a value
                     // expression, not a type name (the seed takes expr here)
@@ -5973,6 +6199,7 @@ fn call(ck: mut Ck, f: ref parser.Node, args: ref parser.NList, env: mut Env) ->
             // R1 intrinsics — a type operand in the mkslice grammar;
             // codegen folds to a descriptor index / qualifier code /
             // Type handle at instantiation time
+            jsintr_rec(ck, f, qn)
             if nl_len(args) != 1 {
                 diag(ck, "check", "`" + qn + "` takes a type operand — " + qn + "(T)")
             } else {
@@ -5982,6 +6209,9 @@ fn call(ck: mut Ck, f: ref parser.Node, args: ref parser.NList, env: mut Env) ->
                 }
             }
             if qn == "type_of" {
+                // a descriptor handle mint — no storage derivation, so
+                // the result carries the param-derived mark return needs
+                ck.vpt = 1
                 return reflect_st(ck, "Type")
             }
             return t_int(ck)
@@ -5990,6 +6220,7 @@ fn call(ck: mut Ck, f: ref parser.Node, args: ref parser.NList, env: mut Env) ->
             // compiler-lowered Value mint — `value_of(v: ref T)` /
             // `value_of_mut(v: mut T)` (own/mut args slot-convert);
             // codegen emits {tdesc(base T), addr, w}
+            jsintr_rec(ck, f, qn)
             if nl_len(args) != 1 {
                 diag(ck, "check", "`" + qn + "` takes one argument — " + qn + "(v)")
                 return reflect_st(ck, "Value")
@@ -6287,6 +6518,13 @@ fn call(ck: mut Ck, f: ref parser.Node, args: ref parser.NList, env: mut Env) ->
         rt0 := -1
         fat := -1
         atain := -1
+        // Value-result provenance (R1): a callee may return only a
+        // param-derived Value, but the returned handle can rest on ANY
+        // of its ref/mut/Value slots — translate through the actuals:
+        // the result stays param-derived here only when every such
+        // slot's arg is param-derived in the caller
+        cand := 0
+        cok := 1
         if recv != nil && wl != nil {
             // receiver slot: `*x`/`&x` adapt — `&` needs an lvalue
             want := subst_ty(ck, wl.v, bind)
@@ -6295,7 +6533,14 @@ fn call(ck: mut Ck, f: ref parser.Node, args: ref parser.NList, env: mut Env) ->
             got := expr(ck, recv, env)
             ck.in_spawn = sp
             rt0 = ck.et
+            rvp := ck.vp
             wk2 := ck.tyv[want].k
+            if wk2 == k_ref() || wk2 == k_mut() || ty_vbound(ck, want) {
+                cand = cand + 1
+                if rvp != 1 {
+                    cok = 0
+                }
+            }
             rg = got
             gk2 := ck.tyv[got].k
             if (wk2 == k_own() || wk2 == k_ref() || wk2 == k_mut()) && (gk2 == k_struct() || gk2 == k_enum()) && !is_lvalue(recv) {
@@ -6323,7 +6568,15 @@ fn call(ck: mut Ck, f: ref parser.Node, args: ref parser.NList, env: mut Env) ->
             ck.in_spawn = 0
             gt := expr(ck, al.v, env)
             at := ck.et
+            avp := ck.vp
             ck.in_spawn = sp
+            wka := ck.tyv[want].k
+            if wka == k_ref() || wka == k_mut() || ty_vbound(ck, want) {
+                cand = cand + 1
+                if avp != 1 {
+                    cok = 0
+                }
+            }
             assignable(ck, want, gt)
             if fg < 0 {
                 fg = gt
@@ -6395,6 +6648,13 @@ fn call(ck: mut Ck, f: ref parser.Node, args: ref parser.NList, env: mut Env) ->
         if ck.ptaint < 0 && atain >= 0 && taint_may(ck, r1) == 1 {
             ck.ptaint = atain
         }
+        if ty_vbound(ck, r1) {
+            pv := 2
+            if cand > 0 && cok == 1 {
+                pv = 1
+            }
+            ck.vpt = pv
+        }
         if sig.retk == 1 {
             return r1
         }
@@ -6419,6 +6679,8 @@ fn call_fnvalue(ck: mut Ck, ps: ref IList, r: int, args: ref parser.NList, env: 
         diag(ck, "check", "fn value takes " + itoa(ilen(ps)) + " args, got " + itoa(nl_len(args)))
     }
     atain := -1
+    cand := 0
+    cok := 1
     wl := ps
     al := args
     for al != nil && wl != nil {
@@ -6426,13 +6688,20 @@ fn call_fnvalue(ck: mut Ck, ps: ref IList, r: int, args: ref parser.NList, env: 
         ck.in_spawn = 0
         gt := expr(ck, al.v, env)
         at := ck.et
+        avp := ck.vp
         ck.in_spawn = sp
+        wk4 := ck.tyv[wl.v].k
+        if wk4 == k_ref() || wk4 == k_mut() || ty_vbound(ck, wl.v) {
+            cand = cand + 1
+            if avp != 1 {
+                cok = 0
+            }
+        }
         assignable(ck, wl.v, gt)
         if at >= 0 {
             atain = taint_merge(ck, atain, at)
         }
         if sp != 0 {
-            wk4 := ck.tyv[wl.v].k
             if wk4 == k_slice() || wk4 == k_ref() || wk4 == k_mut() {
                 diag(ck, "check", "`spawn` arg of `[]T`/`ref`/`mut` escapes into the task — the backing dies with the scope; pass `own` or a value")
             }
@@ -6442,6 +6711,13 @@ fn call_fnvalue(ck: mut Ck, ps: ref IList, r: int, args: ref parser.NList, env: 
         }
         wl = wl.next
         al = al.next
+    }
+    if r >= 0 && ty_vbound(ck, r) {
+        pv := 2
+        if cand > 0 && cok == 1 {
+            pv = 1
+        }
+        ck.vpt = pv
     }
     if r >= 0 && taint_may(ck, r) == 1 && atain >= 0 {
         ck.ptaint = atain
@@ -6521,6 +6797,7 @@ fn stmt(ck: mut Ck, s: ref parser.Node, env: mut Env) {
             ck.in_let2 = 1
             expr(ck, call, env)
             bs := ck.et
+            vp2 := ck.vp
             ck.in_let2 = 0
             val_ty := t_unk(ck)
             if call_retk(ck, call, env) == 2 {
@@ -6538,7 +6815,9 @@ fn stmt(ck: mut Ck, s: ref parser.Node, env: mut Env) {
             if an != "_" {
                 env_set(env, an, val_ty, lo, hi)
                 if ty_vbound(ck, val_ty) {
-                    env_vprov_set(env, an, 1)
+                    // the pair slot carries the call's arg-translated
+                    // provenance, not a blanket param-derived mark
+                    env_vprov_set(env, an, vp2)
                 }
                 if bs >= 0 {
                     if taint_has_temp(ck, bs) == 1 {
@@ -6580,6 +6859,7 @@ fn stmt(ck: mut Ck, s: ref parser.Node, env: mut Env) {
             }
             vt := expr(ck, val, env)
             vtaint := ck.et
+            vpv := ck.vp
             assignable(ck, tt, vt)
             // `x = y` re-initializes (aliasing walks like `s = s.next`
             // stay legal); `s.f = y`/`s[i] = y` hand the value away
@@ -6632,7 +6912,7 @@ fn stmt(ck: mut Ck, s: ref parser.Node, env: mut Env) {
                     env_taint_clear(env, idn)
                 }
                 if ty_vbound(ck, tt) || tt >= 0 && (ck.tyv[tt].k == k_ref() || ck.tyv[tt].k == k_mut()) {
-                    env_vprov_set(env, idn, ck.vp)
+                    env_vprov_set(env, idn, vpv)
                 }
                 sal_bind(ck, env, idn, tt, val)
             }
@@ -6700,10 +6980,15 @@ fn stmt(ck: mut Ck, s: ref parser.Node, env: mut Env) {
                 ck.in_let2 = 1
                 expr(ck, vals.v, env)
                 bs := ck.et
+                vpf := ck.vp
                 ck.in_let2 = 0
                 if call_retk(ck, vals.v, env) == 2 {
                     rt1x := call_ret1(ck, vals.v, env)
-                    if ty_vbound(ck, rt1x) && ck.vp != 1 && nk(vals.v) != 8 {
+                    // a forwarded pair call is checkable now that call
+                    // results carry arg-translated provenance — a
+                    // `return f(local)` forwarding a local-derived Value
+                    // is the same escape as returning the local itself
+                    if ty_vbound(ck, rt1x) && vpf != 1 {
                         diag(ck, "check", "`return` of `reflect.Value` — only a Value derived from a `ref`/`mut`/`Value` parameter may escape")
                     }
                 }
@@ -6730,12 +7015,15 @@ fn stmt(ck: mut Ck, s: ref parser.Node, env: mut Env) {
             spre := sal_clone(ck.srep)
             pre := moved_save(env)
             bpre := borr_save(env)
+            vpre := vpr_save(env)
             block_node(ck, then, env)
             sthen := sal_clone(ck.srep)
             thmv := moved_save(env)
             bth := borr_save(env)
+            vth := vpr_save(env)
             moved_restore(env, pre)
             borr_restore(env, bpre)
+            vpr_restore(env, vpre)
             ck.srep = sal_clone(spre)
             spre = nil
             tft := node_ft(then)
@@ -6751,10 +7039,12 @@ fn stmt(ck: mut Ck, s: ref parser.Node, env: mut Env) {
             if els != nil && !eft && tft {
                 moved_restore(env, thmv)
                 borr_restore(env, bth)
+                vpr_restore(env, vth)
                 ck.srep = sthen
             } else if tft && (els == nil || eft) {
                 moved_union(env, thmv)
                 borr_union(ck, env, bth)
+                vpr_union(env, vth)
                 ck.srep = sal_absorb_to(ck.srep, sthen)
                 sthen = nil
             } else {
@@ -6767,37 +7057,50 @@ fn stmt(ck: mut Ck, s: ref parser.Node, env: mut Env) {
             // restore the pre-loop state (check.rs: Stmt::For)
             pre := moved_save(env)
             bpre := borr_save(env)
+            vpre := vpr_save(env)
             t := expr(ck, cond, env)
             assignable(ck, t_bool(ck), t)
             head := ll_clone(bpre)
+            vhead := ll_clone(vpre)
+            // a diverging body-end state isn't a path to the next head
+            bft := node_ft(body)
             ck.srep = sal_live_only(env, ck.srep)
             shead := sal_clone(ck.srep)
             iter := 0
             lim := env_bind_count(env) + 16
             let lp: own LoopSt = nil
             let post: own LL = nil
+            let vpost: own LL = nil
             for iter < lim {
                 if iter > 0 {
                     borr_restore(env, ll_clone(head))
+                    vpr_restore(env, ll_clone(vhead))
                     moved_restore(env, ll_clone(pre))
                     ck.srep = sal_clone(shead)
                 }
                 npass := ck.nerr
                 lp = for_body(ck, body, env)
                 post = borr_save(env)
+                vpost = vpr_save(env)
                 spost := sal_clone(ck.srep)
                 if iter == 0 {
                     for_moved_check(ck, env, pre)
                 }
                 // next-iteration head: previous head + fallthrough + continues
                 borr_restore(env, ll_clone(head))
+                vpr_restore(env, ll_clone(vhead))
                 borr_union(ck, env, post)
+                if bft {
+                    vpr_union(env, vpost)
+                }
                 cl := lp.cont
                 for cl != nil {
                     borr_union(ck, env, cl.s)
+                    vpr_union(env, cl.vp)
                     cl = cl.next
                 }
                 nh := borr_save(env)
+                vnh := vpr_save(env)
                 // slice memberships join the same way — head + post + continues
                 ck.srep = sal_clone(shead)
                 ck.srep = sal_absorb_to(ck.srep, spost)
@@ -6808,13 +7111,14 @@ fn stmt(ck: mut Ck, s: ref parser.Node, env: mut Env) {
                     cl2 = cl2.next
                 }
                 snh := sal_live_only(env, ck.srep)
-                conv := ck.nerr != npass || ll_covered(ck, nh, head) == 1 && sal_covered(snh, shead) == 1
+                conv := ck.nerr != npass || ll_covered(ck, nh, head) == 1 && vpr_ll_eq(vnh, vhead) == 1 && sal_covered(snh, shead) == 1
                 shead = nil
                 shead = snh
                 if conv {
                     break
                 }
                 head = nh
+                vhead = vnh
                 iter = iter + 1
             }
             moved_restore(env, pre)
@@ -6833,6 +7137,10 @@ fn stmt(ck: mut Ck, s: ref parser.Node, env: mut Env) {
             ck.srep = sal_live_only(env, ck.srep)
             // after-loop may-state: zero-iteration entry + fallthrough + break exits
             borr_restore(env, ll_clone(bpre))
+            // after-loop must-state: the converged head (entry + every
+            // iteration's fallthrough + continues — a false cond exits
+            // from there) merged with each break exit
+            vpr_restore(env, vhead)
             if post != nil {
                 borr_union(ck, env, post)
             }
@@ -6840,6 +7148,7 @@ fn stmt(ck: mut Ck, s: ref parser.Node, env: mut Env) {
                 bl2 := lp.brk
                 for bl2 != nil {
                     borr_union(ck, env, bl2.s)
+                    vpr_union(env, bl2.vp)
                     bl2 = bl2.next
                 }
             }
@@ -6850,6 +7159,7 @@ fn stmt(ck: mut Ck, s: ref parser.Node, env: mut Env) {
             } else if ck.loops != nil {
                 sn := sncons(borr_save(env), ck.loops.brk)
                 sn.sr = sal_clone(ck.srep)
+                sn.vp = vpr_save(env)
                 ck.loops.brk = sn
             }
         }
@@ -6859,6 +7169,7 @@ fn stmt(ck: mut Ck, s: ref parser.Node, env: mut Env) {
             } else if ck.loops != nil {
                 sn := sncons(borr_save(env), ck.loops.cont)
                 sn.sr = sal_clone(ck.srep)
+                sn.vp = vpr_save(env)
                 ck.loops.cont = sn
             }
         }
@@ -7610,11 +7921,13 @@ fn sel_stmt(ck: mut Ck, arms: ref parser.NList, env: mut Env) {
     has_else := false
     tmo := 0
     bpre := borr_save(env)
+    vpre := vpr_save(env)
     spre := sal_clone(ck.srep)
     let bst: own BArmSt = nil
     l := arms
     for l != nil {
         borr_restore(env, ll_clone(bpre))
+        vpr_restore(env, ll_clone(vpre))
         ck.srep = sal_clone(spre)
         env_push(env)
         match l.v {
@@ -7686,7 +7999,19 @@ fn sel_stmt(ck: mut Ck, arms: ref parser.NList, env: mut Env) {
         env_pop_ck(ck, env)
         bc := new(BArmSt)
         bc.st = borr_save(env)
+        bc.vp = vpr_save(env)
         bc.sr = sal_clone(ck.srep)
+        match l.v {
+            parser.Node.SArm{body} => {
+                bc.ft = 0
+                if node_ft(body) {
+                    bc.ft = 1
+                }
+            }
+            _ => {
+                bc.ft = 1
+            }
+        }
         bc.next = bst
         bst = bc
         l = l.next
@@ -7694,10 +8019,25 @@ fn sel_stmt(ck: mut Ck, arms: ref parser.NList, env: mut Env) {
     spre = nil
     borr_clear_all(env)
     ck.srep = nil
+    // vpr join — param-derived survives only when every arm that can
+    // fall through to the join says so (blocking never reaching it is
+    // impossible here: these are the fired-arm end states)
+    vseen := 0
     for bst != nil {
         borr_union(ck, env, bst.st)
         ck.srep = sal_absorb_to(ck.srep, bst.sr)
+        if bst.ft == 1 {
+            if vseen == 0 {
+                vpr_restore(env, ll_clone(bst.vp))
+                vseen = 1
+            } else {
+                vpr_union(env, bst.vp)
+            }
+        }
         bst = bst.next
+    }
+    if vseen == 0 {
+        vpr_restore(env, vpre)
     }
     if has_else && tmo > 0 {
         diag(ck, "check", "`else` makes `timeout` unreachable — drop one")
@@ -10613,8 +10953,10 @@ fn jswalk(ck: mut Ck, n: ref parser.Node) {
     }
     match n {
         parser.Node.Call{f, args} => {
-            nm := callee_name(f)
-            if nm == "tdesc" || nm == "tqual" || nm == "type_of" || nm == "value_of" || nm == "value_of_mut" {
+            // resolved intrinsic sites only — a same-named local callee
+            // never reached jsintr_rec, so it can't trip the gate
+            nm := jsintr_name(ck, ck.cur_file, parser.nlo(f))
+            if len(nm) > 0 {
                 ck.dpos = parser.nlo(n)
                 diag(ck, "check", "`" + nm + "` is not supported under --target js — descriptors are native-lane only")
             }

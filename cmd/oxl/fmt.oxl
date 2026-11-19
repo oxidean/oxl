@@ -852,7 +852,7 @@ fn fp_ty(p: mut FPar) -> own FTy {
         fbump(p)
         inner := "void"
         t2 := fcurt(p)
-        if t2.kind == 1 || t2.kind == 5 && t2.txt == "[" || t2.kind == 2 && (t2.txt == "own" || t2.txt == "ref" || t2.txt == "mut" || t2.txt == "chan") {
+        if t2.kind == 1 || t2.kind == 5 && t2.txt == "[" || t2.kind == 2 && (t2.txt == "own" || t2.txt == "ref" || t2.txt == "mut" || t2.txt == "chan" || t2.txt == "fn") {
             it := fp_ty(p)
             if it == nil {
                 return nil
@@ -1137,7 +1137,9 @@ fn fp_struct(p: mut FPar) -> own FItem {
         if fat_ident(p, "tag") && fpeekt(p).kind == 4 {
             fbump(p)
             tq := fbump(p)
-            tys = tys + " tag \"" + tq.txt + "\""
+            // tq.txt is DECODED — re-escape so `tag "json:\"x\""`
+            // round-trips instead of emitting `tag "json:"x""`
+            tys = tys + " tag \"" + fescape(tq.txt) + "\""
         }
         fields = pcons(mkparam(fn2.v, tys, fn2.lo), fields)
         feat_p(p, ",")

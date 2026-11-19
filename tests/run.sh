@@ -1976,6 +1976,15 @@ printf 'package main\nfn main() { assert(false) }\n' > "$scratch/trap.oxl"
 # drivers — the fixture prints the whole table digest
 seed_out=$("$SEEDOXL" run tests/desc_parity.oxl 2>&1) && seed_rc=0 || seed_rc=$?
 self_out=$("$SELFOXL" run tests/desc_parity.oxl 2>&1) && self_rc=0 || self_rc=$?
+# matching failure IS a failure — both runs must exit 0, not just agree
+if [ "$seed_rc" != 0 ] || [ "$self_rc" != 0 ]; then
+    echo "FAIL tests/desc_parity.oxl native run: seed rc=$seed_rc self rc=$self_rc"
+    echo "-- seed --"; printf '%s
+' "$seed_out"
+    echo "-- self --"; printf '%s
+' "$self_out"
+    exit 1
+fi
 if [ "$seed_out" != "$self_out" ] || [ "$seed_rc" != "$self_rc" ]; then
     echo "FAIL driver parity tests/desc_parity.oxl"
     echo "-- seed ($seed_rc) --"; printf '%s
@@ -2000,6 +2009,35 @@ if [ "$seed_out" != "$self_out" ] || [ "$seed_rc" != "$self_rc" ]; then
 ' "$self_out"
     exit 1
 fi
+# the descriptor runtime lane — elem_ptr on borrow-qualified slots,
+# double-handle value_of loads, reflect handles embedded in pair
+# aggregates, and the rt_desc_alloc* overflow guards
+seed_out=$("$SEEDOXL" run tests/desc_rt.oxl 2>&1) && seed_rc=0 || seed_rc=$?
+self_out=$("$SELFOXL" run tests/desc_rt.oxl 2>&1) && self_rc=0 || self_rc=$?
+if [ "$seed_rc" != 0 ] || [ "$self_rc" != 0 ]; then
+    echo "FAIL tests/desc_rt.oxl native run: seed rc=$seed_rc self rc=$self_rc"
+    echo "-- seed --"; printf '%s
+' "$seed_out"
+    echo "-- self --"; printf '%s
+' "$self_out"
+    exit 1
+fi
+if [ "$seed_out" != "$self_out" ]; then
+    echo "FAIL driver parity tests/desc_rt.oxl"
+    echo "-- seed --"; printf '%s
+' "$seed_out"
+    echo "-- self --"; printf '%s
+' "$self_out"
+    exit 1
+fi
+grep -q 'desc_rt ok' <<<"$self_out" || { echo "FAIL desc_rt output"; printf '%s
+' "$self_out"; exit 1; }
+# a local fn value shadowing an intrinsic name is NOT the resolved
+# intrinsic — the --target js gate keys on resolved call sites, so the
+# shadow must build cleanly on both drivers
+printf 'package main\n\nfn add1(x: int) -> int {\n    return x + 1\n}\n\nfn main() {\n    value_of := add1\n    println(itoa(value_of(41)))\n}\n' > "$scratch/jsshadow.oxl"
+"$SEEDOXL" build "$scratch/jsshadow.oxl" --target js -o "$scratch/jsshad" >/dev/null 2>&1 || { echo "FAIL --target js shadowed value_of: seed rejected"; exit 1; }
+"$SELFOXL" build "$scratch/jsshadow.oxl" --target js -o "$scratch/jsshad2" >/dev/null 2>&1 || { echo "FAIL --target js shadowed value_of: self rejected"; exit 1; }
 # the self driver covers the suite's core sections end to end —
 # build, run with args, test, and the sqlite/net feature gates
 out=$("$SELFOXL" run examples/hello.oxl)

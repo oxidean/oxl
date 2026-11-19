@@ -1501,9 +1501,11 @@ fn gemit_descs(g: mut G) {
         if k == check.k_slice() {
             et := tyi(g, t)
             if et >= 0 {
-                if tyk(g, et) == check.k_own() {
-                    // `[]own T` — the element slot is a pointer to T's
-                    // layout; elem_ptr marks the deref-once contract
+                ek := tyk(g, et)
+                if ek == check.k_own() || ek == check.k_ref() || ek == check.k_mut() {
+                    // `[]own T` / `[]ref T` / `[]mut T` — the element
+                    // slot is a pointer to T's layout; elem_ptr marks
+                    // the deref-once contract ([]byte stays inline)
                     ep = 1
                     el = gdesc(g, tyi(g, et))
                 } else {
@@ -3172,9 +3174,12 @@ fn gcall(g: mut G, f: ref parser.Node, args: ref parser.NList) -> str {
             bk := tyk(g, base)
             // qualified-T binding: the reference lands on the handle
             // slot — load the handle once so addr names the described
-            // layout, not the slot
+            // layout, not the slot. The slot holds a `gcty(base)` handle
+            // (void* for primitive handles) — cast before the deref so
+            // a `new(new(1))`-style double handle reads the inner
+            // pointer instead of dereferencing `void*`
             if bk == check.k_own() || bk == check.k_ref() || bk == check.k_mut() {
-                av = "(*" + av + ")"
+                av = "(*(" + gcty(g, base) + "*)(" + av + "))"
                 base = tyi(g, base)
             }
         }
@@ -6184,6 +6189,19 @@ fn genall(g: mut G) -> str {
     g.dpos = collections.map_new()
     g.dchain = mkslice(int, 0)
     uof := collections.map_new() // item idx (itoa) -> unit idx, globals
+    // R1 — synthesized reflect handle structs: the compound literals
+    // type_of/value_of emit spell `o_s_oxl_reflect_*`, pulling these
+    // decls live through the same textual edge everything else uses.
+    // Declared before every other unit: pair-ret aggregates
+    // (o_vret_*/o_ret_*) embed the handles BY VALUE, so the struct
+    // must be complete at that point in the emitted file
+    rui := gubegin(g)
+    rs := gusnap(g)
+    g.head = push(g.head, "struct o_s_oxl_reflect_Type { int64_t f_td; };\n")
+    g.head = push(g.head, "struct o_s_oxl_reflect_Value { int64_t f_td; int64_t f_addr; int64_t f_w; };\n")
+    gudrain(g, rui, rs)
+    gdef(g, rui, "o_s_oxl_reflect_Type")
+    gdef(g, rui, "o_s_oxl_reflect_Value")
     // enum defs first: variant payload structs + the tagged union —
     // a user struct or another variant may embed an enum by value
     i := 0
@@ -6406,16 +6424,6 @@ fn genall(g: mut G) -> str {
         gdef(g, ui, "o_vt_" + cname(vu.w) + "_" + gvtkey(vu.impl))
         vu = vu.next
     }
-    // R1 — synthesized reflect handle structs: the compound literals
-    // type_of/value_of emit spell `o_s_oxl_reflect_*`, pulling these
-    // decls live through the same textual edge everything else uses
-    rui := gubegin(g)
-    rs := gusnap(g)
-    g.head = push(g.head, "struct o_s_oxl_reflect_Type { int64_t f_td; };\n")
-    g.head = push(g.head, "struct o_s_oxl_reflect_Value { int64_t f_td; int64_t f_addr; int64_t f_w; };\n")
-    gudrain(g, rui, rs)
-    gdef(g, rui, "o_s_oxl_reflect_Type")
-    gdef(g, rui, "o_s_oxl_reflect_Value")
     // R1 — the descriptor table's RECORDS are demand-driven (emitted
     // only for tdesc'd types), but the two symbols always exist: rt.c
     // externs them and --gc-sections binds rt.o's refs to whatever def

@@ -4833,6 +4833,9 @@ int64_t rt_desc_alloc(int64_t td) {
     void *p;
     if (!d) return -1;
     sz = d->size > 0 ? d->size : 1;
+    /* alloc_in rounds +15 then adds ObjHdr — an unrepresentable total
+     * must fail here, not wrap into an under-sized malloc */
+    if (sz > INT64_MAX - 15 - (int64_t)sizeof(ObjHdr)) return -1;
     p = rt_alloc_own(sz);
     memset(p, 0, (size_t)sz);
     return (int64_t)(uintptr_t)p;
@@ -4845,11 +4848,19 @@ int64_t rt_desc_alloc(int64_t td) {
 int64_t rt_desc_alloc_slice(int64_t td, int64_t n) {
     const RtTypeDesc *d = desc_at(td);
     RtSlice *h;
-    int64_t esz;
+    int64_t esz, total;
     if (!d || n < 0) return -1;
-    h = rt_alloc_own(sizeof *h);
     esz = d->size > 0 ? d->size : 1;
-    h->ptr = rt_alloc_own(esz * (n > 0 ? n : 1));
+    /* validate the COMPLETE backing size before touching malloc: esz*n
+     * itself, alloc_in's 16-byte alignment rounding, and the ObjHdr it
+     * prepends. A huge n (e.g. 2^61) passes the n<0 check yet overflows
+     * int64 in the product — wrapping to a small alloc the memset then
+     * walks past */
+    if (n > 0 && esz > INT64_MAX / n) return -1;
+    total = esz * (n > 0 ? n : 1);
+    if (total > INT64_MAX - 15 - (int64_t)sizeof(ObjHdr)) return -1;
+    h = rt_alloc_own(sizeof *h);
+    h->ptr = rt_alloc_own(total);
     memset(h->ptr, 0, (size_t)(esz * n));
     h->len = n;
     h->cap = n;

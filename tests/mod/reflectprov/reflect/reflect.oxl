@@ -1,0 +1,43 @@
+package reflect
+
+// scope-bound stand-in for std/reflect's Value — the decl-site name is
+// what marks Value/Type/Field/Variant in `package reflect`
+struct Value { td: int, addr: int, w: int }
+
+fn idv(v: Value) -> Value {
+    return v
+}
+
+// param-derived forwarded through a call — the arg's prov translates
+// through the callee's param position and stays returnable
+fn keep(v: Value) -> Value {
+    return idv(v)
+}
+
+// if/else merge — param-derived on both paths keeps prov=1
+fn keep_if(v: Value, sel: bool) -> Value {
+    if sel {
+        v = idv(v)
+    }
+    return v
+}
+
+// loop merge — the body's writes stay param-derived end to end
+fn keep_loop(v: Value, n: int) -> Value {
+    i := 0
+    for i < n {
+        v = idv(v)
+        i = i + 1
+    }
+    return v
+}
+
+// pair-result provenance — a forwarded [Value, err] call keeps the
+// param-derived mark through the val position
+fn keep_pair(v: Value) -> [Value, err] {
+    return idvp(v)
+}
+
+fn idvp(v: Value) -> [Value, err] {
+    return v, nil
+}

@@ -1,0 +1,11 @@
+package main
+
+// `new` on a scope-bound reflect handle is a heap store — the rule
+// covers the type-name path (`new(oxl.reflect.Value)`) and the
+// value-expression path (`new(value_of(x))`) alike
+fn main() {
+    x := new(1)
+    value_of(x)
+    new(oxl.reflect.Value)
+    new(value_of(x))
+}

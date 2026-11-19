@@ -4892,6 +4892,8 @@ void rt_field_set_i64(int64_t a, int64_t v) { *(int64_t *)(uintptr_t)a = v; }
 void rt_field_set_i32(int64_t a, int64_t v) { *(int32_t *)(uintptr_t)a = (int32_t)v; }
 void rt_field_set_u8(int64_t a, int64_t v) { *(uint8_t *)(uintptr_t)a = (uint8_t)v; }
 void rt_field_set_f64(int64_t a, double v) { *(double *)(uintptr_t)a = v; }
+int64_t rt_field_f64bits(int64_t a) { union { double d; int64_t i; } u; u.d = *(double *)(uintptr_t)a; return u.i; }
+void rt_field_set_f64bits(int64_t a, int64_t v) { union { double d; int64_t i; } u; u.i = v; *(double *)(uintptr_t)a = u.d; }
 void rt_field_set_str(int64_t a, OxlStr v) { *(OxlStr *)(uintptr_t)a = v; }
 void rt_field_set_ptr(int64_t a, int64_t v) { *(void **)(uintptr_t)a = (void *)(uintptr_t)v; }
 void rt_field_set_slice(int64_t a, int64_t hdr) { *(RtSlice *)(uintptr_t)a = *(RtSlice *)(uintptr_t)hdr; }

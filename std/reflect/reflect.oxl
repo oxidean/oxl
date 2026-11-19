@@ -66,6 +66,8 @@ extern fn rt_field_u8(addr: int) -> int
 
 extern fn rt_field_f64(addr: int) -> float
 
+extern fn rt_field_f64bits(addr: int) -> int
+
 extern fn rt_field_str(addr: int) -> str
 
 extern fn rt_field_cstr(addr: int) -> str
@@ -79,6 +81,8 @@ extern fn rt_field_set_i32(addr: int, v: int)
 extern fn rt_field_set_u8(addr: int, v: int)
 
 extern fn rt_field_set_f64(addr: int, v: float)
+
+extern fn rt_field_set_f64bits(addr: int, v: int)
 
 extern fn rt_field_set_str(addr: int, v: str)
 
@@ -370,6 +374,16 @@ fn (v Value) f64() -> [float, err] {
     return rt_field_f64(v.addr), nil
 }
 
+/// fbits reads the FLOAT lane as raw IEEE-754 bits (int64) —
+/// encoders that need a lossless scalar form use this rather than
+/// a decimal round-trip. err_kind for non-FLOAT values.
+fn (v Value) fbits() -> [int, err] {
+    if rt_desc_kind(v.td) != KindFloat() {
+        return 0, err_kind()
+    }
+    return rt_field_f64bits(v.addr), nil
+}
+
 /// bool reads the i32 lane — C `int`, 4B.
 fn (v Value) bool() -> [int, err] {
     if rt_desc_kind(v.td) != KindBool() {
@@ -433,6 +447,17 @@ fn (v Value) set_f64(x: float) -> err {
         return err_kind()
     }
     rt_field_set_f64(v.addr, x)
+    return nil
+}
+
+/// set_fbits writes the FLOAT lane from raw IEEE-754 bits —
+/// decoders restore the exact bit pattern with no decimal loss.
+/// err_kind for non-FLOAT or non-writable values.
+fn (v Value) set_fbits(x: int) -> err {
+    if v.w == 0 || rt_desc_kind(v.td) != KindFloat() {
+        return err_kind()
+    }
+    rt_field_set_f64bits(v.addr, x)
     return nil
 }
 

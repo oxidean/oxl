@@ -1,0 +1,241 @@
+package main
+
+// R4 fixture — std/encoding/gob's descriptor-driven round-trip:
+// scalars, strings, slices (incl. []byte and []own T), nested structs,
+// enums with payload slots, own-pointer fields, skip-zero emission,
+// tag overrides, and decode-under-missing-field tolerance. All pairs
+// land through marshal/unmarshal; nothing here spells an rt_* extern.
+import "std/encoding/gob"
+
+import "std/errors"
+
+struct Inner { v: int }
+
+struct S {
+    n: int,
+    f: float,
+    b: bool,
+    s: str,
+    y: byte,
+    inner: Inner,
+    p: own Inner,
+    xs: []int,
+    bs: []byte,
+    ox: []own Inner,
+    e: E,
+}
+
+enum E { A(int), B { x: int, s: str }, C, }
+
+// a wider/narrower pair for the missing-field tolerance checks
+struct Wide { a: int, b: str, c: int, deep: Inner }
+
+struct Narrow { a: int, c: int }
+
+struct Extra { a: int, b: str, c: int, deep: Inner, d: int }
+
+struct Shuf { c: int, a: int, b: str, deep: Inner }
+
+// tag overrides: `gob:-` hides a field, `gob:name` renames it
+struct Tagged { keep: int, drop: int tag "gob:-", ren: str tag "gob:wire" }
+
+struct Renamed { keep: int, wire: str }
+
+// szero is the all-zero S — struct literals are exhaustive, so the
+// zero/sparse cases spell every field once here and reuse it.
+fn szero() -> S {
+    return S{n: 0, f: 0.0, b: false, s: "", y: 0, inner: Inner{v: 0}, p: nil, xs: mkslice(int, 0), bs: mkslice(byte, 0), ox: mkslice(own Inner, 0), e: E.A(0)}
+}
+
+fn fails(msg: str) {
+    println("FAIL " + msg)
+    exit(1)
+}
+
+fn want_ok(e: err, msg: str) {
+    if e != nil {
+        fails(msg + " — unexpected err: " + errors.msg(e))
+    }
+}
+
+fn want_err(e: err, sentinel: err, msg: str) {
+    if e == nil {
+        fails(msg + " — expected err, got nil")
+    }
+    if !errors.is(e, sentinel) {
+        fails(msg + " — wrong sentinel: " + errors.msg(e))
+    }
+}
+
+fn main() {
+    i1 := new(Inner)
+    i1.v = 77
+    i2 := new(Inner)
+    i2.v = 88
+    ox := mkslice(own Inner, 0)
+    ox = push(ox, i2)
+    ox = push(ox, nil)
+    s := S{n: -12345, f: 3.14159, b: true, s: "hello", y: 255, inner: Inner{v: 42}, p: i1, xs: mkslice(int, 0), bs: mkslice(byte, 0), ox: ox, e: E.B{x: 4, s: "hi"}}
+    s.xs = push(s.xs, -1)
+    s.xs = push(s.xs, 0)
+    s.xs = push(s.xs, 70000)
+    s.bs = push(s.bs, 0)
+    s.bs = push(s.bs, 200)
+    s.bs = push(s.bs, 55)
+    [bs, me] = gob.marshal(s)
+    want_ok(me, "marshal")
+    o := new(S)
+    ue := gob.unmarshal(bs, o)
+    want_ok(ue, "unmarshal")
+    // scalars
+    if o.n != -12345 {
+        fails("n " + itoa(o.n))
+    }
+    if o.f != 3.14159 {
+        fails("f")
+    }
+    if !o.b || o.s != "hello" || o.y != 255 {
+        fails("bool/str/byte")
+    }
+    // nested inline struct
+    if o.inner.v != 42 {
+        fails("inner " + itoa(o.inner.v))
+    }
+    // own-pointer field minted through alloc_field
+    if o.p == nil || o.p.v != 77 {
+        fails("own field")
+    }
+    // slices
+    if len(o.xs) != 3 || o.xs[0] != -1 || o.xs[1] != 0 || o.xs[2] != 70000 {
+        fails("xs")
+    }
+    if len(o.bs) != 3 || o.bs[0] != 0 || o.bs[1] != 200 || o.bs[2] != 55 {
+        fails("bs")
+    }
+    // []own T — element minted, nil preserved
+    if len(o.ox) != 2 {
+        fails("ox len")
+    }
+    if o.ox[0] == nil || o.ox[0].v != 88 {
+        fails("ox[0]")
+    }
+    if o.ox[1] != nil {
+        fails("ox[1] nil")
+    }
+    // enum: tag + named payload slots
+    if o.e.kind() != 1 {
+        fails("enum tag")
+    }
+    eb := o.e as E.B
+    if eb.x != 4 || eb.s != "hi" {
+        fails("enum payload")
+    }
+    // skip-zero: an all-zero struct emits no field records past the
+    // preamble — decode a zero message into a pre-set target and the
+    // zero fields stay zero-valued via absence (o2 is fresh here, so
+    // the assertion is structural: re-decode must produce zero fields)
+    z := szero()
+    [zb, ze] = gob.marshal(z)
+    want_ok(ze, "marshal zero")
+    o2 := new(S)
+    e2 := gob.unmarshal(zb, o2)
+    want_ok(e2, "unmarshal zero")
+    if o2.n != 0 || o2.p != nil || len(o2.xs) != 0 || o2.e.kind() != 0 {
+        fails("zero round-trip")
+    }
+    // a mostly-zero struct: only n set — the wire carries just its
+    // delta, and decode must not need the other fields
+    m := szero()
+    m.n = 9
+    m.p = new(Inner)
+    m.p.v = 77
+    [mb, me2] = gob.marshal(m)
+    want_ok(me2, "marshal sparse")
+    om := new(S)
+    e3 := gob.unmarshal(mb, om)
+    want_ok(e3, "unmarshal sparse")
+    if om.n != 9 || om.p == nil || om.p.v != 77 || om.s != "" {
+        fails("sparse round-trip")
+    }
+    // positional + unit variants
+    u := szero()
+    u.e = E.A(7)
+    [ub, ue2] = gob.marshal(u)
+    want_ok(ue2, "marshal enum A")
+    ou := new(S)
+    e4 := gob.unmarshal(ub, ou)
+    want_ok(e4, "unmarshal enum A")
+    ua := ou.e as E.A
+    if ua.f0 != 7 {
+        fails("enum positional payload")
+    }
+    c0 := szero()
+    c0.e = E.C
+    [cb, ce] = gob.marshal(c0)
+    want_ok(ce, "marshal enum C")
+    oc := new(S)
+    e5 := gob.unmarshal(cb, oc)
+    want_ok(e5, "unmarshal enum C")
+    // enum root
+    [rb, re] = gob.marshal(E.B{x: 1, s: "r"})
+    want_ok(re, "marshal enum root")
+    er := new(E.C)
+    e6 := gob.unmarshal(rb, er)
+    want_ok(e6, "unmarshal enum root")
+    erb := er as E.B
+    if erb.x != 1 || erb.s != "r" {
+        fails("enum root payload")
+    }
+    // missing-field tolerance: Wide -> Narrow drops b/deep; -> Extra
+    // leaves d zero; -> Shuf matches by name across decl order
+    w := Wide{a: 1, b: "bee", c: 3, deep: Inner{v: 5}}
+    [wb, we] = gob.marshal(w)
+    want_ok(we, "marshal wide")
+    nw := new(Narrow)
+    e7 := gob.unmarshal(wb, nw)
+    want_ok(e7, "unmarshal narrow")
+    if nw.a != 1 || nw.c != 3 {
+        fails("narrow " + itoa(nw.a) + "/" + itoa(nw.c))
+    }
+    ex := new(Extra)
+    e8 := gob.unmarshal(wb, ex)
+    want_ok(e8, "unmarshal extra")
+    if ex.a != 1 || ex.b != "bee" || ex.c != 3 || ex.deep.v != 5 || ex.d != 0 {
+        fails("extra")
+    }
+    sh := new(Shuf)
+    e9 := gob.unmarshal(wb, sh)
+    want_ok(e9, "unmarshal shuf")
+    if sh.a != 1 || sh.b != "bee" || sh.c != 3 || sh.deep.v != 5 {
+        fails("shuf")
+    }
+    // tags: dropped fields never reach the wire, renames match by the
+    // override spelling
+    tg := Tagged{keep: 1, drop: 99, ren: "rn"}
+    [tb, te2] = gob.marshal(tg)
+    want_ok(te2, "marshal tagged")
+    t2 := new(Tagged)
+    e10 := gob.unmarshal(tb, t2)
+    want_ok(e10, "unmarshal tagged")
+    if t2.keep != 1 || t2.drop != 0 || t2.ren != "rn" {
+        fails("tagged round-trip")
+    }
+    rn := new(Renamed)
+    e11 := gob.unmarshal(tb, rn)
+    want_ok(e11, "unmarshal renamed")
+    if rn.wire != "rn" {
+        fails("gob: rename")
+    }
+    // truncated input and a wrong-kind root both report, never panic
+    if len(bs) > 4 {
+        e12 := gob.unmarshal(bs[0:4], o)
+        if e12 == nil {
+            fails("truncated accepted")
+        }
+    }
+    e13 := gob.unmarshal(wb, new(0))
+    if e13 == nil {
+        fails("wrong-kind root accepted")
+    }
+    println("enc_gob ok")
+}

@@ -335,6 +335,7 @@ int64_t rt_field_i64(int64_t addr);      /* INT + ERR lane (8B) */
 int64_t rt_field_i32(int64_t addr);      /* BOOL + enum tag lane (C int) */
 int64_t rt_field_u8(int64_t addr);       /* BYTE lane */
 double  rt_field_f64(int64_t addr);
+int64_t rt_field_f64bits(int64_t addr);       /* IEEE-754 bits of the f64 lane */
 OxlStr  rt_field_str(int64_t addr);      /* borrow — same lifetime as v */
 OxlStr  rt_field_cstr(int64_t addr);     /* PTR lane — rt_str over char* */
 int64_t rt_field_ptr(int64_t addr);      /* the pointer stored in the slot */
@@ -343,6 +344,7 @@ void rt_field_set_i64(int64_t addr, int64_t v);
 void rt_field_set_i32(int64_t addr, int64_t v);
 void rt_field_set_u8(int64_t addr, int64_t v);
 void rt_field_set_f64(int64_t addr, double v);
+void    rt_field_set_f64bits(int64_t addr, int64_t v);
 void rt_field_set_str(int64_t addr, OxlStr v); /* caller passes rt_str_own backing */
 void rt_field_set_ptr(int64_t addr, int64_t v);
 void rt_field_set_slice(int64_t addr, int64_t hdr); /* copies the RtSlice header at hdr */

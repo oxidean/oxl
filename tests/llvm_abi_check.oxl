@@ -16,18 +16,18 @@ extern fn abi_slice_sum(s: []int) -> int
 
 extern fn abi_probe_fnv(f: fn(int) -> int, x: int) -> int
 
-extern fn abi_probe_iface(s: Speaker) -> int
-
-fn addmul(x: int) -> int {
-    return x * 3 + 7
-}
-
 interface Speaker { tag() -> int }
 
 struct Dog { v: int }
 
 fn (d Dog) tag() -> int {
     return 42
+}
+
+extern fn abi_probe_ifaces(ss: []Speaker) -> int
+
+fn addmul(x: int) -> int {
+    return x * 3 + 7
 }
 
 fn main() {
@@ -52,8 +52,11 @@ fn main() {
         exit(1)
     }
     // RtIface {data, vtab}: tag() must dispatch vtab[0](data) → 42 —
-    // a swapped pair reads the object as a vtab array
-    if abi_probe_iface(Dog{v: 0}) != 42 {
+    // a swapped pair reads the object as a vtab array. Ifaces can't
+    // cross FFI bare, so the pair rides a []Speaker elem slot.
+    ifs := mkslice(Speaker, 1)
+    ifs[0] = Dog{v: 0}
+    if abi_probe_ifaces(ifs) != 42 {
         println("FAIL abi iface")
         exit(1)
     }

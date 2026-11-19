@@ -36,8 +36,12 @@ int64_t abi_probe_fnv(RtFnv f, int64_t x) {
 }
 
 /* RtIface {data, vtab}: vtab[i] is (void *data, args...) — tag takes
- * no args, so slot 0 is (void *data) -> int64_t. A swapped pair reads
- * the object as a vtab array and the call lands on garbage. */
-int64_t abi_probe_iface(RtIface i) {
-    return ((int64_t (*)(void *))i.vtab[0])(i.data);
+ * no args, so slot 0 is (void *data) -> int64_t. Iface values cannot
+ * cross FFI by value (the checker explodes the pair into two args),
+ * so the pair rides a []Speaker slice: the element stride exercises
+ * the full RtIface layout — a swapped pair reads the object as a vtab
+ * array and the call lands on garbage. */
+int64_t abi_probe_ifaces(RtSlice s) {
+    const RtIface *a = (const RtIface *)s.ptr;
+    return ((int64_t (*)(void *))a->vtab[0])(a->data);
 }

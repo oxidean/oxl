@@ -1,0 +1,128 @@
+package main
+
+// R2 fixture — fmt's %v family over the descriptor walk: default
+// forms per kind, %+v field names, %T the qualified descriptor name,
+// %#v the source-literal forms, &{…} through pointer slots, opaque
+// placeholders, and the vfmt error lanes.
+import "std/fmt"
+
+import "std/errors"
+
+struct Inner { v: int }
+
+struct Point { x: int, y: int tag "u:mm" }
+
+struct Nest { p: Point, i: own Inner, tags: []str, c: cstr }
+
+enum Shape { Circle(int), Rect { w: int, h: int }, Empty, }
+
+fn fails(msg: str) {
+    println("FAIL " + msg)
+    exit(1)
+}
+
+fn want(got: str, exp: str, msg: str) {
+    if got != exp {
+        fails(msg + " — got `" + got + "` want `" + exp + "`")
+    }
+}
+
+fn vf[T any](f: str, v: T, exp: str, msg: str) {
+    [s, e] = fmt.vfmt(f, v)
+    if e != nil {
+        fails(msg + " — vfmt err " + errors.msg(e))
+    }
+    want(s, exp, msg)
+}
+
+fn main() {
+    // %v scalar lanes
+    want(fmt.sprintv(42), "42", "int %v")
+    want(fmt.sprintv(-7), "-7", "neg int %v")
+    want(fmt.sprintv(3.5), "3.5", "float %v")
+    want(fmt.sprintv(true), "true", "bool %v")
+    want(fmt.sprintv(false), "false", "bool %v")
+    want(fmt.sprintv("hello"), "hello", "str %v")
+    want(fmt.sprintv(65 as byte), "65", "byte %v")
+    e := errors.new("boom")
+    if find(fmt.sprintv(e), "err ") != 0 {
+        fails("err %v prefix — got `" + fmt.sprintv(e) + "`")
+    }
+    want(fmt.sprintv(cstr("cstr-val")), "cstr-val", "cstr %v")
+    // %v composite lanes
+    xs := mkslice(int, 0)
+    xs = push(xs, 4)
+    xs = push(xs, 5)
+    want(fmt.sprintv(xs), "[4 5]", "slice %v")
+    want(fmt.sprintv(mkslice(int, 0)), "[]", "empty slice %v")
+    want(fmt.sprintv(Point{x: 1, y: 2}), "{1 2}", "struct %v")
+    want(fmt.sprintv(Shape.Circle(3)), "Circle", "enum payload %v")
+    want(fmt.sprintv(Shape.Rect{w: 2, h: 9}), "Rect", "enum named %v")
+    want(fmt.sprintv(Shape.Empty), "Empty", "enum unit %v")
+    n := Nest{p: Point{x: 1, y: 2}, i: new(Inner), tags: mkslice(str, 0), c: cstr("cc")}
+    n.i.v = 9
+    n.tags = push(n.tags, "a")
+    n.tags = push(n.tags, "b")
+    want(fmt.sprintv(n), "{{1 2} &{9} [a b] cc}", "nested %v")
+    // pointer-slot forms: own bindings and own fields print &
+    po := new(Point{x: 7, y: 8})
+    want(fmt.sprintv(po), "&{7 8}", "own struct %v")
+    ox := mkslice(own Inner, 0)
+    oi := new(Inner)
+    oi.v = 3
+    ox = push(ox, oi)
+    want(fmt.sprintv(ox), "[&{3}]", "own slice %v")
+    n2 := Nest{p: Point{x: 0, y: 0}, i: nil, tags: nil, c: cstr("")}
+    want(fmt.sprintv(n2), "{{0 0} <nil> [] }", "nil slots %v")
+    // %+v adds field names
+    vf("%+v", Point{x: 1, y: 2}, "{x:1 y:2}", "struct %+v")
+    vf("%+v", n, "{p:{x:1 y:2} i:&{v:9} tags:[a b] c:cc}", "nested %+v")
+    vf("%+v", xs, "[4 5]", "slice %+v")
+    vf("%+v", Shape.Rect{w: 2, h: 9}, "Rect{w:2 h:9}", "enum named %+v")
+    vf("%+v", Shape.Circle(3), "Circle{f0:3}", "enum positional %+v")
+    // %#v source-literal forms
+    vf("%#v", 42, "42", "int %#v")
+    vf("%#v", 3.5, "3.5", "float %#v")
+    vf("%#v", true, "true", "bool %#v")
+    vf("%#v", "hi", "\"hi\"", "str %#v")
+    vf("%#v", "a\nb", "\"a\\nb\"", "str escape %#v")
+    vf("%#v", 65 as byte, "0x41", "byte %#v")
+    vf("%#v", xs, "[]int{4, 5}", "slice %#v")
+    vf("%#v", Point{x: 1, y: 2}, "Point{x:1, y:2}", "struct %#v")
+    vf("%#v", Shape.Circle(3), "Circle(3)", "enum positional %#v")
+    vf("%#v", Shape.Rect{w: 2, h: 9}, "Rect{w:2, h:9}", "enum named %#v")
+    vf("%#v", cstr("cc"), "cc", "cstr %#v falls back")
+    // %T the qualified descriptor name
+    vf("%T", Point{x: 1, y: 2}, "Point", "struct %T")
+    vf("%T", 42, "int", "int %T")
+    vf("%T", xs, "[]int", "slice %T")
+    vf("%T", Shape.Empty, "Shape", "enum %T")
+    po2 := new(Point{x: 0, y: 0})
+    vf("%T", po2, "*Point", "own %T")
+    // vfmt literal text + %% escape + repeated verbs re-render
+    vf("x=%v!", Point{x: 1, y: 2}, "x={1 2}!", "vfmt literal")
+    vf("%%", 1, "%", "vfmt %%")
+    vf("100%%=%v", 5, "100%=5", "vfmt %% + verb")
+    vf("%v %v", 7, "7 7", "vfmt repeat")
+    // error lanes
+    [_, e1] = fmt.vfmt("%q", 1)
+    if e1 == nil {
+        fails("bad verb accepted")
+    }
+    want(errors.msg(e1), "fmt: unknown verb %q", "bad verb msg")
+    [_, e2] = fmt.vfmt("tail%", 1)
+    if e2 == nil {
+        fails("dangling % accepted")
+    }
+    want(errors.msg(e2), "fmt: dangling % at end", "dangling msg")
+    // opaque kinds print the pinned placeholders
+    ch := mkchan(2)
+    send(ch, 5)
+    want(fmt.sprintv(ch), "chan", "chan %v")
+    fv := fails
+    want(fmt.sprintv(fv), "fn", "fn %v")
+    // printv writes one rendered line — the suite's output compare
+    // covers it end to end
+    fmt.printv(Point{x: 9, y: 9})
+    println("fmt_v ok")
+}

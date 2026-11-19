@@ -1,9 +1,16 @@
 package fmt
 
 // std/fmt — bounded formatting: no variadics and no runtime `any`, so
-// %v-style reflection stays parked. sprintf substitutes %s verbs with
-// []str args (callers convert via itoa/ftoa/etc.); %% escapes.
+// %v-style reflection runs one statically typed generic value per
+// call rather than a variadic arg list. sprintf substitutes %s verbs
+// with []str args (callers convert via itoa/ftoa/etc.); %% escapes.
+// sprintv/printv/vfmt cover %v %+v %T %#v through std/reflect's
+// descriptor walk — the spec's Go-forms: {v1 v2} structs, &{…}
+// ptrs, [e1 e2] slices, variant names for enums, opaque placeholders
+// (iface{…}/fn/chan/err <code>) for the read-opaque kinds.
 import "std/errors"
+
+import "std/reflect"
 
 /// sprintf — %s takes the next arg in order; %% emits a literal %.
 /// Bad verbs and arg under/over-supply return an err. Output builds
@@ -61,4 +68,399 @@ fn sprint(s: str) -> str {
 /// sprinti formats an int (itoa alias — the typed %d substitute).
 fn sprinti(v: int) -> str {
     return itoa(v)
+}
+
+// ---------- %v family — descriptor-driven ----------
+
+// hexb renders a byte the Go %#v way — 0xNN, lowercase.
+fn hexb(b: int) -> str {
+    d := "0123456789abcdef"
+    hi := b / 16 % 16
+    lo := b % 16
+    if hi < 0 {
+        hi = 0
+    }
+    if lo < 0 {
+        lo = 0
+    }
+    return "0x" + substr(d, hi, hi + 1) + substr(d, lo, lo + 1)
+}
+
+// vquote renders a str the Go %#v way — a double-quoted literal with
+// the common escapes; other control bytes go \xNN.
+fn vquote(s: str) -> str {
+    d := "0123456789abcdef"
+    out := "\""
+    i := 0
+    for i < len(s) {
+        c := byteat(s, i)
+        if c == 34 {
+            out = out + "\\\""
+        } else if c == 92 {
+            out = out + "\\\\"
+        } else if c == 10 {
+            out = out + "\\n"
+        } else if c == 9 {
+            out = out + "\\t"
+        } else if c == 13 {
+            out = out + "\\r"
+        } else if c < 32 || c > 126 {
+            out = out + "\\x" + substr(d, c / 16 % 16, c / 16 % 16 + 1) + substr(d, c % 16, c % 16 + 1)
+        } else {
+            out = out + substr(s, i, i + 1)
+        }
+        i = i + 1
+    }
+    return out + "\""
+}
+
+// fname_pos reports 1 for a synthesized positional payload name —
+// the emitter spells them `f0`, `f1`, …
+fn fname_pos(s: str) -> int {
+    if len(s) < 2 || byteat(s, 0) != 102 {
+        return 0
+    }
+    i := 1
+    for i < len(s) {
+        c := byteat(s, i)
+        if c < 48 || c > 57 {
+            return 0
+        }
+        i = i + 1
+    }
+    return 1
+}
+
+// vrender walks one reflect.Value into its verb form. ind is the
+// pointer-slot flag — set when the Value was reached through an own/
+// qualified slot (binding qualifier, FieldDesc.ptr, elem_ptr) so the
+// result carries Go's `&` prefix.
+fn vrender(v: reflect.Value, plus: int, sharp: int, ind: int) -> [str, err] {
+    t := v.typ()
+    k := t.kind()
+    s := ""
+    if k == reflect.KindInt() {
+        [x, e] = v.int()
+        if e != nil {
+            return "", e
+        }
+        s = itoa(x)
+    } else if k == reflect.KindFloat() {
+        [x, e] = v.f64()
+        if e != nil {
+            return "", e
+        }
+        s = ftoa(x)
+    } else if k == reflect.KindBool() {
+        [x, e] = v.bool()
+        if e != nil {
+            return "", e
+        }
+        if x != 0 {
+            s = "true"
+        } else {
+            s = "false"
+        }
+    } else if k == reflect.KindStr() {
+        [x, e] = v.str()
+        if e != nil {
+            return "", e
+        }
+        if sharp != 0 {
+            s = vquote(x)
+        } else {
+            s = x
+        }
+    } else if k == reflect.KindByte() {
+        [x, e] = v.byte()
+        if e != nil {
+            return "", e
+        }
+        if sharp != 0 {
+            s = hexb(x)
+        } else {
+            s = itoa(x)
+        }
+    } else if k == reflect.KindSlice() {
+        [x, e] = vslice(v, t, plus, sharp)
+        if e != nil {
+            return "", e
+        }
+        s = x
+    } else if k == reflect.KindStruct() {
+        [x, e] = vstruct(v, t, plus, sharp)
+        if e != nil {
+            return "", e
+        }
+        s = x
+    } else if k == reflect.KindEnum() {
+        [x, e] = venum(v, t, plus, sharp)
+        if e != nil {
+            return "", e
+        }
+        s = x
+    } else if k == reflect.KindPtr() {
+        // PTR is the cstr lane — prints the C string's contents on
+        // every verb (%#v falls back to the %v form per spec)
+        [x, e] = v.str()
+        if e != nil {
+            return "", e
+        }
+        s = x
+        ind = 0
+    } else if k == reflect.KindIface() {
+        s = "iface{…}"
+    } else if k == reflect.KindFn() {
+        s = "fn"
+    } else if k == reflect.KindChan() {
+        s = "chan"
+    } else if k == reflect.KindErr() {
+        [x, e] = v.int()
+        if e != nil {
+            return "", e
+        }
+        s = "err " + itoa(x)
+    } else if k == reflect.KindMap() {
+        s = "map{…}"
+    } else {
+        s = "void"
+    }
+    if ind != 0 {
+        s = "&" + s
+    }
+    return s, nil
+}
+
+// vstruct renders {v1 v2} / {f1:v1 f2:v2} / Name{f1:v1, f2:v2}.
+fn vstruct(v: reflect.Value, t: reflect.Type, plus: int, sharp: int) -> [str, err] {
+    n := t.nfields()
+    s := ""
+    i := 0
+    for i < n {
+        if i > 0 {
+            if sharp != 0 {
+                s = s + ", "
+            } else {
+                s = s + " "
+            }
+        }
+        [fld, fe] = t.field(i)
+        if fe != nil {
+            return "", fe
+        }
+        [fv, ve] = v.field(i)
+        if ve != nil && !errors.is(ve, reflect.err_nil()) {
+            return "", ve
+        }
+        inner := "<nil>"
+        if ve == nil {
+            [r, ie] = vrender(fv, plus, sharp, fld.ptr())
+            if ie != nil {
+                return "", ie
+            }
+            inner = r
+        }
+        if plus != 0 || sharp != 0 {
+            s = s + fld.name() + ":"
+        }
+        s = s + inner
+        i = i + 1
+    }
+    if sharp != 0 {
+        return t.name() + "{" + s + "}", nil
+    }
+    return "{" + s + "}", nil
+}
+
+// vslice renders [e1 e2] (+v identically — Go adds names only for
+// structs) and the composite literal []T{e1, e2} for #v.
+fn vslice(v: reflect.Value, t: reflect.Type, plus: int, sharp: int) -> [str, err] {
+    [n, e] = v.len()
+    if e != nil {
+        return "", e
+    }
+    eptr := t.elemptr()
+    s := ""
+    i := 0
+    for i < n {
+        if i > 0 {
+            if sharp != 0 {
+                s = s + ", "
+            } else {
+                s = s + " "
+            }
+        }
+        [iv, ve] = v.index(i)
+        if ve != nil && !errors.is(ve, reflect.err_nil()) {
+            return "", ve
+        }
+        if ve != nil {
+            s = s + "<nil>"
+            i = i + 1
+            continue
+        }
+        [inner, ie] = vrender(iv, plus, sharp, eptr)
+        if ie != nil {
+            return "", ie
+        }
+        s = s + inner
+        i = i + 1
+    }
+    if sharp != 0 {
+        return t.name() + "{" + s + "}", nil
+    }
+    return "[" + s + "]", nil
+}
+
+// venum renders the live variant's name for %v; %+v spells payload
+// slots name:value; %#v prints the source-literal ctor — Name(v, v)
+// for positional payloads, Name{f:v, f:v} for named ones.
+fn venum(v: reflect.Value, t: reflect.Type, plus: int, sharp: int) -> [str, err] {
+    [tg, te] = v.tag()
+    if te != nil {
+        return "", te
+    }
+    [xv, ve] = t.variant(tg)
+    if ve != nil {
+        return "", ve
+    }
+    nm := xv.name()
+    nf := xv.nfields()
+    if nf == 0 || plus == 0 && sharp == 0 {
+        return nm, nil
+    }
+    pos := 1
+    s := ""
+    i := 0
+    for i < nf {
+        [fn_i, fne] = xv.fname(i)
+        if fne != nil {
+            return "", fne
+        }
+        if fname_pos(fn_i) == 0 {
+            pos = 0
+        }
+        [fp_i, fpe] = xv.fptr(i)
+        if fpe != nil {
+            return "", fpe
+        }
+        [fv, fve] = v.vfield(tg, i)
+        if fve != nil && !errors.is(fve, reflect.err_nil()) {
+            return "", fve
+        }
+        inner := "<nil>"
+        if fve == nil {
+            [r, ie] = vrender(fv, plus, sharp, fp_i)
+            if ie != nil {
+                return "", ie
+            }
+            inner = r
+        }
+        if i > 0 {
+            if sharp != 0 {
+                s = s + ", "
+            } else {
+                s = s + " "
+            }
+        }
+        // %+v always names slots (positional slots use their
+        // synthesized fN spellings); %#v names them only for a
+        // declared-payload variant — a positional one renders the
+        // ctor form Name(v, v) below
+        if plus != 0 {
+            s = s + fn_i + ":"
+        } else if sharp != 0 && pos == 0 {
+            s = s + fn_i + ":"
+        }
+        s = s + inner
+        i = i + 1
+    }
+    if sharp != 0 && pos == 1 {
+        return nm + "(" + s + ")", nil
+    }
+    return nm + "{" + s + "}", nil
+}
+
+/// sprintv renders one value the way Go's %v would: scalar forms per
+/// kind, {v1 v2} structs, &{…} through pointer slots, [e1 e2]
+/// slices, the live variant's name for enums, and the pinned
+/// placeholders for opaque kinds.
+fn sprintv[T any](v: T) -> str {
+    // the spec-pinned bridge: new(v) is an own lane that coerces to
+    // the ref operand value_of wants; it dies with this scope inside
+    // the Value's scope-bound lifetime — sprintv only renders in scope
+    c := new(v)
+    rv := value_of(c)
+    [s, e] = vrender(rv, 0, 0, tqual(T))
+    if e != nil {
+        return "%!v(" + errors.msg(e) + ")"
+    }
+    return s
+}
+
+/// printv is sprintv straight to stdout, one line.
+fn printv[T any](v: T) {
+    println(sprintv(v))
+}
+
+/// vfmt substitutes a single typed value into a format string:
+/// %v/%+v/%#v render through the descriptor walk (flags + and #
+/// accepted in either order), %T prints the static binding's
+/// qualified descriptor name, %% escapes. Anything else is an err —
+/// there is no variadic arg list to advance through, so repeated
+/// verbs re-render the same value.
+fn vfmt[T any](f: str, v: T) -> [str, err] {
+    c := new(v)
+    rv := value_of(c)
+    qual := tqual(T)
+    tn := type_of(T)
+    out := ""
+    i := 0
+    for i < len(f) {
+        if byteat(f, i) != 37 {
+            out = out + substr(f, i, i + 1)
+            i = i + 1
+            continue
+        }
+        i = i + 1
+        plus := 0
+        sharp := 0
+        for i < len(f) && (byteat(f, i) == 43 || byteat(f, i) == 35) {
+            if byteat(f, i) == 43 {
+                plus = 1
+            } else {
+                sharp = 1
+            }
+            i = i + 1
+        }
+        if i >= len(f) {
+            return "", errors.new("fmt: dangling % at end")
+        }
+        cch := byteat(f, i)
+        if cch == 37 {
+            out = out + "%"
+            i = i + 1
+            continue
+        }
+        if cch == 84 {
+            // %T — qualified descriptor name
+            if qual != 0 {
+                out = out + "*"
+            }
+            out = out + tn.name()
+            i = i + 1
+            continue
+        }
+        if cch == 118 {
+            [s, e] = vrender(rv, plus, sharp, qual)
+            if e != nil {
+                return "", e
+            }
+            out = out + s
+            i = i + 1
+            continue
+        }
+        return "", errors.new("fmt: unknown verb %" + substr(f, i, i + 1))
+    }
+    return out, nil
 }

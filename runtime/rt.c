@@ -4952,12 +4952,17 @@ int64_t rt_desc_alloc(int64_t td) {
  * a live RtSlice{ptr,len,cap,heap} header + n*elem-size backing on the
  * own lane; callers store it per FieldDesc.ptr (rt_field_set_ptr for
  * `own []T`, rt_field_set_slice for inline `[]T`) */
-int64_t rt_desc_alloc_slice(int64_t td, int64_t n) {
-    const RtTypeDesc *d = desc_at(td);
+int64_t rt_desc_alloc_slice(int64_t std, int64_t n) {
+    const RtTypeDesc *sd = desc_at(std);
+    const RtTypeDesc *d;
     RtSlice *h;
     int64_t esz, total;
-    if (!d || n < 0) return -1;
-    esz = d->size > 0 ? d->size : 1;
+    if (!sd || n < 0 || sd->kind != 5 /* KindSlice */) return -1;
+    d = desc_at(sd->elem);
+    if (!d) return -1;
+    /* elem_ptr lanes ([]own T) store pointers at stride sizeof(void*)
+     * — sizing off the pointee desc under-allocates when sizeof(T)<8 */
+    esz = sd->elem_ptr ? (int64_t)sizeof(void *) : (d->size > 0 ? d->size : 1);
     /* validate the COMPLETE backing size before touching malloc: esz*n
      * itself, alloc_in's 16-byte alignment rounding, and the ObjHdr it
      * prepends. A huge n (e.g. 2^61) passes the n<0 check yet overflows

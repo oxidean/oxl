@@ -1,0 +1,666 @@
+package reflect
+
+// std/reflect — runtime type descriptors + kind-checked Value walks.
+// The compiler emits a TypeDesc record per tdesc-reachable type (R1);
+// `tdesc`/`tqual`/`type_of`/`value_of`/`value_of_mut` are global
+// builtins folded at monomorphization — no import needed to mint a
+// handle. This package wraps the rt_desc_*/rt_field_* ABI in the
+// Type/Field/Variant/Value methods the handles answer. Value is
+// scope-bound by the checker: only the intrinsics mint one, it may be
+// returned solely when derived from a `ref`/`mut`/`Value` param, and
+// its fields stay opaque outside this file. Kind mismatches report
+// the interned err sentinels below, never garbage.
+import "std/errors"
+
+extern fn rt_desc_count() -> int
+
+extern fn rt_desc_name(td: int) -> str
+
+extern fn rt_desc_kind(td: int) -> int
+
+extern fn rt_desc_size(td: int) -> int
+
+extern fn rt_desc_align(td: int) -> int
+
+extern fn rt_desc_nfields(td: int) -> int
+
+extern fn rt_desc_elem(td: int) -> int
+
+extern fn rt_desc_elem_ptr(td: int) -> int
+
+extern fn rt_desc_nvars(td: int) -> int
+
+extern fn rt_desc_v_name(td: int, i: int) -> str
+
+extern fn rt_desc_v_nfields(td: int, vi: int) -> int
+
+extern fn rt_desc_v_f_name(td: int, vi: int, fi: int) -> str
+
+extern fn rt_desc_v_f_td(td: int, vi: int, fi: int) -> int
+
+extern fn rt_desc_v_f_off(td: int, vi: int, fi: int) -> int
+
+extern fn rt_desc_v_f_ptr(td: int, vi: int, fi: int) -> int
+
+extern fn rt_desc_v_base(td: int) -> int
+
+extern fn rt_desc_f_sname(td: int, i: int) -> str
+
+extern fn rt_desc_f_off(td: int, i: int) -> int
+
+extern fn rt_desc_f_td(td: int, i: int) -> int
+
+extern fn rt_desc_f_tag(td: int, i: int) -> str
+
+extern fn rt_desc_f_ptr(td: int, i: int) -> int
+
+extern fn rt_desc_alloc(td: int) -> int
+
+extern fn rt_desc_alloc_slice(td: int, n: int) -> int
+
+extern fn rt_field_i64(addr: int) -> int
+
+extern fn rt_field_i32(addr: int) -> int
+
+extern fn rt_field_u8(addr: int) -> int
+
+extern fn rt_field_f64(addr: int) -> float
+
+extern fn rt_field_str(addr: int) -> str
+
+extern fn rt_field_cstr(addr: int) -> str
+
+extern fn rt_field_ptr(addr: int) -> int
+
+extern fn rt_field_set_i64(addr: int, v: int)
+
+extern fn rt_field_set_i32(addr: int, v: int)
+
+extern fn rt_field_set_u8(addr: int, v: int)
+
+extern fn rt_field_set_f64(addr: int, v: float)
+
+extern fn rt_field_set_str(addr: int, v: str)
+
+extern fn rt_field_set_ptr(addr: int, v: int)
+
+extern fn rt_field_set_slice(addr: int, hdr: int)
+
+extern fn rt_str_own(s: str) -> str
+
+/// err_kind is the sentinel for every kind mismatch — reading a STR
+/// field as int, writing through a non-mut Value, walking an opaque
+/// kind.
+fn err_kind() -> err {
+    return errors.new("reflect: kind mismatch")
+}
+
+/// err_oob reports an index past a descriptor's or slice's bounds.
+fn err_oob() -> err {
+    return errors.new("reflect: index out of bounds")
+}
+
+/// err_nil reports a nil `own` pointer slot — field/index/vfield
+/// refuse to fabricate a Value at a zeroed address.
+fn err_nil() -> err {
+    return errors.new("reflect: nil pointer slot")
+}
+
+// Kind codes — the frozen descriptor order. One fn per code since v1
+// ships no const surface; KindMap exists for ABI completeness — no Ty
+// produces it.
+fn KindInt() -> int {
+    return 0
+}
+
+fn KindFloat() -> int {
+    return 1
+}
+
+fn KindBool() -> int {
+    return 2
+}
+
+fn KindStr() -> int {
+    return 3
+}
+
+fn KindByte() -> int {
+    return 4
+}
+
+fn KindSlice() -> int {
+    return 5
+}
+
+fn KindMap() -> int {
+    return 6
+}
+
+fn KindStruct() -> int {
+    return 7
+}
+
+fn KindPtr() -> int {
+    return 8
+}
+
+fn KindChan() -> int {
+    return 9
+}
+
+fn KindIface() -> int {
+    return 10
+}
+
+fn KindFn() -> int {
+    return 11
+}
+
+fn KindErr() -> int {
+    return 12
+}
+
+fn KindEnum() -> int {
+    return 13
+}
+
+fn KindVoid() -> int {
+    return 14
+}
+
+/// Type is a descriptor-table handle — reads go through rt_desc_*
+/// lazily rather than materializing records a callee couldn't return.
+struct Type { td: int }
+
+/// Field is a {descriptor, field index} pair — one struct field's
+/// declared name, offset, type, tag, and pointer-slot flag.
+struct Field { td: int, i: int }
+
+/// Variant is a {descriptor, variant index} pair — one enum variant's
+/// name and payload-slot shape.
+struct Variant { td: int, i: int }
+
+/// Value addresses a live layout: td is its descriptor, addr the
+/// memory the descriptor describes, w the write bit set only by
+/// value_of_mut. field/index/vfield walks propagate w so writes stay
+//  gated on a mut-derived root.
+struct Value { td: int, addr: int, w: int }
+
+// vret launders a freshly-minted handle through a generic call —
+// in-place literals carry no parameter provenance so they can't be
+// returned directly, while a call result is treated as derived (the
+// callee's own checks are what hold the line). T binds to the handle
+// type at each site; inside the body it is a plain type variable.
+fn vret[T any](v: T) -> T {
+    return v
+}
+
+/// name is the descriptor's spelled type name — "Point", "io.File",
+/// "[]byte".
+fn (t Type) name() -> str {
+    return rt_desc_name(t.td)
+}
+
+/// kind is the descriptor kind code — compare against the Kind* fns.
+/// (The name shares the enum tag accessor's spelling; the checker
+/// claims `.kind()` for enum receivers only, so the method resolves
+/// here.)
+fn (t Type) kind() -> int {
+    return rt_desc_kind(t.td)
+}
+
+/// size is sizeof the C layout the emitter produced.
+fn (t Type) size() -> int {
+    return rt_desc_size(t.td)
+}
+
+/// nfields is the struct field count — 0 elsewhere.
+fn (t Type) nfields() -> int {
+    return rt_desc_nfields(t.td)
+}
+
+/// field selects struct field i as a handle; err_oob past nfields.
+fn (t Type) field(i: int) -> [Field, err] {
+    f := vret(Field{td: t.td, i: i})
+    if i < 0 || i >= rt_desc_nfields(t.td) {
+        return f, err_oob()
+    }
+    return f, nil
+}
+
+/// elem is the element descriptor for slice/chan shapes — pair-shaped
+/// because scalars and structs have none: absent reports err_kind,
+/// never a Type{td:-1}.
+fn (t Type) elem() -> [Type, err] {
+    e := rt_desc_elem(t.td)
+    if e < 0 {
+        return t, err_kind()
+    }
+    t2 := t
+    t2.td = e
+    return t2, nil
+}
+
+/// elemptr reports 1 when the slice element SLOT is a pointer to the
+/// element layout (`[]own T`) — index's stride/deref-once contract
+/// and fmt's `&`-form both read it.
+fn (t Type) elemptr() -> int {
+    return rt_desc_elem_ptr(t.td)
+}
+
+/// nvars is the enum variant count — 0 elsewhere.
+fn (t Type) nvars() -> int {
+    return rt_desc_nvars(t.td)
+}
+
+/// varname is variant i's declared name; err_oob past nvars.
+fn (t Type) varname(i: int) -> [str, err] {
+    if i < 0 || i >= rt_desc_nvars(t.td) {
+        return "", err_oob()
+    }
+    return rt_desc_v_name(t.td, i), nil
+}
+
+/// variant selects enum variant i as a handle; err_oob past nvars.
+fn (t Type) variant(i: int) -> [Variant, err] {
+    x := vret(Variant{td: t.td, i: i})
+    if i < 0 || i >= rt_desc_nvars(t.td) {
+        return x, err_oob()
+    }
+    return x, nil
+}
+
+/// name is the variant's declared name.
+fn (x Variant) name() -> str {
+    return rt_desc_v_name(x.td, x.i)
+}
+
+/// nfields is the variant's payload slot count (positional slots
+/// count too — their names are synthesized `f0`, `f1`, …).
+fn (x Variant) nfields() -> int {
+    return rt_desc_v_nfields(x.td, x.i)
+}
+
+/// ftyp is payload slot i's descriptor; err_oob past nfields.
+fn (x Variant) ftyp(i: int) -> [Type, err] {
+    if i < 0 || i >= x.nfields() {
+        return vret(Type{td: x.td}), err_oob()
+    }
+    return vret(Type{td: rt_desc_v_f_td(x.td, x.i, i)}), nil
+}
+
+/// foff is payload slot i's offset relative to the union blob base;
+/// err_oob past nfields.
+fn (x Variant) foff(i: int) -> [int, err] {
+    if i < 0 || i >= x.nfields() {
+        return -1, err_oob()
+    }
+    return rt_desc_v_f_off(x.td, x.i, i), nil
+}
+
+/// fname is payload slot i's declared name — the synthesized `fN`
+/// spelling when the payload is positional; err_oob past nfields.
+fn (x Variant) fname(i: int) -> [str, err] {
+    if i < 0 || i >= x.nfields() {
+        return "", err_oob()
+    }
+    return rt_desc_v_f_name(x.td, x.i, i), nil
+}
+
+/// fptr reports 1 when payload slot i stores a pointer to its td's
+/// layout (`own` payloads); err_oob past nfields.
+fn (x Variant) fptr(i: int) -> [int, err] {
+    if i < 0 || i >= x.nfields() {
+        return -1, err_oob()
+    }
+    return rt_desc_v_f_ptr(x.td, x.i, i), nil
+}
+
+/// name is the field's declared name.
+fn (f Field) name() -> str {
+    return rt_desc_f_sname(f.td, f.i)
+}
+
+/// off is the field's absolute offset within the struct layout.
+fn (f Field) off() -> int {
+    return rt_desc_f_off(f.td, f.i)
+}
+
+/// typ is the field's descriptor — pair-shaped like Type.elem: a -1
+/// slot reports err_kind, never a Type{td:-1}.
+fn (f Field) typ() -> [Type, err] {
+    t := vret(Type{td: rt_desc_f_td(f.td, f.i)})
+    if t.td < 0 {
+        return t, err_kind()
+    }
+    return t, nil
+}
+
+/// tag is the field's `tag "..."` text, "" when absent.
+fn (f Field) tag() -> str {
+    return rt_desc_f_tag(f.td, f.i)
+}
+
+/// ptr reports 1 when the declared field type carries `own` — the
+/// slot then stores a pointer to td's layout.
+fn (f Field) ptr() -> int {
+    return rt_desc_f_ptr(f.td, f.i)
+}
+
+/// typ is the descriptor the Value's memory is laid out as.
+fn (v Value) typ() -> Type {
+    return vret(Type{td: v.td})
+}
+
+/// int reads the i64 lane — INT and ERR kinds (ERR yields the code).
+fn (v Value) int() -> [int, err] {
+    k := rt_desc_kind(v.td)
+    if k != KindInt() && k != KindErr() {
+        return 0, err_kind()
+    }
+    return rt_field_i64(v.addr), nil
+}
+
+/// f64 reads the FLOAT lane.
+fn (v Value) f64() -> [float, err] {
+    if rt_desc_kind(v.td) != KindFloat() {
+        return 0.0, err_kind()
+    }
+    return rt_field_f64(v.addr), nil
+}
+
+/// bool reads the i32 lane — C `int`, 4B.
+fn (v Value) bool() -> [int, err] {
+    if rt_desc_kind(v.td) != KindBool() {
+        return 0, err_kind()
+    }
+    return rt_field_i32(v.addr), nil
+}
+
+/// byte reads the u8 lane.
+fn (v Value) byte() -> [int, err] {
+    if rt_desc_kind(v.td) != KindByte() {
+        return 0, err_kind()
+    }
+    return rt_field_u8(v.addr), nil
+}
+
+/// str reads the STR lane — plus PTR (cstr) through rt_field_cstr.
+fn (v Value) str() -> [str, err] {
+    k := rt_desc_kind(v.td)
+    if k == KindStr() {
+        return rt_field_str(v.addr), nil
+    }
+    if k == KindPtr() {
+        return rt_field_cstr(v.addr), nil
+    }
+    return "", err_kind()
+}
+
+/// set_int writes the i64 lane — INT (and ERR) kinds; err_kind on a
+/// mismatched kind or a Value not derived from value_of_mut.
+fn (v Value) set_int(x: int) -> err {
+    k := rt_desc_kind(v.td)
+    if v.w == 0 || k != KindInt() && k != KindErr() {
+        return err_kind()
+    }
+    rt_field_set_i64(v.addr, x)
+    return nil
+}
+
+/// set_bool writes the i32 lane — BOOL kind; err_kind otherwise.
+fn (v Value) set_bool(x: int) -> err {
+    if v.w == 0 || rt_desc_kind(v.td) != KindBool() {
+        return err_kind()
+    }
+    rt_field_set_i32(v.addr, x)
+    return nil
+}
+
+/// set_byte writes the u8 lane — BYTE kind; err_kind otherwise.
+fn (v Value) set_byte(x: int) -> err {
+    if v.w == 0 || rt_desc_kind(v.td) != KindByte() {
+        return err_kind()
+    }
+    rt_field_set_u8(v.addr, x)
+    return nil
+}
+
+/// set_f64 writes the FLOAT lane; err_kind otherwise.
+fn (v Value) set_f64(x: float) -> err {
+    if v.w == 0 || rt_desc_kind(v.td) != KindFloat() {
+        return err_kind()
+    }
+    rt_field_set_f64(v.addr, x)
+    return nil
+}
+
+/// set_str writes the STR lane. The stored str gets rt_str_own
+/// backing so it can't dangle at scope leave; err_kind otherwise.
+fn (v Value) set_str(x: str) -> err {
+    if v.w == 0 || rt_desc_kind(v.td) != KindStr() {
+        return err_kind()
+    }
+    rt_field_set_str(v.addr, rt_str_own(x))
+    return nil
+}
+
+/// field selects struct field i — the `own` lane dereferences a
+/// pointer slot once (nil slot → err_nil); err_oob past nfields,
+/// err_kind off STRUCT.
+fn (v Value) field(i: int) -> [Value, err] {
+    f := v
+    if rt_desc_kind(v.td) != KindStruct() {
+        return f, err_kind()
+    }
+    if i < 0 || i >= rt_desc_nfields(v.td) {
+        return f, err_oob()
+    }
+    a := v.addr + rt_desc_f_off(v.td, i)
+    if rt_desc_f_ptr(v.td, i) == 1 {
+        a = rt_field_ptr(a)
+        if a == 0 {
+            return f, err_nil()
+        }
+    }
+    f.td = rt_desc_f_td(v.td, i)
+    f.addr = a
+    return f, nil
+}
+
+/// len reads the RtSlice header's len — SLICE only.
+fn (v Value) len() -> [int, err] {
+    if rt_desc_kind(v.td) != KindSlice() {
+        return 0, err_kind()
+    }
+    return rt_field_i64(v.addr + 8), nil
+}
+
+/// index selects slice element i — err_oob before address math so the
+/// emitted address never leaves the data window. elem_ptr slices
+/// (`[]own T`) stride pointer-width slots and deref once.
+fn (v Value) index(i: int) -> [Value, err] {
+    f := v
+    if rt_desc_kind(v.td) != KindSlice() {
+        return f, err_kind()
+    }
+    n := rt_field_i64(v.addr + 8)
+    if i < 0 || i >= n {
+        return f, err_oob()
+    }
+    etd := rt_desc_elem(v.td)
+    if etd < 0 {
+        return f, err_kind()
+    }
+    stride := rt_desc_size(etd)
+    if stride <= 0 {
+        stride = 1
+    }
+    if rt_desc_elem_ptr(v.td) == 1 {
+        stride = 8
+    }
+    a := rt_field_ptr(v.addr) + i * stride
+    if rt_desc_elem_ptr(v.td) == 1 {
+        a = rt_field_ptr(a)
+        if a == 0 {
+            return f, err_nil()
+        }
+    }
+    f.td = etd
+    f.addr = a
+    return f, nil
+}
+
+/// tag reads the enum discriminant through the i32 lane (the tag is a
+/// C `int`). The tag value IS the variant's index into the
+/// descriptor's variant table — t.variant(v.tag()) selects the live
+/// variant's metadata.
+fn (v Value) tag() -> [int, err] {
+    if rt_desc_kind(v.td) != KindEnum() {
+        return 0, err_kind()
+    }
+    return rt_field_i32(v.addr), nil
+}
+
+/// set_tag writes the enum discriminant through the i32 lane —
+/// err_kind on a non-ENUM or non-mut Value, err_oob past the variant
+/// count.
+fn (v Value) set_tag(i: int) -> err {
+    if v.w == 0 || rt_desc_kind(v.td) != KindEnum() {
+        return err_kind()
+    }
+    if i < 0 || i >= rt_desc_nvars(v.td) {
+        return err_oob()
+    }
+    rt_field_set_i32(v.addr, i)
+    return nil
+}
+
+/// vfield selects enum variant vi's payload slot fi — the only way a
+/// payload slot becomes a Value. vi must equal the live tag (any
+/// other variant's offsets describe the wrong shape — enforced with
+/// err_kind); an `own`-typed slot derefs once like FieldDesc.ptr.
+fn (v Value) vfield(vi: int, fi: int) -> [Value, err] {
+    f := v
+    if rt_desc_kind(v.td) != KindEnum() {
+        return f, err_kind()
+    }
+    if vi < 0 || vi >= rt_desc_nvars(v.td) {
+        return f, err_oob()
+    }
+    if fi < 0 || fi >= rt_desc_v_nfields(v.td, vi) {
+        return f, err_oob()
+    }
+    if rt_field_i32(v.addr) != vi {
+        return f, err_kind()
+    }
+    a := v.addr + rt_desc_v_base(v.td) + rt_desc_v_f_off(v.td, vi, fi)
+    if rt_desc_v_f_ptr(v.td, vi, fi) == 1 {
+        a = rt_field_ptr(a)
+        if a == 0 {
+            return f, err_nil()
+        }
+    }
+    f.td = rt_desc_v_f_td(v.td, vi, fi)
+    f.addr = a
+    return f, nil
+}
+
+/// alloc_field mints a zeroed pointee for struct field i (`own`
+/// fields only), stores it through the pointer slot, and yields it
+/// mut-set — the decode lane's object mint. err_kind unless a ptr
+/// field on a mut-derived Value; err_oob past nfields.
+fn (v Value) alloc_field(i: int) -> [Value, err] {
+    f := v
+    if rt_desc_kind(v.td) != KindStruct() {
+        return f, err_kind()
+    }
+    if i < 0 || i >= rt_desc_nfields(v.td) {
+        return f, err_oob()
+    }
+    if v.w == 0 || rt_desc_f_ptr(v.td, i) != 1 {
+        return f, err_kind()
+    }
+    p := rt_desc_alloc(rt_desc_f_td(v.td, i))
+    if p < 0 {
+        return f, err_kind()
+    }
+    rt_field_set_ptr(v.addr + rt_desc_f_off(v.td, i), p)
+    f.td = rt_desc_f_td(v.td, i)
+    f.addr = p
+    f.w = 1
+    return f, nil
+}
+
+/// alloc_slice mints a live RtSlice header + n elements of own-lane
+/// backing for SLICE-typed struct field i, lands it per FieldDesc.ptr
+/// (rt_field_set_ptr for `own []T`, rt_field_set_slice's header copy
+/// for inline `[]T`), and yields the slice Value mut-set so index(j)
+/// + set_* fill it. err_oob/err_kind as above.
+fn (v Value) alloc_slice(i: int, n: int) -> [Value, err] {
+    f := v
+    if rt_desc_kind(v.td) != KindStruct() {
+        return f, err_kind()
+    }
+    if i < 0 || i >= rt_desc_nfields(v.td) {
+        return f, err_oob()
+    }
+    ftd := rt_desc_f_td(v.td, i)
+    if v.w == 0 || ftd < 0 || rt_desc_kind(ftd) != KindSlice() {
+        return f, err_kind()
+    }
+    etd := rt_desc_elem(ftd)
+    if etd < 0 {
+        return f, err_kind()
+    }
+    h := rt_desc_alloc_slice(ftd, n)
+    if h < 0 {
+        return f, err_kind()
+    }
+    fa := v.addr + rt_desc_f_off(v.td, i)
+    if rt_desc_f_ptr(v.td, i) == 1 {
+        rt_field_set_ptr(fa, h)
+    } else {
+        rt_field_set_slice(fa, h)
+    }
+    f.td = ftd
+    f.addr = h
+    f.w = 1
+    return f, nil
+}
+
+/// alloc_elem mints a zeroed pointee into a nil `[]own T` element
+/// slot — an idempotent re-entry on a live slot yields the existing
+/// pointee mut-set. SLICE + elem_ptr==1 only; err_oob/err_kind as
+/// above.
+fn (v Value) alloc_elem(i: int) -> [Value, err] {
+    f := v
+    if rt_desc_kind(v.td) != KindSlice() || rt_desc_elem_ptr(v.td) != 1 {
+        return f, err_kind()
+    }
+    if v.w == 0 {
+        return f, err_kind()
+    }
+    n := rt_field_i64(v.addr + 8)
+    if i < 0 || i >= n {
+        return f, err_oob()
+    }
+    etd := rt_desc_elem(v.td)
+    if etd < 0 {
+        return f, err_kind()
+    }
+    slot := rt_field_ptr(v.addr) + i * 8
+    p := rt_field_ptr(slot)
+    if p == 0 {
+        p = rt_desc_alloc(etd)
+        if p < 0 {
+            return f, err_kind()
+        }
+        rt_field_set_ptr(slot, p)
+    }
+    f.td = etd
+    f.addr = p
+    f.w = 1
+    return f, nil
+}

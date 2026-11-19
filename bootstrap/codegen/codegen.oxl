@@ -3020,6 +3020,20 @@ fn gxslice(g: mut G, obj: ref parser.Node, lo: ref parser.Node, hi: ref parser.N
 }
 
 // ---------- call emission (seed call) ----------
+fn grstruct(g: mut G, b: str) -> str {
+    // the intrinsic's Type/Value result is the public `reflect.*` decl
+    // when std/reflect is in the build — the C struct name follows the
+    // checker's resolution, so emit `o_s_reflect_*` there and the
+    // `o_s_oxl_reflect_*` stand-ins otherwise. Mirror check.reflect_st's
+    // probe instead of calling it: reflect_st interns a fresh ty on
+    // every call, and an index over the mutating call would evaluate
+    // against a stale tyv header (trap 10 at emit time)
+    if collections.map_has(g.ck.structs, "reflect." + b) {
+        return "o_s_reflect_" + b
+    }
+    return "o_s_oxl_reflect_" + b
+}
+
 fn gcall(g: mut G, f: ref parser.Node, args: ref parser.NList) -> str {
     argvs := gav(g, args)
     // indirect call through a fn value — bind once, jump through fp
@@ -3191,13 +3205,13 @@ fn gcall(g: mut G, f: ref parser.Node, args: ref parser.NList) -> str {
         }
         di := itoa(gdesc(g, et))
         if qn == "type_of" {
-            return "(struct o_s_oxl_reflect_Type){ " + di + "LL }"
+            return "(struct " + grstruct(g, "Type") + "){ " + di + "LL }"
         }
         return di + "LL"
     }
     if qn == "value_of" || qn == "value_of_mut" {
         if args == nil {
-            return "(struct o_s_oxl_reflect_Value){ 0LL, 0LL, 0LL }"
+            return "(struct " + grstruct(g, "Value") + "){ 0LL, 0LL, 0LL }"
         }
         at := gsub(g, xty(g, args.v))
         ak := tyk(g, at)
@@ -3221,7 +3235,7 @@ fn gcall(g: mut G, f: ref parser.Node, args: ref parser.NList) -> str {
         if qn == "value_of_mut" {
             w = "1LL"
         }
-        return "(struct o_s_oxl_reflect_Value){ " + itoa(gdesc(g, base)) + "LL, (int64_t)(" + av + "), " + w + " }"
+        return "(struct " + grstruct(g, "Value") + "){ " + itoa(gdesc(g, base)) + "LL, (int64_t)(" + av + "), " + w + " }"
     }
     if qn == "box" && args != nil {
         // R3 — `box[T any](v: T)` folds to rt_err_box: tdesc(T) is

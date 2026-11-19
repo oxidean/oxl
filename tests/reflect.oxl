@@ -1,0 +1,456 @@
+package main
+
+// R2 fixture — std/reflect's public walk over the R1 descriptor lane:
+// Type/Field/Variant handles, kind-checked Value reads and writes on
+// every lane, enum tag/payload access, the decode mints, cstr/PTR,
+// and the w-bit write gate. Everything runs through the package's
+// methods — no rt_* externs spelled here — so this is the contract a
+// reflect consumer (fmt, gob, xml) can rely on.
+import "std/reflect"
+
+import "std/errors"
+
+struct Inner { v: int }
+
+struct Sm { y: byte }
+
+struct S {
+    n: int,
+    f: float,
+    b: bool,
+    s: str,
+    y: byte,
+    p: own Inner,
+    xs: []int,
+    ox: []own Inner,
+    c: cstr,
+    sx: []own Sm,
+}
+
+enum E { A(int), B { x: int, s: str }, C, }
+
+interface W { write(s: str) -> int }
+
+// kinds with no mkslice-grammar operand (CHAN/FN/IFACE) resolve
+// through a struct field's declared type
+struct K { ch: chan own int, g: fn(int) -> int, w: W }
+
+fn fails(msg: str) {
+    println("FAIL " + msg)
+    exit(1)
+}
+
+fn want_err(e: err, sentinel: err, msg: str) {
+    if e == nil {
+        fails(msg + " — expected err, got nil")
+    }
+    if !errors.is(e, sentinel) {
+        fails(msg + " — wrong sentinel: " + errors.msg(e))
+    }
+}
+
+fn want_ok(e: err, msg: str) {
+    if e != nil {
+        fails(msg + " — unexpected err: " + errors.msg(e))
+    }
+}
+
+fn main() {
+    // Type: name/kind/size/nfields — STRUCT kind is 7 in the frozen
+    // order; size is layout-dependent, so assert the field offsets
+    // only where the C layout pins them (0 for field 0)
+    t := type_of(S)
+    if t.name() != "S" {
+        fails("type name " + t.name())
+    }
+    if t.kind() != reflect.KindStruct() {
+        fails("type kind")
+    }
+    if t.size() < 40 {
+        fails("type size")
+    }
+    if t.nfields() != 10 {
+        fails("nfields " + itoa(t.nfields()))
+    }
+    [f0, fe0] = t.field(0)
+    want_ok(fe0, "field(0)")
+    if f0.name() != "n" || f0.off() != 0 || f0.tag() != "" || f0.ptr() != 0 {
+        fails("field(0) meta")
+    }
+    [ft0, fte0] = f0.typ()
+    want_ok(fte0, "field(0).typ")
+    if ft0.kind() != reflect.KindInt() || ft0.name() != "int" {
+        fails("field(0) typ")
+    }
+    [f5, fe5] = t.field(5)
+    want_ok(fe5, "field(5)")
+    if f5.ptr() != 1 {
+        fails("own-field ptr flag")
+    }
+    [fpt, fpte] = f5.typ()
+    want_ok(fpte, "own-field typ")
+    if fpt.name() != "Inner" {
+        fails("own-field typ name")
+    }
+    // out-of-bounds field index reports err_oob
+    [fbad, fbade] = t.field(99)
+    want_err(fbade, reflect.err_oob(), "field(99)")
+    // elem: SLICE yes, STRUCT err_kind
+    ts := type_of([]int)
+    if ts.kind() != reflect.KindSlice() {
+        fails("slice kind")
+    }
+    [et, ete] = ts.elem()
+    want_ok(ete, "slice elem")
+    if et.kind() != reflect.KindInt() {
+        fails("slice elem kind")
+    }
+    if ts.elemptr() != 0 {
+        fails("[]int elemptr")
+    }
+    tos := type_of([]own Inner)
+    if tos.elemptr() != 1 {
+        fails("[]own elemptr")
+    }
+    [sel, sele] = t.elem()
+    want_err(sele, reflect.err_kind(), "struct elem")
+    // every frozen kind resolves — Ident operands through type_of,
+    // the operand-less kinds through K's field descriptors
+    ti := type_of(int)
+    tf := type_of(float)
+    tb := type_of(bool)
+    tst := type_of(str)
+    ty := type_of(byte)
+    tp := type_of(cstr)
+    tr := type_of(err)
+    ten := type_of(E)
+    tk := type_of(K)
+    if ti.kind() != reflect.KindInt() {
+        fails("kind int")
+    }
+    if tf.kind() != reflect.KindFloat() {
+        fails("kind float")
+    }
+    if tb.kind() != reflect.KindBool() {
+        fails("kind bool")
+    }
+    if tst.kind() != reflect.KindStr() {
+        fails("kind str")
+    }
+    if ty.kind() != reflect.KindByte() {
+        fails("kind byte")
+    }
+    if tp.kind() != reflect.KindPtr() {
+        fails("kind cstr")
+    }
+    if tr.kind() != reflect.KindErr() {
+        fails("kind err")
+    }
+    if ten.kind() != reflect.KindEnum() {
+        fails("kind enum")
+    }
+    [kch, kche] = tk.field(0)
+    want_ok(kche, "K chan field")
+    [kct, kcte] = kch.typ()
+    want_ok(kcte, "K chan typ")
+    if kct.kind() != reflect.KindChan() {
+        fails("kind chan")
+    }
+    [kg, kge] = tk.field(1)
+    want_ok(kge, "K fn field")
+    [kgt, kgte] = kg.typ()
+    want_ok(kgte, "K fn typ")
+    if kgt.kind() != reflect.KindFn() {
+        fails("kind fn")
+    }
+    [kw, kwe] = tk.field(2)
+    want_ok(kwe, "K iface field")
+    [kwt, kwte] = kw.typ()
+    want_ok(kwte, "K iface typ")
+    if kwt.kind() != reflect.KindIface() {
+        fails("kind iface")
+    }
+    // Variant walk: names, positional vs declared field names, ptr
+    te := type_of(E)
+    if te.nvars() != 3 {
+        fails("nvars")
+    }
+    [va, vae] = te.variant(0)
+    want_ok(vae, "variant(0)")
+    if va.name() != "A" || va.nfields() != 1 {
+        fails("variant A")
+    }
+    [van, vane] = va.fname(0)
+    want_ok(vane, "A.fname")
+    if van != "f0" {
+        fails("positional payload fname " + van)
+    }
+    [vb, vbe] = te.variant(1)
+    want_ok(vbe, "variant(1)")
+    if vb.name() != "B" || vb.nfields() != 2 {
+        fails("variant B")
+    }
+    [vbn, vbne] = vb.fname(1)
+    want_ok(vbne, "B.fname(1)")
+    if vbn != "s" {
+        fails("named payload fname " + vbn)
+    }
+    [vbt, vbte] = vb.ftyp(1)
+    want_ok(vbte, "B.ftyp(1)")
+    if vbt.kind() != reflect.KindStr() {
+        fails("B payload typ")
+    }
+    [vbo, vboe] = vb.foff(0)
+    want_ok(vboe, "B.foff(0)")
+    if vbo < 0 {
+        fails("B payload off")
+    }
+    [vbp, vbpe] = vb.fptr(0)
+    want_ok(vbpe, "B.fptr(0)")
+    if vbp != 0 {
+        fails("B payload ptr")
+    }
+    [vbv, vbve] = te.variant(7)
+    want_err(vbve, reflect.err_oob(), "variant(7)")
+    // Value reads — every kind-checked lane
+    s := new(S)
+    s.n = 11
+    s.f = 2.5
+    s.b = true
+    s.s = "str"
+    s.y = 65 as byte
+    s.p = new(Inner)
+    s.p.v = 77
+    s.xs = mkslice(int, 0)
+    s.xs = push(s.xs, 4)
+    s.xs = push(s.xs, 5)
+    oi := new(Inner)
+    oi.v = 88
+    s.ox = mkslice(own Inner, 0)
+    s.ox = push(s.ox, oi)
+    s.c = cstr("chello")
+    v := value_of_mut(s)
+    [nv, nve] = v.field(0)
+    want_ok(nve, "field n")
+    [n, ne] = nv.int()
+    want_ok(ne, "int read")
+    if n != 11 {
+        fails("int read " + itoa(n))
+    }
+    // kind mismatch reports err_kind, never garbage
+    [mis, mise] = nv.str()
+    want_err(mise, reflect.err_kind(), "int as str")
+    [fv, fve] = v.field(1)
+    want_ok(fve, "field f")
+    [fl, fle] = fv.f64()
+    want_ok(fle, "float read")
+    if fl != 2.5 {
+        fails("float read")
+    }
+    [bv, bve] = v.field(2)
+    want_ok(bve, "field b")
+    [b, bre] = bv.bool()
+    want_ok(bre, "bool read")
+    if b != 1 {
+        fails("bool read " + itoa(b))
+    }
+    [sv, sve] = v.field(3)
+    want_ok(sve, "field s")
+    [st, ste] = sv.str()
+    want_ok(ste, "str read")
+    if st != "str" {
+        fails("str read")
+    }
+    [yv, yve] = v.field(4)
+    want_ok(yve, "field y")
+    [yb, ybe] = yv.byte()
+    want_ok(ybe, "byte read")
+    if yb != 65 {
+        fails("byte read " + itoa(yb))
+    }
+    // own-ptr field derefs once into the pointee layout
+    [pv, pve] = v.field(5)
+    want_ok(pve, "field p")
+    [pvf, pvfe] = pv.field(0)
+    want_ok(pvfe, "inner field")
+    [iv, ive] = pvf.int()
+    want_ok(ive, "inner int")
+    if iv != 77 {
+        fails("inner int " + itoa(iv))
+    }
+    // slice field: len + index + index-time bounds check
+    [xv, xve] = v.field(6)
+    want_ok(xve, "field xs")
+    [xn, xne] = xv.len()
+    want_ok(xne, "slice len")
+    if xn != 2 {
+        fails("slice len " + itoa(xn))
+    }
+    [x1, x1e] = xv.index(1)
+    want_ok(x1e, "index(1)")
+    [x1i, x1ie] = x1.int()
+    want_ok(x1ie, "elem int")
+    if x1i != 5 {
+        fails("elem int " + itoa(x1i))
+    }
+    [xo, xoe] = xv.index(9)
+    want_err(xoe, reflect.err_oob(), "index(9)")
+    [xn2, xn2e] = xv.index(-1)
+    want_err(xn2e, reflect.err_oob(), "index(-1)")
+    // []own T: elem slots deref once
+    [ov, ove] = v.field(7)
+    want_ok(ove, "field ox")
+    [o0, o0e] = ov.index(0)
+    want_ok(o0e, "own index(0)")
+    [o0f, o0fe] = o0.field(0)
+    want_ok(o0fe, "own elem field")
+    [o0i, o0ie] = o0f.int()
+    want_ok(o0ie, "own elem int")
+    if o0i != 88 {
+        fails("own elem int " + itoa(o0i))
+    }
+    // cstr lane: PTR kind reads through rt_field_cstr
+    [cv, cve] = v.field(8)
+    want_ok(cve, "field c")
+    [cs, cse] = cv.str()
+    want_ok(cse, "cstr read")
+    if cs != "chello" {
+        fails("cstr read " + cs)
+    }
+    cvt := cv.typ()
+    if cvt.kind() != reflect.KindPtr() {
+        fails("cstr kind")
+    }
+    // writes — mut-derived Value writes every lane
+    want_ok(nv.set_int(42), "set_int")
+    want_ok(fv.set_f64(1.25), "set_f64")
+    want_ok(bv.set_bool(0), "set_bool")
+    want_ok(yv.set_byte(66), "set_byte")
+    want_ok(sv.set_str("str2"), "set_str")
+    want_ok(x1.set_int(50), "elem set_int")
+    if s.n != 42 || s.f != 1.25 || s.b || s.y != 66 || s.s != "str2" || s.xs[1] != 50 {
+        fails("writes did not land")
+    }
+    // kind-mismatched write reports err_kind
+    want_err(nv.set_str("nope"), reflect.err_kind(), "set_str on int")
+    want_err(sv.set_int(1), reflect.err_kind(), "set_int on str")
+    // read-only Value (value_of) refuses every write lane
+    rv := value_of(s)
+    [rn, rne] = rv.field(0)
+    want_ok(rne, "ro field")
+    [rn2, rn2e] = rn.int()
+    want_ok(rn2e, "ro read")
+    if rn2 != 42 {
+        fails("ro int")
+    }
+    want_err(rn.set_int(9), reflect.err_kind(), "ro set_int")
+    [rx, rxe] = rv.field(6)
+    want_ok(rxe, "ro slice field")
+    [rx0, rx0e] = rx.index(0)
+    want_ok(rx0e, "ro index")
+    want_err(rx0.set_int(9), reflect.err_kind(), "ro elem set_int")
+    // nil own slot reports err_nil — and alloc_field mints it live
+    s2 := new(S)
+    v2 := value_of_mut(s2)
+    [np, npe] = v2.field(5)
+    want_err(npe, reflect.err_nil(), "nil own field")
+    [av, ae] = v2.alloc_field(5)
+    want_ok(ae, "alloc_field")
+    [avf, avfe] = av.field(0)
+    want_ok(avfe, "alloc'd field")
+    want_ok(avf.set_int(31), "alloc'd set")
+    if s2.p.v != 31 {
+        fails("alloc_field did not land")
+    }
+    // alloc_slice mints a live header + backing for a SLICE field
+    [sv2, sv2e] = v2.alloc_slice(6, 3)
+    want_ok(sv2e, "alloc_slice")
+    [sln, slne] = sv2.len()
+    want_ok(slne, "alloc_slice len")
+    if sln != 3 {
+        fails("alloc_slice len " + itoa(sln))
+    }
+    [se0, se0e] = sv2.index(0)
+    want_ok(se0e, "alloc_slice index")
+    want_ok(se0.set_int(17), "alloc_slice elem set")
+    if len(s2.xs) != 3 || s2.xs[0] != 17 {
+        fails("alloc_slice did not land")
+    }
+    // alloc_elem mints a nil []own T element slot
+    [sv3, sv3e] = v2.alloc_slice(7, 1)
+    want_ok(sv3e, "alloc_slice own")
+    [el0, el0e] = sv3.index(0)
+    want_err(el0e, reflect.err_nil(), "nil own elem")
+    [em0, em0e] = sv3.alloc_elem(0)
+    want_ok(em0e, "alloc_elem")
+    [emf, emfe] = em0.field(0)
+    want_ok(emfe, "alloc_elem field")
+    want_ok(emf.set_int(19), "alloc_elem set")
+    // []own T stride is sizeof(ptr) — a sub-8-byte pointee (Sm{byte})
+    // must still mint n full slots, not n*sizeof(T) bytes
+    [sv4, sv4e] = v2.alloc_slice(9, 2)
+    want_ok(sv4e, "alloc_slice small-own")
+    [el1, el1e] = sv4.index(1)
+    want_err(el1e, reflect.err_nil(), "nil small-own elem")
+    [em1, em1e] = sv4.alloc_elem(1)
+    want_ok(em1e, "alloc_elem small-own")
+    [eyf, eyfe] = em1.field(0)
+    want_ok(eyfe, "small-own field")
+    want_ok(eyf.set_byte(9), "small-own set")
+    if s2.sx[1].y != 9 {
+        fails("alloc_slice small-own did not land")
+    }
+    if s2.ox[0].v != 19 {
+        fails("alloc_elem did not land")
+    }
+    // enum: tag is the variant index, set_tag retags, vfield walks
+    // the live variant's payload only
+    e := new(E.B{x: 4, s: "hi"})
+    ev := value_of_mut(e)
+    [tg, tge] = ev.tag()
+    want_ok(tge, "tag")
+    if tg != 1 {
+        fails("tag " + itoa(tg))
+    }
+    vt := ev.typ()
+    [tv, tve] = vt.variant(tg)
+    want_ok(tve, "variant(tag)")
+    if tv.name() != "B" {
+        fails("live variant " + tv.name())
+    }
+    [pf0, pf0e] = ev.vfield(tg, 0)
+    want_ok(pf0e, "vfield 0")
+    [px, pxe] = pf0.int()
+    want_ok(pxe, "payload int")
+    if px != 4 {
+        fails("payload int " + itoa(px))
+    }
+    [pf1, pf1e] = ev.vfield(tg, 1)
+    want_ok(pf1e, "vfield 1")
+    [ps, pse] = pf1.str()
+    want_ok(pse, "payload str")
+    if ps != "hi" {
+        fails("payload str " + ps)
+    }
+    // a variant index that isn't the live tag reports err_kind
+    [wf, wfe] = ev.vfield(0, 0)
+    want_err(wfe, reflect.err_kind(), "stale-variant vfield")
+    want_err(ev.set_tag(9), reflect.err_oob(), "set_tag(9)")
+    want_ok(ev.set_tag(0), "set_tag(0)")
+    if e.kind() != 0 {
+        fails("set_tag did not land")
+    }
+    [af, afe] = ev.vfield(0, 0)
+    want_ok(afe, "retagged vfield")
+    [ai, aie] = af.int()
+    want_ok(aie, "retagged payload")
+    want_ok(af.set_int(33), "payload set")
+    av2 := e as E.A
+    if av2.f0 != 33 {
+        fails("payload write did not land")
+    }
+    // set_tag on a read-only Value reports err_kind
+    re := value_of(e)
+    want_err(re.set_tag(1), reflect.err_kind(), "ro set_tag")
+    println("reflect ok")
+}

@@ -864,10 +864,58 @@ fn ty_vbound(ck: ref Ck, t: int) -> bool {
     return t >= 0 && ck.tyv[t].k == k_struct() && is_vbound(ck, ck.tyv[t].name)
 }
 
+// provenance gates only the addr-carrying handle — Type/Field/Variant
+// are bare descriptor-index tuples with no memory address, so their
+// accessors (elem/typ/field) return them freely; Value.addr can point
+// at scope memory and is what must-analysis must keep from escaping
+fn ty_vaddr(ck: ref Ck, t: int) -> bool {
+    if t < 0 {
+        return false
+    }
+    n := ck.tyv[t].name
+    return ty_vbound(ck, t) && len(n) >= 6 && substr(n, len(n) - 6, len(n)) == ".Value"
+}
+
+// composite carrier walk — ty_vbound only sees an outer k_struct, so
+// `[]reflect.Value`, `chan own reflect.Value`, `fn(..) -> reflect.Value`
+// sigs, and `own` boxes all smuggle a scope-bound handle into a heap
+// shape. Type terms are acyclic in oxl, so a plain recursion suffices.
+fn ty_carries_vbound(ck: ref Ck, t: int) -> bool {
+    if t < 0 {
+        return false
+    }
+    if ty_vbound(ck, t) {
+        return true
+    }
+    k := ck.tyv[t].k
+    if k == k_own() || k == k_slice() || k == k_chan() {
+        return ty_carries_vbound(ck, ck.tyv[t].i)
+    }
+    if k == k_fn() {
+        al := ck.tyv[t].args
+        for al != nil {
+            if ty_carries_vbound(ck, al.v) {
+                return true
+            }
+            al = al.next
+        }
+        return ty_carries_vbound(ck, ck.tyv[t].r)
+    }
+    return false
+}
+
 // lazily register the internal reflect-shaped struct `oxl.reflect.<b>`
 // ({td} for Type, {td,addr,w} for Value) so type_of/value_of results
-// have a real ty handle; codegen emits the matching decl
+// have a real ty handle; codegen emits the matching decl. When
+// std/reflect is in the build its public decl is the canonical handle —
+// the intrinsic result IS `reflect.<b>` so the package's methods apply;
+// the `oxl.reflect.*` stand-ins keep the intrinsic type-checkable (and
+// field-opaque) in programs that don't import it.
 fn reflect_st(ck: mut Ck, b: str) -> int {
+    pub := "reflect." + b
+    if collections.map_has(ck.structs, pub) {
+        return tn(ck, k_struct(), pub)
+    }
     qn := "oxl.reflect." + b
     if collections.map_has(ck.structs, qn) {
         return tn(ck, k_struct(), qn)
@@ -3353,6 +3401,51 @@ fn recv_base_ty(s: str) -> str {
     return r
 }
 
+// a resolved `stem.X`/`stem.T.m` callee is a use of stem's import
+// binding — method dispatch never spells the alias in source, so
+// without this a package used only through methods (std/reflect's
+// Value/Type/Field/Variant, minted by the global intrinsics) would die
+// `imported and not used`
+fn mark_stem_use(ck: mut Ck, qn: str) {
+    d := find(qn, ".")
+    if d < 0 {
+        return
+    }
+    head := substr(qn, 0, d)
+    fi := file_alias_idx(ck, ck.cur_file)
+    if fi < 0 {
+        return
+    }
+    l := ck.file_aliases[fi].aliases
+    for l != nil {
+        if l.stem == head {
+            b := ck.file_aliases[fi].binds
+            for b != nil {
+                if b.qual == l.alias {
+                    b.used = 1
+                }
+                b = b.next
+            }
+        }
+        l = l.next
+    }
+    n := ck.file_aliases[fi].names
+    for n != nil {
+        // selective binds carry tgt `stem.N` — a `stem.N.m` method or a
+        // `stem.x` callee through the same stem marks the bind used
+        if len(n.stem) > len(head) && substr(n.stem, 0, len(head) + 1) == head + "." {
+            b2 := ck.file_aliases[fi].binds
+            for b2 != nil {
+                if b2.tgt == n.stem {
+                    b2.used = 1
+                }
+                b2 = b2.next
+            }
+        }
+        n = n.next
+    }
+}
+
 // qualified decl key for a fn — methods are `T.m` on the receiver's
 // resolved base name, everything else is `mod.name`
 fn fn_qname(ck: mut Ck, mod: str, recv: ref parser.Node, name: str) -> str {
@@ -3471,6 +3564,9 @@ fn call_iface(ck: mut Ck, ps: ref IList, retk: int, ret1: int, args: ref parser.
         if sp != 0 {
             if wk3 == k_slice() || wk3 == k_ref() || wk3 == k_mut() {
                 diag(ck, "check", "`spawn` arg of `[]T`/`ref`/`mut` escapes into the task — the backing dies with the scope; pass `own` or a value")
+            }
+            if ty_carries_vbound(ck, gt) {
+                diag(ck, "check", "`spawn` arg of `reflect.Value` escapes into the task — scope-bound handles may not be sent to spawn")
             }
             if at >= 0 {
                 diag(ck, "check", "`spawn` arg carries a borrow of local `" + taint_src(ck, at) + "` — it escapes into the task")
@@ -3905,8 +4001,16 @@ fn assignable(ck: mut Ck, want: int, got: int) {
     }
     if !ok && wk == k_iface() {
         // interface want: method-set satisfaction, iface coverage, a
-        // constrained Var, or nil
-        ok = iface_ok(ck, want, got)
+        // constrained Var, or nil. A reflect.Value never boxes — the
+        // iface's data ptr is a heap shape and the handle's addr dies
+        // with its scope. ok stays true so the generic diag doesn't
+        // pile onto the scope-bound one.
+        if ty_carries_vbound(ck, got) {
+            diag(ck, "check", "boxing `" + ty_name(ck, got) + "` into iface `" + ty_name(ck, want) + "` — `reflect.Value` is scope-bound and may not be stored in heap shapes")
+            ok = true
+        } else {
+            ok = iface_ok(ck, want, got)
+        }
     }
     if !ok {
         diag(ck, "type", "expected `" + ty_name(ck, want) + "`, found `" + ty_name(ck, got) + "`")
@@ -4405,13 +4509,21 @@ fn reg_variant(ck: mut Ck, en: str, ei: int, vars: ref parser.NList) {
                         if nk(al.v) == 5 {
                             match al.v {
                                 parser.Node.Param{name, ty} => {
-                                    fields = fcons(name, ty_parse(ck, ty_str(ty)), fields)
+                                    pt2 := ty_parse(ck, ty_str(ty))
+                                    if ty_carries_vbound(ck, pt2) {
+                                        diag(ck, "check", "variant field `" + name + "` stores a scope-bound `" + ty_name(ck, pt2) + "` in a heap shape — `reflect.Value` may not be stored")
+                                    }
+                                    fields = fcons(name, pt2, fields)
                                 }
                                 _ => {
                                 }
                             }
                         } else {
-                            fields = fcons("f" + itoa(fi), ty_parse(ck, ty_str(al.v)), fields)
+                            pt3 := ty_parse(ck, ty_str(al.v))
+                            if ty_carries_vbound(ck, pt3) {
+                                diag(ck, "check", "variant field `f" + itoa(fi) + "` stores a scope-bound `" + ty_name(ck, pt3) + "` in a heap shape — `reflect.Value` may not be stored")
+                            }
+                            fields = fcons("f" + itoa(fi), pt3, fields)
                         }
                         fi = fi + 1
                         al = al.next
@@ -4463,7 +4575,7 @@ fn reg_struct(ck: mut Ck, sn: str, si: int, fields: ref parser.NList) {
                 if tk2 == k_ref() || tk2 == k_mut() {
                     diag(ck, "own", "borrowed refs may not be stored in heap objects (v0)")
                 }
-                if tk2 == k_own() && ck.tyv[t].i >= 0 && ty_vbound(ck, ck.tyv[t].i) || ty_vbound(ck, t) {
+                if ty_carries_vbound(ck, t) {
                     diag(ck, "check", "field `" + name + "` stores a scope-bound `" + ty_name(ck, t) + "` in a heap shape — `reflect.Value` may not be stored")
                 }
                 fe := fcons(name, t, out)
@@ -4595,6 +4707,12 @@ fn ret_sig(ck: mut Ck, ret: ref parser.Node) -> own CRet {
         if rk2 == k_ref() || rk2 == k_mut() {
             diag(ck, "own", "borrowed refs may not be returned (v0)")
         }
+        // a bare `reflect.Value` result is provenance-gated at the
+        // return sites; a composite that only *contains* one is a heap
+        // shape laundering the handle past every gate
+        if ty_carries_vbound(ck, cr.r1) && !ty_vbound(ck, cr.r1) {
+            diag(ck, "check", "return type `" + ty_name(ck, cr.r1) + "` carries a `reflect.Value` — scope-bound handles may not be stored in heap shapes")
+        }
     }
     return cr
 }
@@ -4637,7 +4755,11 @@ fn reg_iface(ck: mut Ck, ii: int, ops: ref parser.NList, methods: ref parser.NLi
                 for pl != nil {
                     match pl.v {
                         parser.Node.Param{name, ty} => {
-                            ps = icons(ty_parse(ck, ty_str(ty)), ps)
+                            pt := ty_parse(ck, ty_str(ty))
+                            if ty_carries_vbound(ck, pt) && !ty_vbound(ck, pt) {
+                                diag(ck, "check", "parameter `" + name + "` of `" + ty_name(ck, pt) + "` carries a `reflect.Value` — scope-bound handles may not be stored in heap shapes")
+                            }
+                            ps = icons(pt, ps)
                             if len(pst) > 0 {
                                 pst = pst + ", "
                             }
@@ -4770,7 +4892,11 @@ fn reg_fn(ck: mut Ck, mod: str, ex: bool, name: str, recv: ref parser.Node, typa
     for pl != nil {
         match pl.v {
             parser.Node.Param{name, ty} => {
-                ps = icons(ty_parse(ck, ty_str(ty)), ps)
+                pt := ty_parse(ck, ty_str(ty))
+                if ty_carries_vbound(ck, pt) && !ty_vbound(ck, pt) {
+                    diag(ck, "check", "parameter `" + name + "` of `" + ty_name(ck, pt) + "` carries a `reflect.Value` — scope-bound handles may not be stored in heap shapes")
+                }
+                ps = icons(pt, ps)
             }
             _ => {
             }
@@ -4824,7 +4950,7 @@ fn reg_global(ck: mut Ck, name: str, ty: ref parser.Node, init: ref parser.Node,
         assignable(ck, want, it)
         t = want
     }
-    if ty_vbound(ck, t) {
+    if ty_carries_vbound(ck, t) {
         diag(ck, "check", "global `" + name + "` stores a `reflect.Value` — Values are scope-bound and may not live in file-scope storage")
     }
     // package-qualified key — two packages can share a global name
@@ -5779,6 +5905,43 @@ fn ty_operand(ck: mut Ck, a: ref parser.Node, who: str) -> int {
     return t_unk(ck)
 }
 
+fn kind_probe(ck: mut Ck, f: ref parser.Node, env: mut Env) -> int {
+    // `.kind()` receiver probe — 1: enum receiver (the tag accessor
+    // claims the syntax), 2: a `kind` method exists on a non-enum
+    // receiver (std/reflect's Type.kind — ordinary method dispatch),
+    // 3: a non-enum receiver with no such method (call_kind's diag),
+    // 0: not a Field call shape at all. The receiver node evaluates
+    // here and again in dispatch — method receivers already evaluate
+    // through `ot := expr(obj)` + the arg-bind walk, so the extra
+    // read is consistent with the path it feeds.
+    match f {
+        parser.Node.Field{obj, name} => {
+            ot := expr(ck, obj, env)
+            ok := ck.tyv[ot].k
+            if ok == k_unk() {
+                return 0
+            }
+            if ok == k_enum() {
+                return 1
+            }
+            if ok == k_own() {
+                inner := ck.tyv[ot].i
+                if inner >= 0 && ck.tyv[inner].k == k_enum() {
+                    return 1
+                }
+            }
+            mt := method_target(ck, ot, name)
+            if mt.k != 0 {
+                return 2
+            }
+            return 3
+        }
+        _ => {
+        }
+    }
+    return 0
+}
+
 fn call_kind(ck: mut Ck, f: ref parser.Node, args: ref parser.NList, env: mut Env) -> int {
     // `e.kind()` — enum tag accessor
     match f {
@@ -5852,10 +6015,19 @@ fn call(ck: mut Ck, f: ref parser.Node, args: ref parser.NList, env: mut Env) ->
             }
             return tn(ck, k_enum(), en)
         }
-        // `e.kind()` — enum tag accessor
+        // `e.kind()` — enum tag accessor; a non-enum receiver that
+        // declares a `kind` method (std/reflect's Type.kind) falls
+        // through to ordinary method dispatch — the accessor claims
+        // the syntax only when no such method exists
         if len(name) > 5 && substr(name, len(name) - 5, len(name)) == ".kind" {
             if args == nil {
-                return call_kind(ck, f, args, env)
+                kp := kind_probe(ck, f, env)
+                if kp == 1 {
+                    return t_int(ck)
+                }
+                if kp != 2 {
+                    return call_kind(ck, f, args, env)
+                }
             }
         }
         // local fn value shadows a same-named fn or builtin
@@ -5897,6 +6069,7 @@ fn call(ck: mut Ck, f: ref parser.Node, args: ref parser.NList, env: mut Env) ->
                         if mt.k == 2 {
                             ms := member_span(f)
                             rec_use(ck, ms.lo, ms.hi, mt.q)
+                            mark_stem_use(ck, mt.q)
                             if ck.in_spawn == 0 {
                                 // a susp-declared iface method suspends
                                 // its caller — mt.q names `Iface.m`, the
@@ -5921,6 +6094,7 @@ fn call(ck: mut Ck, f: ref parser.Node, args: ref parser.NList, env: mut Env) ->
                         if mt.k == 1 {
                             recv = obj
                             qn = mt.q
+                            mark_stem_use(ck, mt.q)
                         }
                         if mt.k == 0 {
                             diag(ck, "type", "no method `" + name + "` on `" + ty_name(ck, ot) + "`")
@@ -5941,6 +6115,7 @@ fn call(ck: mut Ck, f: ref parser.Node, args: ref parser.NList, env: mut Env) ->
                 if mt.k == 1 {
                     qn = mt.q
                     srecv = args.v
+                    mark_stem_use(ck, mt.q)
                 }
             }
         }
@@ -6003,6 +6178,9 @@ fn call(ck: mut Ck, f: ref parser.Node, args: ref parser.NList, env: mut Env) ->
                 diag(ck, "check", "`" + qn + "` takes too many args")
             }
             if payload >= 0 {
+                if ty_carries_vbound(ck, payload) {
+                    diag(ck, "check", "`" + qn + "` of `reflect.Value` — scope-bound handles may not be stored in heap shapes")
+                }
                 return ti(ck, k_chan(), payload)
             }
             return tk(ck, k_chan())
@@ -6017,6 +6195,13 @@ fn call(ck: mut Ck, f: ref parser.Node, args: ref parser.NList, env: mut Env) ->
                 }
                 vt := expr(ck, args.next.v, env)
                 vat := ck.et
+                vvp := ck.vp
+                if ct >= 0 && ck.tyv[ct].k == k_chan() && ty_carries_vbound(ck, ct) {
+                    diag(ck, "check", "`" + qn + "` on a channel carrying `reflect.Value` — scope-bound handles may not be stored in heap shapes")
+                }
+                if ty_vaddr(ck, vt) && vvp != 1 {
+                    diag(ck, "check", "`" + qn + "` of `reflect.Value` — only a Value derived from a `ref`/`mut`/`Value` parameter may escape")
+                }
                 if ct >= 0 && ck.tyv[ct].k == k_chan() && ck.tyv[ct].i >= 0 {
                     assignable(ck, ck.tyv[ct].i, vt)
                 } else if !is_word(ck, vt) {
@@ -6111,7 +6296,7 @@ fn call(ck: mut Ck, f: ref parser.Node, args: ref parser.NList, env: mut Env) ->
                 t := expr(ck, a, env)
                 nt := ck.et
                 rt := ti(ck, k_own(), t)
-                if ty_vbound(ck, t) {
+                if ty_carries_vbound(ck, t) {
                     diag(ck, "check", "`new` on `reflect.Value` — scope-bound handles may not be stored in heap shapes")
                 }
                 if nt >= 0 && taint_may(ck, rt) == 1 {
@@ -6191,7 +6376,7 @@ fn call(ck: mut Ck, f: ref parser.Node, args: ref parser.NList, env: mut Env) ->
             } else {
                 diag(ck, "check", "`mkslice` takes (T, n)")
             }
-            if ty_vbound(ck, et) {
+            if ty_carries_vbound(ck, et) {
                 diag(ck, "check", "`mkslice` of `reflect.Value` — scope-bound handles may not be stored in heap shapes")
             }
             return ti(ck, k_slice(), et)
@@ -6235,6 +6420,23 @@ fn call(ck: mut Ck, f: ref parser.Node, args: ref parser.NList, env: mut Env) ->
             }
             if !ok && ak != k_unk() {
                 diag(ck, "type", "`" + qn + "` takes a `ref`/`mut` reference — got `" + ty_name(ck, at) + "`")
+            }
+            // codegen's handle peel loads at most two qualifier levels —
+            // a third own/ref/mut wrap would deref past the emitted loads
+            if ok {
+                d2 := ck.tyv[at].i
+                if d2 >= 0 {
+                    dk2 := ck.tyv[d2].k
+                    if dk2 == k_own() || dk2 == k_ref() || dk2 == k_mut() {
+                        d3 := ck.tyv[d2].i
+                        if d3 >= 0 {
+                            dk3 := ck.tyv[d3].k
+                            if dk3 == k_own() || dk3 == k_ref() || dk3 == k_mut() {
+                                diag(ck, "check", "`" + qn + "` argument nests 3+ reference levels — the handle peel supports at most two")
+                            }
+                        }
+                    }
+                }
             }
             // provenance: the Value may escape via return only when the
             // referenced storage derives from a ref/mut/Value param.
@@ -6316,6 +6518,9 @@ fn call(ck: mut Ck, f: ref parser.Node, args: ref parser.NList, env: mut Env) ->
                 if args.next != nil && args.next.next == nil {
                     vt := expr(ck, args.next.v, env)
                     vat := ck.et
+                    if ty_carries_vbound(ck, vt) {
+                        diag(ck, "check", "`push` of `reflect.Value` — scope-bound handles may not be stored in heap shapes")
+                    }
                     assignable(ck, ck.tyv[st].i, vt)
                     // the result slice carries the pushed value's borrow;
                     // spare-capacity pushes also write it into the input
@@ -6608,7 +6813,7 @@ fn call(ck: mut Ck, f: ref parser.Node, args: ref parser.NList, env: mut Env) ->
                 if wk2 == k_slice() || wk2 == k_ref() || wk2 == k_mut() {
                     diag(ck, "check", "`spawn` arg of `[]T`/`ref`/`mut` escapes into the task — the backing dies with the scope; pass `own` or a value")
                 }
-                if ty_vbound(ck, got) {
+                if ty_carries_vbound(ck, got) {
                     diag(ck, "check", "`spawn` arg of `reflect.Value` escapes into the task — scope-bound handles may not be sent to spawn")
                 }
                 if rt0 >= 0 {
@@ -6646,7 +6851,7 @@ fn call(ck: mut Ck, f: ref parser.Node, args: ref parser.NList, env: mut Env) ->
                 if wk3 == k_slice() || wk3 == k_ref() || wk3 == k_mut() {
                     diag(ck, "check", "`spawn` arg of `[]T`/`ref`/`mut` escapes into the task — the backing dies with the scope; pass `own` or a value")
                 }
-                if ty_vbound(ck, gt) {
+                if ty_carries_vbound(ck, gt) {
                     diag(ck, "check", "`spawn` arg of `reflect.Value` escapes into the task — scope-bound handles may not be sent to spawn")
                 }
                 if at >= 0 {
@@ -6759,6 +6964,9 @@ fn call_fnvalue(ck: mut Ck, ps: ref IList, r: int, args: ref parser.NList, env: 
         if sp != 0 {
             if wk4 == k_slice() || wk4 == k_ref() || wk4 == k_mut() {
                 diag(ck, "check", "`spawn` arg of `[]T`/`ref`/`mut` escapes into the task — the backing dies with the scope; pass `own` or a value")
+            }
+            if ty_carries_vbound(ck, gt) {
+                diag(ck, "check", "`spawn` arg of `reflect.Value` escapes into the task — scope-bound handles may not be sent to spawn")
             }
             if at >= 0 {
                 diag(ck, "check", "`spawn` arg carries a borrow of local `" + taint_src(ck, at) + "` — it escapes into the task")
@@ -6952,7 +7160,7 @@ fn stmt(ck: mut Ck, s: ref parser.Node, env: mut Env) {
                 }
             } else {
                 clear_moved(env, idn)
-                if scope_of(env, idn) < 0 && ty_vbound(ck, vt) {
+                if scope_of(env, idn) < 0 && ty_carries_vbound(ck, vt) {
                     diag(ck, "check", "assignment to `" + idn + "` stores a `reflect.Value` in a file-scope global — Values may not be stored")
                 }
                 if scope_of(env, idn) < 0 && ck.cur_fn != "" && vtaint >= 0 {
@@ -6990,6 +7198,12 @@ fn stmt(ck: mut Ck, s: ref parser.Node, env: mut Env) {
                     t0 := t_void(ck)
                     if n0 == 1 {
                         t0 = expr(ck, vals.v, env)
+                        if ty_vaddr(ck, t0) && ck.vp != 1 {
+                            diag(ck, "check", "`return` of `reflect.Value` — only a Value derived from a `ref`/`mut`/`Value` parameter may escape")
+                        }
+                        if ty_carries_vbound(ck, t0) && !ty_vbound(ck, t0) {
+                            diag(ck, "check", "`return` of `" + ty_name(ck, t0) + "` carries a `reflect.Value` — scope-bound handles may not be stored in heap shapes")
+                        }
                         if ck.et >= 0 {
                             diag(ck, "check", "`return` escapes a borrow of local `" + taint_src(ck, ck.et) + "` — the boxed value dangles when the closure's scope ends")
                         }
@@ -7012,8 +7226,11 @@ fn stmt(ck: mut Ck, s: ref parser.Node, env: mut Env) {
                     diag(ck, "check", "expected one return value")
                 } else {
                     t := expr(ck, vals.v, env)
-                    if ty_vbound(ck, t) && ck.vp != 1 {
+                    if ty_vaddr(ck, t) && ck.vp != 1 {
                         diag(ck, "check", "`return` of `reflect.Value` — only a Value derived from a `ref`/`mut`/`Value` parameter may escape")
+                    }
+                    if ty_carries_vbound(ck, t) && !ty_vbound(ck, t) {
+                        diag(ck, "check", "`return` of `" + ty_name(ck, t) + "` carries a `reflect.Value` — scope-bound handles may not be stored in heap shapes")
                     }
                     if ck.et >= 0 {
                         diag(ck, "check", "`return` escapes a borrow of local `" + taint_src(ck, ck.et) + "` — the boxed value dangles when this scope ends; heap-allocate the receiver or use an `into_*` owned variant")
@@ -7022,8 +7239,11 @@ fn stmt(ck: mut Ck, s: ref parser.Node, env: mut Env) {
                 }
             } else if n == 2 {
                 t := expr(ck, vals.v, env)
-                if ty_vbound(ck, t) && ck.vp != 1 {
+                if ty_vaddr(ck, t) && ck.vp != 1 {
                     diag(ck, "check", "`return` of `reflect.Value` — only a Value derived from a `ref`/`mut`/`Value` parameter may escape")
+                }
+                if ty_carries_vbound(ck, t) && !ty_vbound(ck, t) {
+                    diag(ck, "check", "`return` of `" + ty_name(ck, t) + "` carries a `reflect.Value` — scope-bound handles may not be stored in heap shapes")
                 }
                 if ck.et >= 0 {
                     diag(ck, "check", "`return` escapes a borrow of local `" + taint_src(ck, ck.et) + "` — the boxed value dangles when this scope ends; heap-allocate the receiver or use an `into_*` owned variant")
@@ -7043,8 +7263,11 @@ fn stmt(ck: mut Ck, s: ref parser.Node, env: mut Env) {
                     // results carry arg-translated provenance — a
                     // `return f(local)` forwarding a local-derived Value
                     // is the same escape as returning the local itself
-                    if ty_vbound(ck, rt1x) && vpf != 1 {
+                    if ty_vaddr(ck, rt1x) && vpf != 1 {
                         diag(ck, "check", "`return` of `reflect.Value` — only a Value derived from a `ref`/`mut`/`Value` parameter may escape")
+                    }
+                    if ty_carries_vbound(ck, rt1x) && !ty_vbound(ck, rt1x) {
+                        diag(ck, "check", "`return` of `" + ty_name(ck, rt1x) + "` carries a `reflect.Value` — scope-bound handles may not be stored in heap shapes")
                     }
                 }
                 if bs >= 0 {
@@ -7524,7 +7747,11 @@ fn closure_expr(ck: mut Ck, params: ref parser.NList, body: ref parser.Node, env
     for pl != nil {
         match pl.v {
             parser.Node.Param{name, ty} => {
-                ps = icons(ty_parse(ck, ty_str(ty)), ps)
+                pt := ty_parse(ck, ty_str(ty))
+                if ty_carries_vbound(ck, pt) && !ty_vbound(ck, pt) {
+                    diag(ck, "check", "parameter `" + name + "` of `" + ty_name(ck, pt) + "` carries a `reflect.Value` — scope-bound handles may not be stored in heap shapes")
+                }
+                ps = icons(pt, ps)
                 pnames = scons(name, pnames)
             }
             _ => {
@@ -7578,7 +7805,7 @@ fn closure_expr(ck: mut Ck, params: ref parser.NList, body: ref parser.Node, env
                 if cvk == k_ref() || cvk == k_mut() {
                     diag(ck, "check", "closure captures `" + cn + "` (`" + ty_name(ck, cvt) + "`) — borrowed refs may not be stored in heap objects (v0)")
                 }
-                if ty_vbound(ck, cvt) {
+                if ty_carries_vbound(ck, cvt) {
                     diag(ck, "check", "closure captures `" + cn + "` (`" + ty_name(ck, cvt) + "`) — scope-bound reflect handles may not outlive their source scope")
                 }
                 cit := env_taint(env, cm)
@@ -7608,6 +7835,10 @@ fn closure_expr(ck: mut Ck, params: ref parser.NList, body: ref parser.Node, env
             parser.Node.Param{name, ty, lo, hi} => {
                 env_set(env, name, wl.v, lo, lo + len(name))
                 rec_local(ck, lo, lo + len(name), name, wl.v, env)
+                pk := ck.tyv[wl.v].k
+                if pk == k_ref() || pk == k_mut() || ty_vbound(ck, wl.v) {
+                    env_vprov_set(env, name, 1)
+                }
             }
             _ => {
             }

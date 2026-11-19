@@ -1914,6 +1914,118 @@ else
     echo "  (skipped: clang not installed)"
 fi
 
+echo "== llvm lane (l3) =="
+# L3 driver gate: the L1+L2 whitelist through the product driver's own
+# `--target llvm` — compile_res picks emit_llvm, emit_and_llvm drives
+# clang on out.ll+rt.c in one shot, run execs the produced native
+# binary directly (no launcher — unlike the js lane's node). The
+# _test corpus goes through `test --target llvm`, the trap files
+# through `build --target llvm` + exec, and the flag surface probes
+# --emit-llvm (out.ll kept beside -o, triple-neutral), the
+# --triple/--emit-llvm/--html wrong-lane rejections, a host --triple
+# passthrough, and pick_clang's named floor error under a stale
+# LANG_CLANG. Gated on clang like the node gate — a runner without it
+# skips with the reason spelled out.
+if command -v clang >/dev/null 2>&1; then
+    for f in conc_ping conc_scale select select_fair chan_own chanbuf chanbuf_close scope_exit orphan_join defer_order pairfwd susp_closure zero_str match methods fnval d5_qual stdmods_test susp_ownarg iface_susp iface_susp_shim iface_susp_pair iface_susp_nested iface_susp_rewrap iface_susp_prop iface_susp_convdest iface_susp_cancel vtab_fn closure_mcall closure_fnfield closure_shadow; do
+        case "$f" in
+            conc_ping)      marker='bounces=' ;;
+            conc_scale)     marker='done' ;;
+            select)         marker='select done' ;;
+            select_fair)    marker='select fair ok' ;;
+            chan_own)       marker='chan_own done' ;;
+            chanbuf)        marker='chanbuf done' ;;
+            chanbuf_close)  marker='chanbuf close ok' ;;
+            scope_exit)     marker='scope-exit ok' ;;
+            orphan_join)    marker='orphan-join ok' ;;
+            defer_order)    marker='defer order ok' ;;
+            pairfwd)        marker='pairfwd ok' ;;
+            match)          marker='match ok' ;;
+            methods)        marker='methods ok' ;;
+            fnval)          marker='fnval ok' ;;
+            d5_qual)        marker='d5 qual ok' ;;
+            stdmods_test)   marker='done' ;;
+            susp_closure)   marker='susp closure ok' ;;
+            closure_mcall)  marker='closure mcall ok' ;;
+            closure_fnfield) marker='closure fnfield ok' ;;
+            closure_shadow) marker='closure shadow ok' ;;
+            zero_str)       marker='zero str ok' ;;
+            susp_ownarg)    marker='susp ownarg ok' ;;
+            iface_susp)         marker='iface susp ok' ;;
+            iface_susp_shim)    marker='iface susp shim ok' ;;
+            iface_susp_pair)    marker='iface susp pair ok' ;;
+            iface_susp_nested)  marker='iface susp nested ok' ;;
+            iface_susp_rewrap)  marker='iface susp rewrap ok' ;;
+            iface_susp_prop)    marker='iface susp prop ok' ;;
+            iface_susp_convdest) marker='iface susp convdest ok' ;;
+            iface_susp_cancel)  marker='iface susp cancel ok' ;;
+            vtab_fn)            marker='vtab fn ok' ;;
+        esac
+        out=$(with_timeout 180 "$OXL" run --target llvm "tests/$f.oxl" 2>&1) || { echo "FAIL llvm l3 $f: $out"; exit 1; }
+        grep -q "$marker" <<<"$out" || { echo "FAIL llvm l3 $f marker '$marker': $out"; exit 1; }
+        echo "  llvm l3 run: $f ok"
+    done
+    # the _test corpus through `test --target llvm` — the testm=1
+    # wrappers (dynamic RtScope allocas) through the same driver path
+    for f in stdlib_test float_test regexp_test util_test enc_test; do
+        out=$(with_timeout 180 "$OXL" test --target llvm "tests/$f.oxl" 2>&1) || { echo "FAIL llvm l3 test $f: $out"; exit 1; }
+        grep -q ' \.\.\. ok' <<<"$out" || { echo "FAIL llvm l3 test $f: $out"; exit 1; }
+        echo "  llvm l3 test: $f ok"
+    done
+    # trap files through build + exec — the produced native binary
+    # must carry the abort shape itself
+    for f in select_cancel cancel_join; do
+        "$OXL" build --target llvm "tests/$f.oxl" -o "$scratch/$f-l3$EXE" || { echo "FAIL llvm l3 $f: build"; exit 1; }
+        rc=0
+        out=$(with_timeout 30 "$scratch/$f-l3$EXE" 2>&1) || rc=$?
+        [ "$rc" -ne 0 ] || { echo "FAIL llvm l3 $f: expected trap exit"; exit 1; }
+        grep -q 'escaped top scope' <<<"$out" || { echo "FAIL llvm l3 $f: trap line: $out"; exit 1; }
+        echo "  llvm l3: $f ok"
+    done
+    # --emit-llvm keeps out.ll beside the -o output — and the kept IR
+    # must stay triple-neutral (no `target triple`/`datalayout` lines:
+    # clang supplies both from -target, an emitted triple would
+    # override the --triple passthrough)
+    "$OXL" build --target llvm tests/select.oxl -o "$scratch/el$EXE" || { echo "FAIL llvm l3 build"; exit 1; }
+    [ ! -f "$scratch/out.ll" ] || { echo "FAIL llvm l3: out.ll kept without --emit-llvm"; exit 1; }
+    "$OXL" build --target llvm --emit-llvm tests/select.oxl -o "$scratch/el$EXE" || { echo "FAIL llvm l3 --emit-llvm build"; exit 1; }
+    [ -f "$scratch/out.ll" ] || { echo "FAIL llvm l3: --emit-llvm kept no out.ll"; exit 1; }
+    grep -qE '^target (triple|datalayout)' "$scratch/out.ll" && { echo "FAIL llvm l3: out.ll not triple-neutral"; exit 1; }
+    # --triple passthrough: the lane's own reach claim is the local
+    # clang's configured reach — smoke the flag with the host triple
+    # (cross sysroots are the runner's clang's problem)
+    host_triple=$(clang -print-target-triple 2>/dev/null || true)
+    if [ -n "$host_triple" ]; then
+        "$OXL" build --target llvm --triple "$host_triple" tests/select.oxl -o "$scratch/tr$EXE" || { echo "FAIL llvm l3 --triple host: build"; exit 1; }
+        out=$(with_timeout 30 "$scratch/tr$EXE") || { echo "FAIL llvm l3 --triple host: run"; exit 1; }
+        grep -q 'select done' <<<"$out" || { echo "FAIL llvm l3 --triple host: $out"; exit 1; }
+    fi
+    # wrong-lane flag rejections — errors, not warnings
+    out=$("$OXL" build tests/select.oxl --triple x -o "$scratch/x" 2>&1) && { echo "FAIL llvm l3: --triple accepted on native"; exit 1; }
+    grep -q -- '--triple needs' <<<"$out" || { echo "FAIL llvm l3 --triple msg: $out"; exit 1; }
+    out=$("$OXL" build tests/select.oxl --target js --triple x -o "$scratch/x" 2>&1) && { echo "FAIL llvm l3: --triple accepted on js"; exit 1; }
+    out=$("$OXL" build tests/select.oxl --target llvm --html -o "$scratch/x" 2>&1) && { echo "FAIL llvm l3: --html accepted on llvm"; exit 1; }
+    out=$("$OXL" build tests/select.oxl --target bogus -o "$scratch/x" 2>&1) && { echo "FAIL llvm l3: bogus --target accepted"; exit 1; }
+    grep -q 'native, js, or llvm' <<<"$out" || { echo "FAIL llvm l3 --target msg: $out"; exit 1; }
+    echo "  llvm l3: flag surface ok"
+    # pick_clang's named floor error — a stale LANG_CLANG fails fast
+    # rather than dying on an IR parse error. POSIX-only: the probe is
+    # a shell script, which CreateProcess can't exec on Windows (the
+    # version-parse logic itself is platform-neutral)
+    case "$(uname -s)" in
+        MINGW*|MSYS*|CYGWIN*) ;;
+        *)
+            printf '#!/bin/sh\necho "clang version 14.0.0 (stale)"\n' > "$scratch/clang14"
+            chmod +x "$scratch/clang14"
+            out=$(LANG_CLANG="$scratch/clang14" "$OXL" build tests/select.oxl --target llvm -o "$scratch/x" 2>&1) && { echo "FAIL llvm l3: stale clang accepted"; exit 1; }
+            grep -q 'clang >= 15' <<<"$out" || { echo "FAIL llvm l3 floor msg: $out"; exit 1; }
+            echo "  llvm l3: toolchain floor ok"
+            ;;
+    esac
+else
+    echo "  (skipped: clang not installed — the lane's only consumer)"
+fi
+
 echo "== toolchain driver in .oxl (t2) =="
 # cmd/oxl is the product driver ported to .oxl — argv dispatch, the
 # pkg-args/file-list rule, compile orchestration over bootstrap/check +

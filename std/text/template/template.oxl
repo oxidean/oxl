@@ -19,6 +19,8 @@ package template
 // field names are the declared names (struct tags are not consulted);
 // the if/range operand is a field path only, not a literal; and
 // {{else}} exists only on {{if}} (Go's range-else is unimplemented).
+// {{if}}/{{range}} nesting is capped at MAX_TDEPTH — deeper input
+// reports err_syntax instead of overflowing the C stack.
 import "std/errors"
 
 import "std/reflect"
@@ -70,10 +72,16 @@ fn tnode(kind: int, text: str, path: str) -> own Tpl {
 
 // ---------- parser ----------
 
-// TCur is the parse cursor — src, pos, a sticky err flag, and stop,
+// TCur is the parse cursor — src, pos, a sticky err flag, stop,
 // which names the token that ended the innermost list ("end", "else",
-// or "eof").
-struct TCur { src: str, pos: int, err: int, stop: str }
+// or "eof"), and depth, the count of enclosing {{if}}/{{range}}
+// bodies (bounded by MAX_TDEPTH so deep nesting cannot overflow the
+// recursive-descent call stack — same convention as MAX_XDEPTH in
+// std/encoding/xml and MAX_JDEPTH in std/encoding/json).
+struct TCur { src: str, pos: int, err: int, stop: str, depth: int }
+
+/// MAX_TDEPTH bounds {{if}}/{{range}} nesting against the call stack.
+let MAX_TDEPTH = 256
 
 // taction reads one action word: a field path ("." or ".A.B"), or a
 // keyword followed by its path operand ("if .F" / "range .F"). kind 1
@@ -148,18 +156,26 @@ fn tlist(p: mut TCur) -> own Tpl {
             return l.head
         }
         if n.kind == 2 || n.kind == 3 {
+            if p.depth >= MAX_TDEPTH {
+                p.err = 1
+                return l.head
+            }
+            p.depth = p.depth + 1
             p.stop = ""
             n.body = tlist(p)
             if p.err != 0 {
+                p.depth = p.depth - 1
                 return l.head
             }
             if n.kind == 3 && p.stop == "else" {
                 p.stop = ""
                 n.alt = tlist(p)
                 if p.err != 0 {
+                    p.depth = p.depth - 1
                     return l.head
                 }
             }
+            p.depth = p.depth - 1
             if p.stop != "end" {
                 p.err = 1
                 return l.head
@@ -172,13 +188,15 @@ fn tlist(p: mut TCur) -> own Tpl {
 }
 
 /// parse builds the node tree for src. {{end}}/{{else}} at top level,
-/// an unclosed {{, or an unrecognized action report err_syntax.
+/// an unclosed {{, an unrecognized action, or {{if}}/{{range}}
+/// nesting past MAX_TDEPTH report err_syntax.
 fn parse(src: str) -> [own Tpl, err] {
     p := new(TCur)
     p.src = src
     p.pos = 0
     p.err = 0
     p.stop = ""
+    p.depth = 0
     t := tlist(p)
     if p.err != 0 || p.stop != "eof" {
         return nil, err_syntax()

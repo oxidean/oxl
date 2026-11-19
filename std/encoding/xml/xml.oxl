@@ -23,7 +23,15 @@ package xml
 // imposes no field order, []byte unmarshal reads the first matching
 // element only, an own-typed enum payload slot that is nil cannot be
 // minted (there is no alloc_vfield lane) and reports err, cstr fields
-// and slice-typed enum payload slots are marshal-only.
+// and slice-typed enum payload slots are marshal-only. Unknown tag
+// options (`,omitempty` and friends) parse and are ignored. Further
+// divergences from Go: repeated scalar elements take the FIRST match
+// (Go assigns the last), a `,chardata` field emits ahead of every
+// child element regardless of declaration order, and marshal on a
+// top-level slice writes sibling root elements a single unmarshal
+// call cannot read back. A malformed document abandons its partial
+// tree — the buffer leaks, same convention as std/encoding/json
+// (`own T` cannot cross rt_free's `own void` FFI boundary in v0).
 import "std/errors"
 
 import "std/reflect"
@@ -194,10 +202,15 @@ fn xescq(s: str) -> str {
 }
 
 // xnameok reports whether s is already a legal XML name — the same
-// keep-set xname emits. Routed tag names must pass; anything else is
-// a malformed tag, not a name to sanitize silently.
+// keep-set xname emits, plus the first-char gate (a letter or _;
+// digits, ., -, and : are interior-only). Routed tag names must
+// pass; anything else is a malformed tag, not a name to sanitize
+// silently.
 fn xnameok(s: str) -> bool {
-    i := 0
+    if len(s) == 0 || !xnamest(byteat(s, 0)) {
+        return false
+    }
+    i := 1
     for i < len(s) {
         c := byteat(s, i)
         ok := c >= 97 && c <= 122 || c >= 65 && c <= 90 || c >= 48 && c <= 57
@@ -206,7 +219,7 @@ fn xnameok(s: str) -> bool {
         }
         i = i + 1
     }
-    return len(s) > 0
+    return true
 }
 
 // xname sanitizes a descriptor name into an XML element name — keeps
@@ -547,6 +560,14 @@ fn xnamech(c: int) -> bool {
     return c >= 65 && c <= 90 || c >= 97 && c <= 122 || c >= 48 && c <= 57 || c == 46 || c == 95 || c == 45 || c == 58
 }
 
+// xnamest reports whether c may START an element/attribute name —
+// the NameStartChar subset xname keeps (an ASCII letter or _). A
+// digit-, -, or .-led tag is malformed on the read side exactly as a
+// routed `xml:9x` name is on the write side.
+fn xnamest(c: int) -> bool {
+    return c >= 65 && c <= 90 || c >= 97 && c <= 122 || c == 95
+}
+
 fn xws(p: mut XCur) {
     for p.pos < len(p.src) {
         c := byteat(p.src, p.pos)
@@ -755,6 +776,11 @@ fn xqtext(p: mut XCur) -> str {
 // comments, and <!…> declarations (DOCTYPE included — an internal
 // subset in brackets is not parsed and ends the declaration early).
 fn xskip_misc(p: mut XCur) {
+    // a UTF-8 BOM (EF BB BF) sits at byte 0 of many documents —
+    // consume it before the misc loop
+    if p.pos == 0 && len(p.src) >= 3 && byteat(p.src, 0) == 239 && byteat(p.src, 1) == 187 && byteat(p.src, 2) == 191 {
+        p.pos = 3
+    }
     for p.pos < len(p.src) {
         xws(p)
         if xeat(p, "<?") {
@@ -797,8 +823,15 @@ fn xelem(p: mut XCur) -> own XNode {
         return n
     }
     p.depth = p.depth + 1
-    // entry sits on '<' followed by a name char
+    // entry sits on '<' followed by a NameStartChar — a digit-, -,
+    // or .-led tag is malformed on the read side exactly as a routed
+    // `xml:9x` name is on the write side
     p.pos = p.pos + 1
+    if p.pos >= len(p.src) || !xnamest(byteat(p.src, p.pos)) {
+        p.err = 1
+        p.depth = p.depth - 1
+        return n
+    }
     start := p.pos
     for p.pos < len(p.src) && xnamech(byteat(p.src, p.pos)) {
         p.pos = p.pos + 1
@@ -820,6 +853,11 @@ fn xelem(p: mut XCur) -> own XNode {
         c := byteat(p.src, p.pos)
         if c == 47 || c == 62 {
             break
+        }
+        if !xnamest(byteat(p.src, p.pos)) {
+            p.err = 1
+            p.depth = p.depth - 1
+            return n
         }
         astart := p.pos
         for p.pos < len(p.src) && xnamech(byteat(p.src, p.pos)) {
@@ -1064,10 +1102,30 @@ fn xfill_enum(n: ref XNode, v: reflect.Value, t: reflect.Type) -> err {
                 return xve
             }
             nf := xv.nfields()
-            if nf > 0 && m.child == nil {
-                // a payload variant spelled with no child elements
-                // would silently mint all-zero payload slots
-                return errors.new("xml: variant <" + m.name + "> needs payload elements")
+            if nf > 0 {
+                // a payload variant spelled without ≥1 child matching
+                // a payload slot name would silently mint all-zero
+                // slots — the fill loop below routes by the same
+                // name comparison
+                matched := 0
+                probe := m.child
+                for probe != nil && matched == 0 {
+                    pj := 0
+                    for pj < nf {
+                        [pfn, pfe] = xv.fname(pj)
+                        if pfe != nil {
+                            return pfe
+                        }
+                        if probe.name == pfn {
+                            matched = 1
+                        }
+                        pj = pj + 1
+                    }
+                    probe = probe.next
+                }
+                if matched == 0 {
+                    return errors.new("xml: variant <" + m.name + "> needs payload elements")
+                }
             }
             e := v.set_tag(vi)
             if e != nil {

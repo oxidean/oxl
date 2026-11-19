@@ -117,5 +117,35 @@ fn main() {
     if e15 != nil || find(s15, "err ") != 0 {
         fails("err render: " + s15)
     }
+    // {{if}} nesting caps at MAX_TDEPTH (256) — at-cap renders, one
+    // past reports err_syntax instead of overflowing the parse's
+    // recursive-descent stack
+    o.rush = true
+    deep := ""
+    i := 0
+    for i < 256 {
+        deep = deep + "{{if .rush}}"
+        i = i + 1
+    }
+    deep = deep + "x"
+    i = 0
+    for i < 256 {
+        deep = deep + "{{end}}"
+        i = i + 1
+    }
+    [sd, ed] = template.render(deep, o)
+    if ed != nil || sd != "x" {
+        fails("at-cap depth: " + sd)
+    }
+    deep2 := ""
+    i = 0
+    for i < 257 {
+        deep2 = deep2 + "{{if .rush}}"
+        i = i + 1
+    }
+    [_, edp] = template.parse(deep2)
+    if edp == nil {
+        fails("expected depth-cap err")
+    }
     println("text_template ok")
 }

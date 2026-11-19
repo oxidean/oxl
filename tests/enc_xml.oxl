@@ -41,6 +41,12 @@ struct Bad { v: int tag "xml:\"a>b\"" }
 // two ,chardata fields are a type-analysis error
 struct Dbl { a: str tag "xml:\",chardata\"", b: str tag "xml:\",chardata\"" }
 
+// routed names must start with a letter or _ — digit- and dash-led
+// names are malformed on both lanes
+struct BadNum { v: int tag "xml:9x" }
+
+struct BadDash { v: int tag "xml:-x" }
+
 fn fails(msg: str) {
     println("FAIL " + msg)
     exit(1)
@@ -217,6 +223,57 @@ fn main() {
     d8 := new(Doc)
     if xml.unmarshal("<Doc><name><![CDATA[a<b&c]]></name></Doc>", d8) != nil || d8.name != "a<b&c" {
         fails("cdata lane: " + d8.name)
+    }
+    // digit- and dash-led routed names error on both lanes — a
+    // NameStartChar gate on the tag keeps `<9x>` off the wire
+    [_, bn1] = xml.marshal(BadNum{v: 1})
+    if bn1 == nil {
+        fails("expected digit-name marshal err")
+    }
+    [_, bn2] = xml.marshal(BadDash{v: 1})
+    if bn2 == nil {
+        fails("expected dash-name marshal err")
+    }
+    bn := new(BadNum)
+    if xml.unmarshal("<BadNum><v>1</v></BadNum>", bn) == nil {
+        fails("expected digit-name unmarshal err")
+    }
+    bd2 := new(BadDash)
+    if xml.unmarshal("<BadDash><v>1</v></BadDash>", bd2) == nil {
+        fails("expected dash-name unmarshal err")
+    }
+    // the parser applies the same gate — a digit-led element is
+    // malformed XML at the root and nested
+    if xml.unmarshal("<9x></9x>", d4) == nil {
+        fails("expected digit-element parse err")
+    }
+    d9 := new(Doc)
+    if xml.unmarshal("<Doc><listed><9x/></listed></Doc>", d9) == nil {
+        fails("expected nested digit-element parse err")
+    }
+    // a UTF-8 BOM prefixes many documents — built byte-wise (there is
+    // no \x escape lane) and consumed before the misc scan
+    bom := mkbuf(3)
+    poke8(bom, 0, 239)
+    poke8(bom, 1, 187)
+    poke8(bom, 2, 191)
+    d10 := new(Doc)
+    if xml.unmarshal(bufstr(bom, 3) + "<Doc><name>bom</name></Doc>", d10) != nil || d10.name != "bom" {
+        fails("bom document")
+    }
+    // a payload variant whose children all miss the payload slot
+    // names still errs — zeroed slots must not mint silently
+    if xml.unmarshal("<Doc><sh><Circ><other/></Circ></sh></Doc>", d5) == nil {
+        fails("expected payload-variant unmatched-child err")
+    }
+    // scalar text trims — padded numerals parse; an xml:"-" field
+    // ignores a matching element on the unmarshal lane too
+    d11 := new(Doc)
+    if xml.unmarshal("<Doc><inner><v> 5 </v></inner><skip>9</skip></Doc>", d11) != nil {
+        fails("padded numeral")
+    }
+    if d11.inner.v != 5 || d11.skip != 0 {
+        fails("padded numeral / skip lane")
     }
     println("enc_xml ok")
 }

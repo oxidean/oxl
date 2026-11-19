@@ -2117,6 +2117,81 @@ else
     echo "  (skipped: clang not installed — the lane's only consumer)"
 fi
 
+echo "== llvm lane (l4) =="
+# L4 gate: the lane's own fixpoint + cross-lane output parity, plus
+# the implicit coverage claim — the llvm lane compiles the *whole*
+# toolchain (cmd/oxl + bootstrap/* end-to-end under --target llvm).
+#
+# IR fixpoint (ADR-0006 one lane over): the C-lane-built product
+# driver emits drv1.ll for the driver sources; the same driver
+# rebuilt *via --target llvm* (target/oxl-llvm — an in-repo path so
+# its exe-walk finds std/ and runtime/) emits drv2.ll; the two must
+# be byte-identical. The C-text fixpoint above stays the shared
+# regression guard — this is the lane's own determinism claim.
+#
+# Cross-lane parity: llvm_abi_check plus the conformance whitelist
+# are built through BOTH lanes (manual codegen emit + cc/clang, and
+# the product driver's --target llvm path is exercised by l3 already)
+# and their program output diffed — same runtime, same observable
+# behavior, IR instead of C. Where the native build needs the ABI
+# shim, tests/llvm_abi_shim.c rides along on both compile lines.
+if command -v clang >/dev/null 2>&1; then
+    l4libs="$THREAD_FLAG"
+    case "$(uname -s)" in
+        MINGW*|MSYS*|CYGWIN*) l4libs="-ladvapi32 -lshell32" ;;
+    esac
+    "$OXL" run bootstrap/cmd/codegen -- --emit llvm cmd/oxl > "$scratch/drv1.ll" || { echo "FAIL llvm l4: drv1 emit"; exit 1; }
+    echo "  llvm l4: drv1.ll emitted ($(wc -l < "$scratch/drv1.ll") lines)"
+    "$OXL" build cmd/oxl --target llvm -o "target/oxl-llvm$EXE" || { echo "FAIL llvm l4: driver build --target llvm"; exit 1; }
+    LLVMOXL="$PWD/target/oxl-llvm$EXE"
+    echo "  llvm l4: toolchain compiled end-to-end under --target llvm"
+    "$LLVMOXL" run bootstrap/cmd/codegen -- --emit llvm cmd/oxl > "$scratch/drv2.ll" || { echo "FAIL llvm l4: drv2 emit"; exit 1; }
+    diff "$scratch/drv1.ll" "$scratch/drv2.ll" >/dev/null || { echo "FAIL llvm l4: IR fixpoint"; diff "$scratch/drv1.ll" "$scratch/drv2.ll" | head -20; exit 1; }
+    echo "  llvm l4: IR fixpoint clean"
+    # the llvm-built driver is itself a conformance subject: the smoke
+    # sections' assertions re-run under it (hello, features, match,
+    # methods — same markers as their native sections)
+    out=$("$LLVMOXL" run examples/hello.oxl)
+    [ "$out" = "hello, world" ] || { echo "FAIL llvm l4 driver hello: $out"; exit 1; }
+    out=$("$LLVMOXL" run examples/features.oxl)
+    [ "$(tail -1 <<<"$out")" = "done" ] || { echo "FAIL llvm l4 driver features"; exit 1; }
+    out=$(with_timeout 60 "$LLVMOXL" run tests/match.oxl)
+    grep -q 'match ok' <<<"$out" || { echo "FAIL llvm l4 driver match: $out"; exit 1; }
+    out=$(with_timeout 60 "$LLVMOXL" run tests/methods.oxl)
+    grep -q 'methods ok' <<<"$out" || { echo "FAIL llvm l4 driver methods: $out"; exit 1; }
+    echo "  llvm l4: llvm-built driver smoke ok"
+    # cross-lane parity table — one line per corpus file: native-lane
+    # binary output vs llvm-lane binary output, byte-diffed. The
+    # trap-expectation files are l3's; every file here exits 0.
+    for f in select chan_own chanbuf chanbuf_close scope_exit orphan_join defer_order pairfwd susp_closure zero_str match methods fnval d5_qual susp_ownarg iface_susp iface_susp_shim iface_susp_pair iface_susp_nested iface_susp_rewrap iface_susp_prop iface_susp_convdest iface_susp_cancel vtab_fn closure_mcall closure_fnfield closure_shadow; do
+        "$OXL" build "tests/$f.oxl" -o "$scratch/$f-c$EXE" || { echo "FAIL llvm l4 parity $f: native build"; exit 1; }
+        "$OXL" build --target llvm "tests/$f.oxl" -o "$scratch/$f-l$EXE" || { echo "FAIL llvm l4 parity $f: llvm build"; exit 1; }
+        cout=$(with_timeout 60 "$scratch/$f-c$EXE" 2>&1) || { echo "FAIL llvm l4 parity $f: native run"; exit 1; }
+        lout=$(with_timeout 60 "$scratch/$f-l$EXE" 2>&1) || { echo "FAIL llvm l4 parity $f: llvm run"; exit 1; }
+        [ "$cout" = "$lout" ] || { echo "FAIL llvm l4 parity $f: $cout vs $lout"; exit 1; }
+        echo "  llvm l4 parity: $f ok"
+    done
+    # conc_ping/conc_scale/select_fair/stdmods_test stay out of the
+    # diff table — scheduling/fairness counters and wall-clock prints
+    # make their output nondeterministic; l2/l3 already marker-gate
+    # them.
+    # llvm_abi_check both ways: the shim compiles against rt.h for
+    # both emits, so the same probe binary contract holds on either
+    # lane — outputs must match byte-for-byte.
+    "$OXL" run bootstrap/cmd/codegen -- tests/llvm_abi_check.oxl > "$scratch/abi.c" || { echo "FAIL llvm l4 abi: native emit"; exit 1; }
+    "$CC" -O0 -Iruntime "$scratch/abi.c" tests/llvm_abi_shim.c runtime/rt.c $l4libs -o "$scratch/abi-c$EXE" || { echo "FAIL llvm l4 abi: native cc"; exit 1; }
+    "$OXL" run bootstrap/cmd/codegen -- --emit llvm tests/llvm_abi_check.oxl > "$scratch/abi-l4.ll" || { echo "FAIL llvm l4 abi: llvm emit"; exit 1; }
+    clang -O0 -Iruntime "$scratch/abi-l4.ll" tests/llvm_abi_shim.c runtime/rt.c $l4libs -o "$scratch/abi-l$EXE" || { echo "FAIL llvm l4 abi: clang"; exit 1; }
+    # slice.heap prints a live alloc address — mask it before the diff
+    cout=$(with_timeout 30 "$scratch/abi-c$EXE" 2>&1 | sed 's/slice.heap=.*/slice.heap=X/') || { echo "FAIL llvm l4 abi: native run"; exit 1; }
+    lout=$(with_timeout 30 "$scratch/abi-l$EXE" 2>&1 | sed 's/slice.heap=.*/slice.heap=X/') || { echo "FAIL llvm l4 abi: llvm run"; exit 1; }
+    [ "$cout" = "$lout" ] || { echo "FAIL llvm l4 abi parity: $cout vs $lout"; exit 1; }
+    grep -q "llvm_abi_check ok" <<<"$lout" || { echo "FAIL llvm l4 abi: $lout"; exit 1; }
+    echo "  llvm l4 parity: llvm_abi_check ok"
+else
+    echo "  (skipped: clang not installed — the lane's only consumer)"
+fi
+
 echo "== toolchain driver in .oxl (t2) =="
 # cmd/oxl is the product driver ported to .oxl — argv dispatch, the
 # pkg-args/file-list rule, compile orchestration over bootstrap/check +

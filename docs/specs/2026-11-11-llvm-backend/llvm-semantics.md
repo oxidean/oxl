@@ -34,7 +34,7 @@ Two layout domains with different rules:
 | `cstr` | `ptr` | NUL-terminated, extern-boundary only |
 | `[]T` | `%RtSlice = type { ptr, i64, i64, i64 }` | boundary — `{ptr,len,cap,heap}`, element type erased exactly like the C lane |
 | `struct` | `%o_s_<qn> = type { f0, f1, … }` | source field order, `f_<name>` order preserved; lane-owned layout |
-| `enum` | `%o_en_<qn> = type { i32, [4 x i8], <payloadTy>, i64 }` | lane-owned — §4 |
+| `enum` | `%o_en_<qn> = type { i32, [4 x i8], [N x i64], i64 }` | lane-owned — §4 |
 | `own T` / `ref T` / `mut T` | `ptr` | opaque pointers; borrow/move checks are rt.c calls, not types |
 | `chan` / `chan own T` | `ptr` | `RtChan*` opaque |
 | `shared` | `ptr` | `RtShared*` opaque |
@@ -162,17 +162,23 @@ define void @oxl_main() { … }
 - `%o_ret_<qn> = type { <val>, i64 }` — `val` then `err`, matching
   the C `{ <T> val; int64_t err; }` shape (lane-owned, but keeping
   C's order is free).
-- `%o_en_<qn> = type { i32, [4 x i8], <payloadTy>, i64 }` — the tagged
+- `%o_en_<qn> = type { i32, [4 x i8], [N x i64], i64 }` — the tagged
   union C emits `{ int tag; union {…} u; }`. IR has no union: the
   lane keeps `i32` tag at offset 0, one `[4 x i8]` pad, and a single
-  payload field typed as the **largest variant** (`%o_s_<qn>.<V>`
-  with max size under the §6 model); `<payloadTy>` is `i8` for
-  all-unit enums. Max *size* alone doesn't bound alignment — a
-  low-align largest variant would leave the slot under-aligned for
-  a sibling needing align 8 — so the enum type carries an `i64`
-  anchor/pad field raising its ABI alignment to 8 (an alloca-level
-  `align` would not propagate to nested struct/array fields),
-  which ≥ every variant's natural align under §6. The pad makes the payload offset 8 unconditionally —
+  payload field of `N = ceil(psz/8)` `i64`s where `psz` is the
+  **largest variant**'s size under the §6 model (`i8` in place of
+  the array for all-unit enums). An earlier draft typed the member
+  as the largest variant's `%o_s_<qn>.<V>` struct — rejected at L4:
+  a struct-typed member's *internal padding* is not transferred by
+  the by-value aggregate ABI (clang correctly elides declared pad
+  bytes when marshaling an aggregate argument or return), but a
+  smaller variant's live data can occupy exactly those offsets —
+  e.g. `%o_s_*.Fn` pads bytes 4..8 of its first word while
+  `%o_s_*.Ty`'s `f0` ptr keeps its high bits there, so passing an
+  enum by value silently truncated payload pointers. The `i64`
+  array makes every payload byte a live scalar while holding the
+  slot at align 8 ≥ every variant's natural align under §6; the
+  pad before it makes the payload offset 8 unconditionally —
   matching C's union offset whenever any variant carries an
   8-aligned field (the common case) and diverging harmlessly
   otherwise (lane-owned layout). Payload access is a

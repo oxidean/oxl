@@ -34,6 +34,8 @@ extern fn rt_sqlite_step(st: own byte) -> int
 
 extern fn rt_sqlite_reset(st: own byte) -> int
 
+extern fn rt_sqlite_readonly(st: own byte) -> int
+
 extern fn rt_sqlite_cols(st: own byte) -> int
 
 extern fn rt_sqlite_col_type(st: own byte, i: int) -> int
@@ -207,11 +209,21 @@ fn set_col(fv: reflect.Value, rows: Rows, j: int) -> err {
 /// Rows are stepped twice — a count pass, then a reset + fill pass —
 /// so out's backing mints once at exact length on the own lane. scan
 /// resets the cursor before each pass, so re-scanning a live Rows
-/// deterministically replays the full result set.
+/// deterministically replays the full result set. Because replay would
+/// re-execute a writable statement's side effects, scan accepts only
+/// statements sqlite3_stmt_readonly reports true — RETURNING writes get
+/// an error, not a silent double-execution.
 fn scan[T any](rows: Rows, out: mut []T) -> err {
     t := type_of(T)
     if t.kind() != reflect.KindStruct() {
         return errors.new("sql: scan target " + t.name() + " is not a struct")
+    }
+    // scan replays the statement twice (count, then fill) — for a
+    // writable cursor (INSERT/UPDATE/DELETE ... RETURNING) the second
+    // pass would double-execute the write's side effects. Readonly
+    // statements are idempotent; anything else gets a hard error.
+    if rt_sqlite_readonly(rows.st) == 0 {
+        return errors.new("sql: scan: statement is not read-only")
     }
     nf := t.nfields()
     if rt_sqlite_cols(rows.st) != nf {

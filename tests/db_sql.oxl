@@ -10,6 +10,7 @@ import "std/database/sql"
 import "std/errors"
 
 struct Item { id: int, name: str, price: float, active: bool, code: byte }
+struct Count { n: int }
 
 // a struct field outside the scalar lanes reports err_kind
 struct Wide { id: int, xs: []int }
@@ -121,6 +122,25 @@ fn main() {
     [rbad, qbad] = db.query("SELECT bogus FROM nowhere")
     want_err(qbad, "bad query")
     rbad.close()
+    // INSERT ... RETURNING is writable — scan must refuse it outright
+    // rather than replay the write a second time
+    [rw, qw] = db.query("INSERT INTO items (name, price, active, code) VALUES ('dup', 1.0, 1, 'x') RETURNING id")
+    want_ok(qw, "query returning")
+    outp := new(mkslice(Item, 0))
+    se5 := sql.scan(rw, outp)
+    want_err(se5, "scan returning")
+    rw.close()
+    // the write never ran — the row count proves scan refused before
+    // any execution (a replaying scan would have landed it twice)
+    [rc1, qc1] = db.query("SELECT COUNT(*) FROM items WHERE name = 'dup'")
+    want_ok(qc1, "query dup count")
+    outc := new(mkslice(Count, 0))
+    se6 := sql.scan(rc1, outc)
+    want_ok(se6, "scan count")
+    if len(outc) != 1 || outc[0].n != 0 {
+        fails("returning write ran " + itoa(outc[0].n) + " times")
+    }
+    rc1.close()
     db.close()
     println("db_sql ok")
 }

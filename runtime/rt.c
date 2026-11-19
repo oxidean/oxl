@@ -4206,6 +4206,7 @@ int64_t rt_sqlite_step(void *st) {
     return -rc; /* sqlite rcs are positive — negate so <0 reports error */
 }
 int64_t rt_sqlite_reset(void *st) { return sqlite3_reset((sqlite3_stmt *)st); }
+int64_t rt_sqlite_readonly(void *st) { return sqlite3_stmt_readonly((sqlite3_stmt *)st); }
 int64_t rt_sqlite_cols(void *st) { return sqlite3_column_count((sqlite3_stmt *)st); }
 int64_t rt_sqlite_col_type(void *st, int64_t i) {
     return sqlite3_column_type((sqlite3_stmt *)st, (int)i);

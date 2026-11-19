@@ -562,6 +562,7 @@ void rt_sqlite_close(void *db);
 void *rt_sqlite_prepare(void *db, const char *sql);
 int64_t rt_sqlite_step(void *st);
 int64_t rt_sqlite_reset(void *st);
+int64_t rt_sqlite_readonly(void *st);
 int64_t rt_sqlite_cols(void *st);
 int64_t rt_sqlite_col_type(void *st, int64_t i); /* SQLITE_INTEGER..NULL */
 int64_t rt_sqlite_col_int(void *st, int64_t i);

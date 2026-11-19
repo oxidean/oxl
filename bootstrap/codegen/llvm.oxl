@@ -3616,6 +3616,13 @@ fn lbuiltin(g: mut G, name: str, args: ref parser.NList, argvs: ref GAv) -> str 
     if name == "errstr" {
         return lcallrt(g, "%OxlStr", "rt_errstr", "i64 " + a0)
     }
+    // descriptor intrinsics (R1) — no gdesc/table machinery in this
+    // lane yet; trap loud rather than emit a call to a missing symbol
+    if name == "tdesc" || name == "tqual" || name == "type_of" || name == "value_of" || name == "value_of_mut" {
+        lrtuse(g, "rt_trap")
+        lw(g, "call void @rt_trap(i64 21)")
+        return "0"
+    }
     return ""
 }
 
@@ -4660,6 +4667,11 @@ fn emit_llvm(r: own check.CkRes, testm: int) -> str {
     out = out + "%RtSlice = type { ptr, i64, i64, i64 }\n"
     out = out + "%RtFnv = type { ptr, ptr }\n"
     out = out + "%RtIface = type { ptr, ptr }\n"
+    // rt.c's rt_desc_* externs reference the descriptor table — the
+    // lane emits the unpopulated stub (tdesc intrinsics trap below)
+    out = out + "%RtTypeDesc = type { ptr, i8, i64, i64, i64, ptr, i64, i64, i64, ptr, i64 }\n"
+    out = out + "@o_desc_tab = constant [0 x %RtTypeDesc] zeroinitializer\n"
+    out = out + "@o_desc_tab_n = constant i64 0\n"
     i = 0
     for i < len(g.ltys) {
         out = out + g.ltys[i]

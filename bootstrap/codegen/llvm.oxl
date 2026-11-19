@@ -27,7 +27,6 @@ import "std/collections"
 // (auto-opening a dead block if the last block already terminated),
 // `lt` a terminator, `llb` a label (auto-bridging fallthrough), and
 // `lfin` a conditional end-of-block jump.
-
 fn lreg(g: mut G) -> str {
     n := g.lreg
     g.lreg = g.lreg + 1
@@ -420,128 +419,354 @@ fn lrtuse(g: mut G, name: str) {
 fn lrt_sig(name: str) -> str {
     d := ""
     // — alloc / ownership / borrow ledger --
-    if name == "rt_alloc" { d = "ptr @rt_alloc(i64)" }
-    if name == "rt_alloc_own" { d = "ptr @rt_alloc_own(i64)" }
-    if name == "rt_free" { d = "void @rt_free(ptr)" }
-    if name == "rt_borrow_read" { d = "void @rt_borrow_read(ptr)" }
-    if name == "rt_borrow_mut" { d = "void @rt_borrow_mut(ptr)" }
-    if name == "rt_unborrow" { d = "void @rt_unborrow(ptr)" }
+    if name == "rt_alloc" {
+        d = "ptr @rt_alloc(i64)"
+    }
+    if name == "rt_alloc_own" {
+        d = "ptr @rt_alloc_own(i64)"
+    }
+    if name == "rt_free" {
+        d = "void @rt_free(ptr)"
+    }
+    if name == "rt_borrow_read" {
+        d = "void @rt_borrow_read(ptr)"
+    }
+    if name == "rt_borrow_mut" {
+        d = "void @rt_borrow_mut(ptr)"
+    }
+    if name == "rt_unborrow" {
+        d = "void @rt_unborrow(ptr)"
+    }
     // — control / defers --
-    if name == "rt_trap" { d = "void @rt_trap(i64)" }
-    if name == "rt_exit" { d = "void @rt_exit(i64)" }
-    if name == "rt_defer_mark" { d = "ptr @rt_defer_mark()" }
-    if name == "rt_defer_push" { d = "void @rt_defer_push(ptr, ptr)" }
-    if name == "rt_defer_drain_to" { d = "void @rt_defer_drain_to(ptr)" }
+    if name == "rt_trap" {
+        d = "void @rt_trap(i64)"
+    }
+    if name == "rt_exit" {
+        d = "void @rt_exit(i64)"
+    }
+    if name == "rt_defer_mark" {
+        d = "ptr @rt_defer_mark()"
+    }
+    if name == "rt_defer_push" {
+        d = "void @rt_defer_push(ptr, ptr)"
+    }
+    if name == "rt_defer_drain_to" {
+        d = "void @rt_defer_drain_to(ptr)"
+    }
     // — scopes / tasks --
-    if name == "rt_scope_sizeof" { d = "i64 @rt_scope_sizeof()" }
-    if name == "rt_scope_enter" { d = "void @rt_scope_enter(ptr)" }
-    if name == "rt_scope_leave" { d = "void @rt_scope_leave(ptr)" }
-    if name == "rt_scope_try" { d = "i32 @rt_scope_try(ptr)" }
-    if name == "rt_scope_named" { d = "ptr @rt_scope_named()" }
-    if name == "rt_scope_current" { d = "ptr @rt_scope_current()" }
-    if name == "rt_scope_new" { d = "ptr @rt_scope_new()" }
-    if name == "rt_scope_join_named" { d = "i64 @rt_scope_join_named(ptr)" }
-    if name == "rt_scope_finish_named" { d = "i64 @rt_scope_finish_named(ptr)" }
-    if name == "rt_scope_join_free" { d = "i64 @rt_scope_join_free(ptr)" }
-    if name == "rt_scope_cancel" { d = "void @rt_scope_cancel(ptr)" }
-    if name == "rt_spawn" { d = "void @rt_spawn(ptr, ptr)" }
-    if name == "rt_spawnb" { d = "void @rt_spawnb(ptr, ptr)" }
-    if name == "rt_task_new" { d = "ptr @rt_task_new(ptr, i64)" }
-    if name == "rt_task_new_in" { d = "ptr @rt_task_new_in(ptr, ptr, i64)" }
-    if name == "rt_spawn_task" { d = "void @rt_spawn_task(ptr)" }
-    if name == "rt_spawnb_task" { d = "void @rt_spawnb_task(ptr)" }
-    if name == "rt_run_root" { d = "i32 @rt_run_root(ptr)" }
-    if name == "rt_task_data" { d = "i64 @rt_task_data(ptr)" }
-    if name == "rt_is_root" { d = "i32 @rt_is_root()" }
-    if name == "rt_cancelled" { d = "i32 @rt_cancelled()" }
-    if name == "rt_scope_join_poll" { d = "i32 @rt_scope_join_poll(ptr, ptr)" }
-    if name == "rt_scope_finish" { d = "i32 @rt_scope_finish(ptr)" }
-    if name == "rt_scope_propagate" { d = "void @rt_scope_propagate(ptr, i64)" }
+    if name == "rt_scope_sizeof" {
+        d = "i64 @rt_scope_sizeof()"
+    }
+    if name == "rt_scope_enter" {
+        d = "void @rt_scope_enter(ptr)"
+    }
+    if name == "rt_scope_leave" {
+        d = "void @rt_scope_leave(ptr)"
+    }
+    if name == "rt_scope_try" {
+        d = "i32 @rt_scope_try(ptr)"
+    }
+    if name == "rt_scope_named" {
+        d = "ptr @rt_scope_named()"
+    }
+    if name == "rt_scope_current" {
+        d = "ptr @rt_scope_current()"
+    }
+    if name == "rt_scope_new" {
+        d = "ptr @rt_scope_new()"
+    }
+    if name == "rt_scope_join_named" {
+        d = "i64 @rt_scope_join_named(ptr)"
+    }
+    if name == "rt_scope_finish_named" {
+        d = "i64 @rt_scope_finish_named(ptr)"
+    }
+    if name == "rt_scope_join_free" {
+        d = "i64 @rt_scope_join_free(ptr)"
+    }
+    if name == "rt_scope_cancel" {
+        d = "void @rt_scope_cancel(ptr)"
+    }
+    if name == "rt_spawn" {
+        d = "void @rt_spawn(ptr, ptr)"
+    }
+    if name == "rt_spawnb" {
+        d = "void @rt_spawnb(ptr, ptr)"
+    }
+    if name == "rt_task_new" {
+        d = "ptr @rt_task_new(ptr, i64)"
+    }
+    if name == "rt_task_new_in" {
+        d = "ptr @rt_task_new_in(ptr, ptr, i64)"
+    }
+    if name == "rt_spawn_task" {
+        d = "void @rt_spawn_task(ptr)"
+    }
+    if name == "rt_spawnb_task" {
+        d = "void @rt_spawnb_task(ptr)"
+    }
+    if name == "rt_run_root" {
+        d = "i32 @rt_run_root(ptr)"
+    }
+    if name == "rt_task_data" {
+        d = "i64 @rt_task_data(ptr)"
+    }
+    if name == "rt_is_root" {
+        d = "i32 @rt_is_root()"
+    }
+    if name == "rt_cancelled" {
+        d = "i32 @rt_cancelled()"
+    }
+    if name == "rt_scope_join_poll" {
+        d = "i32 @rt_scope_join_poll(ptr, ptr)"
+    }
+    if name == "rt_scope_finish" {
+        d = "i32 @rt_scope_finish(ptr)"
+    }
+    if name == "rt_scope_propagate" {
+        d = "void @rt_scope_propagate(ptr, i64)"
+    }
     // — chans / shared cells --
-    if name == "rt_mkchan_scoped" { d = "ptr @rt_mkchan_scoped(ptr, i64, ptr)" }
-    if name == "rt_send" { d = "void @rt_send(ptr, i64)" }
-    if name == "rt_try_send" { d = "i32 @rt_try_send(ptr, i64)" }
-    if name == "rt_recv" { d = "i64 @rt_recv(ptr)" }
-    if name == "rt_close" { d = "void @rt_close(ptr)" }
-    if name == "rt_chan_is_closed" { d = "i64 @rt_chan_is_closed(ptr)" }
-    if name == "rt_send_poll" { d = "i32 @rt_send_poll(ptr, i64, ptr)" }
-    if name == "rt_recv_poll" { d = "i32 @rt_recv_poll(ptr, ptr)" }
-    if name == "rt_select_poll" { d = "i32 @rt_select_poll(ptr, i32, i64, i32, ptr)" }
-    if name == "rt_select_arm" { d = "i64 @rt_select_arm(ptr)" }
-    if name == "rt_sleep_poll" { d = "i32 @rt_sleep_poll(i64, ptr)" }
-    if name == "rt_msleep_poll" { d = "i32 @rt_msleep_poll(i64, ptr)" }
-    if name == "rt_mkshared" { d = "ptr @rt_mkshared(i64)" }
-    if name == "rt_sget" { d = "i64 @rt_sget(ptr)" }
-    if name == "rt_sset" { d = "void @rt_sset(ptr, i64)" }
-    if name == "rt_scas" { d = "i64 @rt_scas(ptr, i64, i64)" }
-    if name == "rt_sadd" { d = "i64 @rt_sadd(ptr, i64)" }
+    if name == "rt_mkchan_scoped" {
+        d = "ptr @rt_mkchan_scoped(ptr, i64, ptr)"
+    }
+    if name == "rt_send" {
+        d = "void @rt_send(ptr, i64)"
+    }
+    if name == "rt_try_send" {
+        d = "i32 @rt_try_send(ptr, i64)"
+    }
+    if name == "rt_recv" {
+        d = "i64 @rt_recv(ptr)"
+    }
+    if name == "rt_close" {
+        d = "void @rt_close(ptr)"
+    }
+    if name == "rt_chan_is_closed" {
+        d = "i64 @rt_chan_is_closed(ptr)"
+    }
+    if name == "rt_send_poll" {
+        d = "i32 @rt_send_poll(ptr, i64, ptr)"
+    }
+    if name == "rt_recv_poll" {
+        d = "i32 @rt_recv_poll(ptr, ptr)"
+    }
+    if name == "rt_select_poll" {
+        d = "i32 @rt_select_poll(ptr, i32, i64, i32, ptr)"
+    }
+    if name == "rt_select_arm" {
+        d = "i64 @rt_select_arm(ptr)"
+    }
+    if name == "rt_sleep_poll" {
+        d = "i32 @rt_sleep_poll(i64, ptr)"
+    }
+    if name == "rt_msleep_poll" {
+        d = "i32 @rt_msleep_poll(i64, ptr)"
+    }
+    if name == "rt_mkshared" {
+        d = "ptr @rt_mkshared(i64)"
+    }
+    if name == "rt_sget" {
+        d = "i64 @rt_sget(ptr)"
+    }
+    if name == "rt_sset" {
+        d = "void @rt_sset(ptr, i64)"
+    }
+    if name == "rt_scas" {
+        d = "i64 @rt_scas(ptr, i64, i64)"
+    }
+    if name == "rt_sadd" {
+        d = "i64 @rt_sadd(ptr, i64)"
+    }
     // — slices / buffers --
-    if name == "rt_mkslice" { d = "%RtSlice @rt_mkslice(i64, i64)" }
-    if name == "rt_slice_push" { d = "%RtSlice @rt_slice_push(ptr, i64, ptr)" }
-    if name == "rt_slice_own" { d = "ptr @rt_slice_own(ptr, i64)" }
-    if name == "rt_mkbuf" { d = "ptr @rt_mkbuf(i64)" }
-    if name == "rt_bufstr" { d = "%OxlStr @rt_bufstr(ptr, i64)" }
-    if name == "rt_poke8" { d = "void @rt_poke8(ptr, i64, i64)" }
-    if name == "rt_poke16" { d = "void @rt_poke16(ptr, i64, i64)" }
-    if name == "rt_poke32" { d = "void @rt_poke32(ptr, i64, i64)" }
-    if name == "rt_bytes_str" { d = "%RtSlice @rt_bytes_str(%OxlStr)" }
-    if name == "rt_str_bytes" { d = "%OxlStr @rt_str_bytes(ptr)" }
+    if name == "rt_mkslice" {
+        d = "%RtSlice @rt_mkslice(i64, i64)"
+    }
+    if name == "rt_slice_push" {
+        d = "%RtSlice @rt_slice_push(ptr, i64, ptr)"
+    }
+    if name == "rt_slice_own" {
+        d = "ptr @rt_slice_own(ptr, i64)"
+    }
+    if name == "rt_mkbuf" {
+        d = "ptr @rt_mkbuf(i64)"
+    }
+    if name == "rt_bufstr" {
+        d = "%OxlStr @rt_bufstr(ptr, i64)"
+    }
+    if name == "rt_poke8" {
+        d = "void @rt_poke8(ptr, i64, i64)"
+    }
+    if name == "rt_poke16" {
+        d = "void @rt_poke16(ptr, i64, i64)"
+    }
+    if name == "rt_poke32" {
+        d = "void @rt_poke32(ptr, i64, i64)"
+    }
+    if name == "rt_bytes_str" {
+        d = "%RtSlice @rt_bytes_str(%OxlStr)"
+    }
+    if name == "rt_str_bytes" {
+        d = "%OxlStr @rt_str_bytes(ptr)"
+    }
     // — strings / print --
-    if name == "rt_str_lit" { d = "%OxlStr @rt_str_lit(ptr)" }
-    if name == "rt_strcat" { d = "%OxlStr @rt_strcat(%OxlStr, %OxlStr)" }
-    if name == "rt_streq" { d = "i32 @rt_streq(%OxlStr, %OxlStr)" }
-    if name == "rt_str_cmp" { d = "i64 @rt_str_cmp(%OxlStr, %OxlStr)" }
-    if name == "rt_str" { d = "%OxlStr @rt_str(ptr)" }
-    if name == "rt_cstr" { d = "ptr @rt_cstr(%OxlStr)" }
-    if name == "rt_str_own" { d = "%OxlStr @rt_str_own(%OxlStr)" }
-    if name == "rt_str_scope" { d = "%OxlStr @rt_str_scope(%OxlStr)" }
-    if name == "rt_str_free" { d = "void @rt_str_free(%OxlStr)" }
-    if name == "rt_len" { d = "i64 @rt_len(%OxlStr)" }
-    if name == "rt_byteat" { d = "i64 @rt_byteat(%OxlStr, i64)" }
-    if name == "rt_substr" { d = "%OxlStr @rt_substr(%OxlStr, i64, i64)" }
-    if name == "rt_find" { d = "i64 @rt_find(%OxlStr, %OxlStr)" }
-    if name == "rt_atoi" { d = "i64 @rt_atoi(%OxlStr)" }
-    if name == "rt_atof" { d = "double @rt_atof(%OxlStr)" }
-    if name == "rt_itoa" { d = "%OxlStr @rt_itoa(i64)" }
-    if name == "rt_ftoa" { d = "%OxlStr @rt_ftoa(double)" }
-    if name == "rt_ftoa_p" { d = "%OxlStr @rt_ftoa_p(double, i64)" }
-    if name == "rt_print_str" { d = "void @rt_print_str(%OxlStr)" }
-    if name == "rt_println_str" { d = "void @rt_println_str(%OxlStr)" }
-    if name == "rt_print_i64" { d = "void @rt_print_i64(i64)" }
-    if name == "rt_println_i64" { d = "void @rt_println_i64(i64)" }
-    if name == "rt_print_f64" { d = "void @rt_print_f64(double)" }
-    if name == "rt_println_f64" { d = "void @rt_println_f64(double)" }
-    if name == "rt_err_new" { d = "i64 @rt_err_new(%OxlStr)" }
-    if name == "rt_err_wrap" { d = "i64 @rt_err_wrap(%OxlStr, i64)" }
-    if name == "rt_err_cause" { d = "i64 @rt_err_cause(i64)" }
-    if name == "rt_err_msg" { d = "%OxlStr @rt_err_msg(i64)" }
-    if name == "rt_errstr" { d = "%OxlStr @rt_errstr(i64)" }
+    if name == "rt_str_lit" {
+        d = "%OxlStr @rt_str_lit(ptr)"
+    }
+    if name == "rt_strcat" {
+        d = "%OxlStr @rt_strcat(%OxlStr, %OxlStr)"
+    }
+    if name == "rt_streq" {
+        d = "i32 @rt_streq(%OxlStr, %OxlStr)"
+    }
+    if name == "rt_str_cmp" {
+        d = "i64 @rt_str_cmp(%OxlStr, %OxlStr)"
+    }
+    if name == "rt_str" {
+        d = "%OxlStr @rt_str(ptr)"
+    }
+    if name == "rt_cstr" {
+        d = "ptr @rt_cstr(%OxlStr)"
+    }
+    if name == "rt_str_own" {
+        d = "%OxlStr @rt_str_own(%OxlStr)"
+    }
+    if name == "rt_str_scope" {
+        d = "%OxlStr @rt_str_scope(%OxlStr)"
+    }
+    if name == "rt_str_free" {
+        d = "void @rt_str_free(%OxlStr)"
+    }
+    if name == "rt_len" {
+        d = "i64 @rt_len(%OxlStr)"
+    }
+    if name == "rt_byteat" {
+        d = "i64 @rt_byteat(%OxlStr, i64)"
+    }
+    if name == "rt_substr" {
+        d = "%OxlStr @rt_substr(%OxlStr, i64, i64)"
+    }
+    if name == "rt_find" {
+        d = "i64 @rt_find(%OxlStr, %OxlStr)"
+    }
+    if name == "rt_atoi" {
+        d = "i64 @rt_atoi(%OxlStr)"
+    }
+    if name == "rt_atof" {
+        d = "double @rt_atof(%OxlStr)"
+    }
+    if name == "rt_itoa" {
+        d = "%OxlStr @rt_itoa(i64)"
+    }
+    if name == "rt_ftoa" {
+        d = "%OxlStr @rt_ftoa(double)"
+    }
+    if name == "rt_ftoa_p" {
+        d = "%OxlStr @rt_ftoa_p(double, i64)"
+    }
+    if name == "rt_print_str" {
+        d = "void @rt_print_str(%OxlStr)"
+    }
+    if name == "rt_println_str" {
+        d = "void @rt_println_str(%OxlStr)"
+    }
+    if name == "rt_print_i64" {
+        d = "void @rt_print_i64(i64)"
+    }
+    if name == "rt_println_i64" {
+        d = "void @rt_println_i64(i64)"
+    }
+    if name == "rt_print_f64" {
+        d = "void @rt_print_f64(double)"
+    }
+    if name == "rt_println_f64" {
+        d = "void @rt_println_f64(double)"
+    }
+    if name == "rt_err_new" {
+        d = "i64 @rt_err_new(%OxlStr)"
+    }
+    if name == "rt_err_wrap" {
+        d = "i64 @rt_err_wrap(%OxlStr, i64)"
+    }
+    if name == "rt_err_cause" {
+        d = "i64 @rt_err_cause(i64)"
+    }
+    if name == "rt_err_msg" {
+        d = "%OxlStr @rt_err_msg(i64)"
+    }
+    if name == "rt_errstr" {
+        d = "%OxlStr @rt_errstr(i64)"
+    }
     // — args / env / time / sleep --
-    if name == "rt_argc" { d = "i64 @rt_argc()" }
-    if name == "rt_argv" { d = "%OxlStr @rt_argv(i64)" }
-    if name == "rt_sleep" { d = "void @rt_sleep(i64)" }
-    if name == "rt_msleep" { d = "void @rt_msleep(i64)" }
-    if name == "rt_usleep" { d = "void @rt_usleep(i64)" }
-    if name == "rt_now" { d = "i64 @rt_now()" }
-    if name == "rt_now_ms" { d = "i64 @rt_now_ms()" }
+    if name == "rt_argc" {
+        d = "i64 @rt_argc()"
+    }
+    if name == "rt_argv" {
+        d = "%OxlStr @rt_argv(i64)"
+    }
+    if name == "rt_sleep" {
+        d = "void @rt_sleep(i64)"
+    }
+    if name == "rt_msleep" {
+        d = "void @rt_msleep(i64)"
+    }
+    if name == "rt_usleep" {
+        d = "void @rt_usleep(i64)"
+    }
+    if name == "rt_now" {
+        d = "i64 @rt_now()"
+    }
+    if name == "rt_now_ms" {
+        d = "i64 @rt_now_ms()"
+    }
     // — files / misc word fns --
-    if name == "rt_readfile" { d = "%OxlStr @rt_readfile(%OxlStr)" }
-    if name == "rt_writefile" { d = "i64 @rt_writefile(%OxlStr, %OxlStr)" }
-    if name == "rt_htons" { d = "i64 @rt_htons(i64)" }
-    if name == "rt_htonl" { d = "i64 @rt_htonl(i64)" }
-    if name == "rt_set_rcvtimo" { d = "i64 @rt_set_rcvtimo(i64, i64)" }
-    if name == "rt_set_rcvtimo_ms" { d = "i64 @rt_set_rcvtimo_ms(i64, i64)" }
-    if name == "rt_set_sndtimo" { d = "i64 @rt_set_sndtimo(i64, i64)" }
+    if name == "rt_readfile" {
+        d = "%OxlStr @rt_readfile(%OxlStr)"
+    }
+    if name == "rt_writefile" {
+        d = "i64 @rt_writefile(%OxlStr, %OxlStr)"
+    }
+    if name == "rt_htons" {
+        d = "i64 @rt_htons(i64)"
+    }
+    if name == "rt_htonl" {
+        d = "i64 @rt_htonl(i64)"
+    }
+    if name == "rt_set_rcvtimo" {
+        d = "i64 @rt_set_rcvtimo(i64, i64)"
+    }
+    if name == "rt_set_rcvtimo_ms" {
+        d = "i64 @rt_set_rcvtimo_ms(i64, i64)"
+    }
+    if name == "rt_set_sndtimo" {
+        d = "i64 @rt_set_sndtimo(i64, i64)"
+    }
     // — sqlite shims --
-    if name == "rt_sqlite_open" { d = "ptr @rt_sqlite_open(ptr)" }
-    if name == "rt_sqlite_exec" { d = "i64 @rt_sqlite_exec(ptr, ptr)" }
-    if name == "rt_sqlite_exec_bind" { d = "i64 @rt_sqlite_exec_bind(ptr, ptr, %OxlStr)" }
-    if name == "rt_sqlite_query" { d = "%OxlStr @rt_sqlite_query(ptr, ptr)" }
-    if name == "rt_sqlite_close" { d = "void @rt_sqlite_close(ptr)" }
+    if name == "rt_sqlite_open" {
+        d = "ptr @rt_sqlite_open(ptr)"
+    }
+    if name == "rt_sqlite_exec" {
+        d = "i64 @rt_sqlite_exec(ptr, ptr)"
+    }
+    if name == "rt_sqlite_exec_bind" {
+        d = "i64 @rt_sqlite_exec_bind(ptr, ptr, %OxlStr)"
+    }
+    if name == "rt_sqlite_query" {
+        d = "%OxlStr @rt_sqlite_query(ptr, ptr)"
+    }
+    if name == "rt_sqlite_close" {
+        d = "void @rt_sqlite_close(ptr)"
+    }
     // — libc --
-    if name == "close" { d = "i32 @close(i32)" }
-    if name == "malloc" { d = "ptr @malloc(i64)" }
-    if name == "free" { d = "void @free(ptr)" }
+    if name == "close" {
+        d = "i32 @close(i32)"
+    }
+    if name == "malloc" {
+        d = "ptr @malloc(i64)"
+    }
+    if name == "free" {
+        d = "void @free(ptr)"
+    }
     if len(d) == 0 {
         // unregistered name — i64 word default keeps the module
         // assembled; the verifier still cross-checks call spellings
@@ -549,6 +774,7 @@ fn lrt_sig(name: str) -> str {
     }
     return "declare " + d + "\n"
 }
+
 // ---------- typed operand helpers ----------
 // every lw'd instruction spells operand types explicitly — these wrap
 // the common shapes so call sites stay readable
@@ -1210,12 +1436,24 @@ fn lxbin(g: mut G, op: str, l: ref parser.Node, r: ref parser.Node, e: ref parse
             sgn = "urem"
         }
         if len(sgn) == 0 {
-            if op == "+" { sgn = "add" }
-            if op == "-" { sgn = "sub" }
-            if op == "*" { sgn = "mul" }
-            if op == "&" { sgn = "and" }
-            if op == "|" { sgn = "or" }
-            if op == "^" { sgn = "xor" }
+            if op == "+" {
+                sgn = "add"
+            }
+            if op == "-" {
+                sgn = "sub"
+            }
+            if op == "*" {
+                sgn = "mul"
+            }
+            if op == "&" {
+                sgn = "and"
+            }
+            if op == "|" {
+                sgn = "or"
+            }
+            if op == "^" {
+                sgn = "xor"
+            }
         }
         lv = lfit(g, lv, lt, check.t_byte(g.ck))
         rv = lfit(g, rv, rt2, check.t_byte(g.ck))
@@ -1240,9 +1478,15 @@ fn lxbin(g: mut G, op: str, l: ref parser.Node, r: ref parser.Node, e: ref parse
     if (op == "<" || op == "<=" || op == ">" || op == ">=") && ltk == check.k_str() {
         s := lcallrt(g, "i64", "rt_str_cmp", "%OxlStr " + lv + ", %OxlStr " + rv)
         pr := "slt"
-        if op == "<=" { pr = "sle" }
-        if op == ">" { pr = "sgt" }
-        if op == ">=" { pr = "sge" }
+        if op == "<=" {
+            pr = "sle"
+        }
+        if op == ">" {
+            pr = "sgt"
+        }
+        if op == ">=" {
+            pr = "sge"
+        }
         c := lreg(g)
         lw(g, c + " = icmp " + pr + " i64 " + s + ", 0")
         z := lreg(g)
@@ -1254,7 +1498,9 @@ fn lxbin(g: mut G, op: str, l: ref parser.Node, r: ref parser.Node, e: ref parse
         ta := lexv(g, lty(g, lt), lv, 0)
         tb := lexv(g, lty(g, lt), rv, 0)
         pr := "eq"
-        if op == "!=" { pr = "ne" }
+        if op == "!=" {
+            pr = "ne"
+        }
         c := lreg(g)
         lw(g, c + " = icmp " + pr + " i32 " + ta + ", " + tb)
         z := lreg(g)
@@ -1275,7 +1521,9 @@ fn lxbin(g: mut G, op: str, l: ref parser.Node, r: ref parser.Node, e: ref parse
                 re = lexv(g, "%RtIface", rv, 0)
             }
             pr := "eq"
-            if op == "!=" { pr = "ne" }
+            if op == "!=" {
+                pr = "ne"
+            }
             c := lreg(g)
             lw(g, c + " = icmp " + pr + " ptr " + le + ", " + re)
             z := lreg(g)
@@ -1307,7 +1555,9 @@ fn lxbin(g: mut G, op: str, l: ref parser.Node, r: ref parser.Node, e: ref parse
         pk := tyk(g, lt2)
         if pk == check.k_own() || pk == check.k_ref() || pk == check.k_mut() || pk == check.k_chan() || pk == check.k_shared() || pk == check.k_scope() || pk == check.k_cstr() {
             pr := "eq"
-            if op == "!=" { pr = "ne" }
+            if op == "!=" {
+                pr = "ne"
+            }
             c := lreg(g)
             lw(g, c + " = icmp " + pr + " ptr " + lv + ", " + rv)
             z := lreg(g)
@@ -1326,11 +1576,21 @@ fn lxbin(g: mut G, op: str, l: ref parser.Node, r: ref parser.Node, e: ref parse
         }
         if op == "==" || op == "!=" || op == "<" || op == "<=" || op == ">" || op == ">=" {
             pr := "oeq"
-            if op == "!=" { pr = "one" }
-            if op == "<" { pr = "olt" }
-            if op == "<=" { pr = "ole" }
-            if op == ">" { pr = "ogt" }
-            if op == ">=" { pr = "oge" }
+            if op == "!=" {
+                pr = "one"
+            }
+            if op == "<" {
+                pr = "olt"
+            }
+            if op == "<=" {
+                pr = "ole"
+            }
+            if op == ">" {
+                pr = "ogt"
+            }
+            if op == ">=" {
+                pr = "oge"
+            }
             c := lreg(g)
             lw(g, c + " = fcmp " + pr + " double " + lv + ", " + rv)
             z := lreg(g)
@@ -1338,10 +1598,18 @@ fn lxbin(g: mut G, op: str, l: ref parser.Node, r: ref parser.Node, e: ref parse
             return z
         }
         sgn := "fadd"
-        if op == "-" { sgn = "fsub" }
-        if op == "*" { sgn = "fmul" }
-        if op == "/" { sgn = "fdiv" }
-        if op == "%" { sgn = "frem" }
+        if op == "-" {
+            sgn = "fsub"
+        }
+        if op == "*" {
+            sgn = "fmul"
+        }
+        if op == "/" {
+            sgn = "fdiv"
+        }
+        if op == "%" {
+            sgn = "frem"
+        }
         v := lreg(g)
         lw(g, v + " = " + sgn + " double " + lv + ", " + rv)
         return v
@@ -1352,16 +1620,34 @@ fn lxbin(g: mut G, op: str, l: ref parser.Node, r: ref parser.Node, e: ref parse
     rv = lfit(g, rv, rt2, check.t_int(g.ck))
     if op == "==" || op == "!=" || op == "<" || op == "<=" || op == ">" || op == ">=" {
         pr := "eq"
-        if op == "!=" { pr = "ne" }
-        if op == "<" { pr = "slt" }
-        if op == "<=" { pr = "sle" }
-        if op == ">" { pr = "sgt" }
-        if op == ">=" { pr = "sge" }
+        if op == "!=" {
+            pr = "ne"
+        }
+        if op == "<" {
+            pr = "slt"
+        }
+        if op == "<=" {
+            pr = "sle"
+        }
+        if op == ">" {
+            pr = "sgt"
+        }
+        if op == ">=" {
+            pr = "sge"
+        }
         if ltk == check.k_byte() {
-            if pr == "slt" { pr = "ult" }
-            if pr == "sle" { pr = "ule" }
-            if pr == "sgt" { pr = "ugt" }
-            if pr == "sge" { pr = "uge" }
+            if pr == "slt" {
+                pr = "ult"
+            }
+            if pr == "sle" {
+                pr = "ule"
+            }
+            if pr == "sgt" {
+                pr = "ugt"
+            }
+            if pr == "sge" {
+                pr = "uge"
+            }
         }
         c := lreg(g)
         lw(g, c + " = icmp " + pr + " i64 " + lv + ", " + rv)
@@ -1370,13 +1656,27 @@ fn lxbin(g: mut G, op: str, l: ref parser.Node, r: ref parser.Node, e: ref parse
         return z
     }
     sgn := "add"
-    if op == "-" { sgn = "sub" }
-    if op == "*" { sgn = "mul" }
-    if op == "/" { sgn = "sdiv" }
-    if op == "%" { sgn = "srem" }
-    if op == "&" { sgn = "and" }
-    if op == "|" { sgn = "or" }
-    if op == "^" { sgn = "xor" }
+    if op == "-" {
+        sgn = "sub"
+    }
+    if op == "*" {
+        sgn = "mul"
+    }
+    if op == "/" {
+        sgn = "sdiv"
+    }
+    if op == "%" {
+        sgn = "srem"
+    }
+    if op == "&" {
+        sgn = "and"
+    }
+    if op == "|" {
+        sgn = "or"
+    }
+    if op == "^" {
+        sgn = "xor"
+    }
     v := lreg(g)
     lw(g, v + " = " + sgn + " i64 " + lv + ", " + rv)
     return v
@@ -1808,6 +2108,7 @@ fn lclosure(g: mut G, params: ref parser.NList, body: ref parser.Node) -> str {
 // ---------- match ----------
 // arm binds: (name, ty, field-idx) — fi -1 binds the whole scrutinee
 struct LBnd { n: str, t: int, fi: int, next: own LBnd }
+
 struct LArm { has: int, cond: str, binds: own LBnd }
 
 fn lbnd(n: str, t: int, fi: int, next: own LBnd) -> own LBnd {
@@ -2431,7 +2732,7 @@ fn ldefer(g: mut G, call: own parser.Node) {
 // spawn/go — L1 covers the non-susp path only: `{env, tramp}` handed
 // to rt_spawn (spec §7, stage-4 shape); susp callees trap. go_in
 // enters the resolved named scope on the env first.
-fn lspawn(g: mut G, scope: ref parser.Node, e: ref parser.Node, blocking: bool) {
+fn lspawn(g: mut G, sc: ref parser.Node, e: ref parser.Node, blocking: bool) {
     cn := ""
     let carg: own parser.NList = nil
     ce := e
@@ -2469,7 +2770,7 @@ fn lspawn(g: mut G, scope: ref parser.Node, e: ref parser.Node, blocking: bool) 
     sid := itoa(id)
     sig := g.ck.fnsv[fi]
     envf := ""
-    if scope != nil {
+    if sc != nil {
         envf = "ptr"
     }
     pl := sig.params
@@ -2510,7 +2811,7 @@ fn lspawn(g: mut G, scope: ref parser.Node, e: ref parser.Node, blocking: bool) 
     g.ldmark = lcallrt(g, "ptr", "rt_defer_mark", "")
     lenv_push(g)
     i := 0
-    if scope != nil {
+    if sc != nil {
         ssp := lbind(g, "_sc", check.tk(g.ck, check.k_scope()))
         fp := lgepf(g, "%o_spenv_" + sid, "%_e", 0)
         fv := lload(g, "ptr", fp)
@@ -2530,7 +2831,7 @@ fn lspawn(g: mut G, scope: ref parser.Node, e: ref parser.Node, blocking: bool) 
     }
     let targs: str = ""
     i = 0
-    if scope != nil {
+    if sc != nil {
         i = 1
     }
     pl = sig.params
@@ -2547,7 +2848,7 @@ fn lspawn(g: mut G, scope: ref parser.Node, e: ref parser.Node, blocking: bool) 
     } else {
         lcallr(g, lty(g, gsub(g, sig.ret1)), "@o_f_" + cname(qn), targs)
     }
-    if scope != nil {
+    if sc != nil {
         sv := lxname(g, "_sc")
         lcallrtv(g, "rt_scope_leave", "ptr " + sv)
     }
@@ -2570,9 +2871,9 @@ fn lspawn(g: mut G, scope: ref parser.Node, e: ref parser.Node, blocking: bool) 
     // the env value
     ep := lcallrt(g, "ptr", "rt_alloc", "i64 ptrtoint (ptr getelementptr (%o_spenv_" + sid + ", ptr null, i64 1) to i64)")
     i = 0
-    if scope != nil {
+    if sc != nil {
         fp := lgepf(g, "%o_spenv_" + sid, ep, 0)
-        scv := lresolve_scope(g, scope)
+        scv := lresolve_scope(g, sc)
         lstore(g, "ptr", scv, fp)
         i = 1
     }
@@ -2597,12 +2898,12 @@ fn lspawn(g: mut G, scope: ref parser.Node, e: ref parser.Node, blocking: bool) 
 // `go_in name { ... }` / scope exprs — named-scope resolution: the
 // operand is a ptr (scope exprs resolve at runtime; a bare name is a
 // local var holding the scope)
-fn lresolve_scope(g: mut G, scope: ref parser.Node) -> str {
-    if scope == nil {
+fn lresolve_scope(g: mut G, sc: ref parser.Node) -> str {
+    if sc == nil {
         return lcallrt(g, "ptr", "rt_scope_current", "")
     }
-    v := lx(g, scope)
-    return lfit(g, v, xty(g, scope), check.tk(g.ck, check.k_scope()))
+    v := lx(g, sc)
+    return lfit(g, v, xty(g, sc), check.tk(g.ck, check.k_scope()))
 }
 
 // ---------- calls ----------

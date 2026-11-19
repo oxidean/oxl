@@ -37,6 +37,40 @@ contract the typechecker, codegen, and runtime are built against.
 reliable. `new(expr)` heap-boxes a *value*: `new(E.V(...))` yields
 `own E`, `new(42)` yields `own int`.
 
+## Address stability
+
+An `own T` handle's pointee never moves. `rt_alloc_own` placements are
+fixed for the object's whole lifetime — the allocator returns a stable
+address and no relocation, compaction, or rehashing step ever moves a
+live `own` block. Handing an `own` pointer to a C callee (or stashing
+its address) is therefore safe *for the duration of the borrow* — see
+the FFI retention rule in `docs/site/language.mdx`.
+
+A pinned object's address is released only on its death path:
+
+| Death path | What ends the stable address |
+|---|---|
+| `rt_free` (extern C callers, FFI surface) | explicit free |
+| `drop_elem` on an `own` field/element | owner teardown |
+| Scope arena close | bulk-free of scope-lived blocks |
+| Process exit | everything |
+
+This is **not** a promise about every pointer:
+
+- Borrowed `[]T` backings relocate on `push` — a `mut []T` that grows
+  may return a different base address; never keep a pointer into one
+  across a call that can grow it.
+- Views (`s[lo:hi]`, `str` slices) die with their scope — the view is
+  scope-lived even when the backing is heap-stable.
+- Arena objects die at scope close regardless of how stable their
+  address was while the scope lived.
+
+The checked form of "a callee retains this pointer past return" is the
+parked `pin` primitive — `docs/specs/2026-11-11-pin-primitive/` pre-
+decides its design; until its trigger fires, retention is a contract
+violation (the FFI bullet). This section only pins the guarantee that
+already holds: addresses don't move *while the object is alive*.
+
 ## Borrow rules (dynamic)
 
 1. While a `mut T` borrow is live: no other `mut` or `ref` borrow of the

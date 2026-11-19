@@ -4216,6 +4216,23 @@ int64_t rt_is_windows(void) {
 #endif
 }
 
+/* host CPU arch — the llvm lane picks its C-boundary aggregate ABI
+ * spelling from this (byval stack copies only exist on SysV x86-64;
+ * AAPCS64 and win64 both pass a pointer to the composite). */
+OxlStr rt_host_arch(void) {
+#if defined(__x86_64__) || defined(_M_X64)
+    return rt_str("x86_64");
+#elif defined(__aarch64__) || defined(_M_ARM64)
+    return rt_str("aarch64");
+#elif defined(__arm__) || defined(_M_ARM)
+    return rt_str("arm");
+#elif defined(__i386__) || defined(_M_IX86)
+    return rt_str("x86");
+#else
+    return rt_str("unknown");
+#endif
+}
+
 /* "YYYY-MM-DD HH:MM:SS" local time — log line stamps, time.stamp() */
 OxlStr rt_timestr(void) {
     char buf[20];

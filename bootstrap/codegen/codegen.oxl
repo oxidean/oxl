@@ -215,6 +215,7 @@ struct G {
     // llvm lane state (llvm.oxl) — entry-alloca staging, block
     // bookkeeping, and the module-wide decl tables; the C lane never
     // touches these
+    labi: int, // C-boundary ABI mode: 0 unset, 1 sysv-x86_64, 2 aapcs64, 3 win64
     lreg: int,
     ldeadn: int,
     lterm: int,

@@ -520,6 +520,7 @@ int64_t rt_proc_run(RtSlice argv, RtSlice env);
 int64_t rt_proc_output(RtSlice argv, RtSlice env, RtSlice *out, RtSlice *errb);
 int64_t rt_str_cmp(OxlStr a, OxlStr b);      /* byte-lex order for str < str */
 int64_t rt_is_windows(void);                  /* 1 under _WIN32              */
+OxlStr  rt_host_arch(void);                   /* "x86_64" | "aarch64" | ...  */
 OxlStr  rt_timestr(void);                     /* "YYYY-MM-DD HH:MM:SS" local */
 double  rt_m_sqrt(double);
 double  rt_m_pow(double, double);

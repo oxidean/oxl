@@ -20,6 +20,7 @@ package codegen
 import "oxl/bootstrap/check"
 
 import "std/collections"
+import "std/strings"
 
 // ---------- block / instruction helpers ----------
 // SSA temps are %v<n>; user-visible labels L<n>; dead continuations
@@ -281,7 +282,7 @@ fn lsizeof(g: mut G, t: int) -> str {
 // on both ABIs. Returns the aggregate spelling to sret, else "".
 fn lsret_ty(g: mut G, t: int) -> str {
     t = gsub(g, t)
-    if lsize(g, t) <= 16 {
+    if lsize(g, t) <= laggt(g) {
         return ""
     }
     return lty(g, t)
@@ -411,6 +412,250 @@ fn lstr_op(g: mut G, s: str) -> str {
 
 fn lstr_op_u(g: mut G, u: int, s: str) -> str {
     return "getelementptr ([" + itoa(len(lunesc(s)) + 1) + " x i8], ptr " + lstrlit_u(g, u, s) + ", i64 0, i64 0)"
+}
+
+// ---------- C-boundary ABI mode ----------
+// Aggregate params and returns above the host's indirect threshold
+// have no single neutral spelling: SysV x86-64 wants the `byval`
+// stack-copy convention (the callee reads its own stack arg area),
+// AAPCS64 and win64 pass a pointer to a caller-side copy in an arg
+// register (the callee reads through it), and every indirect return
+// goes through sret. The emitted .ll only ever feeds the local clang
+// — --triple cross-compile is an L3 driver item — so the boundary is
+// spelled for the host ABI: 1 sysv-x86_64, 2 aapcs64, 3 win64.
+extern fn rt_host_arch() -> str
+extern fn rt_is_windows() -> int
+extern fn rt_getenv(name: str) -> str
+
+fn labi(g: mut G) -> int {
+    if g.labi == 0 {
+        g.labi = 1
+        if rt_is_windows() != 0 {
+            g.labi = 3
+        } else {
+            if rt_host_arch() == "aarch64" {
+                g.labi = 2
+            }
+        }
+        // emit-time override — the cross-compile spelling hook the
+        // driver's --triple wiring (L3) feeds; unset = host
+        ov := rt_getenv("OXL_LLVM_ABI")
+        if ov == "sysv" {
+            g.labi = 1
+        }
+        if ov == "aapcs64" {
+            g.labi = 2
+        }
+        if ov == "win64" {
+            g.labi = 3
+        }
+    }
+    return g.labi
+}
+
+// composite byte size above which C params/returns go indirect —
+// win64 byrefs every composite over 8 bytes, SysV/AAPCS64 over 16
+fn laggt(g: mut G) -> int {
+    if labi(g) == 3 {
+        return 8
+    }
+    return 16
+}
+
+// size of the named boundary aggregates the lane spells at call
+// sites; 0 marks a scalar/other type the ABI rules leave alone
+fn lagsz(tyn: str) -> int {
+    if tyn == "%RtSlice" {
+        return 32
+    }
+    if tyn == "%OxlStr" || tyn == "%RtFnv" || tyn == "%RtIface" {
+        return 16
+    }
+    return 0
+}
+
+// split a typed call-arg string on top-level commas — constant
+// operands like getelementptr(...) nest commas inside parens
+fn lsplit_args(a: str) -> []str {
+    r := mkslice(str, 0)
+    depth := 0
+    st := 0
+    i := 0
+    for i < len(a) {
+        c := byteat(a, i)
+        if c == 40 || c == 91 || c == 123 {
+            depth = depth + 1
+        } else {
+            if c == 41 || c == 93 || c == 125 {
+                depth = depth - 1
+            } else {
+                if c == 44 && depth == 0 {
+                    r = push(r, substr(a, st, i))
+                    st = i + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    tail := substr(a, st, len(a))
+    if len(tail) > 0 {
+        r = push(r, tail)
+    }
+    return r
+}
+
+// spill a value into an entry alloca and hand back the per-ABI param
+// spelling — `byval` on SysV (the callee's stack-arg copy), a plain
+// pointer to the copy on AAPCS64/win64 (the callee reads through it;
+// the copy keeps callee writes off the caller's aggregate either way)
+fn lagg_copy(g: mut G, tyn: str, v: str) -> str {
+    p := lalloc(g, tyn)
+    lstore(g, tyn, v, p)
+    if labi(g) == 1 {
+        return "ptr byval(" + tyn + ") align 8 " + p
+    }
+    return "ptr " + p
+}
+
+// one typed call arg ("<ty>[ <attr>…] <val>") → boundary spelling;
+// emits the materializing store for indirect aggregates and strips a
+// `byval` attr where the ABI takes a plain pointer instead
+fn labi_arg(g: mut G, arg: str) -> str {
+    arg = strings.trim(arg)
+    sp := -1
+    i := 0
+    for i < len(arg) {
+        if byteat(arg, i) == 32 {
+            sp = i
+            break
+        }
+        i = i + 1
+    }
+    if sp < 0 {
+        return arg
+    }
+    ty := substr(arg, 0, sp)
+    rest := substr(arg, sp + 1, len(arg))
+    if lagsz(ty) > laggt(g) {
+        return lagg_copy(g, ty, rest)
+    }
+    if ty == "ptr" && strings.startswith(rest, "byval(") {
+        if labi(g) == 1 {
+            return arg
+        }
+        // byval is the SysV spelling — strip the attr elsewhere; the
+        // last token is the pointer operand (attrs carry the spaces)
+        j := len(arg) - 1
+        for j > 0 {
+            if byteat(arg, j) == 32 {
+                break
+            }
+            j = j - 1
+        }
+        return "ptr " + substr(arg, j + 1, len(arg))
+    }
+    return arg
+}
+
+// rewrite a whole boundary-call arg string for the host ABI
+fn labi_args(g: mut G, a: str) -> str {
+    if len(a) == 0 {
+        return a
+    }
+    ps := lsplit_args(a)
+    out := ""
+    i := 0
+    for i < len(ps) {
+        if i > 0 {
+            out = out + ", "
+        }
+        out = out + labi_arg(g, ps[i])
+        i = i + 1
+    }
+    return out
+}
+
+// declare-side param spelling: attrs ride the call site, so `ptr`
+// alone covers every indirect class; bare aggregates over the
+// threshold become `ptr`
+fn labi_sig_pt(g: mut G, p: str) -> str {
+    p = strings.trim(p)
+    sp := 0
+    for sp < len(p) {
+        if byteat(p, sp) == 32 {
+            break
+        }
+        sp = sp + 1
+    }
+    ty := substr(p, 0, sp)
+    if ty == "ptr" {
+        if strings.startswith(substr(p, sp, len(p)), " sret(") {
+            return p
+        }
+        return "ptr"
+    }
+    if lagsz(ty) > laggt(g) {
+        return "ptr"
+    }
+    return p
+}
+
+// rewrite a literal rt.h signature for the host ABI — indirect
+// aggregate params become `ptr`, an indirect return becomes `void` +
+// a leading `sret` out-param. Idempotent: sret'd table entries and
+// scalar sigs pass through unchanged
+fn labi_sig(g: mut G, d: str) -> str {
+    at := -1
+    lp := -1
+    i := 0
+    for i < len(d) {
+        if at < 0 && byteat(d, i) == 64 {
+            at = i
+        }
+        if byteat(d, i) == 40 {
+            lp = i
+            break
+        }
+        i = i + 1
+    }
+    if at < 0 || lp < 0 {
+        return d
+    }
+    off := 0
+    if strings.startswith(d, "declare ") {
+        off = 8
+    }
+    ret := substr(d, off, at - 1)
+    name := substr(d, at, lp)
+    rp := len(d) - 1
+    for rp > lp {
+        if byteat(d, rp) == 41 {
+            break
+        }
+        rp = rp - 1
+    }
+    params := substr(d, lp + 1, rp)
+    np := ""
+    if len(params) > 0 {
+        ps := lsplit_args(params)
+        i = 0
+        for i < len(ps) {
+            if i > 0 {
+                np = np + ", "
+            }
+            np = np + labi_sig_pt(g, ps[i])
+            i = i + 1
+        }
+    }
+    if lagsz(ret) > laggt(g) {
+        if len(np) > 0 {
+            np = "ptr sret(" + ret + "), " + np
+        } else {
+            np = "ptr sret(" + ret + ")"
+        }
+        ret = "void"
+    }
+    return substr(d, 0, off) + ret + " " + name + "(" + np + ")" + substr(d, rp + 1, len(d))
 }
 
 // ---------- runtime declares ----------
@@ -839,18 +1084,22 @@ fn lrt(g: mut G, name: str) {
     lrtuse(g, name)
 }
 
-// >16-byte aggregates are MEMORY-class in the C ABI — the runtime's
-// by-value RtSlice params must be spelled `byval` (a stack copy),
-// not decomposed. The operand is the slice VALUE; this spills it and
-// hands back the typed arg spelling.
 fn lbyval_slice(g: mut G, v: str) -> str {
-    p := lalloc(g, "%RtSlice")
-    lstore(g, "%RtSlice", v, p)
-    return "ptr byval(%RtSlice) align 8 " + p
+    return lagg_copy(g, "%RtSlice", v)
 }
 
 fn lcallrt(g: mut G, rt: str, name: str, a: str) -> str {
     lrtuse(g, name)
+    a = labi_args(g, a)
+    if lagsz(rt) > laggt(g) {
+        dst := lalloc(g, rt)
+        sep := ""
+        if a != "" {
+            sep = ", "
+        }
+        lcallv(g, "@" + name, "ptr sret(" + rt + ") " + dst + sep + a)
+        return lload(g, rt, dst)
+    }
     return lcallr(g, rt, "@" + name, a)
 }
 
@@ -866,13 +1115,13 @@ fn lcallrt_sret(g: mut G, tyn: str, name: str, a: str) -> str {
     if a != "" {
         sep = ", "
     }
-    lcallv(g, "@" + name, "ptr sret(" + tyn + ") " + dst + sep + a)
+    lcallv(g, "@" + name, "ptr sret(" + tyn + ") " + dst + sep + labi_args(g, a))
     return lload(g, tyn, dst)
 }
 
 fn lcallrtv(g: mut G, name: str, a: str) {
     lrtuse(g, name)
-    lcallv(g, "@" + name, a)
+    lcallv(g, "@" + name, labi_args(g, a))
 }
 
 // ---------- width / representation normalization ----------
@@ -3371,12 +3620,11 @@ fn lcall(g: mut G, f: ref parser.Node, args: ref parser.NList) -> str {
             a = a + ", "
         }
         if pt >= 0 {
-            if sig.is_extern == 1 && tyk(g, pt) == check.k_slice() {
-                // >16B aggregates are MEMORY-class in the C ABI --
-                // a bare %RtSlice arg decomposes element-wise and the
-                // callee reads the wrong slots; same rule lbyval_slice
-                // applies to rt_* calls
-                a = a + lbyval_slice(g, cav.v)
+            if sig.is_extern == 1 && lsize(g, pt) > laggt(g) {
+                // composites over the host threshold cross indirectly
+                // — a bare aggregate arg decomposes element-wise and
+                // the callee reads the wrong slots
+                a = a + lagg_copy(g, lty(g, pt), cav.v)
             } else {
                 a = a + lty(g, pt) + " " + cav.v
             }
@@ -4003,10 +4251,10 @@ fn lemit_extern(g: mut G, i: int) {
                             ps = ps + ", "
                         }
                         pt := gty(g, ty)
-                        if tyk(g, pt) == check.k_slice() {
-                            // MEMORY-class boundary — the call spells
-                            // ptr byval(%RtSlice); the declare carries
-                            // the lowered param type
+                        if lsize(g, gsub(g, pt)) > laggt(g) {
+                            // indirect-aggregate boundary — the call
+                            // carries the per-ABI spelling; the
+                            // declare carries the lowered param type
                             ps = ps + "ptr"
                         } else {
                             ps = ps + lty(g, pt)
@@ -4247,12 +4495,26 @@ fn lemit_fnv_one(g: mut G, n: str) {
     }
     psig := ""
     argl := ""
+    cargl := ""
+    cpre := ""
     il := sig.params
     i := 0
     for il != nil {
         t := lty(g, gsub(g, il.v))
         psig = psig + ", " + t + " %a" + itoa(i)
         argl = argl + ", " + t + " %a" + itoa(i)
+        if sig.is_extern == 1 && lsize(g, gsub(g, il.v)) > laggt(g) {
+            // extern boundary — materialize per-ABI and point the call
+            // at the copy
+            cpre = cpre + "  %_c" + itoa(i) + " = alloca " + t + ", align 8\n  store " + t + " %a" + itoa(i) + ", ptr %_c" + itoa(i) + "\n"
+            if labi(g) == 1 {
+                cargl = cargl + ", ptr byval(" + t + ") align 8 %_c" + itoa(i)
+            } else {
+                cargl = cargl + ", ptr %_c" + itoa(i)
+            }
+        } else {
+            cargl = cargl + ", " + t + " %a" + itoa(i)
+        }
         i = i + 1
         il = il.next
     }
@@ -4260,7 +4522,7 @@ fn lemit_fnv_one(g: mut G, n: str) {
     if sig.is_extern == 0 {
         callee = "@o_f_" + cname(n)
     }
-    b := "define " + ret_c + " @o_fnv_wrap_" + cname(n) + "(ptr %_e" + psig + ") {\n"
+    b := "define " + ret_c + " @o_fnv_wrap_" + cname(n) + "(ptr %_e" + psig + ") {\n" + cpre
     if sig.retk == 1 {
         st := ""
         if sig.is_extern == 1 {
@@ -4269,14 +4531,14 @@ fn lemit_fnv_one(g: mut G, n: str) {
         if len(st) > 0 {
             sargs := "ptr sret(" + st + ") %_d"
             if len(argl) > 0 {
-                sargs = sargs + ", " + substr(argl, 2, len(argl))
+                sargs = sargs + ", " + substr(cargl, 2, len(cargl))
             }
             b = b + "  %_d = alloca " + st + ", align 8\n  call void " + callee + "(" + sargs + ")\n  %r = load " + st + ", ptr %_d\n  ret " + ret_c + " %r\n}\n"
         } else {
-            b = b + "  %r = call " + ret_c + " " + callee + "(" + substr(argl, 2, len(argl)) + ")\n  ret " + ret_c + " %r\n}\n"
+            b = b + "  %r = call " + ret_c + " " + callee + "(" + substr(cargl, 2, len(cargl)) + ")\n  ret " + ret_c + " %r\n}\n"
         }
     } else {
-        b = b + "  call void " + callee + "(" + substr(argl, 2, len(argl)) + ")\n  ret void\n}\n"
+        b = b + "  call void " + callee + "(" + substr(cargl, 2, len(cargl)) + ")\n  ret void\n}\n"
     }
     g.lwrap = push(g.lwrap, b)
 }
@@ -4502,6 +4764,7 @@ fn emit_llvm(r: own check.CkRes, testm: int) -> str {
     g.drop_tys = mkslice(str, 0)
     g.drop_word = 0
     g.drop_slice = 0
+    g.labi = 0
     g.lreg = 0
     g.ldeadn = 0
     g.lterm = 0
@@ -4769,7 +5032,7 @@ fn emit_llvm(r: own check.CkRes, testm: int) -> str {
     }
     i = 0
     for i < len(g.lrtl) {
-        out = out + lrt_sig(g.lrtl[i])
+        out = out + labi_sig(g, lrt_sig(g.lrtl[i]))
         i = i + 1
     }
     out = out + "\n"

@@ -2042,8 +2042,8 @@ printf 'package main\n\nfn add1(x: int) -> int {\n    return x + 1\n}\n\nfn main
 # values, handle move for own) and errors.as folds to rt_err_as; the
 # fixture exercises round-trip, exact-descr match, once-only
 # consumption, and wrapped-chain walking through both drivers
-seed_out=$("$SEEDOXL" run tests/errors_as.oxl 2>&1) && seed_rc=0 || seed_rc=$?
-self_out=$("$SELFOXL" run tests/errors_as.oxl 2>&1) && self_rc=0 || self_rc=$?
+seed_out=$("$SEEDOXL" run tests/errors_as.oxl 2>&1 | sed -E 's/^([A-Za-z]:)?[^:]*:[0-9]+:[0-9]+: //') && seed_rc=0 || seed_rc=$?
+self_out=$("$SELFOXL" run tests/errors_as.oxl 2>&1 | sed -E 's/^([A-Za-z]:)?[^:]*:[0-9]+:[0-9]+: //') && self_rc=0 || self_rc=$?
 if [ "$seed_out" != "$self_out" ] || [ "$seed_rc" != "$self_rc" ]; then
     echo "FAIL driver parity tests/errors_as.oxl"
     echo "-- seed ($seed_rc) --"; printf '%s

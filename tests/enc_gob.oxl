@@ -536,10 +536,11 @@ fn main() {
     if pqv.f0 != 2000000000 {
         fails("PE.I payload after re-decode")
     }
-    // --- depth cap: DEPTHMAX (10000) nesting levels. Hand-rolled
+    // --- depth cap: DEPTHMAX (256) nesting levels. Hand-rolled
     // Node wire: each `01` opens a nested `next` delta stream, each
-    // `00` closes one — ~11k levels in ~22k bytes must fail with
-    // err_depth instead of exhausting the C stack.
+    // `00` closes one — ~11k levels in ~22k bytes blows far past the
+    // 256 cap and must fail with err_depth (the cap also keeps decode
+    // inside the smallest target stack reserve, Windows' 1 MiB).
     dn := mkslice(byte, 0)
     dn = w1(dn, 1)
     dn = w1(dn, 4)

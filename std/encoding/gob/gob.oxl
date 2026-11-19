@@ -88,7 +88,10 @@ let MININT = 0 - 9223372036854775807 - 1
 // DEPTHMAX caps encoder/decoder recursion: each nested composite
 // level (struct field, enum payload, slice element) charges one unit
 // on enc.depth/dec.depth; past the cap the lane reports err_depth.
-let DEPTHMAX = 10000
+// 256 matches the xml/json parser caps — every nested level is
+// several C frames, so a cap this size stays inside the smallest
+// target stack reserve (Windows links at 1 MiB).
+let DEPTHMAX = 256
 
 fn p256(i: int) -> int {
     p := 1

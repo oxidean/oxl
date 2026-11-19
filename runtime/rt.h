@@ -110,6 +110,11 @@ typedef struct {
 } OxlStr;
 
 typedef struct RtScope RtScope;
+/* Placement invariant: objects carrying an ObjHdr never relocate —
+ * rt_alloc_own returns a stable address valid until the death path
+ * (rt_free, drop_elem teardown, scope close, or process exit). FFI
+ * consumers may borrow that address for the call's duration only;
+ * checked retention is the parked `pin` primitive. */
 typedef struct ObjHdr {
     uint32_t gen;
     uint8_t borrow; /* advisory last-seen mode — the borrow

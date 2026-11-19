@@ -390,6 +390,11 @@ fn main() {
         }
         bi = bi + 1
     }
+    // a skipped []own byte field still parses — the skip lane shares
+    // the ep gate, so presence words are consumed per element
+    scb := new(Sc)
+    scbe := gob.unmarshal(byb, scb)
+    want_ok(scbe, "unmarshal []own byte into other shape")
     // --- malformed wire shapes report, never panic: scalar range
     // checks, negative deltas, out-of-bounds tids and tags, and
     // giant field/type counts that must hit end-of-input.

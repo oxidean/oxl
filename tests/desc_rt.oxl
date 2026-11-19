@@ -19,6 +19,11 @@ fn id[T any](v: T) -> [T, err] {
     return v, nil
 }
 
+// keep is a generic sink — expr statements of a compound-literal Value
+// trip -Wunused-value on host compilers that warn (clang/msvc), so the
+// double-handle calls route through a param instead
+fn keep[T any](v: T) {}
+
 fn main() {
     // elem_ptr: borrow-qualified element slots are pointers, inline
     // value elements are not
@@ -45,8 +50,8 @@ fn main() {
     // double handle: new(new(1)) stores a handle in a heap slot —
     // value_of must load the inner pointer through a typed cast
     p := new(new(1))
-    value_of(p)
-    value_of_mut(p)
+    keep(value_of(p))
+    keep(value_of_mut(p))
     // pair-result generic instantiations embed the reflect handles by
     // value — the handle decls must precede the o_ret_ aggregates
     [v, e] = id(value_of(p))

@@ -2,9 +2,9 @@
   "schema_version": 1,
   "id": "WI-0016",
   "title": "shiki-oxl package: GitHub Packages publish + release tarball (issue #122)",
-  "state": "verifying",
+  "state": "archived",
   "profile": "normal",
   "current_stage": "verification",
   "created_at": "2026-11-17T09:59:13Z",
-  "updated_at": "2026-11-17T10:00:42Z"
+  "updated_at": "2026-11-19T01:41:53Z"
 }

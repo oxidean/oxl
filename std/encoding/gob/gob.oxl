@@ -1,0 +1,1516 @@
+package gob
+
+// std/encoding/gob — descriptor-driven struct -> bytes -> struct
+// round-trip over std/reflect's walk surface (R4).
+//
+// Wire shape follows Go's gob: each message is a type preamble then a
+// body. The preamble carries one record per encodable type reachable
+// from the root (first-mention order, root first): name, kind, and for
+// structs/enums a named field/payload list so the decoder matches by
+// NAME — unknown wire fields are skipped, missing ones keep their
+// zero value (decode-under-missing-field tolerance). Bodies are
+// delta-coded field-number streams: uvarint deltas over the preamble
+// field list, 0 terminates; only non-zero fields ride the wire, so a
+// skipped field IS the zero value on decode.
+//
+// Kind lanes: INT/ERR -> signed varint (^x with the top bit set),
+// FLOAT -> uvarint of the IEEE bits (reflect.fbits — decimal text
+// would lose precision), BOOL/BYTE -> uvarint, STR -> uvarint len +
+// bytes, []byte -> len + raw bytes, other slices -> len + elements
+// (elem_ptr slices add a per-element presence uvarint so nils
+// round-trip), STRUCT -> nested delta stream, ENUM -> tag uvarint +
+// delta stream over that variant's payload slots. `own` fields are
+// flattened like Go: the pointee's bytes ride under the field number,
+// a nil pointee is just an absent field; decode mints through
+// alloc_field/alloc_slice/alloc_elem, and a nil `own` enum payload
+// slot mints through alloc_vfield. The mints are arena-scoped:
+// alloc_field/alloc_slice/alloc_vfield/set_str overwrite a live slot
+// WITHOUT dropping the old pointee/backing — a re-decode into the
+// same target accumulates allocations until scope leave, bounded by
+// the scope's lifetime. PTR(cstr)/MAP/CHAN/IFACE/FN/VOID fields are
+// unencodable and stay out of preamble and numbering on both sides.
+// Decode limits: slice-typed payload slots and nested slices only
+// fill in place when the existing length matches — the reflect mints
+// reach struct fields and `own` enum payload slots, not slice
+// resizing (err_unsupported). Both lanes cap nesting at DEPTHMAX on
+// the enc/dec state — a deeper wire body or value reports err_depth
+// rather than exhausting the fixed C stack (attacker input costs
+// ~4 bytes per level). Skip-zero reads -0.0 as zero (iszero's
+// x == 0.0), so -0.0 stays off the wire and decodes back as +0.0 —
+// the one scalar that doesn't bit-round-trip.
+//
+// gob-shaped, not Go-compatible: the uvarint count byte is 255-n
+// where Go's encoding/gob writes 256-n, and the signed lane is
+// ^x|top-bit rather than Go's (^x<<1)|1 — nothing here interoperates
+// with Go on the wire. Cycles: wwalk terminates on cyclic TYPES (a
+// recursive descriptor is collected once), while cyclic VALUES —
+// `own` back-edges closing a data cycle — hit DEPTHMAX on encode and
+// report err_depth; Go's gob documents the same limit as unbounded
+// recursion.
+import "std/errors"
+
+import "std/reflect"
+
+/// err_malformed is the sentinel for truncated or ill-formed input.
+fn err_malformed() -> err {
+    return errors.new("gob: malformed input")
+}
+
+/// err_type reports a wire record whose kind can't bind to the
+/// decode target (wrong root kind, unknown enum variant).
+fn err_type() -> err {
+    return errors.new("gob: type mismatch")
+}
+
+/// err_unsupported reports a shape the decode lane can't mint —
+//  own-typed enum payload slots, slice fields needing a resize, or a
+//  kind that never reaches the wire.
+fn err_unsupported() -> err {
+    return errors.new("gob: unsupported shape")
+}
+
+/// err_depth reports a wire body or value nested past DEPTHMAX —
+/// the recursion cap that keeps hostile input off the fixed C stack.
+fn err_depth() -> err {
+    return errors.new("gob: depth limit exceeded")
+}
+
+/// err_nil reports a nil qualified root: marshal on a nil `own` or
+/// unmarshal through a nil `own` target mints Value{addr:0} and the
+/// walks would dereference address 0.
+fn err_nil() -> err {
+    return errors.new("gob: nil root value")
+}
+
+// -9223372036854775808 — the literal can't be spelled in one token
+let MININT = 0 - 9223372036854775807 - 1
+
+// DEPTHMAX caps encoder/decoder recursion: each nested composite
+// level (struct field, enum payload, slice element) charges one unit
+// on enc.depth/dec.depth; past the cap the lane reports err_depth.
+// 256 matches the xml/json parser caps — every nested level is
+// several C frames, so a cap this size stays inside the smallest
+// target stack reserve (Windows links at 1 MiB).
+let DEPTHMAX = 256
+
+fn p256(i: int) -> int {
+    p := 1
+    for i > 0 {
+        p = p * 256
+        i = i - 1
+    }
+    return p
+}
+
+// ---------- encode ----------
+
+// enc carries the output buffer plus the preamble bookkeeping — the
+// collected (name, kind) pairs in first-mention order and em, the
+// count of records already emitted on the second pass. reflect.Type
+// handles are scope-bound and can't ride in a heap slice, so the two
+// passes re-walk the descriptor graph instead of storing the handles.
+struct enc { out: []byte, tn: []str, tk: []int, em: int, depth: int }
+
+// leave returns the depth unit charged at each composite encoder's
+// entry — deferred there so every return path decrements.
+fn (e mut enc) leave() {
+    e.depth = e.depth - 1
+}
+
+fn (e mut enc) ubyte(b: int) {
+    e.out = push(e.out, b & 255)
+}
+
+// uvar writes u gob-style: one byte for u <= 127, else 255-n then the
+// n significant big-endian bytes (Go's encoding/gob writes 256-n —
+// the streams are shaped alike but not byte-compatible). u is the raw
+// 64-bit pattern — a negative i64 carries a set top bit and always
+// takes 8 bytes. lo masks that bit off so the byte extraction below
+// never divides a negative.
+fn (e mut enc) uvar(u: int) {
+    if u >= 0 && u < 128 {
+        e.out = push(e.out, u)
+        return
+    }
+    lo := u & 9223372036854775807
+    n := 8
+    if u > 0 {
+        n = 1
+        p := 256
+        for n < 8 && u >= p {
+            p = p * 256
+            n = n + 1
+        }
+    }
+    e.out = push(e.out, 255 - n)
+    i := n - 1
+    for i >= 0 {
+        b := lo / p256(i) % 256
+        if i == 7 && u < 0 {
+            b = b + 128
+        }
+        e.out = push(e.out, b)
+        i = i - 1
+    }
+}
+
+// svar writes a signed int gob-style: negative x rides as (^x) with
+// the top bit set (^x spelled 0-x-1 — the language has no unary ~).
+// Go's encoding/gob maps negatives to (^x<<1)|1 instead — same idea,
+// different bits.
+fn (e mut enc) svar(x: int) {
+    u := x
+    if x < 0 {
+        u = 0 - x - 1 + MININT
+    }
+    e.uvar(u)
+}
+
+fn (e mut enc) bstr(s: str) {
+    e.uvar(len(s))
+    i := 0
+    for i < len(s) {
+        e.out = push(e.out, byteat(s, i))
+        i = i + 1
+    }
+}
+
+// etid is the preamble index of a collected (name, kind) pair — the
+// collection pass ran ahead of emission so every reachable type sits
+// in the tables; a -1 miss on the emit pass is an internal bug, on
+// the collect pass it means "first mention".
+fn (e ref enc) etid(t: reflect.Type) -> int {
+    nm := t.name()
+    kd := t.kind()
+    i := 0
+    for i < len(e.tn) {
+        if e.tn[i] == nm && e.tk[i] == kd {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// encodable reports whether a descriptor kind reaches the wire —
+// scalars and composites do; cstr/chan/iface/fn/void slots don't and
+// are dropped from preamble and field numbering alike.
+fn encodable(t: reflect.Type) -> bool {
+    k := t.kind()
+    if k == reflect.KindInt() || k == reflect.KindErr() || k == reflect.KindFloat() || k == reflect.KindBool() || k == reflect.KindByte() || k == reflect.KindStr() || k == reflect.KindStruct() || k == reflect.KindEnum() {
+        return true
+    }
+    if k == reflect.KindSlice() {
+        [et, ee] = t.elem()
+        if ee != nil {
+            return false
+        }
+        return encodable(et)
+    }
+    return false
+}
+
+// lwname is a struct field's wire name: a `tag "gob:..."` overrides
+// the declared name, `gob:-` (quoted or bare) hides the field.
+fn lwname(f: reflect.Field) -> str {
+    tag := f.tag()
+    if len(tag) > 4 && substr(tag, 0, 4) == "gob:" {
+        s := substr(tag, 4, len(tag))
+        if len(s) >= 2 && byteat(s, 0) == 34 && byteat(s, len(s) - 1) == 34 {
+            s = substr(s, 1, len(s) - 1)
+        }
+        return s
+    }
+    return f.name()
+}
+
+// wwalk visits every encodable type reachable from t in first-mention
+// order, root first. emit=0 collects (name, kind) pairs into tn/tk;
+// emit=1 re-runs the identical walk emitting one preamble record per
+// type — the order is deterministic, so the record at hand is always
+// the one whose index equals e.em and erec's tid references resolve.
+fn (e mut enc) wwalk(t: reflect.Type, emit: int) {
+    i := e.etid(t)
+    if emit == 0 {
+        if i >= 0 {
+            return
+        }
+        e.tn = push(e.tn, t.name())
+        e.tk = push(e.tk, t.kind())
+    } else {
+        if i >= 0 && i < e.em {
+            return
+        }
+        assert(i == e.em)
+        e.erec(t)
+        e.em = e.em + 1
+    }
+    k := t.kind()
+    if k == reflect.KindStruct() {
+        i = 0
+        for i < t.nfields() {
+            [f, fe] = t.field(i)
+            if fe == nil {
+                [ft, f2] = f.typ()
+                if f2 == nil && encodable(ft) && lwname(f) != "-" {
+                    e.wwalk(ft, emit)
+                }
+            }
+            i = i + 1
+        }
+    }
+    if k == reflect.KindSlice() {
+        [et, ee] = t.elem()
+        if ee == nil && encodable(et) {
+            e.wwalk(et, emit)
+        }
+    }
+    if k == reflect.KindEnum() {
+        i = 0
+        for i < t.nvars() {
+            [x, xe] = t.variant(i)
+            if xe == nil {
+                j := 0
+                for j < x.nfields() {
+                    [pt, pe] = x.ftyp(j)
+                    if pe == nil && encodable(pt) {
+                        e.wwalk(pt, emit)
+                    }
+                    j = j + 1
+                }
+            }
+            i = i + 1
+        }
+    }
+}
+
+// erec emits one preamble record for t — the kind word plus the
+// field/variant/element metadata a decoder needs for name matching
+// and value skipping.
+fn (e mut enc) erec(t: reflect.Type) {
+    e.bstr(t.name())
+    e.uvar(t.kind())
+    k := t.kind()
+    if k == reflect.KindStruct() {
+        nf := 0
+        i := 0
+        for i < t.nfields() {
+            [f, fe] = t.field(i)
+            if fe == nil {
+                [ft, f2] = f.typ()
+                if f2 == nil && encodable(ft) && lwname(f) != "-" {
+                    nf = nf + 1
+                }
+            }
+            i = i + 1
+        }
+        e.uvar(nf)
+        i = 0
+        for i < t.nfields() {
+            [f, fe] = t.field(i)
+            if fe == nil {
+                [ft, f2] = f.typ()
+                if f2 == nil && encodable(ft) && lwname(f) != "-" {
+                    e.bstr(lwname(f))
+                    e.uvar(ft.kind())
+                    e.uvar(f.ptr())
+                    e.uvar(e.etid(ft))
+                }
+            }
+            i = i + 1
+        }
+    }
+    if k == reflect.KindSlice() {
+        [et, ee] = t.elem()
+        if ee == nil {
+            e.uvar(et.kind())
+            e.uvar(t.elemptr())
+            e.uvar(e.etid(et))
+        }
+    }
+    if k == reflect.KindEnum() {
+        e.uvar(t.nvars())
+        i := 0
+        for i < t.nvars() {
+            [x, xe] = t.variant(i)
+            if xe != nil {
+                i = i + 1
+                continue
+            }
+            e.bstr(x.name())
+            np := 0
+            j := 0
+            for j < x.nfields() {
+                [pt, pe] = x.ftyp(j)
+                if pe == nil && encodable(pt) {
+                    np = np + 1
+                }
+                j = j + 1
+            }
+            e.uvar(np)
+            j = 0
+            for j < x.nfields() {
+                [pt, pe] = x.ftyp(j)
+                if pe != nil || !encodable(pt) {
+                    j = j + 1
+                    continue
+                }
+                [pn, pne] = x.fname(j)
+                if pne != nil {
+                    j = j + 1
+                    continue
+                }
+                [pp, ppe] = x.fptr(j)
+                if ppe != nil {
+                    j = j + 1
+                    continue
+                }
+                e.bstr(pn)
+                e.uvar(pt.kind())
+                e.uvar(pp)
+                e.uvar(e.etid(pt))
+                j = j + 1
+            }
+            i = i + 1
+        }
+    }
+}
+
+// iszero reports whether v reads as its kind's zero — skipped fields
+// never ride the wire. Unencodable kinds count as zero; a nil `own`
+// slot reads zero by absence, but a READABLE `own` slot (field/vfield
+// returned the pointee) is non-zero on presence alone — nil-ness is
+// what absence means, not zero-ness.
+fn (e mut enc) iszero(v: reflect.Value) -> bool {
+    if e.depth >= DEPTHMAX {
+        // a bool can't report — judge over-deep as non-zero so the
+        // field stays on the wire and eval reaches the real cap
+        // (which returns err_depth) instead of silently dropping it
+        return false
+    }
+    e.depth = e.depth + 1
+    defer e.leave()
+    t := v.typ()
+    k := t.kind()
+    if k == reflect.KindInt() || k == reflect.KindErr() {
+        [x, xe] = v.int()
+        if xe != nil {
+            return true
+        }
+        return x == 0
+    }
+    if k == reflect.KindFloat() {
+        [x, xe] = v.f64()
+        if xe != nil {
+            return true
+        }
+        return x == 0.0
+    }
+    if k == reflect.KindBool() {
+        [x, xe] = v.bool()
+        return xe != nil || x == 0
+    }
+    if k == reflect.KindByte() {
+        [y, ye] = v.byte()
+        return ye != nil || y == 0
+    }
+    if k == reflect.KindStr() {
+        [s, se] = v.str()
+        return se != nil || len(s) == 0
+    }
+    if k == reflect.KindSlice() {
+        [n, ne] = v.len()
+        return ne != nil || n == 0
+    }
+    if k == reflect.KindStruct() {
+        i := 0
+        for i < t.nfields() {
+            [f, fe] = t.field(i)
+            if fe == nil {
+                [ft, f2] = f.typ()
+                if f2 == nil && encodable(ft) && lwname(f) != "-" {
+                    [fv, f3] = v.field(i)
+                    if f3 == nil {
+                        // a successful read on an `own` slot means
+                        // non-nil — presence is non-zero even when the
+                        // pointee reads all-zero
+                        if f.ptr() == 1 || !e.iszero(fv) {
+                            return false
+                        }
+                    }
+                }
+            }
+            i = i + 1
+        }
+        return true
+    }
+    if k == reflect.KindEnum() {
+        [tg, te] = v.tag()
+        if te != nil || tg != 0 {
+            return false
+        }
+        [x, xe] = t.variant(0)
+        if xe != nil {
+            return true
+        }
+        i := 0
+        for i < x.nfields() {
+            [pt, pe] = x.ftyp(i)
+            if pe == nil && encodable(pt) {
+                [fv, fe] = v.vfield(0, i)
+                if fe == nil {
+                    // `own` payload slot read OK → non-nil → present
+                    [fp, fpe] = x.fptr(i)
+                    if fpe == nil && fp == 1 {
+                        return false
+                    }
+                    if !e.iszero(fv) {
+                        return false
+                    }
+                }
+            }
+            i = i + 1
+        }
+        return true
+    }
+    return true
+}
+
+// estruct emits the delta-coded field stream: deltas count positions
+// in the preamble field list (encodable, unhidden fields in decl
+// order), 0 terminates.
+fn (e mut enc) estruct(v: reflect.Value) -> err {
+    if e.depth >= DEPTHMAX {
+        return err_depth()
+    }
+    e.depth = e.depth + 1
+    defer e.leave()
+    t := v.typ()
+    last := -1
+    wn := -1
+    i := 0
+    for i < t.nfields() {
+        [f, fe] = t.field(i)
+        if fe != nil {
+            return fe
+        }
+        [ft, f2] = f.typ()
+        if f2 != nil {
+            return f2
+        }
+        if !encodable(ft) || lwname(f) == "-" {
+            i = i + 1
+            continue
+        }
+        wn = wn + 1
+        [fv, f3] = v.field(i)
+        if f3 != nil {
+            // a nil `own` slot is an absent field, never a read
+            if !errors.is(f3, reflect.err_nil()) {
+                return f3
+            }
+            i = i + 1
+            continue
+        }
+        if f.ptr() == 0 && e.iszero(fv) {
+            i = i + 1
+            continue
+        }
+        e.uvar(wn - last)
+        last = wn
+        e2 := e.eval(fv)
+        if e2 != nil {
+            return e2
+        }
+        i = i + 1
+    }
+    e.uvar(0)
+    return nil
+}
+
+// eenum emits the tag uvarint then a delta stream over the live
+// variant's encodable payload slots, numbered as the preamble lists
+// them.
+fn (e mut enc) eenum(v: reflect.Value) -> err {
+    if e.depth >= DEPTHMAX {
+        return err_depth()
+    }
+    e.depth = e.depth + 1
+    defer e.leave()
+    [tg, te] = v.tag()
+    if te != nil {
+        return te
+    }
+    e.uvar(tg)
+    t := v.typ()
+    [x, xe] = t.variant(tg)
+    if xe != nil {
+        return xe
+    }
+    last := -1
+    wn := -1
+    i := 0
+    for i < x.nfields() {
+        [pt, pe] = x.ftyp(i)
+        if pe != nil {
+            return pe
+        }
+        if !encodable(pt) {
+            i = i + 1
+            continue
+        }
+        wn = wn + 1
+        [fv, fe] = v.vfield(tg, i)
+        if fe != nil {
+            if !errors.is(fe, reflect.err_nil()) {
+                return fe
+            }
+            i = i + 1
+            continue
+        }
+        [fp, fpe] = x.fptr(i)
+        if fpe != nil {
+            return fpe
+        }
+        // a non-nil `own` payload slot is present regardless of the
+        // pointee's zero-ness — nil slots never reach here (err_nil)
+        if fp == 0 && e.iszero(fv) {
+            i = i + 1
+            continue
+        }
+        e.uvar(wn - last)
+        last = wn
+        e2 := e.eval(fv)
+        if e2 != nil {
+            return e2
+        }
+        i = i + 1
+    }
+    e.uvar(0)
+    return nil
+}
+
+// eslice emits uvarint len then the elements — raw bytes for []byte,
+// presence uvarint + value for elem_ptr slices ([]own T keeps its
+// nils), bare values otherwise.
+fn (e mut enc) eslice(v: reflect.Value) -> err {
+    if e.depth >= DEPTHMAX {
+        return err_depth()
+    }
+    e.depth = e.depth + 1
+    defer e.leave()
+    [n, ne] = v.len()
+    if ne != nil {
+        return ne
+    }
+    e.uvar(n)
+    t := v.typ()
+    [et, ee] = t.elem()
+    if ee != nil {
+        return ee
+    }
+    ep := t.elemptr()
+    // raw bytes only for inline []byte — []own byte rides the generic
+    // lane so each element carries a presence uvarint and nils survive
+    if et.kind() == reflect.KindByte() && ep == 0 {
+        i := 0
+        for i < n {
+            [ev, e2] = v.index(i)
+            if e2 != nil {
+                return e2
+            }
+            [b, be] = ev.byte()
+            if be != nil {
+                return be
+            }
+            e.ubyte(b)
+            i = i + 1
+        }
+        return nil
+    }
+    i := 0
+    for i < n {
+        if ep == 1 {
+            [ev, e2] = v.index(i)
+            if e2 != nil {
+                if !errors.is(e2, reflect.err_nil()) {
+                    return e2
+                }
+                e.uvar(0)
+                i = i + 1
+                continue
+            }
+            e.uvar(1)
+            e3 := e.eval(ev)
+            if e3 != nil {
+                return e3
+            }
+        } else {
+            [ev, e2] = v.index(i)
+            if e2 != nil {
+                return e2
+            }
+            e3 := e.eval(ev)
+            if e3 != nil {
+                return e3
+            }
+        }
+        i = i + 1
+    }
+    return nil
+}
+
+// eval dispatches a value onto its kind's wire lane.
+fn (e mut enc) eval(v: reflect.Value) -> err {
+    t := v.typ()
+    k := t.kind()
+    if k == reflect.KindInt() || k == reflect.KindErr() {
+        // an err serializes as its raw int64 code — the registry is
+        // process-local and interned per binary, so a code decoded in
+        // a different binary is a foreign code: errors.msg yields ""
+        // and errors.is never matches. Wire-stable within one
+        // binary's registry only.
+        [x, xe] = v.int()
+        if xe != nil {
+            return xe
+        }
+        e.svar(x)
+        return nil
+    }
+    if k == reflect.KindFloat() {
+        [x, xe] = v.fbits()
+        if xe != nil {
+            return xe
+        }
+        e.uvar(x)
+        return nil
+    }
+    if k == reflect.KindBool() {
+        [x, xe] = v.bool()
+        if xe != nil {
+            return xe
+        }
+        e.uvar(x)
+        return nil
+    }
+    if k == reflect.KindByte() {
+        [x, xe] = v.byte()
+        if xe != nil {
+            return xe
+        }
+        e.uvar(x)
+        return nil
+    }
+    if k == reflect.KindStr() {
+        [s, se] = v.str()
+        if se != nil {
+            return se
+        }
+        e.bstr(s)
+        return nil
+    }
+    if k == reflect.KindStruct() {
+        return e.estruct(v)
+    }
+    if k == reflect.KindEnum() {
+        return e.eenum(v)
+    }
+    if k == reflect.KindSlice() {
+        return e.eslice(v)
+    }
+    return err_unsupported()
+}
+
+/// marshal encodes v — a gob-shaped byte string: type preamble then
+/// the delta-coded body. Any encodable root kind marshals; decode of
+/// the pair is symmetric where the reflect mints reach (STRUCT/ENUM
+/// roots are the covered case).
+fn marshal[T any](v: T) -> [[]byte, err] {
+    e := enc{out: mkslice(byte, 0), tn: mkslice(str, 0), tk: mkslice(int, 0), em: 0, depth: 0}
+    c := new(v)
+    rv := value_of(c)
+    // a nil qualified root (`own T` — tqual(T) marks it) mints
+    // Value{addr:0}; the walks below would dereference address 0
+    if rv.isnull() {
+        return nil, err_nil()
+    }
+    t := rv.typ()
+    e.wwalk(t, 0)
+    e.uvar(len(e.tn))
+    e.wwalk(t, 1)
+    e2 := e.eval(rv)
+    if e2 != nil {
+        // no partial output on error — the prefix could pass for a
+        // complete message if a caller ignored err
+        return nil, e2
+    }
+    return e.out, nil
+}
+
+// ---------- decode ----------
+
+// one wire field/payload slot: name for matching, kind for the value
+// lane, ptr for the writer's own-ness (informational — decode keys on
+// the local field), tid into ts for composite kinds.
+struct wslot { name: str, kind: int, ptr: int, tid: int }
+
+struct wvar { name: str, ps: []wslot }
+
+// one preamble type record — fs for STRUCT, vs for ENUM, ek/ep/et for
+// SLICE (element kind, element slot ptr-ness, element record tid).
+struct wt {
+    name: str,
+    kind: int,
+    fs: []wslot,
+    vs: []wvar,
+    ek: int,
+    ep: int,
+    et: int,
+}
+
+struct dec { b: []byte, pos: int, depth: int }
+
+// leave returns the depth unit charged at each composite decoder's
+// entry — deferred there so every return path decrements.
+fn (d mut dec) leave() {
+    d.depth = d.depth - 1
+}
+
+fn (d mut dec) uvar() -> [int, err] {
+    if d.pos >= len(d.b) {
+        return 0, err_malformed()
+    }
+    c := d.b[d.pos]
+    d.pos = d.pos + 1
+    if c < 128 {
+        return c, nil
+    }
+    n := 255 - c
+    if n < 1 || n > 8 || d.pos + n > len(d.b) {
+        return 0, err_malformed()
+    }
+    u := 0
+    for n > 0 {
+        // the multiply wraps on a set top bit — the pattern IS the
+        // value (two's complement, same as the writer side)
+        u = u * 256 + d.b[d.pos]
+        d.pos = d.pos + 1
+        n = n - 1
+    }
+    return u, nil
+}
+
+fn (d mut dec) svar() -> [int, err] {
+    [u, e] = d.uvar()
+    if e != nil {
+        return 0, e
+    }
+    if u < 0 {
+        return 0 - (u - MININT) - 1, nil
+    }
+    return u, nil
+}
+
+fn (d mut dec) bstr() -> [str, err] {
+    [n, e] = d.uvar()
+    if e != nil {
+        return "", e
+    }
+    if n < 0 || n > len(d.b) - d.pos {
+        return "", err_malformed()
+    }
+    s := d.b[d.pos:d.pos + n] as str
+    d.pos = d.pos + n
+    return s, nil
+}
+
+// dslot reads one wire slot (name + kind + ptr + tid words).
+fn (d mut dec) dslot() -> [wslot, err] {
+    w := wslot{name: "", kind: 0, ptr: 0, tid: 0}
+    [nm, e] = d.bstr()
+    if e != nil {
+        return w, e
+    }
+    w.name = nm
+    [k, e2] = d.uvar()
+    if e2 != nil {
+        return w, e2
+    }
+    w.kind = k
+    [p, e3] = d.uvar()
+    if e3 != nil {
+        return w, e3
+    }
+    w.ptr = p
+    [t, e4] = d.uvar()
+    if e4 != nil {
+        return w, e4
+    }
+    w.tid = t
+    return w, nil
+}
+
+// dparse reads the preamble into ts — record 0 is the root type.
+fn (d mut dec) dparse() -> [[]wt, err] {
+    ts := mkslice(wt, 0)
+    [nt, e] = d.uvar()
+    if e != nil {
+        return ts, e
+    }
+    if nt < 1 {
+        return ts, err_malformed()
+    }
+    i := 0
+    for i < nt {
+        w := wt{name: "", kind: 0, fs: mkslice(wslot, 0), vs: mkslice(wvar, 0), ek: 0, ep: 0, et: 0}
+        [nm, e2] = d.bstr()
+        if e2 != nil {
+            return ts, e2
+        }
+        w.name = nm
+        [k, e3] = d.uvar()
+        if e3 != nil {
+            return ts, e3
+        }
+        if k < 0 || k > reflect.KindVoid() {
+            return ts, err_malformed()
+        }
+        w.kind = k
+        if k == reflect.KindStruct() {
+            [nf, e4] = d.uvar()
+            if e4 != nil {
+                return ts, e4
+            }
+            j := 0
+            for j < nf {
+                [ws, we] = d.dslot()
+                if we != nil {
+                    return ts, we
+                }
+                w.fs = push(w.fs, ws)
+                j = j + 1
+            }
+        }
+        if k == reflect.KindSlice() {
+            [ek, e5] = d.uvar()
+            if e5 != nil {
+                return ts, e5
+            }
+            [ep, e6] = d.uvar()
+            if e6 != nil {
+                return ts, e6
+            }
+            [et, e7] = d.uvar()
+            if e7 != nil {
+                return ts, e7
+            }
+            w.ek = ek
+            w.ep = ep
+            w.et = et
+        }
+        if k == reflect.KindEnum() {
+            [nv, e8] = d.uvar()
+            if e8 != nil {
+                return ts, e8
+            }
+            vi := 0
+            for vi < nv {
+                wv := wvar{name: "", ps: mkslice(wslot, 0)}
+                [vn, e9] = d.bstr()
+                if e9 != nil {
+                    return ts, e9
+                }
+                wv.name = vn
+                [np, e10] = d.uvar()
+                if e10 != nil {
+                    return ts, e10
+                }
+                pi := 0
+                for pi < np {
+                    [ws, we] = d.dslot()
+                    if we != nil {
+                        return ts, we
+                    }
+                    wv.ps = push(wv.ps, ws)
+                    pi = pi + 1
+                }
+                w.vs = push(w.vs, wv)
+                vi = vi + 1
+            }
+        }
+        ts = push(ts, w)
+        i = i + 1
+    }
+    return ts, nil
+}
+
+// dskip consumes a wire value by its slot metadata — the tolerance
+// lane for fields the local type lacks or names differently.
+fn (d mut dec) dskip(ws: wslot, ts: []wt) -> err {
+    if d.depth >= DEPTHMAX {
+        return err_depth()
+    }
+    d.depth = d.depth + 1
+    defer d.leave()
+    k := ws.kind
+    if k == reflect.KindInt() || k == reflect.KindErr() || k == reflect.KindFloat() || k == reflect.KindBool() || k == reflect.KindByte() {
+        [_u, e] = d.uvar()
+        return e
+    }
+    if k == reflect.KindStr() {
+        [n, e] = d.uvar()
+        if e != nil {
+            return e
+        }
+        if n < 0 || n > len(d.b) - d.pos {
+            return err_malformed()
+        }
+        d.pos = d.pos + n
+        return nil
+    }
+    if k == reflect.KindStruct() {
+        if ws.tid < 0 || ws.tid >= len(ts) {
+            return err_malformed()
+        }
+        w := ts[ws.tid]
+        last := -1
+        for true {
+            [dl, e] = d.uvar()
+            if e != nil {
+                return e
+            }
+            if dl == 0 {
+                return nil
+            }
+            if dl < 0 {
+                return err_malformed()
+            }
+            last = last + dl
+            if last < 0 || last >= len(w.fs) {
+                return err_malformed()
+            }
+            e2 := d.dskip(w.fs[last], ts)
+            if e2 != nil {
+                return e2
+            }
+        }
+    }
+    if k == reflect.KindEnum() {
+        if ws.tid < 0 || ws.tid >= len(ts) {
+            return err_malformed()
+        }
+        w := ts[ws.tid]
+        [tg, e] = d.uvar()
+        if e != nil {
+            return e
+        }
+        if tg < 0 || tg >= len(w.vs) {
+            return err_malformed()
+        }
+        wv := w.vs[tg]
+        last := -1
+        for true {
+            [dl, e2] = d.uvar()
+            if e2 != nil {
+                return e2
+            }
+            if dl == 0 {
+                return nil
+            }
+            if dl < 0 {
+                return err_malformed()
+            }
+            last = last + dl
+            if last < 0 || last >= len(wv.ps) {
+                return err_malformed()
+            }
+            e3 := d.dskip(wv.ps[last], ts)
+            if e3 != nil {
+                return e3
+            }
+        }
+    }
+    if k == reflect.KindSlice() {
+        if ws.tid < 0 || ws.tid >= len(ts) {
+            return err_malformed()
+        }
+        w := ts[ws.tid]
+        [n, e] = d.uvar()
+        if e != nil {
+            return e
+        }
+        if n < 0 {
+            return err_malformed()
+        }
+        if w.ek == reflect.KindByte() && w.ep == 0 {
+            if n > len(d.b) - d.pos {
+                return err_malformed()
+            }
+            d.pos = d.pos + n
+            return nil
+        }
+        es := wslot{name: "", kind: w.ek, ptr: w.ep, tid: w.et}
+        i := 0
+        for i < n {
+            if w.ep == 1 {
+                [pr, e2] = d.uvar()
+                if e2 != nil {
+                    return e2
+                }
+                if pr == 0 {
+                    i = i + 1
+                    continue
+                }
+            }
+            e3 := d.dskip(es, ts)
+            if e3 != nil {
+                return e3
+            }
+            i = i + 1
+        }
+        return nil
+    }
+    return err_unsupported()
+}
+
+// dsliceinto fills an already-allocated slice Value with n wire
+// elements — shared by the field-mint path and the in-place fills
+// (existing enum payload slots, nested slices) where len must match.
+fn (d mut dec) dsliceinto(w: wt, sv: reflect.Value, n: int, ts: []wt) -> err {
+    if d.depth >= DEPTHMAX {
+        return err_depth()
+    }
+    d.depth = d.depth + 1
+    defer d.leave()
+    es := wslot{name: "", kind: w.ek, ptr: w.ep, tid: w.et}
+    st := sv.typ()
+    [et, ee] = st.elem()
+    if ee != nil {
+        return ee
+    }
+    if w.ek == reflect.KindByte() && w.ep == 0 {
+        // the encode lane writes inline []byte raw — n bytes, no
+        // per-element uvarint — mirroring dskip's BYTE fast path. A
+        // wire ep of 1 ([]own byte) rides the generic lane below.
+        if n > len(d.b) - d.pos {
+            return err_malformed()
+        }
+        i := 0
+        for i < n {
+            // a local []own byte mints per element — index errs
+            // err_nil on freshly-allocated nil slots
+            ev := sv
+            if st.elemptr() == 1 {
+                [av, ae] = sv.alloc_elem(i)
+                if ae != nil {
+                    return ae
+                }
+                ev = av
+            } else {
+                [xv, xe] = sv.index(i)
+                if xe != nil {
+                    return xe
+                }
+                ev = xv
+            }
+            be := ev.set_byte(d.b[d.pos])
+            if be != nil {
+                return be
+            }
+            d.pos = d.pos + 1
+            i = i + 1
+        }
+        return nil
+    }
+    i := 0
+    for i < n {
+        // mint or select per the LOCAL slot shape; presence rides on
+        // the wire's ep flag so a flattened pair (own writer, inline
+        // reader or back) still lines up
+        ev := sv
+        if st.elemptr() == 1 {
+            if w.ep == 1 {
+                [pr, e2] = d.uvar()
+                if e2 != nil {
+                    return e2
+                }
+                if pr == 0 {
+                    i = i + 1
+                    continue
+                }
+            }
+            [av, ae] = sv.alloc_elem(i)
+            if ae != nil {
+                return ae
+            }
+            ev = av
+        } else {
+            if w.ep == 1 {
+                [pr, e2] = d.uvar()
+                if e2 != nil {
+                    return e2
+                }
+                if pr == 0 {
+                    i = i + 1
+                    continue
+                }
+            }
+            [xv, xe] = sv.index(i)
+            if xe != nil {
+                return xe
+            }
+            ev = xv
+        }
+        e3 := d.dsval(es, ev, ts)
+        if e3 != nil {
+            return e3
+        }
+        i = i + 1
+    }
+    return nil
+}
+
+// dsval decodes one wire slot into an already-selected local Value —
+// kinds were matched by the caller. SLICE slots need a mint the Value
+// can't give, so they only fill in place when the length matches.
+fn (d mut dec) dsval(ws: wslot, v: reflect.Value, ts: []wt) -> err {
+    k := ws.kind
+    if k == reflect.KindInt() || k == reflect.KindErr() {
+        [x, e] = d.svar()
+        if e != nil {
+            return e
+        }
+        return v.set_int(x)
+    }
+    if k == reflect.KindFloat() {
+        [u, e] = d.uvar()
+        if e != nil {
+            return e
+        }
+        return v.set_fbits(u)
+    }
+    if k == reflect.KindBool() {
+        [u, e] = d.uvar()
+        if e != nil {
+            return e
+        }
+        if u < 0 || u > 1 {
+            return err_malformed()
+        }
+        return v.set_bool(u)
+    }
+    if k == reflect.KindByte() {
+        [u, e] = d.uvar()
+        if e != nil {
+            return e
+        }
+        if u < 0 || u > 255 {
+            return err_malformed()
+        }
+        return v.set_byte(u)
+    }
+    if k == reflect.KindStr() {
+        [s, e] = d.bstr()
+        if e != nil {
+            return e
+        }
+        return v.set_str(s)
+    }
+    if k == reflect.KindStruct() {
+        if ws.tid < 0 || ws.tid >= len(ts) {
+            return err_malformed()
+        }
+        return d.dsstruct(ts[ws.tid], v, ts)
+    }
+    if k == reflect.KindEnum() {
+        if ws.tid < 0 || ws.tid >= len(ts) {
+            return err_malformed()
+        }
+        return d.dsenum(ts[ws.tid], v, ts)
+    }
+    if k == reflect.KindSlice() {
+        if ws.tid < 0 || ws.tid >= len(ts) {
+            return err_malformed()
+        }
+        [n, e] = d.uvar()
+        if e != nil {
+            return e
+        }
+        if n < 0 {
+            return err_malformed()
+        }
+        [ln, le] = v.len()
+        if le != nil {
+            return le
+        }
+        if ln != n {
+            return err_unsupported()
+        }
+        return d.dsliceinto(ts[ws.tid], v, n, ts)
+    }
+    return err_unsupported()
+}
+
+// dslicefield reads a SLICE wire field: len, mint through
+// alloc_slice (inline and own-slice slots alike), fill.
+fn (d mut dec) dslicefield(ws: wslot, v: reflect.Value, li: int, ts: []wt) -> err {
+    if ws.tid < 0 || ws.tid >= len(ts) {
+        return err_malformed()
+    }
+    [n, e] = d.uvar()
+    if e != nil {
+        return e
+    }
+    // every element costs at least a byte (presence or terminator), so
+    // the remaining input bounds a sane n
+    if n < 0 || n > len(d.b) - d.pos {
+        return err_malformed()
+    }
+    [sv, se] = v.alloc_slice(li, n)
+    if se != nil {
+        return se
+    }
+    return d.dsliceinto(ts[ws.tid], sv, n, ts)
+}
+
+// dsstruct runs the field-delta stream: each delta picks a wire slot,
+// the slot's NAME binds to a local field (wire-name equal — the
+// decoder's own fields map through their gob: tags), a match decodes,
+// a miss skips.
+fn (d mut dec) dsstruct(w: wt, v: reflect.Value, ts: []wt) -> err {
+    if d.depth >= DEPTHMAX {
+        return err_depth()
+    }
+    d.depth = d.depth + 1
+    defer d.leave()
+    lt := v.typ()
+    last := -1
+    for true {
+        [dl, e] = d.uvar()
+        if e != nil {
+            return e
+        }
+        if dl == 0 {
+            return nil
+        }
+        if dl < 0 {
+            return err_malformed()
+        }
+        last = last + dl
+        if last < 0 || last >= len(w.fs) {
+            return err_malformed()
+        }
+        ws := w.fs[last]
+        li := -1
+        lptr := 0
+        i := 0
+        for i < lt.nfields() {
+            [f, fe] = lt.field(i)
+            if fe != nil {
+                return fe
+            }
+            // hidden (`gob:-`) locals never match — a wire field
+            // named "-" must dskip like any other unknown
+            if lwname(f) != ws.name || lwname(f) == "-" {
+                i = i + 1
+                continue
+            }
+            [ft, f2] = f.typ()
+            if f2 != nil {
+                return f2
+            }
+            if ft.kind() != ws.kind {
+                break
+            }
+            li = i
+            lptr = f.ptr()
+            break
+        }
+        if li < 0 {
+            e3 := d.dskip(ws, ts)
+            if e3 != nil {
+                return e3
+            }
+            continue
+        }
+        if ws.kind == reflect.KindSlice() {
+            e4 := d.dslicefield(ws, v, li, ts)
+            if e4 != nil {
+                return e4
+            }
+            continue
+        }
+        if lptr == 1 {
+            [fv, fe2] = v.alloc_field(li)
+            if fe2 != nil {
+                return fe2
+            }
+            e5 := d.dsval(ws, fv, ts)
+            if e5 != nil {
+                return e5
+            }
+            continue
+        }
+        [fv, fe3] = v.field(li)
+        if fe3 != nil {
+            return fe3
+        }
+        e6 := d.dsval(ws, fv, ts)
+        if e6 != nil {
+            return e6
+        }
+    }
+    return nil
+}
+
+// dsenum reads the wire tag, binds the variant by NAME (reader and
+// writer variant orders may differ), sets the local tag — which
+// zeroes the union region when the variant actually changes so a
+// previous variant's bytes can't masquerade as a live slot — then
+// runs the payload delta stream with the same name-match/skip rule
+// as structs. A nil `own` payload slot mints through alloc_vfield;
+// the remaining unsupported shapes are slice slots at the wrong
+// length and kinds that never reach the wire (err_unsupported).
+fn (d mut dec) dsenum(w: wt, v: reflect.Value, ts: []wt) -> err {
+    if d.depth >= DEPTHMAX {
+        return err_depth()
+    }
+    d.depth = d.depth + 1
+    defer d.leave()
+    [tg, e] = d.uvar()
+    if e != nil {
+        return e
+    }
+    if tg < 0 || tg >= len(w.vs) {
+        return err_malformed()
+    }
+    wv := w.vs[tg]
+    lt := v.typ()
+    li := -1
+    i := 0
+    for i < lt.nvars() {
+        [x, xe] = lt.variant(i)
+        if xe != nil {
+            return xe
+        }
+        if x.name() == wv.name {
+            li = i
+            break
+        }
+        i = i + 1
+    }
+    if li < 0 {
+        return err_type()
+    }
+    e2 := v.set_tag(li)
+    if e2 != nil {
+        return e2
+    }
+    [lv, le] = lt.variant(li)
+    if le != nil {
+        return le
+    }
+    last := -1
+    for true {
+        [dl, e3] = d.uvar()
+        if e3 != nil {
+            return e3
+        }
+        if dl == 0 {
+            return nil
+        }
+        if dl < 0 {
+            return err_malformed()
+        }
+        last = last + dl
+        if last < 0 || last >= len(wv.ps) {
+            return err_malformed()
+        }
+        ws := wv.ps[last]
+        fi := -1
+        i := 0
+        for i < lv.nfields() {
+            [nm, ne] = lv.fname(i)
+            if ne != nil {
+                return ne
+            }
+            if nm != ws.name {
+                i = i + 1
+                continue
+            }
+            [pt, pe] = lv.ftyp(i)
+            if pe != nil {
+                return pe
+            }
+            if pt.kind() != ws.kind {
+                break
+            }
+            fi = i
+            break
+        }
+        if fi < 0 {
+            e4 := d.dskip(ws, ts)
+            if e4 != nil {
+                return e4
+            }
+            continue
+        }
+        [fv, fe] = v.vfield(li, fi)
+        if fe != nil {
+            if !errors.is(fe, reflect.err_nil()) {
+                return fe
+            }
+            // nil `own` payload slot — mint the pointee in place and
+            // fill it like a struct field's alloc_field
+            [av, ae] = v.alloc_vfield(li, fi)
+            if ae != nil {
+                return ae
+            }
+            fv = av
+        }
+        e5 := d.dsval(ws, fv, ts)
+        if e5 != nil {
+            return e5
+        }
+    }
+    return nil
+}
+
+/// unmarshal decodes b into out — matched field-for-field by wire
+/// name against the preamble. Wire fields out lacks are skipped,
+/// fields out has that the wire doesn't keep their existing value.
+fn unmarshal[T any](b: []byte, out: mut T) -> err {
+    d := dec{b: b, pos: 0, depth: 0}
+    [ts, e] = d.dparse()
+    if e != nil {
+        return e
+    }
+    v := value_of_mut(out)
+    // a nil `own` target reaches value_of_mut through the mut borrow
+    // as Value{addr:0} — writes would land at address 0
+    if v.isnull() {
+        return err_nil()
+    }
+    lt := v.typ()
+    lk := lt.kind()
+    if ts[0].kind != lk {
+        return err_type()
+    }
+    w := ts[0]
+    e2 := e
+    if lk == reflect.KindStruct() {
+        e2 = d.dsstruct(w, v, ts)
+    } else if lk == reflect.KindEnum() {
+        e2 = d.dsenum(w, v, ts)
+    } else {
+        ws := wslot{name: "", kind: lk, ptr: 0, tid: 0}
+        e2 = d.dsval(ws, v, ts)
+    }
+    if e2 != nil {
+        return e2
+    }
+    if d.pos != len(d.b) {
+        return err_malformed()
+    }
+    return nil
+}

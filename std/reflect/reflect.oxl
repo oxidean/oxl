@@ -44,6 +44,8 @@ extern fn rt_desc_v_f_ptr(td: int, vi: int, fi: int) -> int
 
 extern fn rt_desc_v_base(td: int) -> int
 
+extern fn rt_desc_zero_payload(td: int, addr: int)
+
 extern fn rt_desc_f_sname(td: int, i: int) -> str
 
 extern fn rt_desc_f_off(td: int, i: int) -> int
@@ -66,6 +68,8 @@ extern fn rt_field_u8(addr: int) -> int
 
 extern fn rt_field_f64(addr: int) -> float
 
+extern fn rt_field_f64bits(addr: int) -> int
+
 extern fn rt_field_str(addr: int) -> str
 
 extern fn rt_field_cstr(addr: int) -> str
@@ -79,6 +83,8 @@ extern fn rt_field_set_i32(addr: int, v: int)
 extern fn rt_field_set_u8(addr: int, v: int)
 
 extern fn rt_field_set_f64(addr: int, v: float)
+
+extern fn rt_field_set_f64bits(addr: int, v: int)
 
 extern fn rt_field_set_str(addr: int, v: str)
 
@@ -353,6 +359,15 @@ fn (v Value) typ() -> Type {
     return vret(Type{td: v.td})
 }
 
+/// isnull reports whether the Value's backing address is zero — a
+/// nil `own`/`ref`/`mut` handle minted through value_of/value_of_mut
+/// produces Value{addr:0}, and any field/index/vfield walk on it
+/// would dereference address 0. Callers that accept qualified roots
+/// gate on this before walking.
+fn (v Value) isnull() -> bool {
+    return v.addr == 0
+}
+
 /// int reads the i64 lane — INT and ERR kinds (ERR yields the code).
 fn (v Value) int() -> [int, err] {
     k := rt_desc_kind(v.td)
@@ -368,6 +383,16 @@ fn (v Value) f64() -> [float, err] {
         return 0.0, err_kind()
     }
     return rt_field_f64(v.addr), nil
+}
+
+/// fbits reads the FLOAT lane as raw IEEE-754 bits (int64) —
+/// encoders that need a lossless scalar form use this rather than
+/// a decimal round-trip. err_kind for non-FLOAT values.
+fn (v Value) fbits() -> [int, err] {
+    if rt_desc_kind(v.td) != KindFloat() {
+        return 0, err_kind()
+    }
+    return rt_field_f64bits(v.addr), nil
 }
 
 /// bool reads the i32 lane — C `int`, 4B.
@@ -433,6 +458,17 @@ fn (v Value) set_f64(x: float) -> err {
         return err_kind()
     }
     rt_field_set_f64(v.addr, x)
+    return nil
+}
+
+/// set_fbits writes the FLOAT lane from raw IEEE-754 bits —
+/// decoders restore the exact bit pattern with no decimal loss.
+/// err_kind for non-FLOAT or non-writable values.
+fn (v Value) set_fbits(x: int) -> err {
+    if v.w == 0 || rt_desc_kind(v.td) != KindFloat() {
+        return err_kind()
+    }
+    rt_field_set_f64bits(v.addr, x)
     return nil
 }
 
@@ -525,13 +561,21 @@ fn (v Value) tag() -> [int, err] {
 
 /// set_tag writes the enum discriminant through the i32 lane —
 /// err_kind on a non-ENUM or non-mut Value, err_oob past the variant
-/// count.
+/// count. A tag that differs from the stored one first zeroes the
+/// union region [addr+v_base, addr+size): the previous variant's
+/// payload bytes must never be reinterpreted through the new
+/// variant's shape — a stale int payload would otherwise ride into a
+/// pointer slot and vfield would hand out a wild address. Same-tag
+/// writes keep the union: its bytes belong to the live variant.
 fn (v Value) set_tag(i: int) -> err {
     if v.w == 0 || rt_desc_kind(v.td) != KindEnum() {
         return err_kind()
     }
     if i < 0 || i >= rt_desc_nvars(v.td) {
         return err_oob()
+    }
+    if rt_field_i32(v.addr) != i {
+        rt_desc_zero_payload(v.td, v.addr)
     }
     rt_field_set_i32(v.addr, i)
     return nil
@@ -660,6 +704,49 @@ fn (v Value) alloc_elem(i: int) -> [Value, err] {
         rt_field_set_ptr(slot, p)
     }
     f.td = etd
+    f.addr = p
+    f.w = 1
+    return f, nil
+}
+
+/// alloc_vfield mints a zeroed pointee into a nil `own` payload slot
+/// of enum variant vi — the enum-slot counterpart of alloc_field,
+/// used by decoders after set_tag's union scrub leaves the slot
+/// zeroed. A live (non-nil) slot yields the existing pointee mut-set,
+/// so re-entry is idempotent. err_kind off ENUM, on a non-mut Value,
+/// on a non-`own` slot, or when vi isn't the live tag; err_oob past
+/// variant/slot counts.
+fn (v Value) alloc_vfield(vi: int, fi: int) -> [Value, err] {
+    f := v
+    if rt_desc_kind(v.td) != KindEnum() {
+        return f, err_kind()
+    }
+    if v.w == 0 {
+        return f, err_kind()
+    }
+    if vi < 0 || vi >= rt_desc_nvars(v.td) {
+        return f, err_oob()
+    }
+    if fi < 0 || fi >= rt_desc_v_nfields(v.td, vi) {
+        return f, err_oob()
+    }
+    if rt_field_i32(v.addr) != vi {
+        return f, err_kind()
+    }
+    if rt_desc_v_f_ptr(v.td, vi, fi) != 1 {
+        return f, err_kind()
+    }
+    ftd := rt_desc_v_f_td(v.td, vi, fi)
+    slot := v.addr + rt_desc_v_base(v.td) + rt_desc_v_f_off(v.td, vi, fi)
+    p := rt_field_ptr(slot)
+    if p == 0 {
+        p = rt_desc_alloc(ftd)
+        if p < 0 {
+            return f, err_kind()
+        }
+        rt_field_set_ptr(slot, p)
+    }
+    f.td = ftd
     f.addr = p
     f.w = 1
     return f, nil

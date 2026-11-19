@@ -1,0 +1,39 @@
+package main
+
+// llvm_abi_check — L1 ABI tripwire: boundary-type field layout under
+// the emitted IR must match rt.h compiled by the same toolchain. The
+// probes live in tests/llvm_abi_shim.c (C, reads via rt.h offsets);
+// a drifted %OxlStr/%RtSlice/%RtFnv decl turns these calls to garbage.
+
+extern fn abi_probe_str(s: str) -> int
+extern fn abi_slice_len(s: []int) -> int
+extern fn abi_slice_cap(s: []int) -> int
+extern fn abi_slice_heap(s: []int) -> int
+extern fn abi_slice_sum(s: []int) -> int
+extern fn abi_probe_fnv(f: fn(int) -> int, x: int) -> int
+
+fn addmul(x: int) -> int { return x * 3 + 7 }
+
+fn main() {
+    // OxlStr: "ABI!" n=4 → 4e6 + 65+66+73+33 = 4000237
+    if abi_probe_str("ABI!") != 4000237 {
+        println("FAIL abi str")
+        exit(1)
+    }
+    xs := mkslice(int, 3)
+    xs[0] = 10
+    xs[1] = 20
+    xs[2] = 30
+    if abi_slice_len(xs) != 3 || abi_slice_cap(xs) != 3 || abi_slice_sum(xs) != 60 {
+        println("FAIL abi slice")
+        exit(1)
+    }
+    // heap is informational — print, don't assert (alloc lane detail)
+    println("slice.heap=" + itoa(abi_slice_heap(xs)))
+    // RtFnv: 5*3+7 = 22 through the {env, fp} pair
+    if abi_probe_fnv(addmul, 5) != 22 {
+        println("FAIL abi fnv")
+        exit(1)
+    }
+    println("llvm_abi_check ok")
+}

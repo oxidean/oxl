@@ -210,6 +210,36 @@ struct G {
     dchain: []int,
     uhits: []int,
     live: []int,
+    // llvm lane state (llvm.oxl) — entry-alloca staging, block
+    // bookkeeping, and the module-wide decl tables; the C lane never
+    // touches these
+    lreg: int,
+    ldeadn: int,
+    lterm: int,
+    lfn: int,
+    lall: []str,
+    lallg: []str,
+    lstrs: own collections.Map,
+    lstrn: int,
+    lrtd: own collections.Map,
+    lrtl: []str,
+    lscsz: str,
+    ldmark: str,
+    ltsd: int,
+    dwrapn: int, // defer-thunk counter
+    spn: int, // spawn-tramp counter
+    dpro: []str, // defer env type decls
+    dbod: []str, // defer thunk bodies
+    spro: []str, // spawn env type decls
+    spbod: []str, // spawn tramp bodies
+    ltys: []str, // named type decls
+    lglob: []str, // @o_g_* globals
+    lext: []str, // extern declares
+    lbody: []str, // fn bodies
+    lwrap: []str, // fnv wrappers
+    lvtb: []str, // vtab thunks + arrays
+    ldrp: []str, // drop fns
+    liret: []str, // inst pair-ret types
 }
 
 fn wl(g: mut G, s: str) {
@@ -6410,6 +6440,7 @@ fn emit(r: own check.CkRes, testm: int) -> str {
 fn run() {
     testm := 0
     jsm := 0
+    lvm := 0
     file := ""
     ai := 1
     for ai < argc() {
@@ -6418,13 +6449,25 @@ fn run() {
             testm = 1
         } else if a == "--js" {
             jsm = 1
+        } else if a == "--emit" {
+            // test hook for the sibling emit lanes — the full
+            // --target plumbing is milestone L3
+            if ai + 1 < argc() {
+                if argv(ai + 1) == "llvm" {
+                    lvm = 1
+                }
+                if argv(ai + 1) == "js" {
+                    jsm = 1
+                }
+                ai = ai + 1
+            }
         } else {
             file = a
         }
         ai = ai + 1
     }
     if len(file) == 0 {
-        println("usage: codegen [--test] <file.oxl>")
+        println("usage: codegen [--test] [--emit c|js|llvm] <file.oxl>")
         exit(1)
     }
     r := check.check_file(file, 1 - testm)
@@ -6437,7 +6480,9 @@ fn run() {
         }
         exit(1)
     }
-    if jsm == 1 {
+    if lvm == 1 {
+        print(emit_llvm(r, testm))
+    } else if jsm == 1 {
         print(emit_js(r, testm))
     } else {
         print(emit(r, testm))

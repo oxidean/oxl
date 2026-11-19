@@ -142,6 +142,10 @@ void rt_free(void *obj) {
  * scope mu nested inside; never two scope mutexes under it. */
 static oxl_mutex_t link_mu = OXL_MUTEX_INIT;
 
+int64_t rt_scope_sizeof(void) {
+    return (int64_t)sizeof(RtScope);
+}
+
 void rt_scope_enter(RtScope *s) {
     memset(s, 0, sizeof *s);
     s->parent = tls_scope;

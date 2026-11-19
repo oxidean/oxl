@@ -196,6 +196,9 @@ struct RtScope {
  * around poll() so interleaved tasks on one worker keep their own chain */
 extern _Thread_local RtScope *tls_scope;
 
+/* opaque size for emitters that can't see RtScope's layout (the LLVM
+ * lane allocates scope storage as raw bytes in the entry block) */
+int64_t rt_scope_sizeof(void);
 void rt_scope_enter(RtScope *s);
 void rt_scope_leave(RtScope *s);
 int rt_scope_try(RtScope *s); /* join; return trap code without propagating */

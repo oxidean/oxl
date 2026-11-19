@@ -1,0 +1,157 @@
+package main
+
+// R5 fixture — std/encoding/xml marshal/unmarshal over the descriptor
+// lane: `tag "xml:..."` routing (names, ,attr, ,chardata, -), scalars,
+// nested structs, own fields, inline and own-element slices, []byte
+// base64, enums (unit and payload variants), and the parser's
+// malformed-input lane. Everything asserts in-process; the suite
+// checks the trailing ok line.
+import "std/encoding/xml"
+
+import "std/errors"
+
+struct Inner { v: int, s: str }
+
+enum Shape { Circ(int), Rect { w: int, h: int }, Empty, }
+
+struct Doc {
+    id: int tag "xml:id,attr",
+    name: str,
+    inner: Inner,
+    oi: own Inner,
+    xs: []int,
+    os: []own Inner,
+    raw: []byte,
+    b: bool,
+    f: float,
+    sh: Shape,
+    note: str tag "xml:\"note,attr\"",
+    body: str tag "xml:,chardata",
+    skip: int tag "xml:-",
+    listed: str,
+}
+
+fn fails(msg: str) {
+    println("FAIL " + msg)
+    exit(1)
+}
+
+fn mkdoc() -> Doc {
+    i1 := new(Inner)
+    i1.v = 7
+    i1.s = "seven"
+    i2 := new(Inner)
+    i2.v = 8
+    i2.s = "eight"
+    d := Doc{id: 9, name: "doc&<>", inner: Inner{v: 1, s: "one"}, oi: i1, xs: mkslice(int, 0), os: mkslice(own Inner, 0), raw: mkslice(byte, 0), b: true, f: 1.5, sh: Shape.Rect{w: 3, h: 4}, note: "nb", body: "text", skip: 5, listed: "keep"}
+    d.xs = push(d.xs, 10)
+    d.xs = push(d.xs, 20)
+    d.os = push(d.os, i2)
+    d.raw = push(d.raw, 104)
+    d.raw = push(d.raw, 105)
+    return d
+}
+
+fn main() {
+    d := mkdoc()
+    [s, e] = xml.marshal(d)
+    if e != nil {
+        fails("marshal: " + errors.msg(e))
+    }
+    // exact emitted shape — attrs in the open tag, chardata inline,
+    // skipped field absent, []byte base64, enum wrapped in its
+    // variant element
+    want := "<Doc id=\"9\" note=\"nb\">text<name>doc&amp;&lt;&gt;</name><inner><v>1</v><s>one</s></inner><oi><v>7</v><s>seven</s></oi><xs>10</xs><xs>20</xs><os><v>8</v><s>eight</s></os><raw>aGk=</raw><b>true</b><f>1.5</f><sh><Rect><w>3</w><h>4</h></Rect></sh><listed>keep</listed></Doc>"
+    if s != want {
+        fails("marshal shape:\n" + s + "\nwant:\n" + want)
+    }
+    // round-trip — every lane lands
+    d2 := new(Doc)
+    ue := xml.unmarshal(s, d2)
+    if ue != nil {
+        fails("unmarshal: " + errors.msg(ue))
+    }
+    if d2.id != 9 || d2.name != "doc&<>" || d2.inner.v != 1 || d2.inner.s != "one" {
+        fails("scalar/struct fields")
+    }
+    if d2.oi == nil || d2.oi.v != 7 || d2.oi.s != "seven" {
+        fails("own field mint")
+    }
+    if len(d2.xs) != 2 || d2.xs[0] != 10 || d2.xs[1] != 20 {
+        fails("int slice")
+    }
+    if len(d2.os) != 1 || d2.os[0].v != 8 || d2.os[0].s != "eight" {
+        fails("own elem slice")
+    }
+    if len(d2.raw) != 2 || d2.raw[0] != 104 || d2.raw[1] != 105 {
+        fails("[]byte base64")
+    }
+    if !d2.b || d2.f != 1.5 || d2.note != "nb" || d2.body != "text" || d2.skip != 0 || d2.listed != "keep" {
+        fails("attr/chardata/skip lanes")
+    }
+    match d2.sh {
+        Shape.Rect{w, h} => {
+            if w != 3 || h != 4 {
+                fails("enum payload values")
+            }
+        }
+        _ => {
+            fails("enum variant")
+        }
+    }
+    // unit variant: bare text names it on both lanes
+    d.sh = Shape.Empty
+    [s2, e2] = xml.marshal(d)
+    if e2 != nil {
+        fails("marshal unit: " + errors.msg(e2))
+    }
+    if find(s2, "<sh>Empty</sh>") < 0 {
+        fails("unit variant form: " + s2)
+    }
+    d3 := new(Doc)
+    ue3 := xml.unmarshal(s2, d3)
+    if ue3 != nil {
+        fails("unmarshal unit: " + errors.msg(ue3))
+    }
+    if d3.sh.kind() != 2 {
+        fails("unit variant tag " + itoa(d3.sh.kind()))
+    }
+    // unmarshal ignores unknown elements and unordered children, and
+    // entities/char refs decode
+    d4 := new(Doc)
+    ue4 := xml.unmarshal("<?xml version=\"1.0\"?><!-- hi --><Doc id=\"1\"><name>a &lt;b&gt; &#65;</name><xs>5</xs><extra/><raw></raw><xs>6</xs><sh><Circ><f0>4</f0></Circ></sh></Doc>", d4)
+    if ue4 != nil {
+        fails("loose input: " + errors.msg(ue4))
+    }
+    if d4.id != 1 || d4.name != "a <b> A" || len(d4.xs) != 2 || d4.xs[1] != 6 {
+        fails("loose input fields: " + d4.name)
+    }
+    match d4.sh {
+        Shape.Circ(v) => {
+            if v != 4 {
+                fails("positional payload value")
+            }
+        }
+        _ => {
+            fails("positional payload variant")
+        }
+    }
+    // malformed input and a scalar type mismatch report err
+    ue5 := xml.unmarshal("<Doc><name>x", d4)
+    if ue5 == nil {
+        fails("expected syntax err")
+    }
+    ue6 := xml.unmarshal("<Doc><inner><v>z</v></inner></Doc>", d4)
+    if ue6 == nil {
+        fails("expected nested int parse err")
+    }
+    ue7 := xml.unmarshal("<Doc><xs>no</xs></Doc>", d4)
+    if ue7 == nil {
+        fails("expected int parse err")
+    }
+    ue8 := xml.unmarshal("<Doc id=\"z\"></Doc>", d4)
+    if ue8 == nil {
+        fails("expected attr parse err")
+    }
+    println("enc_xml ok")
+}

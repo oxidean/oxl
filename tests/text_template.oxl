@@ -1,0 +1,108 @@
+package main
+
+// R5 fixture — std/text/template over descriptor field names:
+// {{.Field}} prints (dotted paths included), {{range .F}} iterates
+// slices with `.` rebound to the element, {{if .F}}/{{else}}/{{end}}
+// test truthiness, and malformed templates + unknown fields report
+// err. Everything asserts in-process; the suite checks the trailing
+// ok line.
+import "std/text/template"
+
+import "std/errors"
+
+struct Item { name: str, qty: int }
+
+struct Order {
+    customer: str,
+    items: []Item,
+    rush: bool,
+    count: int,
+    note: str,
+    last: Item,
+}
+
+fn fails(msg: str) {
+    println("FAIL " + msg)
+    exit(1)
+}
+
+fn main() {
+    o := Order{customer: "Ada", items: mkslice(Item, 0), rush: true, count: 0, note: "", last: Item{name: "zeta", qty: 9}}
+    o.items = push(o.items, Item{name: "widget", qty: 3})
+    o.items = push(o.items, Item{name: "sprocket", qty: 1})
+    [s, e] = template.render("Order for {{.customer}}:\n{{range .items}}- {{.name}} x{{.qty}}\n{{end}}{{if .rush}}RUSH{{else}}standard{{end}}", o)
+    if e != nil {
+        fails("render: " + errors.msg(e))
+    }
+    want := "Order for Ada:\n- widget x3\n- sprocket x1\nRUSH"
+    if s != want {
+        fails("render shape:\n" + s + "\nwant:\n" + want)
+    }
+    // else branch + nested paths + struct/slice/enum-free prints
+    o.rush = false
+    [s2, e2] = template.render("{{if .rush}}R{{else}}S{{end}} {{.last.name}}/{{.last}} {{.items}}", o)
+    if e2 != nil {
+        fails("render2: " + errors.msg(e2))
+    }
+    if s2 != "S zeta/{zeta 9} [{widget 3} {sprocket 1}]" {
+        fails("render2 shape: " + s2)
+    }
+    // {{range .}} on a scalar slice — `.` is the element itself
+    ints := mkslice(int, 0)
+    ints = push(ints, 1)
+    ints = push(ints, 2)
+    [s3, e3] = template.render("{{range .}}({{.}}){{end}}", ints)
+    if e3 != nil || s3 != "(1)(2)" {
+        fails("range scalars: " + s3)
+    }
+    // if on an empty vs non-empty string, and on a zero int
+    [s4, e4] = template.render("{{if .note}}n{{else}}none{{end}}{{if .count}}c{{else}}z{{end}}", o)
+    if e4 != nil || s4 != "nonez" {
+        fails("truthiness: " + s4)
+    }
+    // nested range inside if
+    [s5, e5] = template.render("{{if .items}}{{#noop}}{{end}}", o)
+    if e5 == nil {
+        fails("expected unknown action err")
+    }
+    // parse once, exec twice
+    [t, pe] = template.parse("hi {{.name}}")
+    if pe != nil {
+        fails("parse: " + errors.msg(pe))
+    }
+    [s6, e6] = template.exec(t, Item{name: "x", qty: 0})
+    if e6 != nil || s6 != "hi x" {
+        fails("exec1: " + s6)
+    }
+    [s7, e7] = template.exec(t, Item{name: "y", qty: 0})
+    if e7 != nil || s7 != "hi y" {
+        fails("exec2: " + s7)
+    }
+    // error lanes: unknown field, field path on a non-struct, stray
+    // and unmatched stoppers, unclosed action, range of non-slice
+    [_, e8] = template.render("{{.nosuch}}", o)
+    if e8 == nil {
+        fails("expected no-field err")
+    }
+    [_, e9] = template.render("{{.count.x}}", o)
+    if e9 == nil {
+        fails("expected non-struct path err")
+    }
+    [_, e10] = template.parse("{{end}}")
+    if e10 == nil {
+        fails("expected stray end err")
+    }
+    [_, e11] = template.parse("{{range .items}}")
+    if e11 == nil {
+        fails("expected unclosed range err")
+    }
+    [_, e12] = template.parse("{{.name")
+    if e12 == nil {
+        fails("expected unclosed action err")
+    }
+    [_, e13] = template.render("{{range .count}}x{{end}}", o)
+    if e13 == nil {
+        fails("expected range-of-int err")
+    }
+    println("text_template ok")
+}

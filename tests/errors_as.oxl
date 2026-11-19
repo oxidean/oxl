@@ -1,0 +1,130 @@
+package main
+
+// R3 — typed err payloads: `box(v)` is the global compiler builtin;
+// `errors.as(e, out)` is a declared generic whose call site folds.
+// Covers the box→as round trip on a by-value payload, descriptor-
+// exact matching, once-only consumption, wrapped-chain traversal,
+// own-handle moves, and str payloads. Boxes stay ordinary err codes
+// for msg/wrap/unwrap/is.
+import "std/errors"
+
+interface Speaker { speak() -> str }
+
+struct Point { x: int, y: int }
+
+struct W { v: int }
+
+struct S { s: str }
+
+struct Holder { p: own Point }
+
+struct Dog { n: str }
+
+fn (d Dog) speak() -> str {
+    return "woof " + d.n
+}
+
+fn mk() -> Speaker {
+    return Dog{n: "rex"}
+}
+
+fn mv_hit(e: err, h: mut Holder) -> bool {
+    return errors.as(e, h.p)
+}
+
+fn main() {
+    // by-value round trip — msg on a box is the descriptor name
+    e := box(Point{x: 3, y: 4})
+    println("msg: " + errors.msg(e))
+    out := new(Point)
+    if errors.as(e, out) {
+        println("hit " + itoa(out.x) + "," + itoa(out.y))
+    }
+    // once-only — the slot clears on match
+    out2 := new(Point)
+    if errors.as(e, out2) {
+        println("second hit (BUG)")
+    } else {
+        println("once-only ok")
+    }
+    // wrapped chain — as walks wrap entries to the box
+    eb := box(W{v: 11})
+    w := errors.wrap("ctx", eb)
+    m := new(W)
+    if errors.as(w, m) {
+        println("chain hit " + itoa(m.v))
+    }
+    // the consumed box contributes no match on a re-walk
+    m2 := new(W)
+    if errors.as(w, m2) {
+        println("chain re-hit (BUG)")
+    } else {
+        println("chain consumed ok")
+    }
+    // boxes are still ordinary errs for is/unwrap
+    if errors.is(w, eb) {
+        println("is ok")
+    }
+    println("unwrap msg: " + errors.msg(errors.unwrap(w)))
+    // a miss on a different descriptor doesn't consume the box
+    e2 := box(W{v: 42})
+    p := new(Point)
+    if !errors.as(e2, p) {
+        println("nomatch ok")
+    }
+    n := new(W)
+    if errors.as(e2, n) {
+        println("int hit " + itoa(n.v))
+    }
+    // own payload — the handle moves into the entry
+    hp := new(Point)
+    hp.x = 7
+    e3 := box(hp)
+    hp2 := new(Point)
+    if errors.as(e3, hp2) {
+        println("own hit " + itoa(hp2.x))
+    }
+    // non-box errs miss cleanly
+    plain := errors.new("plain")
+    pp := new(Point)
+    if errors.as(plain, pp) {
+        println("plain hit (BUG)")
+    } else {
+        println("nonbox ok")
+    }
+    // str payload round trip (rt upgrades the backing to own)
+    es := box(S{s: "hello" + " world"})
+    ss := new(S)
+    if errors.as(es, ss) {
+        println("str hit " + ss.s)
+    }
+    // iface payloads match the exact stored descriptor only —
+    // boxing a Speaker matches an `own Speaker` out but never a
+    // Dog out, even though Dog implements Speaker
+    ei := box(mk())
+    si := new(mk())
+    if errors.as(ei, si) {
+        println("iface matched")
+    }
+    ei2 := box(mk())
+    di := new(Dog)
+    if errors.as(ei2, di) {
+        println("impl matched (BUG)")
+    } else {
+        println("exact-descr ok")
+    }
+    // mv=1: a `mut own Point` out binds T=own Point — the match moves
+    // the stored Point* handle into hp's slot instead of copying the
+    // pointee; hp then owns the boxed handle
+    mvsrc := new(Point)
+    mvsrc.x = 9
+    hb := box(mvsrc)
+    h := new(Holder)
+    h.p = new(Point)
+    if mv_hit(hb, h) && h.p.x == 9 {
+        println("mv ok")
+    } else {
+        println("mv miss (BUG)")
+    }
+    println("errors_as ok")
+}

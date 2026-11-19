@@ -42,9 +42,9 @@ fn unwrap(e: err) -> err {
 }
 
 /// is reports whether target appears in e's cause chain — a plain
-/// code compare at each link, so interned sentinels match. A typed
-/// `as` stays parked: err is an int64 code and no runtime type
-/// descriptors exist to bind a target to.
+/// code compare at each link, so interned sentinels match. Boxes are
+/// distinct codes per mint so `is` finds a box only by identity —
+/// typed lookup is `as`'s job.
 fn is(e: err, target: err) -> bool {
     for e != nil {
         if e == target {
@@ -52,5 +52,32 @@ fn is(e: err, target: err) -> bool {
         }
         e = rt_err_cause(e)
     }
+    return false
+}
+
+/// box[T any](v: T) is a global compiler builtin (the
+/// value_of/mkslice family — no extern signature can carry a generic
+/// T/own payload into an int slot), not an errors member; call it
+/// bare as `box(v)`. It consumes v, mints a fresh int64 code backed
+/// by the rt err registry, and records the payload pointer against
+/// v's descriptor. A box IS an err end to end — wrap/unwrap/is all
+/// work on it — and errors.msg yields the boxed type's name. A bare
+/// `own` binding moves its handle into the entry; other own exprs
+/// and value/ref/mut args heap-copy into an own-lane sizeof(T)
+/// block the registry adopts. A nil `own` payload mints an
+// entry with no pdata that can never match `as` — box nil only to
+// reserve a code. See docs/semantics/errors.md.
+
+/// as reports whether a box in e's unwrap chain stores out's exact
+/// descriptor — first match wins; an iface-typed out matches only a
+/// box of that same iface descriptor, no implementability walk. On a
+/// match the payload copies into *out (moving the handle for `own`-
+/// bound outs), the registry slot clears — a given box answers
+/// exactly once — and walking continues past consumed boxes. as is a
+/// declared generic so `mut T` binds T from out, but the call site
+/// folds to rt_err_as like box does — a `mut T` param's C pointer is
+/// already the writable *out address the extern needs. The body is
+/// unreachable; it exists to keep the signature real.
+fn as[T any](e: err, out: mut T) -> bool {
     return false
 }

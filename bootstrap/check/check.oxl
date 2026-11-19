@@ -5013,7 +5013,7 @@ fn register(ck: mut Ck, its: []It) {
 
 // ---------- builtins ----------
 fn is_builtin(n: str) -> bool {
-    return n == "print" || n == "println" || n == "mkchan" || n == "send" || n == "recv" || n == "close" || n == "sleep" || n == "msleep" || n == "new" || n == "mkslice" || n == "push" || n == "assert" || n == "itoa" || n == "argc" || n == "argv" || n == "len" || n == "byteat" || n == "substr" || n == "find" || n == "atoi" || n == "mkbuf" || n == "bufstr" || n == "poke8" || n == "poke16" || n == "poke32" || n == "htons" || n == "htonl" || n == "cstr" || n == "sqlite_open" || n == "str" || n == "sqlite_exec" || n == "sqlite_exec_bind" || n == "set_rcvtimo" || n == "set_rcvtimo_ms" || n == "set_sndtimo" || n == "sqlite_query" || n == "sqlite_close" || n == "readfile" || n == "writefile" || n == "exit" || n == "mkshared" || n == "sget" || n == "sset" || n == "scas" || n == "sadd" || n == "now" || n == "now_ms" || n == "usleep" || n == "ftoi" || n == "itof" || n == "atof" || n == "ftoa" || n == "smkchan" || n == "try_send" || n == "mkscope" || n == "sjoin" || n == "scancel" || n == "is_root" || n == "curscope" || n == "tdesc" || n == "tqual" || n == "type_of" || n == "value_of" || n == "value_of_mut"
+    return n == "print" || n == "println" || n == "mkchan" || n == "send" || n == "recv" || n == "close" || n == "sleep" || n == "msleep" || n == "new" || n == "mkslice" || n == "push" || n == "assert" || n == "itoa" || n == "argc" || n == "argv" || n == "len" || n == "byteat" || n == "substr" || n == "find" || n == "atoi" || n == "mkbuf" || n == "bufstr" || n == "poke8" || n == "poke16" || n == "poke32" || n == "htons" || n == "htonl" || n == "cstr" || n == "sqlite_open" || n == "str" || n == "sqlite_exec" || n == "sqlite_exec_bind" || n == "set_rcvtimo" || n == "set_rcvtimo_ms" || n == "set_sndtimo" || n == "sqlite_query" || n == "sqlite_close" || n == "readfile" || n == "writefile" || n == "exit" || n == "mkshared" || n == "sget" || n == "sset" || n == "scas" || n == "sadd" || n == "now" || n == "now_ms" || n == "usleep" || n == "ftoi" || n == "itof" || n == "atof" || n == "ftoa" || n == "smkchan" || n == "try_send" || n == "mkscope" || n == "sjoin" || n == "scancel" || n == "is_root" || n == "curscope" || n == "tdesc" || n == "tqual" || n == "type_of" || n == "value_of" || n == "value_of_mut" || n == "box"
 }
 
 fn is_susp_builtin(n: str) -> bool {
@@ -6453,6 +6453,60 @@ fn call(ck: mut Ck, f: ref parser.Node, args: ref parser.NList, env: mut Env) ->
             }
             ck.vpt = prov
             return reflect_st(ck, "Value")
+        }
+        if qn == "box" {
+            // R3 — compiler-lowered typed err payload: `box[T any](v: T)`
+            // binds T from v and mints an err code backed by the rt
+            // registry. codegen emits rt_err_box — no extern signature
+            // can carry a generic `T`/`own` payload into an int slot.
+            if nl_len(args) != 1 {
+                diag(ck, "check", "`box` takes one argument — box(v)")
+            } else {
+                bt := expr(ck, args.v, env)
+                if ty_vbound(ck, bt) {
+                    diag(ck, "check", "`box` of `reflect.Value` — scope-bound handles may not be stored in heap shapes")
+                }
+                // depth guard: the emit strips the outer qualifier to
+                // name the descriptor, so a doubly-qualified payload
+                // (`own own T`, `ref own T`, `mut own T`) would store
+                // a T* under desc(T) indistinguishable from box(T) —
+                // `as` then memcpys a pointer-sized slot past T's size
+                bq := ck.tyv[bt].k == k_own() || ck.tyv[bt].k == k_ref() || ck.tyv[bt].k == k_mut()
+                if bq && ck.tyv[bt].i >= 0 {
+                    iq := ck.tyv[ck.tyv[bt].i].k
+                    if iq == k_own() || iq == k_ref() || iq == k_mut() {
+                        diag(ck, "check", "`box` of a doubly-qualified handle — payload descriptors carry one qualifier level")
+                    }
+                }
+                // box consumes v — the registry adopts the payload. A
+                // bare `own` binding moves its handle (codegen emits
+                // it raw); other own exprs heap-copy the pointee so
+                // they keep their value, and only Name args take the
+                // move mark here for the same reason.
+                move_own(ck, args.v, env)
+            }
+            return t_err(ck)
+        }
+        if qn == "errors.as" {
+            // out-depth guard: `mut T` binds T to the out's pointee,
+            // and mv=1 handles a qualified T — but a bound T that is
+            // ITSELF doubly-qualified (`own own own X` out) would
+            // write a T* into a T** slot at the fold. T may carry at
+            // most one qualifier level.
+            if args != nil && args.next != nil {
+                ot := expr(ck, args.next.v, env)
+                oq := ck.tyv[ot].k == k_own() || ck.tyv[ot].k == k_ref() || ck.tyv[ot].k == k_mut()
+                if oq && ck.tyv[ot].i >= 0 {
+                    tt := ck.tyv[ot].i
+                    tq := ck.tyv[tt].k == k_own() || ck.tyv[tt].k == k_ref() || ck.tyv[tt].k == k_mut()
+                    if tq && ck.tyv[tt].i >= 0 {
+                        t2q := ck.tyv[ck.tyv[tt].i].k
+                        if t2q == k_own() || t2q == k_ref() || t2q == k_mut() {
+                            diag(ck, "check", "`errors.as` out is doubly-qualified beyond the bound T — `own own own T` can't be described")
+                        }
+                    }
+                }
+            }
         }
         if qn == "push" {
             if args == nil {
@@ -11153,7 +11207,7 @@ fn js_gate(ck: mut Ck, its: []It) {
         match its[i].node {
             parser.Node.Fn{ex, name, body, lo} => {
                 if ex {
-                    if len(name) >= 8 && substr(name, 0, 8) == "rt_desc_" || len(name) >= 9 && substr(name, 0, 9) == "rt_field_" {
+                    if len(name) >= 8 && substr(name, 0, 8) == "rt_desc_" || len(name) >= 9 && substr(name, 0, 9) == "rt_field_" || name == "rt_err_box" || name == "rt_err_as" {
                         ck.dpos = lo
                         diag(ck, "check", "extern `" + name + "` is not supported under --target js — descriptor helpers are native-lane only")
                     }
@@ -11188,9 +11242,16 @@ fn jswalk(ck: mut Ck, n: ref parser.Node) {
             // resolved intrinsic sites only — a same-named local callee
             // never reached jsintr_rec, so it can't trip the gate
             nm := jsintr_name(ck, ck.cur_file, parser.nlo(f))
+            qn2 := resolve_named(ck, callee_name(f))
             if len(nm) > 0 {
                 ck.dpos = parser.nlo(n)
                 diag(ck, "check", "`" + nm + "` is not supported under --target js — descriptors are native-lane only")
+            }
+            if qn2 == "box" || qn2 == "errors.as" {
+                // R3 fold sites — box is a global builtin; errors.as
+                // resolves through any import alias to the package fn
+                ck.dpos = parser.nlo(n)
+                diag(ck, "check", "`" + qn2 + "` is not supported under --target js — typed error payloads are native-lane only")
             }
             jswalk(ck, f)
             jswalk_list(ck, args)

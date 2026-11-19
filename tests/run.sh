@@ -1580,13 +1580,13 @@ echo "== reflect + fmt %v (r2) =="
 # decode mints, cstr) and fmt's %v/%+v/%T/%#v over the same
 # descriptor table — both fixtures assert in-process and end with an
 # ok line
-out=$("$OXL" run tests/reflect.oxl)
+out=$("$OXL" run tests/reflect.oxl) || { echo "FAIL reflect run exit=$?: $out"; exit 1; }
 [ "$(tail -1 <<<"$out")" = "reflect ok" ] || { echo "FAIL reflect: $out"; exit 1; }
-out=$("$OXL" run tests/fmt_v.oxl)
+out=$("$OXL" run tests/fmt_v.oxl) || { echo "FAIL fmt_v run exit=$?: $out"; exit 1; }
 [ "$(tail -1 <<<"$out")" = "fmt_v ok" ] || { echo "FAIL fmt_v: $out"; exit 1; }
 # r4: std/encoding/gob's descriptor-driven round-trip — preamble +
 # field-delta wire, minted own/slice slots, name-matched tolerance
-out=$("$OXL" run tests/enc_gob.oxl)
+out=$("$OXL" run tests/enc_gob.oxl) || { echo "FAIL enc_gob run exit=$?: $out"; exit 1; }
 [ "$(tail -1 <<<"$out")" = "enc_gob ok" ] || { echo "FAIL enc_gob: $out"; exit 1; }
 
 echo "== bootstrap codegen =="

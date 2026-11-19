@@ -1982,15 +1982,19 @@ if command -v clang >/dev/null 2>&1; then
         grep -q 'escaped top scope' <<<"$out" || { echo "FAIL llvm l3 $f: trap line: $out"; exit 1; }
         echo "  llvm l3: $f ok"
     done
-    # --emit-llvm keeps out.ll beside the -o output — and the kept IR
+    # --emit-llvm keeps <out>.ll beside the binary — and the kept IR
     # must stay triple-neutral (no `target triple`/`datalayout` lines:
     # clang supplies both from -target, an emitted triple would
     # override the --triple passthrough)
     "$OXL" build --target llvm tests/select.oxl -o "$scratch/el$EXE" || { echo "FAIL llvm l3 build"; exit 1; }
-    [ ! -f "$scratch/out.ll" ] || { echo "FAIL llvm l3: out.ll kept without --emit-llvm"; exit 1; }
+    [ ! -f "$scratch/el$EXE.ll" ] || { echo "FAIL llvm l3: .ll kept without --emit-llvm"; exit 1; }
     "$OXL" build --target llvm --emit-llvm tests/select.oxl -o "$scratch/el$EXE" || { echo "FAIL llvm l3 --emit-llvm build"; exit 1; }
-    [ -f "$scratch/out.ll" ] || { echo "FAIL llvm l3: --emit-llvm kept no out.ll"; exit 1; }
-    grep -qE '^target (triple|datalayout)' "$scratch/out.ll" && { echo "FAIL llvm l3: out.ll not triple-neutral"; exit 1; }
+    [ -f "$scratch/el$EXE.ll" ] || { echo "FAIL llvm l3: --emit-llvm kept no .ll"; exit 1; }
+    grep -qE '^target (triple|datalayout)' "$scratch/el$EXE.ll" && { echo "FAIL llvm l3: .ll not triple-neutral"; exit 1; }
+    # a second --emit-llvm build to a different -o lands its own .ll
+    # (the fixed out.ll name used to overwrite across builds)
+    "$OXL" build --target llvm --emit-llvm tests/select.oxl -o "$scratch/el2$EXE" || { echo "FAIL llvm l3 --emit-llvm second build"; exit 1; }
+    [ -f "$scratch/el2$EXE.ll" ] || { echo "FAIL llvm l3: second build kept no .ll"; exit 1; }
     # --triple passthrough: the lane's own reach claim is the local
     # clang's configured reach — smoke the flag with the host triple
     # (cross sysroots are the runner's clang's problem)
@@ -2004,6 +2008,10 @@ if command -v clang >/dev/null 2>&1; then
     out=$("$OXL" build tests/select.oxl --triple x -o "$scratch/x" 2>&1) && { echo "FAIL llvm l3: --triple accepted on native"; exit 1; }
     grep -q -- '--triple needs' <<<"$out" || { echo "FAIL llvm l3 --triple msg: $out"; exit 1; }
     out=$("$OXL" build tests/select.oxl --target js --triple x -o "$scratch/x" 2>&1) && { echo "FAIL llvm l3: --triple accepted on js"; exit 1; }
+    out=$("$OXL" build tests/select.oxl --emit-llvm -o "$scratch/x" 2>&1) && { echo "FAIL llvm l3: --emit-llvm accepted on native"; exit 1; }
+    grep -q -- '--emit-llvm needs' <<<"$out" || { echo "FAIL llvm l3 --emit-llvm off-lane msg: $out"; exit 1; }
+    out=$("$OXL" run tests/select.oxl --target llvm --emit-llvm 2>&1) && { echo "FAIL llvm l3: --emit-llvm accepted on run"; exit 1; }
+    grep -q -- "only applies to" <<<"$out" || { echo "FAIL llvm l3 --emit-llvm scope msg: $out"; exit 1; }
     out=$("$OXL" build tests/select.oxl --target llvm --html -o "$scratch/x" 2>&1) && { echo "FAIL llvm l3: --html accepted on llvm"; exit 1; }
     out=$("$OXL" build tests/select.oxl --target bogus -o "$scratch/x" 2>&1) && { echo "FAIL llvm l3: bogus --target accepted"; exit 1; }
     grep -q 'native, js, or llvm' <<<"$out" || { echo "FAIL llvm l3 --target msg: $out"; exit 1; }

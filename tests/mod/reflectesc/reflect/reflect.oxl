@@ -1,0 +1,47 @@
+package reflect
+
+struct Value { td: int, addr: int, w: int }
+
+fn idv(v: Value) -> Value {
+    return v
+}
+
+fn idvp(v: Value) -> [Value, err] {
+    return v, nil
+}
+
+// local literal forwarded through a call — the callee's param position
+// translates the arg's LOCAL prov into the result, so the return must
+// reject
+fn leak_call() -> Value {
+    v := Value{td: 0, addr: 0, w: 0}
+    return idv(v)
+}
+
+// branch merge — param-derived on the else path, local on the if
+// path; any local-derived path poisons the join
+fn leak_if(v: Value, sel: bool) -> Value {
+    if sel {
+        v = Value{td: 0, addr: 0, w: 0}
+    }
+    return v
+}
+
+// loop merge — the body's local write poisons every later iteration's
+// head state, so the exit join is local-derived
+fn leak_loop(v: Value, n: int) -> Value {
+    i := 0
+    for i < n {
+        v = Value{td: 0, addr: i, w: 0}
+        i = i + 1
+    }
+    return v
+}
+
+// pair-result merge — [r, e] bind keeps the local prov through the
+// forwarded call's val position
+fn leak_pair() -> [Value, err] {
+    v := Value{td: 0, addr: 0, w: 0}
+    [r, e] = idvp(v)
+    return r, e
+}

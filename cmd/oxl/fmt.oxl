@@ -409,6 +409,12 @@ fn fat_kw(p: mut FPar, w: str) -> bool {
     return t.kind == 2 && t.txt == w
 }
 
+// ident (kind 1) variant — contextual words like `tag` aren't keywords
+fn fat_ident(p: mut FPar, w: str) -> bool {
+    t := fcurt(p)
+    return t.kind == 1 && t.txt == w
+}
+
 fn feat_kw(p: mut FPar, w: str) -> bool {
     if fat_kw(p, w) {
         fbump(p)
@@ -846,7 +852,7 @@ fn fp_ty(p: mut FPar) -> own FTy {
         fbump(p)
         inner := "void"
         t2 := fcurt(p)
-        if t2.kind == 1 || t2.kind == 5 && t2.txt == "[" || t2.kind == 2 && (t2.txt == "own" || t2.txt == "ref" || t2.txt == "mut" || t2.txt == "chan") {
+        if t2.kind == 1 || t2.kind == 5 && t2.txt == "[" || t2.kind == 2 && (t2.txt == "own" || t2.txt == "ref" || t2.txt == "mut" || t2.txt == "chan" || t2.txt == "fn") {
             it := fp_ty(p)
             if it == nil {
                 return nil
@@ -1125,7 +1131,17 @@ fn fp_struct(p: mut FPar) -> own FItem {
         if ty == nil {
             return nil
         }
-        fields = pcons(mkparam(fn2.v, ty.s, fn2.lo), fields)
+        // `tag "..."` — reflect/wire metadata kept in the field's text
+        // (a `tag` word NOT followed by a string is the next field)
+        tys := ty.s
+        if fat_ident(p, "tag") && fpeekt(p).kind == 4 {
+            fbump(p)
+            tq := fbump(p)
+            // tq.txt is DECODED — re-escape so `tag "json:\"x\""`
+            // round-trips instead of emitting `tag "json:"x""`
+            tys = tys + " tag \"" + fescape(tq.txt) + "\""
+        }
+        fields = pcons(mkparam(fn2.v, tys, fn2.lo), fields)
         feat_p(p, ",")
         feat_p(p, ";")
     }
@@ -2139,6 +2155,29 @@ fn fp_primary(p: mut FPar) -> own FX {
             }
             return mkx(FXK.XTyLit(ty.s), slo, shi)
         }
+        if t.txt == "own" || t.txt == "ref" || t.txt == "mut" || t.txt == "chan" {
+            // tdesc/mkslice operand grammar: the qualifier starts a type
+            // literal only when a type follows — a bare `own`/`ref`/
+            // `mut`/`chan` still reads as a name below
+            nt := fpeekt(p)
+            starts := nt.kind == 1 || nt.kind == 5 && nt.txt == "[" || nt.kind == 2 && (nt.txt == "own" || nt.txt == "ref" || nt.txt == "mut" || nt.txt == "chan" || nt.txt == "fn")
+            if t.txt == "chan" {
+                starts = nt.kind == 2 && nt.txt == "own"
+            }
+            if starts {
+                ty := fp_ty(p)
+                if ty == nil {
+                    return nil
+                }
+                return mkx(FXK.XTyLit(ty.s), slo, shi)
+            }
+            // bare qualifier word — an ident, matching parser.oxl's
+            // fallthrough (`f(own)` keeps `own` a name)
+            fbump(p)
+            x := mkx(FXK.XIdent(t.txt), slo, shi)
+            x.ka = 1
+            return x
+        }
         if t.txt == "match" {
             fbump(p)
             e := fp_cond(p)
@@ -2235,6 +2274,13 @@ fn fp_primary(p: mut FPar) -> own FX {
         x := mkx(FXK.XIdent(name), slo, shi)
         x.ka = 1
         return x
+    }
+    if t.kind == 5 && t.txt == "[" {
+        ty := fp_ty(p)
+        if ty == nil {
+            return nil
+        }
+        return mkx(FXK.XTyLit(ty.s), slo, shi)
     }
     if fat_p(p, "(") {
         fbump(p)

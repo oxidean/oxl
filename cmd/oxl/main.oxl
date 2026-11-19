@@ -289,6 +289,11 @@ fn compile_res(r: own check.CkRes, testm: int) -> own CRes {
         return res
     }
     if target_is_js() == 1 {
+        check.js_gate(r.ck, r.items)
+        if len(r.ck.diags) > 0 {
+            report_diags(r.ck.diags)
+            return res
+        }
         res.c = codegen.emit_js(r, testm)
     } else {
         res.c = codegen.emit(r, testm)

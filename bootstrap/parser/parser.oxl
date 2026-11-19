@@ -43,7 +43,7 @@ enum Node {
     Ty { f0: str, lo: int, hi: int }, // {"ty": s}
     NamedField { name: str, val: own Node }, // {"name": s, "val": <v>}
     Param { name: str, ty: own Node, lo: int, hi: int }, // {"name": s} (+"ty")
-    FieldDef { name: str, ty: own Node, lo: int, hi: int }, // {"name": s} (+"ty")
+    FieldDef { name: str, ty: own Node, tag: str, lo: int, hi: int }, // {"name": s} (+"ty","tag")
     Lit { obj: own Node, fields: own NList, lo: int, hi: int }, // {"lit": <o>, "fields": [...]}
     Call { f: own Node, args: own NList }, // {"call": <f>, "args": [...]}
     Field { obj: own Node, name: str, lo: int, hi: int }, // {"field": <o>, "name": s}
@@ -162,10 +162,13 @@ fn to_json(n: own Node) -> own json.Json {
                 json.jadd(o, "ty", to_json(ty))
             }
         }
-        Node.FieldDef{name, ty} => {
+        Node.FieldDef{name, ty, tag} => {
             json.jadd(o, "name", json.jstr(name))
             if ty != nil {
                 json.jadd(o, "ty", to_json(ty))
+            }
+            if len(tag) > 0 {
+                json.jadd(o, "tag", json.jstr(tag))
             }
         }
         Node.Lit{obj, fields} => {
@@ -531,6 +534,32 @@ fn p_primary(c: mut PCur) -> own Node {
     // `fn(T, ...) -> R` type literal — only meaningful as mkslice's elem ty
     if at(c, "fn") && c.t.next != nil && c.t.next.text == "(" {
         return p_ty(c)
+    }
+    // type literals in operand position (mkslice's arg0 grammar —
+    // tdesc/tqual/type_of share it): `[]T`, `own T`, `ref T`, `mut T`,
+    // `chan own T`. A bare own/ref/mut/chan with no type following
+    // still falls through to the ident path so `f(own)` stays a name.
+    if at(c, "[") {
+        return p_ty(c)
+    }
+    if at(c, "own") || at(c, "ref") || at(c, "mut") || at(c, "chan") {
+        nt := ""
+        if c.t.next != nil {
+            nt = c.t.next.text
+        }
+        starts_ty := nt == "[" || nt == "own" || nt == "ref" || nt == "mut" || nt == "chan" || nt == "fn"
+        if c.t.next != nil && c.t.next.kind == lexlib.k_ident() {
+            starts_ty = true
+        }
+        // `chan` keeps a narrower gate — only `chan own T` is a type
+        // literal; a bare `chan` operand reads as a name (the checker
+        // resolves it to the word chan type like mkchan's bare form)
+        if at(c, "chan") {
+            starts_ty = nt == "own"
+        }
+        if starts_ty {
+            return p_ty(c)
+        }
     }
     k := pkind(c)
     if k == 3 {
@@ -1336,7 +1365,16 @@ fn p_item(c: mut PCur) -> own Node {
                 if eat(c, ":") {
                     ty = p_ty(c)
                 }
-                fields = ncons(b(Node.FieldDef{name: fname, ty: ty, lo: fm, hi: c.phi}), fields)
+                // `tag "..."` — wire/reflect metadata carried on the
+                // FieldDesc.tag slot; a `tag` word followed by anything
+                // but a string literal is the next field's name
+                tg := ""
+                if peek(c) == "tag" && c.t.next != nil && c.t.next.kind == 4 {
+                    next(c)
+                    tg = peek(c)
+                    next(c)
+                }
+                fields = ncons(b(Node.FieldDef{name: fname, ty: ty, tag: tg, lo: fm, hi: c.phi}), fields)
                 eat(c, ",")
             }
             eat(c, "}")

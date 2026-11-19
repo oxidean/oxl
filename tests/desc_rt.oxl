@@ -1,0 +1,82 @@
+package main
+
+// R1 runtime/descriptor lane checks — complements desc_parity's digest
+// with cases that only compile/run correctly when codegen and the rt
+// helpers get the details right.
+struct Point { x: int, y: int }
+
+extern fn rt_desc_elem_ptr(td: int) -> int
+
+extern fn rt_desc_elem(td: int) -> int
+
+extern fn rt_desc_name(td: int) -> str
+
+extern fn rt_desc_alloc(td: int) -> int
+
+extern fn rt_desc_alloc_slice(td: int, n: int) -> int
+
+fn id[T any](v: T) -> [T, err] {
+    return v, nil
+}
+
+// keep is a generic sink — expr statements of a compound-literal Value
+// trip -Wunused-value on host compilers that warn (clang/msvc), so the
+// double-handle calls route through a param instead
+fn keep[T any](v: T) {}
+
+fn main() {
+    // elem_ptr: borrow-qualified element slots are pointers, inline
+    // value elements are not
+    if rt_desc_elem_ptr(tdesc([]own Point)) != 1 {
+        println("FAIL elem_ptr []own")
+        exit(1)
+    }
+    if rt_desc_elem_ptr(tdesc([]ref Point)) != 1 {
+        println("FAIL elem_ptr []ref")
+        exit(1)
+    }
+    if rt_desc_elem_ptr(tdesc([]mut Point)) != 1 {
+        println("FAIL elem_ptr []mut")
+        exit(1)
+    }
+    if rt_desc_elem_ptr(tdesc([]byte)) != 0 {
+        println("FAIL elem_ptr []byte")
+        exit(1)
+    }
+    if rt_desc_name(rt_desc_elem(tdesc([]ref Point))) != "Point" {
+        println("FAIL elem []ref")
+        exit(1)
+    }
+    // double handle: new(new(1)) stores a handle in a heap slot —
+    // value_of must load the inner pointer through a typed cast
+    p := new(new(1))
+    keep(value_of(p))
+    keep(value_of_mut(p))
+    // pair-result generic instantiations embed the reflect handles by
+    // value — the handle decls must precede the o_ret_ aggregates
+    [v, e] = id(value_of(p))
+    [t, e2] = id(type_of(int))
+    if e != nil || e2 != nil {
+        println("FAIL pair inst")
+        exit(1)
+    }
+    // descriptor alloc overflow: esz*n at n=2^61 wraps int64 — the
+    // helper must return -1, not under-allocate
+    if rt_desc_alloc_slice(tdesc(int), 2305843009213693952) != -1 {
+        println("FAIL rt_desc_alloc_slice overflow")
+        exit(1)
+    }
+    if rt_desc_alloc_slice(tdesc(byte), 4) == -1 {
+        println("FAIL rt_desc_alloc_slice small")
+        exit(1)
+    }
+    if rt_desc_alloc_slice(tdesc(int), -1) != -1 {
+        println("FAIL rt_desc_alloc_slice negative")
+        exit(1)
+    }
+    if rt_desc_alloc(tdesc(int)) == -1 {
+        println("FAIL rt_desc_alloc")
+        exit(1)
+    }
+    println("desc_rt ok")
+}

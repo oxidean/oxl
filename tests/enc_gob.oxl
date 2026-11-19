@@ -157,6 +157,18 @@ fn main() {
     if om.n != 9 || om.p == nil || om.p.v != 77 || om.s != "" {
         fails("sparse round-trip")
     }
+    // a non-nil own whose pointee is all-zero still round-trips as
+    // present — nil-ness is what absence means, not zero-ness
+    zown := szero()
+    zown.p = new(Inner)
+    [zz, ze2] = gob.marshal(zown)
+    want_ok(ze2, "marshal zero own")
+    oz := new(S)
+    ezown := gob.unmarshal(zz, oz)
+    want_ok(ezown, "unmarshal zero own")
+    if oz.p == nil || oz.p.v != 0 {
+        fails("non-nil own zero pointee lost")
+    }
     // positional + unit variants
     u := szero()
     u.e = E.A(7)

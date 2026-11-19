@@ -435,7 +435,7 @@ fn (e mut enc) estruct(v: reflect.Value) -> err {
             i = i + 1
             continue
         }
-        if iszero(fv) {
+        if f.ptr() == 0 && iszero(fv) {
             i = i + 1
             continue
         }
@@ -703,7 +703,7 @@ fn (d mut dec) bstr() -> [str, err] {
     if e != nil {
         return "", e
     }
-    if n < 0 || d.pos + n > len(d.b) {
+    if n < 0 || n > len(d.b) - d.pos {
         return "", err_malformed()
     }
     s := d.b[d.pos:d.pos + n] as str
@@ -844,7 +844,7 @@ fn (d mut dec) dskip(ws: wslot, ts: []wt) -> err {
         if e != nil {
             return e
         }
-        if n < 0 || d.pos + n > len(d.b) {
+        if n < 0 || n > len(d.b) - d.pos {
             return err_malformed()
         }
         d.pos = d.pos + n
@@ -863,6 +863,9 @@ fn (d mut dec) dskip(ws: wslot, ts: []wt) -> err {
             }
             if dl == 0 {
                 return nil
+            }
+            if dl < 0 {
+                return err_malformed()
             }
             last = last + dl
             if last < 0 || last >= len(w.fs) {
@@ -896,6 +899,9 @@ fn (d mut dec) dskip(ws: wslot, ts: []wt) -> err {
             if dl == 0 {
                 return nil
             }
+            if dl < 0 {
+                return err_malformed()
+            }
             last = last + dl
             if last < 0 || last >= len(wv.ps) {
                 return err_malformed()
@@ -919,7 +925,7 @@ fn (d mut dec) dskip(ws: wslot, ts: []wt) -> err {
             return err_malformed()
         }
         if w.ek == reflect.KindByte() {
-            if d.pos + n > len(d.b) {
+            if n > len(d.b) - d.pos {
                 return err_malformed()
             }
             d.pos = d.pos + n
@@ -1140,6 +1146,9 @@ fn (d mut dec) dsstruct(w: wt, v: reflect.Value, ts: []wt) -> err {
         if dl == 0 {
             return nil
         }
+        if dl < 0 {
+            return err_malformed()
+        }
         last = last + dl
         if last < 0 || last >= len(w.fs) {
             return err_malformed()
@@ -1153,7 +1162,9 @@ fn (d mut dec) dsstruct(w: wt, v: reflect.Value, ts: []wt) -> err {
             if fe != nil {
                 return fe
             }
-            if lwname(f) != ws.name {
+            // hidden (`gob:-`) locals never match — a wire field
+            // named "-" must dskip like any other unknown
+            if lwname(f) != ws.name || lwname(f) == "-" {
                 i = i + 1
                 continue
             }
@@ -1253,6 +1264,9 @@ fn (d mut dec) dsenum(w: wt, v: reflect.Value, ts: []wt) -> err {
         }
         if dl == 0 {
             return nil
+        }
+        if dl < 0 {
+            return err_malformed()
         }
         last = last + dl
         if last < 0 || last >= len(wv.ps) {

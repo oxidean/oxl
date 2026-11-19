@@ -1900,7 +1900,7 @@ export OXLMODCACHE="$scratch/oxlmodcache-drv"
 for f in tests/mod/*/; do
     case "$f" in tests/mod/widget/|tests/mod/intmod/) continue ;; esac
     seed_out=$("$SEEDOXL" build "$f" -o "$scratch/drvbin" 2>&1 | sed 's/^[^:]*:[0-9][0-9]*:[0-9][0-9]*: //') && seed_rc=0 || seed_rc=$?
-    self_out=$("$SELFOXL" build "$f" -o "$scratch/drvbin2" 2>&1) && self_rc=0 || self_rc=$?
+    self_out=$("$SELFOXL" build "$f" -o "$scratch/drvbin2" 2>&1 | sed 's/^[^:]*:[0-9][0-9]*:[0-9][0-9]*: //') && self_rc=0 || self_rc=$?
     if [ "$(cat "$f/expected")" = ok ]; then
         if [ "$seed_rc" != 0 ] || [ "$self_rc" != 0 ]; then
             echo "FAIL driver module $f: a driver rejected (seed=$seed_rc self=$self_rc)"

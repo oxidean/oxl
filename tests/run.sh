@@ -1927,7 +1927,7 @@ echo "== llvm lane (l3) =="
 # LANG_CLANG. Gated on clang like the node gate — a runner without it
 # skips with the reason spelled out.
 if command -v clang >/dev/null 2>&1; then
-    for f in conc_ping conc_scale select select_fair chan_own chanbuf chanbuf_close scope_exit orphan_join defer_order pairfwd susp_closure zero_str match methods fnval d5_qual stdmods_test susp_ownarg iface_susp iface_susp_shim iface_susp_pair iface_susp_nested iface_susp_rewrap iface_susp_prop iface_susp_convdest iface_susp_cancel iface_susp_ownarg vtab_fn closure_mcall closure_fnfield closure_shadow; do
+    for f in conc_ping conc_scale select select_fair chan_own chanbuf chanbuf_close scope_exit orphan_join defer_order pairfwd susp_closure zero_str match methods fnval d5_qual stdmods_test susp_ownarg spawn_forms iface_susp iface_susp_shim iface_susp_pair iface_susp_nested iface_susp_rewrap iface_susp_prop iface_susp_convdest iface_susp_cancel iface_susp_ownarg vtab_fn closure_mcall closure_fnfield closure_shadow; do
         case "$f" in
             conc_ping)      marker='bounces=' ;;
             conc_scale)     marker='done' ;;
@@ -1951,6 +1951,7 @@ if command -v clang >/dev/null 2>&1; then
             closure_shadow) marker='closure shadow ok' ;;
             zero_str)       marker='zero str ok' ;;
             susp_ownarg)    marker='susp ownarg ok' ;;
+            spawn_forms)    marker='spawn forms ok' ;;
             iface_susp)         marker='iface susp ok' ;;
             iface_susp_shim)    marker='iface susp shim ok' ;;
             iface_susp_pair)    marker='iface susp pair ok' ;;

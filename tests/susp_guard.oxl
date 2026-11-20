@@ -1,0 +1,29 @@
+package main
+
+// L3 review — susp-call result members associate with their call
+// site, not queue position: a skipped && rhs parks its member but
+// never fills it, so the || arm's recv must read ITS OWN slot — FIFO
+// popping would read the skipped arm's never-written member instead.
+fn feed(c: chan, v: int) {
+    send(c, v)
+}
+
+fn main() {
+    c1 := mkchan()
+    c2 := mkchan()
+    c3 := mkchan()
+    scope {
+        spawn feed(c1, 0)
+        spawn feed(c3, 9)
+        // recv(c1) delivers 0 → the && fails before its susp rhs runs
+        // (c2 keeps its value — nobody recv'd it); the || arm's
+        // recv(c3) then yields 9 from its own member
+        v := recv(c1) > 0 && recv(c2) > 0 || recv(c3) > 0
+        assert(v)
+        // the skipped rhs truly never ran — c2 still holds nothing;
+        // send now and read it back in order
+        spawn feed(c2, 5)
+        assert(recv(c2) == 5)
+    }
+    println("susp guard ok")
+}

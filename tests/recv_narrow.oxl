@@ -1,0 +1,24 @@
+package main
+
+// L3 review — a susp recv narrows the delivered i64 word to the
+// destination member's ty before the store: `let b: byte = recv(ch)`
+// parks an i8 member, and an i64 store would spill over the
+// neighbouring members (the C lane narrows implicitly at the assign).
+fn feed(ch: chan, a: int, b: int) {
+    send(ch, a)
+    send(ch, b)
+}
+
+fn main() {
+    ch := mkchan()
+    scope {
+        spawn feed(ch, 260, 77)
+        // untyped chan delivers the raw i64 word — narrowed to i8
+        let b: byte = recv(ch)
+        assert(b == 4)
+        // and an int-width member still gets the whole word
+        let v: int = recv(ch)
+        assert(v == 77)
+    }
+    println("recv narrow ok")
+}

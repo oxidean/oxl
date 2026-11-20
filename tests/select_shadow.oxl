@@ -1,0 +1,24 @@
+package main
+
+// L3 review — a select arm's recv bind lives in the arm's own scope,
+// which must open BEFORE the bind: binding first writes the arm's
+// variable into the enclosing scope, and the pop can't restore an
+// outer same-name binding (checker's sel_stmt order).
+fn feed(c: chan, v: int) {
+    send(c, v)
+}
+
+fn main() {
+    c := mkchan()
+    scope {
+        spawn feed(c, 41)
+        v := 7
+        select {
+            v := recv(c) => {
+                assert(v == 41)
+            }
+        }
+        assert(v == 7)
+    }
+    println("select shadow ok")
+}

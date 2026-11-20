@@ -1,0 +1,11 @@
+package main
+
+// run's `--` boundary probe — every token past it is the child's own
+// argv, including flag-shaped ones like --triple
+fn main() {
+    i := 0
+    for i < argc() {
+        println("arg " + itoa(i) + "=" + argv(i))
+        i = i + 1
+    }
+}

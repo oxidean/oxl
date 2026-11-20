@@ -21,7 +21,7 @@ jobs:
     # observed once at 68min on a docs-only diff vs ~20min normal (#117).
     # windows gets 90: its suite runs ~4x slower than the other legs and
     # crossed the 45min cap after the TLS/editor lanes landed.
-    timeout-minutes: ${{ matrix.os == 'windows-latest' && 90 || 45 }}
+    timeout-minutes: ${{ matrix.os == 'windows-latest' && 150 || 60 }}
     strategy:
       fail-fast: false
       matrix:

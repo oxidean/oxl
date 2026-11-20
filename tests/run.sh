@@ -2163,7 +2163,7 @@ if command -v clang >/dev/null 2>&1; then
     # cross-lane parity table — one line per corpus file: native-lane
     # binary output vs llvm-lane binary output, byte-diffed. The
     # trap-expectation files are l3's; every file here exits 0.
-    for f in select chan_own chanbuf chanbuf_close scope_exit orphan_join defer_order pairfwd susp_closure zero_str match methods fnval d5_qual susp_ownarg iface_susp iface_susp_shim iface_susp_pair iface_susp_nested iface_susp_rewrap iface_susp_prop iface_susp_convdest iface_susp_cancel iface_susp_ownarg vtab_fn closure_mcall closure_fnfield closure_shadow; do
+    for f in select chan_own chanbuf chanbuf_close scope_exit orphan_join defer_order pairfwd susp_closure zero_str match methods fnval d5_qual susp_ownarg spawn_forms iface_susp iface_susp_shim iface_susp_pair iface_susp_nested iface_susp_rewrap iface_susp_prop iface_susp_convdest iface_susp_cancel iface_susp_ownarg vtab_fn closure_mcall closure_fnfield closure_shadow; do
         "$OXL" build "tests/$f.oxl" -o "$scratch/$f-c$EXE" || { echo "FAIL llvm l4 parity $f: native build"; exit 1; }
         "$OXL" build --target llvm "tests/$f.oxl" -o "$scratch/$f-l$EXE" || { echo "FAIL llvm l4 parity $f: llvm build"; exit 1; }
         cout=$(with_timeout 60 "$scratch/$f-c$EXE" 2>&1) || { echo "FAIL llvm l4 parity $f: native run"; exit 1; }

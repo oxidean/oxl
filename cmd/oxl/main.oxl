@@ -180,6 +180,33 @@ fn has_flag(name: str) -> int {
     return 0
 }
 
+// 1 when `--triple` is present but malformed — presence is scanned
+// separately from flag_value's value so `--triple=`, a missing value,
+// or a flag-shaped value can't silently mean "build for host". Past
+// `--` argv belongs to the program, so a child-arg `--triple` stays
+// available to the child.
+fn triple_bad() -> int {
+    i := 2
+    for i < argc() {
+        a := argv(i)
+        if a == "--" {
+            break
+        }
+        if a == "--triple" {
+            // a triple never begins with '-' — that rejects `--`, a
+            // following flag, and the missing-value case alike
+            if i + 1 >= argc() || strings.startswith(argv(i + 1), "-") {
+                return 1
+            }
+        }
+        if strings.startswith(a, "--triple=") && len(a) == len("--triple=") {
+            return 1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
 // the validated --target value: "js"/"llvm" select their lanes,
 // ""/"c"/"native" the C lane — an unknown value dies here so every
 // lane check below can read it freely
@@ -312,6 +339,17 @@ fn compile_res(r: own check.CkRes, testm: int) -> own CRes {
         }
         res.c = codegen.emit_js(r, testm)
     } else if target_is_llvm() == 1 {
+        check.llvm_gate(r.ck, r.items)
+        if len(r.ck.diags) > 0 {
+            report_diags(r.ck.diags)
+            return res
+        }
+        // clang + the effective target resolve ahead of emission — the
+        // ABI pick must match what the selected compiler will actually
+        // build for, and a toolchain rejection must precede staging
+        if len(llvm_toolchain()) == 0 {
+            return res
+        }
         res.c = codegen.emit_llvm(r, testm, llvm_triple_abi())
     } else {
         res.c = codegen.emit(r, testm)
@@ -687,7 +725,12 @@ fn pick_clang() -> str {
         eprintln("llvm toolchain floor: --target llvm needs clang >= 15 (" + cands[i] + " reports `" + line + "`)")
         return ""
     }
-    return "clang" // let the spawn error name a binary that isn't there
+    // every candidate failed its probe — say so rather than handing a
+    // clang that never passed the version check to the IR compile (a
+    // wrapper that fails --version but delegates would slip a stale
+    // clang under the floor)
+    eprintln("llvm toolchain: no clang >= 15 found — set LANG_CLANG to a clang 15+ driver")
+    return ""
 }
 
 // `clang --version`'s major — the first line carries `clang version
@@ -717,6 +760,56 @@ fn clang_major(line: str) -> int {
     return n
 }
 
+// the lane's resolved toolchain — picked once so compile_res's ABI
+// pick and emit_and_llvm's invocation can never disagree (a clang
+// defaulting to a different arch than the host would otherwise build
+// for a target the boundary wasn't spelled for)
+let llvm_cc: str = ""
+
+let llvm_trip: str = ""
+
+let llvm_done: int = 0
+
+// the selected clang's own normalization of a target triple — "" asks
+// for the compiler's default; `x86_64-pc-win32-msvc` and
+// `x86_64-pc-windows-msvc` come back identical, so the ABI pick and the
+// -target arg both see the canonical spelling. A failed probe returns
+// the input unchanged (a garbage --triple still dies at the compile).
+fn clang_triple(clang: str, t: str) -> str {
+    args := mkslice(str, 0)
+    if len(t) > 0 {
+        args = push(args, "-target")
+        args = push(args, t)
+    }
+    args = push(args, "-print-target-triple")
+    p := exec.cmd(clang, args)
+    [o, e] = p.output()
+    if e != nil || o.status != 0 {
+        return t
+    }
+    out := strings.trim(o.stdout as str)
+    if len(out) == 0 {
+        return t
+    }
+    return out
+}
+
+// resolve clang + the effective target once: --triple wins, else the
+// selected compiler's default triple — "no --triple" then always
+// spells BOTH sides for the same target instead of hoping clang's
+// default happens to match the host probes. "" = no usable clang
+// (the diagnostic already printed).
+fn llvm_toolchain() -> str {
+    if llvm_done == 0 {
+        llvm_done = 1
+        llvm_cc = pick_clang()
+        if len(llvm_cc) > 0 {
+            llvm_trip = clang_triple(llvm_cc, flag_value("--triple"))
+        }
+    }
+    return llvm_cc
+}
+
 // emit_and_llvm mirrors emit_and_cc's shape: scratch intermediates,
 // rt.h/rt.c copied beside out.ll, clang invoked exactly like cc (the
 // only LLVM tool — its driver runs the whole pipeline on .ll + .c in
@@ -730,13 +823,21 @@ fn clang_major(line: str) -> int {
 // param/ret spellings differ, and clang compiles both sides under
 // -target, so the pick must match the clang target.
 fn llvm_triple_abi() -> int {
-    t := flag_value("--triple")
+    // the RESOLVED, clang-normalized triple — an absent --triple lands
+    // on the selected compiler's default (not the host probes, so ABI
+    // spelling matches what clang actually compiles for), and aliases
+    // like win32-msvc can't pick a different ABI than their canonical
+    // spelling
+    t := llvm_trip
     if len(t) == 0 {
-        // resolve the host ABI explicitly — returning 0 leaves labi's
-        // OXL_LLVM_ABI consult live on the driver path, where a stale
-        // dev env var would re-spell the C boundary while clang still
-        // compiles for the host (the env hook is for `codegen --emit`)
+        // the triple probe itself failed — resolve the host ABI
+        // explicitly (0 would leave labi's OXL_LLVM_ABI consult live on
+        // the driver path, where a stale dev env var would re-spell
+        // the C boundary while clang still compiles for the host)
         if rt_is_windows() != 0 {
+            if rt_host_arch() == "aarch64" {
+                return 2
+            }
             return 3
         }
         if rt_host_arch() == "aarch64" {
@@ -744,19 +845,17 @@ fn llvm_triple_abi() -> int {
         }
         return 1
     }
-    // OS tail first — aarch64-pc-windows is the win64 byref ABI, not
-    // aapcs64. A 32-bit arch under either OS family falls back to the
-    // sysv stack-copy spelling, the closest of the three (win32's
-    // byval and AAPCS32's stack spill are nearer sysv than the 64-bit
-    // caller-copy forms)
-    if strings.contains(t, "windows") || strings.contains(t, "win64") {
-        if strings.contains(t, "aarch64") || strings.contains(t, "arm64") || strings.contains(t, "x86_64") || strings.contains(t, "amd64") {
-            return 3
+    // OS tail first — Windows-x64 is the win64 byref ABI, but Windows
+    // ARM64 returns <=16B aggregates directly like aapcs64 (clang
+    // compiles both sides that way). A 32-bit arch under either OS
+    // family falls back to the sysv stack-copy spelling, the closest
+    // of the three (win32's byval and AAPCS32's stack spill are nearer
+    // sysv than the 64-bit caller-copy forms)
+    if strings.contains(t, "windows") || strings.contains(t, "win64") || strings.contains(t, "mingw") {
+        if strings.contains(t, "aarch64") || strings.contains(t, "arm64") {
+            return 2
         }
-        return 1
-    }
-    if strings.contains(t, "mingw") {
-        if strings.contains(t, "aarch64") || strings.contains(t, "arm64") || strings.contains(t, "x86_64") || strings.contains(t, "amd64") {
+        if strings.contains(t, "x86_64") || strings.contains(t, "amd64") {
             return 3
         }
         return 1
@@ -767,11 +866,35 @@ fn llvm_triple_abi() -> int {
     return 1
 }
 
+// a live `@sym` reference in emitted IR — declare/call lines only.
+// String constants ride `@.str_* = private constant [...] c"..."`
+// lines, so a bare substring scan would treat printed text like
+// "rt_sqlite_open" as a feature use.
+fn llsrc_uses(llsrc: str, sym: str) -> bool {
+    needle := "@" + sym
+    lines := strings.split(llsrc, "\n")
+    for lines != nil {
+        ln := lines.v
+        if strings.contains(ln, needle) && strings.startswith(ln, "@.str_") == false {
+            return true
+        }
+        lines = lines.next
+    }
+    return false
+}
+
 // --triple passes through to `clang -target` for BOTH inputs — the
 // emitted .ll stays triple-neutral (no `target triple`/`datalayout`
 // lines) so clang supplies the datalayout each side compiles under.
 // `out` needs .exe handling done by the caller (exe_out_name).
 fn emit_and_llvm(llsrc: str, out: str, entry: str) -> int {
+    // the toolchain resolves BEFORE any staging — a rejected clang
+    // must not strand scratch dirs nobody reports (compile_res
+    // already gated on this; emit sites stay defensive)
+    clang := llvm_toolchain()
+    if len(clang) == 0 {
+        return 0 // the toolchain diagnostic already printed
+    }
     dir := mk_scratch_dir("oxl-build")
     if len(dir) == 0 {
         return 0
@@ -803,14 +926,12 @@ fn emit_and_llvm(llsrc: str, out: str, entry: str) -> int {
         eprintln("cannot write " + dir + "/rt.c: " + rt_errstr(we))
         return 0
     }
-    clang := pick_clang()
-    if len(clang) == 0 {
-        return 0 // the floor diagnostic already printed
-    }
     // link (and compile) sqlite/net/math only when the emitted program
-    // uses them — the same rt_* spellings appear as .ll call targets,
-    // so the C lane's needle set carries over verbatim
-    needs_sqlite := strings.contains(llsrc, "rt_sqlite_")
+    // uses them — the scan must see live symbol refs (declare/call
+    // lines spell `@name`), not raw text: `println("rt_sqlite_open")`
+    // puts that text in a c"..." string constant and would flip
+    // OXL_SQLITE on for a program that never calls it
+    needs_sqlite := llsrc_uses(llsrc, "rt_sqlite_")
     needs_net := 0
     nets := mkslice(str, 0)
     nets = push(nets, "rt_sock_")
@@ -823,7 +944,7 @@ fn emit_and_llvm(llsrc: str, out: str, entry: str) -> int {
     nets = push(nets, "rt_lookup_ipv4")
     i := 0
     for i < len(nets) {
-        if strings.contains(llsrc, nets[i]) {
+        if llsrc_uses(llsrc, nets[i]) {
             needs_net = 1
         }
         i = i + 1
@@ -834,13 +955,21 @@ fn emit_and_llvm(llsrc: str, out: str, entry: str) -> int {
     // trips clang's -Woverride-module on every compile; the override
     // IS the design (clang supplies the triple), so hush it
     args = push(args, "-Wno-override-module")
-    // host probes alone can't gate target spellings — a
-    // `--triple *windows*` cross from POSIX must not see -pthread or
-    // the ELF gc-sections flag, and the win32 libs must follow the
-    // triple, not the host
-    triple := flag_value("--triple")
-    twin := rt_is_windows() != 0 || strings.contains(triple, "windows") || strings.contains(triple, "mingw")
-    tmac := is_macos() == 1 || strings.contains(triple, "apple") || strings.contains(triple, "darwin")
+    // every target-dependent option keys off the RESOLVED triple —
+    // llvm_trip is clang's normalized spelling, and with --triple
+    // absent it's the selected compiler's own default so host probes
+    // can't disagree with what clang compiles for. Host probes only
+    // back a triple we couldn't resolve at all.
+    triple := llvm_trip
+    twin := false
+    tmac := false
+    if len(triple) > 0 {
+        twin = strings.contains(triple, "windows") || strings.contains(triple, "mingw")
+        tmac = strings.contains(triple, "apple") || strings.contains(triple, "darwin") || strings.contains(triple, "macos")
+    } else {
+        twin = rt_is_windows() != 0
+        tmac = is_macos() == 1
+    }
     if !twin {
         args = push(args, "-pthread")
     }
@@ -880,15 +1009,15 @@ fn emit_and_llvm(llsrc: str, out: str, entry: str) -> int {
     }
     // -DOXL_MATH compiles the rt_m_* wrappers and -lm links them,
     // together (sqlite pattern). Windows skips both.
-    if strings.contains(llsrc, "rt_m_") {
+    if llsrc_uses(llsrc, "rt_m_") {
         args = push(args, "-DOXL_MATH")
         if !twin {
             args = push(args, "-lm")
         }
     }
-    // rt_csrand( verbatim — a real call site, not the driver's own
+    // @rt_csrand( verbatim — a real call site, not the driver's own
     // source text (the emit_and_cc needle)
-    if strings.contains(llsrc, "rt_csrand" + "(") {
+    if llsrc_uses(llsrc, "rt_csrand") {
         args = push(args, "-DOXL_CRYPTO")
         if twin {
             args = push(args, "-lbcrypt")
@@ -1128,16 +1257,21 @@ fn cmd_run() {
         exit(1)
     }
     out := exe_out_name(dir + "/a.out")
+    // an emit failure never produced the exec — drop the empty run
+    // dir (the emit fn's own scratch dir is either cleaned or reported)
     if target_is_js() == 1 {
         out = dir + "/out.mjs"
         if emit_and_js(res.c, out, entry_dir(src)) == 0 {
+            os.remove_all(dir)
             exit(1)
         }
     } else if target_is_llvm() == 1 {
         if emit_and_llvm(res.c, out, entry_dir(src)) == 0 {
+            os.remove_all(dir)
             exit(1)
         }
     } else if emit_and_cc(res.c, out, entry_dir(src)) == 0 {
+        os.remove_all(dir)
         exit(1)
     }
     // everything after the sources is the program's argv — minus
@@ -1304,6 +1438,13 @@ fn main() {
     // misuse on every other shape instead of silently swallowing it
     if has_flag("--html") == 1 && (c != "build" || target_is_js() == 0) {
         eprintln("--html needs `oxl build --target js`")
+        exit(2)
+    }
+    // a --triple PRESENT but valueless is a usage error, not "absent" —
+    // flag_value can't distinguish `--triple=` / a missing value / a
+    // `--`-shaped value from no flag at all
+    if triple_bad() == 1 {
+        eprintln("--triple needs a target triple value (e.g. --triple x86_64-unknown-linux-gnu)")
         exit(2)
     }
     // --triple/--emit-llvm are llvm-lane vocabulary — a flag another

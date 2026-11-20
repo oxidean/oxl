@@ -28,6 +28,8 @@ extern fn rt_errstr(code: int) -> str
 
 extern fn rt_is_windows() -> int
 
+extern fn rt_host_arch() -> str
+
 // the running binary's canonical path — PATH lookup hands us a bare
 // argv(0), so exe-anchored probes (runtime/, std/) must anchor here
 // to find a shipped toolchain from another project
@@ -730,7 +732,17 @@ fn clang_major(line: str) -> int {
 fn llvm_triple_abi() -> int {
     t := flag_value("--triple")
     if len(t) == 0 {
-        return 0
+        // resolve the host ABI explicitly — returning 0 leaves labi's
+        // OXL_LLVM_ABI consult live on the driver path, where a stale
+        // dev env var would re-spell the C boundary while clang still
+        // compiles for the host (the env hook is for `codegen --emit`)
+        if rt_is_windows() != 0 {
+            return 3
+        }
+        if rt_host_arch() == "aarch64" {
+            return 2
+        }
+        return 1
     }
     // OS tail first — aarch64-pc-windows is the win64 byref ABI, not
     // aapcs64. A 32-bit arch under either OS family falls back to the
@@ -744,7 +756,10 @@ fn llvm_triple_abi() -> int {
         return 1
     }
     if strings.contains(t, "mingw") {
-        return 3
+        if strings.contains(t, "aarch64") || strings.contains(t, "arm64") || strings.contains(t, "x86_64") || strings.contains(t, "amd64") {
+            return 3
+        }
+        return 1
     }
     if strings.contains(t, "aarch64") || strings.contains(t, "arm64") {
         return 2
@@ -819,7 +834,14 @@ fn emit_and_llvm(llsrc: str, out: str, entry: str) -> int {
     // trips clang's -Woverride-module on every compile; the override
     // IS the design (clang supplies the triple), so hush it
     args = push(args, "-Wno-override-module")
-    if rt_is_windows() == 0 {
+    // host probes alone can't gate target spellings — a
+    // `--triple *windows*` cross from POSIX must not see -pthread or
+    // the ELF gc-sections flag, and the win32 libs must follow the
+    // triple, not the host
+    triple := flag_value("--triple")
+    twin := rt_is_windows() != 0 || strings.contains(triple, "windows") || strings.contains(triple, "mingw")
+    tmac := is_macos() == 1 || strings.contains(triple, "apple") || strings.contains(triple, "darwin")
+    if !twin {
         args = push(args, "-pthread")
     }
     // G2: every emitted fn gets its own section so the linker can GC
@@ -827,18 +849,14 @@ fn emit_and_llvm(llsrc: str, out: str, entry: str) -> int {
     // under Mach-O (the GNU-driver spelling pick_clang's floor pins)
     args = push(args, "-ffunction-sections")
     args = push(args, "-fdata-sections")
-    if is_macos() == 1 {
+    if tmac {
         args = push(args, "-Wl,-dead_strip")
-    } else if rt_is_windows() != 0 || strings.contains(flag_value("--triple"), "windows") {
+    } else if twin {
         // lld-link has no --gc-sections spelling — it warns and
         // ignores (OPT:REF is already the default)
     } else {
         args = push(args, "-Wl,--gc-sections")
     }
-    // --triple is this lane's only flag: a passthrough to `clang
-    // -target` covering out.ll AND rt.c in one shot — headers/libs/
-    // sysroot are the local clang's problem (items/toolchain.md)
-    triple := flag_value("--triple")
     if len(triple) > 0 {
         args = push(args, "-target")
         args = push(args, triple)
@@ -850,7 +868,7 @@ fn emit_and_llvm(llsrc: str, out: str, entry: str) -> int {
     // clang doesn't auto-link the Win32 libs MinGW gcc folds in —
     // rt.c's advapi32 (security attrs) + shell32 (CommandLineToArgvW)
     // callers need them spelled out (the l1 abi probe's note)
-    if rt_is_windows() != 0 {
+    if twin {
         args = push(args, "-ladvapi32")
         args = push(args, "-lshell32")
         if needs_net == 1 {
@@ -864,7 +882,7 @@ fn emit_and_llvm(llsrc: str, out: str, entry: str) -> int {
     // together (sqlite pattern). Windows skips both.
     if strings.contains(llsrc, "rt_m_") {
         args = push(args, "-DOXL_MATH")
-        if rt_is_windows() == 0 {
+        if !twin {
             args = push(args, "-lm")
         }
     }
@@ -872,7 +890,7 @@ fn emit_and_llvm(llsrc: str, out: str, entry: str) -> int {
     // source text (the emit_and_cc needle)
     if strings.contains(llsrc, "rt_csrand" + "(") {
         args = push(args, "-DOXL_CRYPTO")
-        if rt_is_windows() != 0 {
+        if twin {
             args = push(args, "-lbcrypt")
         }
     }
@@ -917,6 +935,11 @@ fn emit_and_llvm(llsrc: str, out: str, entry: str) -> int {
         }
         os.remove_all(dir) // scratch dir — best effort
         return 1
+    }
+    if e != nil {
+        // the spawn itself failed (no clang, bad LANG_CLANG) — name
+        // it, else a missing toolchain reads as a compile failure
+        eprintln("clang exec failed: " + errors.msg(e))
     }
     eprintln("clang failed (emitted LLVM IR kept at " + lfile + ")")
     return 0
@@ -1161,6 +1184,9 @@ fn cmd_run() {
     }
     child := exec.cmd(out, cargs)
     [st, e] = child.run()
+    if e != nil {
+        eprintln("exec failed: " + errors.msg(e))
+    }
     os.remove_all(dir)
     exit(child_code(st, e))
 }

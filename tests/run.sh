@@ -1927,7 +1927,7 @@ echo "== llvm lane (l3) =="
 # LANG_CLANG. Gated on clang like the node gate — a runner without it
 # skips with the reason spelled out.
 if command -v clang >/dev/null 2>&1; then
-    for f in conc_ping conc_scale select select_fair chan_own chanbuf chanbuf_close scope_exit orphan_join defer_order pairfwd susp_closure zero_str match methods fnval d5_qual stdmods_test susp_ownarg iface_susp iface_susp_shim iface_susp_pair iface_susp_nested iface_susp_rewrap iface_susp_prop iface_susp_convdest iface_susp_cancel vtab_fn closure_mcall closure_fnfield closure_shadow; do
+    for f in conc_ping conc_scale select select_fair chan_own chanbuf chanbuf_close scope_exit orphan_join defer_order pairfwd susp_closure zero_str match methods fnval d5_qual stdmods_test susp_ownarg iface_susp iface_susp_shim iface_susp_pair iface_susp_nested iface_susp_rewrap iface_susp_prop iface_susp_convdest iface_susp_cancel iface_susp_ownarg vtab_fn closure_mcall closure_fnfield closure_shadow; do
         case "$f" in
             conc_ping)      marker='bounces=' ;;
             conc_scale)     marker='done' ;;
@@ -1959,6 +1959,7 @@ if command -v clang >/dev/null 2>&1; then
             iface_susp_prop)    marker='iface susp prop ok' ;;
             iface_susp_convdest) marker='iface susp convdest ok' ;;
             iface_susp_cancel)  marker='iface susp cancel ok' ;;
+            iface_susp_ownarg)  marker='iface susp ownarg ok' ;;
             vtab_fn)            marker='vtab fn ok' ;;
         esac
         out=$(with_timeout 180 "$OXL" run --target llvm "tests/$f.oxl" 2>&1) || { echo "FAIL llvm l3 $f: $out"; exit 1; }

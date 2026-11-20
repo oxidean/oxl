@@ -1967,10 +1967,19 @@ if command -v clang >/dev/null 2>&1; then
         echo "  llvm l3 run: $f ok"
     done
     # the _test corpus through `test --target llvm` — the testm=1
-    # wrappers (dynamic RtScope allocas) through the same driver path
+    # wrappers (dynamic RtScope allocas) through the same driver path.
+    # Output goes to a file, not $( ) — a capture pipe whose write end a
+    # spawned grandchild inherits can't hold the substitution open past
+    # the watchdog, and on timeout the survivors report themselves
     for f in stdlib_test float_test regexp_test util_test enc_test; do
-        out=$(with_timeout 180 "$OXL" test --target llvm "tests/$f.oxl" 2>&1) || { echo "FAIL llvm l3 test $f: $out"; exit 1; }
-        grep -q ' \.\.\. ok' <<<"$out" || { echo "FAIL llvm l3 test $f: $out"; exit 1; }
+        lf="$scratch/l3test-$f.out"
+        if ! with_timeout 180 "$OXL" test --target llvm "tests/$f.oxl" >"$lf" 2>&1; then
+            echo "FAIL llvm l3 test $f:"
+            cat "$lf"
+            ps -axo pid,ppid,pgid,stat,etime,command 2>/dev/null | head -50
+            exit 1
+        fi
+        grep -q ' \.\.\. ok' "$lf" || { echo "FAIL llvm l3 test $f:"; cat "$lf"; exit 1; }
         echo "  llvm l3 test: $f ok"
     done
     # trap files through build + exec — the produced native binary

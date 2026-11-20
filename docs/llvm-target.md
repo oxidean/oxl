@@ -24,13 +24,15 @@ oxl test  <pkg|file.oxl> --target llvm        # test_* fns, same `… ok` lines
 - `--triple <t>` / `--triple=<t>` — cross-compile: passes through to
   `clang -target <t>` covering the emitted `.ll` *and* `rt.c` in one
   shot. Rejected off-lane: ``--triple needs `--target llvm` ``.
-- `--emit-llvm` — on a successful build, keeps the emitted IR as
-  `out.ll` in the `-o` output's directory (the inspectability story
-  replacing emitted-C readability — scratch intermediates are
-  otherwise always removed on success). Under `run`/`test` the kept
-  `.ll` lands in the scratch dir the driver removes after the child
-  exits, so it is a `build` story in practice. Rejected off-lane:
-  ``--emit-llvm needs `--target llvm` ``.
+- `--emit-llvm` — `build`-only. On a successful build it keeps the
+  emitted IR as `<out>.ll` beside the `-o` binary (the
+  inspectability story replacing emitted-C readability — scratch
+  intermediates are otherwise always removed on success; the name
+  derives from the binary so it can't collide with `-o dir/out.ll`
+  or across same-dir builds). Rejected under `run`/`test` — the
+  kept file would land in scratch the driver removes, a silent
+  no-op: ``--emit-llvm only applies to `build` ``. Rejected
+  off-lane: ``--emit-llvm needs `--target llvm` ``.
 - The raw emitter is also reachable without the driver:
   `oxl run bootstrap/cmd/codegen -- [--test] --emit llvm <file.oxl>`
   prints the `.ll` module to stdout (the suite's ABI probe and the
@@ -64,7 +66,7 @@ on `out.ll rt.c` in one shot).
 | `LANG_CLANG` | toolchain override — the `LANG_CC` convention; probed before `clang` on `PATH` and still held to the >=15 floor |
 | `LANG_SQLITE_SRC` | sqlite amalgamation source — compiled in place of `-lsqlite3` when the program spells `rt_sqlite_*` (shared with the C lane) |
 | `LANG_LDFLAGS` | extra link inputs appended verbatim — FFI shim objects, `pkg-config` output (shared with the C lane) |
-| `OXL_LLVM_ABI` | emit-time ABI override — `sysv`/`aapcs64`/`win64`; the emitter reads it only when no explicit ABI pick arrived — i.e. on the raw `bootstrap/cmd/codegen --emit llvm` path, or `--target llvm` without `--triple` (a `--triple` pick wins) |
+| `OXL_LLVM_ABI` | emit-time ABI override — `sysv`/`aapcs64`/`win64`; the emitter reads it only when no explicit ABI pick arrived. The driver path always sends one — `--triple`-derived or host autodetect — so the hook is reachable solely on the raw `bootstrap/cmd/codegen --emit llvm` path |
 
 ## `--triple` and the ABI boundary
 
@@ -83,11 +85,12 @@ Two different things travel under one flag:
   stack-copy convention vs AAPCS64/win64's pointer-to-caller-copy in
   an arg register, plus `sret` for indirect returns. The emitter
   therefore spells call sites for one ABI: host autodetect by
-  default; `--triple` overrides it (`aarch64`/`arm64`/`armv*` →
-  `aapcs64`, `windows`/`win64`/`mingw` → `win64`, everything else →
-  `sysv`), and `OXL_LLVM_ABI` fills the no-pick cases above. The
-  pick must match the clang target — clang compiles both inputs
-  under it.
+  default; `--triple` overrides it (`aarch64`/`arm64` → `aapcs64`;
+  `windows`/`win64`/`mingw` → `win64` when the arch is also 64-bit
+  — `aarch64`/`arm64`/`x86_64`/`amd64` — and `sysv` for a 32-bit
+  arch under either OS family; everything else → `sysv`). The pick
+  must match the clang target — clang compiles both inputs under
+  it.
 
 Cross reach is the local clang's configured reach: headers, libs,
 and the sysroot for the target are the installed toolchain's
@@ -151,8 +154,8 @@ Reopen only on trigger; the full text lives in the spec
   codegen bug reports at generated line numbers. There is no
   source-level debug info (parked above); the kept IR is the
   debugging story:
-  - `--emit-llvm` keeps `out.ll` beside the binary on a clean build
-    — inspect it, replay it through `clang` by hand.
+  - `--emit-llvm` keeps `<out>.ll` beside the binary on a clean
+    build — inspect it, replay it through `clang` by hand.
   - On a clang failure the driver keeps the intermediates anyway:
     `clang failed (emitted LLVM IR kept at <scratch>/out.ll)` —
     `rt.h`/`rt.c` copies sit beside it, so the failing invocation

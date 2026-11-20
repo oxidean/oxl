@@ -1,6 +1,6 @@
 package codegen
 
-// bootstrap/codegen/llvm.oxl — the LLVM textual-IR lane, milestone L1.
+// bootstrap/codegen/llvm.oxl — the LLVM textual-IR lane, milestone L2.
 // Sibling emitter behind the check.CkRes seam: emit_llvm(r, testm)
 // returns one .ll module per
 // docs/specs/2026-11-11-llvm-backend/llvm-semantics.md. Shares the G
@@ -12,11 +12,12 @@ package codegen
 //
 // Locals are entry-hoisted `alloca`s under the mem2reg contract; every
 // block ends in one terminator (lterm tracks it so unreachable
-// continuations get fresh dead labels). susp positions — calls to
-// susp fns, spawn of susp callees, susp vtab slots, select, susp main
-// — all land `call void @rt_trap(i64 21)`; the poll-machine lowering
-// is L2. Boundary layouts (%OxlStr/%RtSlice/%RtFnv/%RtIface + the rt_*
-// signatures in lrt_sig) match runtime/rt.h field-for-field.
+// continuations get fresh dead labels). susp fns lower to a heap
+// frame + poll-driver pair (lframe); susp calls resume through it,
+// spawn of susp callees emits rt_spawn_task on the frame, susp vtab
+// slots carry RtSuspDescs, and susp main/test fns run under
+// rt_run_root. Boundary layouts (%OxlStr/%RtSlice/%RtFnv/%RtIface +
+// the rt_* signatures in lrt_sig) match runtime/rt.h field-for-field.
 import "oxl/bootstrap/check"
 
 import "std/collections"
@@ -87,6 +88,16 @@ fn lalloc(g: mut G, tyn: str) -> str {
         g.lallg = push(g.lallg, "  " + p + " = alloca " + tyn + ", align 8\n")
     }
     return p
+}
+
+// splice the staged entry allocas at the @@ALLOC@@ marker — lallg is
+// lalloc's lfn==0 (global-init) twin; every fn ctx sets lfn=1 so it
+// stays empty in practice, but drain it beside lall so a stray push
+// can never vanish silently
+fn lall_drain(g: mut G) -> str {
+    s := wjoin(g.lallg)
+    g.lallg = mkslice(str, 0)
+    return s + wjoin(g.lall)
 }
 
 // bind an oxl name to a fresh slot: g.env carries the ty handle (type
@@ -1482,7 +1493,8 @@ fn ltrapc(g: mut G, c: str, code: int) {
     llb(g, b)
 }
 
-// unconditional susp trap — every susp position in L1
+// unconditional trap — positions the lane deliberately rejects
+// (unresolvable/builtin spawn callees, unspelled susp operands)
 fn ltrapu(g: mut G) {
     lrtuse(g, "rt_trap")
     lw(g, "call void @rt_trap(i64 21)")
@@ -2632,7 +2644,7 @@ fn lclosure(g: mut G, params: ref parser.NList, body: ref parser.Node) -> str {
     } else {
         lt(g, "ret " + ret_c + " zeroinitializer")
     }
-    g.w[aidx] = wjoin(g.lall)
+    g.w[aidx] = lall_drain(g)
     wln(g, "}\n")
     wpop(g)
     lunit(g, 8, wjoin(g.wlast), "o_cl_" + sid)
@@ -3467,7 +3479,7 @@ fn ldefer(g: mut G, call: own parser.Node) {
     v2 := lx(g, rewritten)
     lenv_pop(g)
     lt(g, "ret void")
-    g.w[aidx] = wjoin(g.lall)
+    g.w[aidx] = lall_drain(g)
     wln(g, "}\n")
     wpop(g)
     lunit(g, 10, wjoin(g.wlast), thunk)
@@ -3497,14 +3509,20 @@ fn ldefer(g: mut G, call: own parser.Node) {
     lcallrtv(g, "rt_defer_push", "ptr @" + thunk + ", ptr " + ep)
 }
 
-// spawn/go — L1 covers the non-susp path only: `{env, tramp}` handed
-// to rt_spawn (spec §7, stage-4 shape); susp callees trap. go_in
-// enters the resolved named scope on the env first.
+// spawn/go — the C lane's gspawn split (spec §7, stage-4 shape): susp
+// callees route to lspawn_susp's heap frame + poll task; non-susp
+// callees get a heap args struct plus a `ptr(ptr)` trampoline handed
+// to rt_spawn/rt_spawnb. The callee surface mirrors the C lane too:
+// dotted `x.m` resolves through gcall_plan and leads the env with a
+// receiver slot, generic callees bind + queue a mangled inst, and fn
+// values pack the %RtFnv pair as the first arg slot — the thunk calls
+// through its fp half. go_in enters the resolved named scope on the
+// env first (slot 0). Builtin/iface-slot callees reject at the spawn
+// site (rt_trap 21), same net effect as the C lane's trampoline trap.
 fn lspawn(g: mut G, sc: ref parser.Node, e: ref parser.Node, blocking: bool) {
     cn := ""
     let carg: own parser.NList = nil
     let cf: ref parser.Node = nil
-    ce := e
     match e {
         parser.Node.Call{f, args} => {
             cn = check.callee_name(f)
@@ -3512,7 +3530,6 @@ fn lspawn(g: mut G, sc: ref parser.Node, e: ref parser.Node, blocking: bool) {
             cf = f
         }
         parser.Node.ExprStmt{e} => {
-            ce = e
             match e {
                 parser.Node.Call{f, args} => {
                     cn = check.callee_name(f)
@@ -3526,42 +3543,153 @@ fn lspawn(g: mut G, sc: ref parser.Node, e: ref parser.Node, blocking: bool) {
         _ => {
         }
     }
-    if len(cn) == 0 {
+    if cf == nil {
         ltrapu(g)
         return
     }
-    if cf != nil {
-        cp2 := gcall_plan(g, cf, carg)
-        if cp2.k == 1 && check.sl_has(g.ck.susp, cp2.q) {
-            lspawn_susp(g, sc, cf, carg, blocking)
+    cp := gcall_plan(g, cf, carg)
+    if cp.k == 1 && check.sl_has(g.ck.susp, cp.q) {
+        lspawn_susp(g, sc, cf, carg, blocking)
+        return
+    }
+    // fn value callee — the %RtFnv pair is the env's first arg slot
+    // (a susp fn spelled by name types as k_fn but already routed to
+    // lspawn_susp above; keep lcall's same-name guard anyway)
+    ft := xfnval_ty(g, cf)
+    if ft >= 0 && tyk(g, ft) == check.k_fn() {
+        if len(cn) > 0 && check.sl_has(g.ck.susp, check.resolve_named(g.ck, cn)) {
+            ft = -1
+        }
+    }
+    fnv := false
+    if ft >= 0 && tyk(g, ft) == check.k_fn() {
+        fnv = true
+    }
+    // named callee — the plan's qualified name for dotted/generic
+    // calls, the spelled name for the rest (seed gspawn's base/fi2)
+    base := check.resolve_named(g.ck, cn)
+    fi := -1
+    if !fnv {
+        if len(cn) == 0 {
+            ltrapu(g)
+            return
+        }
+        if cp.k == 1 {
+            base = cp.q
+            fi = gfn(g, cp.q)
+        } else if cp.k == 0 {
+            fi = gfn(g, cn)
+        }
+        if fi < 0 {
+            ltrapu(g)
             return
         }
     }
-    qn := check.resolve_named(g.ck, cn)
-    fi := gfn(g, cn)
-    if fi < 0 {
-        ltrapu(g)
-        return
+    let bind: own collections.Map = nil
+    ename := base
+    let rnode: ref parser.Node = nil
+    callee := ""
+    retk := 0
+    rt1 := -1
+    if fnv {
+        rt1 = gsub(g, g.ck.tyv[ft].r)
+        if tyk(g, rt1) != check.k_void() {
+            retk = 1
+        }
+    } else {
+        sig := g.ck.fnsv[fi]
+        if sig.typarams != nil {
+            bind = gcall_bindf(g, fi, cf, carg, cp.dotted)
+            ename = ginst_name(g, base, sig.typarams, bind)
+        }
+        if cp.k == 1 && cp.dotted == 1 {
+            match cf {
+                parser.Node.Field{obj} => {
+                    rnode = obj
+                }
+                _ => {
+                }
+            }
+        }
+        callee = "@" + cn
+        if sig.is_extern == 0 {
+            callee = "@o_f_" + cname(ename)
+        }
+        retk = sig.retk
+        rt1 = sig.ret1
+        if bind != nil {
+            rt1 = check.subst_ty(g.ck, rt1, bind)
+        }
+        rt1 = gsub(g, rt1)
     }
-    id := g.spn
-    g.spn = g.spn + 1
-    sid := itoa(id)
-    sig := g.ck.fnsv[fi]
-    envf := ""
+    // env field tys: [go_in scope ptr] then the callee slots — the
+    // %RtFnv pair for fn values, the receiver for dotted methods, then
+    // one slot per arg (declared param ty subst'd through the inst
+    // bind where it resolves, else the arg expr's ty — gspawn's il
+    // walk). `slots` drives the type decl, the thunk's slot loads, and
+    // the spawn-site fills alike.
+    slots := mkslice(int, 0)
     if sc != nil {
-        envf = "ptr"
+        slots = push(slots, check.tk(g.ck, check.k_scope()))
     }
-    pl := sig.params
-    for pl != nil {
+    if fnv {
+        slots = push(slots, ft)
+        il := g.ck.tyv[ft].args
+        al := carg
+        for al != nil {
+            pt := gsub(g, xty(g, al.v))
+            if il != nil {
+                pt = il.v
+                il = il.next
+            }
+            slots = push(slots, pt)
+            al = al.next
+        }
+    } else {
+        let il: own check.IList = nil
+        il = g.ck.fnsv[fi].params
+        if rnode != nil {
+            pt := gsub(g, xty(g, rnode))
+            if il != nil {
+                pt = il.v
+                if bind != nil {
+                    pt = check.subst_ty(g.ck, pt, bind)
+                }
+                pt = gsub(g, pt)
+                il = il.next
+            }
+            slots = push(slots, pt)
+        }
+        al := carg
+        for al != nil {
+            pt := gsub(g, xty(g, al.v))
+            if il != nil {
+                pt = il.v
+                if bind != nil {
+                    pt = check.subst_ty(g.ck, pt, bind)
+                }
+                pt = gsub(g, pt)
+                il = il.next
+            }
+            slots = push(slots, pt)
+            al = al.next
+        }
+    }
+    envf := ""
+    k := 0
+    for k < len(slots) {
         if len(envf) > 0 {
             envf = envf + ", "
         }
-        envf = envf + lty(g, gsub(g, pl.v))
-        pl = pl.next
+        envf = envf + lty(g, slots[k])
+        k = k + 1
     }
     if len(envf) == 0 {
         envf = "i8"
     }
+    id := g.spn
+    g.spn = g.spn + 1
+    sid := itoa(id)
     lunit(g, 11, "%o_spenv_" + sid + " = type { " + envf + " }\n", "o_spenv_" + sid)
     save_lall := g.lall
     save_lfn := g.lfn
@@ -3583,7 +3711,7 @@ fn lspawn(g: mut G, sc: ref parser.Node, e: ref parser.Node, blocking: bool) {
     g.sopen = mkslice(int, 0)
     g.defers = nil
     g.retk = 0
-    g.cret = sig.ret1
+    g.cret = rt1
     g.cur = "o_sp_" + sid
     g.inframe = 0
     wpush(g)
@@ -3601,34 +3729,54 @@ fn lspawn(g: mut G, sc: ref parser.Node, e: ref parser.Node, blocking: bool) {
         lcallrtv(g, "rt_scope_enter", "ptr " + fv)
         i = 1
     }
-    pl = sig.params
-    for pl != nil {
-        nm := "_a" + itoa(i)
-        sp := lbind(g, nm, gsub(g, pl.v))
-        fp := lgepf(g, "%o_spenv_" + sid, "%_e", i)
-        fv := lload(g, lty(g, gsub(g, pl.v)), fp)
-        lstore(g, lty(g, gsub(g, pl.v)), fv, sp)
-        i = i + 1
-        pl = pl.next
+    // each callee slot unloads into a _a<k> local; the call spells
+    // them back via lxname
+    k = i
+    for k < len(slots) {
+        nm := "_a" + itoa(k)
+        sp := lbind(g, nm, slots[k])
+        fp := lgepf(g, "%o_spenv_" + sid, "%_e", k)
+        fv := lload(g, lty(g, slots[k]), fp)
+        lstore(g, lty(g, slots[k]), fv, sp)
+        k = k + 1
     }
-    let targs: str = ""
-    i = 0
-    if sc != nil {
-        i = 1
-    }
-    pl = sig.params
-    for pl != nil {
-        if len(targs) > 0 {
-            targs = targs + ", "
+    if fnv {
+        // the pair sits in the first arg slot — fp(env, a1..) is the
+        // same indirect shape lcall emits for fn-value calls
+        pv := lxname(g, "_a" + itoa(i))
+        penv := lexv(g, "%RtFnv", pv, 0)
+        pf := lexv(g, "%RtFnv", pv, 1)
+        argl := "ptr " + penv
+        k = i + 1
+        for k < len(slots) {
+            argl = argl + ", " + lty(g, slots[k]) + " " + lxname(g, "_a" + itoa(k))
+            k = k + 1
         }
-        targs = targs + lty(g, gsub(g, pl.v)) + " " + lxname(g, "_a" + itoa(i))
-        i = i + 1
-        pl = pl.next
-    }
-    if sig.retk == 0 {
-        lcallv(g, "@o_f_" + cname(qn), targs)
+        if retk == 0 {
+            lw(g, "call void " + pf + "(" + argl + ")")
+        } else {
+            v := lreg(g)
+            lw(g, v + " = call " + lty(g, rt1) + " " + pf + "(" + argl + ")")
+        }
     } else {
-        lcallr(g, lty(g, gsub(g, sig.ret1)), "@o_f_" + cname(qn), targs)
+        targs := ""
+        k = i
+        for k < len(slots) {
+            if len(targs) > 0 {
+                targs = targs + ", "
+            }
+            targs = targs + lty(g, slots[k]) + " " + lxname(g, "_a" + itoa(k))
+            k = k + 1
+        }
+        if retk == 0 {
+            lcallv(g, callee, targs)
+        } else {
+            rty := lty(g, rt1)
+            if retk == 2 {
+                rty = "%o_ret_" + cname(ename)
+            }
+            lcallr(g, rty, callee, targs)
+        }
     }
     if sc != nil {
         sv := lxname(g, "_sc")
@@ -3636,7 +3784,7 @@ fn lspawn(g: mut G, sc: ref parser.Node, e: ref parser.Node, blocking: bool) {
     }
     lenv_pop(g)
     lt(g, "ret ptr null")
-    g.w[aidx] = wjoin(g.lall)
+    g.w[aidx] = lall_drain(g)
     wln(g, "}\n")
     wpop(g)
     lunit(g, 12, wjoin(g.wlast), "o_sp_" + sid)
@@ -3652,7 +3800,8 @@ fn lspawn(g: mut G, sc: ref parser.Node, e: ref parser.Node, blocking: bool) {
     g.cret = save_cret
     g.cur = save_cur
     g.inframe = save_frm
-    // the env value
+    // the env value — fills evaluate at the spawn site; lav_decl's
+    // order leads with the adapted receiver for dotted calls
     ep := lcallrt(g, "ptr", "rt_alloc", "i64 ptrtoint (ptr getelementptr (%o_spenv_" + sid + ", ptr null, i64 1) to i64)")
     i = 0
     if sc != nil {
@@ -3661,16 +3810,33 @@ fn lspawn(g: mut G, sc: ref parser.Node, e: ref parser.Node, blocking: bool) {
         lstore(g, "ptr", scv, fp)
         i = 1
     }
-    pl = sig.params
-    al := carg
-    for pl != nil && al != nil {
+    if fnv {
         fp := lgepf(g, "%o_spenv_" + sid, ep, i)
-        v := lx(g, al.v)
-        v = lconv_v(g, al.v, v, gsub(g, pl.v))
-        lstore(g, lty(g, gsub(g, pl.v)), v, fp)
+        lstore(g, "%RtFnv", lx(g, cf), fp)
         i = i + 1
-        pl = pl.next
-        al = al.next
+        il := g.ck.tyv[ft].args
+        al := carg
+        for al != nil {
+            v := lx(g, al.v)
+            if il != nil {
+                v = lconv_v(g, al.v, v, il.v)
+                il = il.next
+            }
+            lstore(g, lty(g, slots[i]), v, lgepf(g, "%o_spenv_" + sid, ep, i))
+            i = i + 1
+            al = al.next
+        }
+    } else {
+        fills := lav_decl(g, carg, fi, bind, rnode, 0)
+        av := fills
+        for av != nil {
+            lstore(g, lty(g, slots[i]), av.v, lgepf(g, "%o_spenv_" + sid, ep, i))
+            i = i + 1
+            av = av.next
+        }
+        if bind != nil {
+            ginst_queue(g, base, g.ck.fnsv[fi].typarams, bind)
+        }
     }
     if blocking {
         lcallrtv(g, "rt_spawnb", "ptr @o_sp_" + sid + ", ptr " + ep)
@@ -3681,11 +3847,8 @@ fn lspawn(g: mut G, sc: ref parser.Node, e: ref parser.Node, blocking: bool) {
 
 // `go_in name { ... }` / scope exprs — named-scope resolution: the
 // operand is a ptr (scope exprs resolve at runtime; a bare name is a
-// local var holding the scope)
+// local var holding the scope). Both callers guard `sc != nil`.
 fn lresolve_scope(g: mut G, sc: ref parser.Node) -> str {
-    if sc == nil {
-        return lcallrt(g, "ptr", "rt_scope_current", "")
-    }
     v := lx(g, sc)
     return lfit(g, v, xty(g, sc), check.tk(g.ck, check.k_scope()))
 }
@@ -4912,9 +5075,8 @@ fn lret_ty(g: mut G, ret: ref parser.Node, name: str) -> str {
 }
 
 // emit one fn under `qn` — `base` is the fnsv/susp key (qn except for
-// instantiations). Susp fns lower as ordinary defines in L1: susp
-// positions trap inline; the poll driver comes with the frame lane
-// (spec stage 4)
+// instantiations). Susp fns route to lframe's heap-frame + poll
+// lowering; the ordinary define below is the non-susp arm
 fn lemit_named_fn(g: mut G, i: int, qn: str, base: str) {
     match g.its[i].node {
         parser.Node.Fn{recv, params, ret, body} => {
@@ -4975,14 +5137,12 @@ fn lemit_named_fn(g: mut G, i: int, qn: str, base: str) {
             } else {
                 lt(g, "ret " + lret_ty(g, ret, qn) + " zeroinitializer")
             }
-            g.w[aidx] = wjoin(g.lall)
+            g.w[aidx] = lall_drain(g)
             wln(g, "}\n")
             wpop(g)
             lunit(g, 3, wjoin(g.wlast), "o_f_" + cname(qn))
             if qn == "main" {
-                if g.maink != 3 {
-                    g.maink = 2
-                }
+                g.maink = 2
             }
         }
         _ => {
@@ -5104,8 +5264,9 @@ fn lemit_fnv_one(g: mut G, n: str) {
 }
 
 // vtab thunk `o_vtt_<w>_<impl>_<i>` — normalizes the erased data ptr
-// to the method's declared receiver ty; susp slots trap for L1 (seed
-// emit_vtabs sync path)
+// to the method's declared receiver ty; susp-declared slots carry an
+// RtSuspDesc (o_wmk_/o_wp_ make+poll pair) instead of a thunk (seed
+// emit_vtabs)
 fn lemvtab_one(g: mut G, vu: ref GVU) {
     w := vu.w
     impl := vu.impl
@@ -7180,10 +7341,9 @@ fn lout_band(g: mut G, band: int) -> str {
 // One pass: named types first (enums before structs — a struct member
 // can be an enum), then globals, externs, fn bodies, the inst drain
 // (a co-fixpoint with vtab-seeded method insts, same as the C lane),
-// fnv wraps, vtabs, drops, and oxl_main. Reachability is deliberately
-// not run in L1 — dead decls are legal IR and every spelling a live
-// fn needs is emitted unconditionally; the G1 unit machinery stays
-// shared for when the lane wants pruning (spec §8 keeps the seam).
+// fnv wraps, vtabs, drops, and oxl_main. Every emitted artifact then
+// goes through the shared G1 mark — the module prints only what a
+// live root chain spells (lout_band's filter, spec §8).
 fn emit_llvm(r: own check.CkRes, testm: int) -> str {
     g := new(G)
     g.ck = r.ck
@@ -7558,13 +7718,9 @@ fn emit_llvm(r: own check.CkRes, testm: int) -> str {
     if g.testm == 0 && g.maink == 2 {
         lcallv(g, "@o_f_main", "")
     }
-    if g.testm == 0 && g.maink == 3 {
-        // susp main: suspension entrypoints trap in L1
-        ltrapu(g)
-    }
     lenv_pop(g)
     lt(g, "ret void")
-    g.w[aidx] = wjoin(g.lall)
+    g.w[aidx] = lall_drain(g)
     wln(g, "}\n")
     wpop(g)
     main_txt := wjoin(g.wlast)

@@ -1,0 +1,147 @@
+package main
+
+// R6 fixture — std/database/sql lite: open/exec/exec_bind/query over
+// an in-memory sqlite db, then scan[T]'s column-order-onto-fields
+// mapping through descriptors. Covers every scalar lane, NULL → zero,
+// count-mismatch and non-struct errors, the unsupported-kind lanes,
+// and scan-on-exhausted. Asserts in-process, ends with an ok line.
+import "std/database/sql"
+
+import "std/errors"
+
+struct Item { id: int, name: str, price: float, active: bool, code: byte }
+
+struct Count { n: int }
+
+// a struct field outside the scalar lanes reports err_kind
+struct Wide { id: int, xs: []int }
+
+// an `own` field reports err_kind before a row is consumed
+struct Owned { id: int, p: own Item }
+
+fn fails(msg: str) {
+    println("FAIL " + msg)
+    exit(1)
+}
+
+fn want_ok(e: err, msg: str) {
+    if e != nil {
+        fails(msg + " — unexpected err: " + errors.msg(e))
+    }
+}
+
+fn want_err(e: err, msg: str) {
+    if e == nil {
+        fails(msg + " — expected err, got nil")
+    }
+}
+
+fn want_sentinel(e: err, sentinel: err, msg: str) {
+    want_err(e, msg)
+    if !errors.is(e, sentinel) {
+        fails(msg + " — wrong sentinel: " + errors.msg(e))
+    }
+}
+
+fn main() {
+    [db, oe] = sql.open(":memory:")
+    want_ok(oe, "open :memory:")
+    want_ok(db.exec("CREATE TABLE items(id INTEGER, name TEXT, price REAL, active INTEGER, code INTEGER)"), "create table")
+    // exec reports a driver error
+    want_err(db.exec("INSERT INTO nope VALUES(1)"), "exec bad sql")
+    // exec_bind inserts request-supplied text through ?1
+    want_ok(db.exec_bind("INSERT INTO items VALUES(1, ?, 9.99, 1, 65)", "hammer"), "bind hammer")
+    want_ok(db.exec("INSERT INTO items VALUES(2, 'nail', 0.05, 0, 66)"), "insert nail")
+    // NULL name scans as the field's zero — ""
+    want_ok(db.exec("INSERT INTO items VALUES(3, NULL, 1.5, 1, 67)"), "insert null-name")
+    // INTEGER into a REAL column reads back as a float column would —
+    // sqlite stores dynamic types, so this also exercises the
+    // INTEGER→FLOAT-field coercion
+    want_ok(db.exec("INSERT INTO items VALUES(4, 'saw', 20, 1, 68)"), "insert saw")
+    [rows, qe] = db.query("SELECT id, name, price, active, code FROM items ORDER BY id")
+    want_ok(qe, "query")
+    out := new(mkslice(Item, 0))
+    se := sql.scan(rows, out)
+    want_ok(se, "scan")
+    if len(out) != 4 {
+        fails("scan len " + itoa(len(out)))
+    }
+    if out[0].id != 1 || out[0].name != "hammer" || out[0].price != 9.99 || !out[0].active || out[0].code != 65 {
+        fails("row 0: " + itoa(out[0].id) + " " + out[0].name)
+    }
+    if out[1].id != 2 || out[1].name != "nail" || out[1].active {
+        fails("row 1")
+    }
+    if out[2].id != 3 || out[2].name != "" || out[2].price != 1.5 {
+        fails("null-name row: '" + out[2].name + "'")
+    }
+    if out[3].id != 4 || out[3].price != 20.0 {
+        fails("int-as-float row " + ftoa(out[3].price))
+    }
+    // re-scanning a consumed (still open) cursor replays the full
+    // result set — scan resets before each pass
+    out2 := new(mkslice(Item, 0))
+    se2 := sql.scan(rows, out2)
+    want_ok(se2, "rescan")
+    if len(out2) != 4 || out2[0].id != 1 || out2[3].id != 4 {
+        fails("rescan len " + itoa(len(out2)))
+    }
+    // an empty result set scans to a zero-length slice
+    [rows0, qe0] = db.query("SELECT id, name, price, active, code FROM items WHERE id > 99")
+    want_ok(qe0, "query empty")
+    out3 := new(mkslice(Item, 0))
+    se3 := sql.scan(rows0, out3)
+    want_ok(se3, "scan empty")
+    if len(out3) != 0 {
+        fails("empty len " + itoa(len(out3)))
+    }
+    rows0.close()
+    rows.close()
+    // column count vs field count mismatch reports err_cols
+    [rows3, qe3] = db.query("SELECT id, name FROM items")
+    want_ok(qe3, "query narrow")
+    want_sentinel(sql.scan(rows3, out), sql.err_cols(), "col-count mismatch")
+    rows3.close()
+    // a non-struct target reports err, not garbage
+    outi := new(mkslice(int, 0))
+    [rows4, qe4] = db.query("SELECT id FROM items")
+    want_ok(qe4, "query id")
+    want_err(sql.scan(rows4, outi), "scan[int]")
+    rows4.close()
+    // unsupported field kinds report err_kind — slice and own lanes
+    outw := new(mkslice(Wide, 0))
+    [rows5, qe5] = db.query("SELECT id, name FROM items")
+    want_ok(qe5, "query wide")
+    want_sentinel(sql.scan(rows5, outw), sql.err_kind(), "slice field")
+    rows5.close()
+    outo := new(mkslice(Owned, 0))
+    [rows6, qe6] = db.query("SELECT id, name FROM items")
+    want_ok(qe6, "query owned")
+    want_sentinel(sql.scan(rows6, outo), sql.err_kind(), "own field")
+    rows6.close()
+    // query against a bad statement reports through err
+    [rbad, qbad] = db.query("SELECT bogus FROM nowhere")
+    want_err(qbad, "bad query")
+    rbad.close()
+    // INSERT ... RETURNING is writable — scan must refuse it outright
+    // rather than replay the write a second time
+    [rw, qw] = db.query("INSERT INTO items (name, price, active, code) VALUES ('dup', 1.0, 1, 'x') RETURNING id")
+    want_ok(qw, "query returning")
+    outp := new(mkslice(Item, 0))
+    se5 := sql.scan(rw, outp)
+    want_err(se5, "scan returning")
+    rw.close()
+    // the write never ran — the row count proves scan refused before
+    // any execution (a replaying scan would have landed it twice)
+    [rc1, qc1] = db.query("SELECT COUNT(*) FROM items WHERE name = 'dup'")
+    want_ok(qc1, "query dup count")
+    outc := new(mkslice(Count, 0))
+    se6 := sql.scan(rc1, outc)
+    want_ok(se6, "scan count")
+    if len(outc) != 1 || outc[0].n != 0 {
+        fails("returning write ran " + itoa(outc[0].n) + " times")
+    }
+    rc1.close()
+    db.close()
+    println("db_sql ok")
+}

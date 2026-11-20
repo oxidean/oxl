@@ -562,6 +562,22 @@ int64_t rt_sqlite_exec(void *db, const char *sql);
 int64_t rt_sqlite_exec_bind(void *db, const char *sql, OxlStr param); /* bind ?1 */
 OxlStr rt_sqlite_query(void *db, const char *sql);
 void rt_sqlite_close(void *db);
+/* cursor lane for database/sql's descriptor-driven scan: prepare hands
+ * back a sqlite3_stmt* (NULL on error), step reports 1 row / 0 done /
+ * <0 negated sqlite rc, reset rewinds for a second pass, finalize
+ * releases */
+void *rt_sqlite_prepare(void *db, const char *sql);
+int64_t rt_sqlite_step(void *st);
+int64_t rt_sqlite_reset(void *st);
+int64_t rt_sqlite_readonly(void *st);
+int64_t rt_sqlite_cols(void *st);
+int64_t rt_sqlite_col_type(void *st, int64_t i); /* SQLITE_INTEGER..NULL */
+int64_t rt_sqlite_col_int(void *st, int64_t i);
+double rt_sqlite_col_f64(void *st, int64_t i);
+OxlStr rt_sqlite_col_text(void *st, int64_t i); /* scope-copied — step invalidates */
+void rt_sqlite_finalize(void *st);
+OxlStr rt_sqlite_errstr(void *db); /* scope-copied last-error text */
+OxlStr rt_sqlite_errstr_rc(int64_t rc); /* scope-copied text for a raw sqlite rc */
 
 /* entry: generated code provides oxl_main() */
 void oxl_main(void);

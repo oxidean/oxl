@@ -709,6 +709,24 @@ fn (v Value) alloc_elem(i: int) -> [Value, err] {
     return f, nil
 }
 
+/// set_slice copies the slice header src describes into the slot v
+/// addresses — {ptr,len,cap,heap} land whole, so v's slice then aliases
+/// src's backing (the caller hands the backing's ownership across: it
+/// must be heap-stable, not scope-arena). v must be a mut-derived
+/// SLICE Value and src a SLICE Value over the same descriptor —
+/// element-type identity is the td equality; err_kind otherwise.
+/// This is the only way a `mut []T` out-param takes a grown slice: the
+/// callee mints `new(mkslice(T, n))` — an own-lane boxed header whose
+/// heap backing escapes — fills it through index/set_*, then lands the
+/// header through the mut Value.
+fn (v Value) set_slice(src: Value) -> err {
+    if v.w == 0 || rt_desc_kind(v.td) != KindSlice() || rt_desc_kind(src.td) != KindSlice() || v.td != src.td {
+        return err_kind()
+    }
+    rt_field_set_slice(v.addr, src.addr)
+    return nil
+}
+
 /// alloc_vfield mints a zeroed pointee into a nil `own` payload slot
 /// of enum variant vi — the enum-slot counterpart of alloc_field,
 /// used by decoders after set_tag's union scrub leaves the slot

@@ -1579,11 +1579,15 @@ echo "== reflect + fmt %v (r2) =="
 # std/reflect's public walk (Type/Field/Variant/Value, enum lanes,
 # decode mints, cstr) and fmt's %v/%+v/%T/%#v over the same
 # descriptor table — both fixtures assert in-process and end with an
-# ok line
+# ok line; db_sql exercises scan[T]'s column-order-onto-fields
+# mapping through sqlite (driver links it automatically — the
+# emitted C references rt_sqlite_)
 out=$("$OXL" run tests/reflect.oxl) || { echo "FAIL reflect run exit=$?: $out"; exit 1; }
 [ "$(tail -1 <<<"$out")" = "reflect ok" ] || { echo "FAIL reflect: $out"; exit 1; }
 out=$("$OXL" run tests/fmt_v.oxl) || { echo "FAIL fmt_v run exit=$?: $out"; exit 1; }
 [ "$(tail -1 <<<"$out")" = "fmt_v ok" ] || { echo "FAIL fmt_v: $out"; exit 1; }
+out=$("$OXL" run tests/db_sql.oxl) || { echo "FAIL db_sql run exit=$?: $out"; exit 1; }
+[ "$(tail -1 <<<"$out")" = "db_sql ok" ] || { echo "FAIL db_sql: $out"; exit 1; }
 # r4: std/encoding/gob's descriptor-driven round-trip — preamble +
 # field-delta wire, minted own/slice slots, name-matched tolerance
 out=$("$OXL" run tests/enc_gob.oxl) || { echo "FAIL enc_gob run exit=$?: $out"; exit 1; }
@@ -1623,7 +1627,7 @@ cgen() {  # cgen <src> <name> — emit C via codegen.oxl, compile it
     grep -q 'rt_csrand(' "$cgen_dir/$2.c" && { cdef="-DOXL_CRYPTO"; clib="$CRYPTO_LIBS"; }
     "$CC" -O2 $THREAD_FLAG -Iruntime $def $net $mdef $cdef "$cgen_dir/$2.c" runtime/rt.c $lib $mlib $clib $NET_LIBS -o "$cgen_dir/$2$EXE" || { echo "FAIL codegen cc $1"; exit 1; }
 }
-for f in examples/hello.oxl examples/features.oxl tests/match.oxl tests/chanbuf.oxl tests/methods.oxl tests/pairfwd.oxl tests/spawn_forms.oxl tests/iface_susp.oxl tests/iface_susp_shim.oxl tests/iface_susp_pair.oxl tests/iface_susp_nested.oxl tests/iface_susp_rewrap.oxl tests/iface_susp_prop.oxl tests/iface_susp_convdest.oxl tests/iface_susp_cancel.oxl tests/iface_susp_ownarg.oxl tests/vtab_fn.oxl tests/reflect.oxl tests/fmt_v.oxl tests/enc_xml.oxl tests/text_template.oxl tests/enc_gob.oxl; do
+for f in examples/hello.oxl examples/features.oxl tests/match.oxl tests/chanbuf.oxl tests/methods.oxl tests/pairfwd.oxl tests/spawn_forms.oxl tests/iface_susp.oxl tests/iface_susp_shim.oxl tests/iface_susp_pair.oxl tests/iface_susp_nested.oxl tests/iface_susp_rewrap.oxl tests/iface_susp_prop.oxl tests/iface_susp_convdest.oxl tests/iface_susp_cancel.oxl tests/iface_susp_ownarg.oxl tests/vtab_fn.oxl tests/reflect.oxl tests/fmt_v.oxl tests/enc_xml.oxl tests/text_template.oxl tests/enc_gob.oxl tests/db_sql.oxl; do
     n=$(basename "$f" .oxl)
     cgen "$f" "$n"
     got=$("$cgen_dir/$n$EXE")

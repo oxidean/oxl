@@ -2125,9 +2125,11 @@ echo "== llvm lane (l4) =="
 # IR fixpoint (ADR-0006 one lane over): the C-lane-built product
 # driver emits drv1.ll for the driver sources; the same driver
 # rebuilt *via --target llvm* (target/oxl-llvm — an in-repo path so
-# its exe-walk finds std/ and runtime/) emits drv2.ll; the two must
-# be byte-identical. The C-text fixpoint above stays the shared
-# regression guard — this is the lane's own determinism claim.
+# its exe-walk finds std/ and runtime/) then compiles the codegen
+# *through its own llvm lane* and the llvm-built codegen emits
+# drv2.ll; the two must be byte-identical. The C-text fixpoint above
+# stays the shared regression guard — this is the lane's own
+# determinism claim, exercised by llvm-compiled codegen code.
 #
 # Cross-lane parity: llvm_abi_check plus the conformance whitelist
 # are built through BOTH lanes (manual codegen emit + cc/clang, and
@@ -2145,7 +2147,7 @@ if command -v clang >/dev/null 2>&1; then
     "$OXL" build cmd/oxl --target llvm -o "target/oxl-llvm$EXE" || { echo "FAIL llvm l4: driver build --target llvm"; exit 1; }
     LLVMOXL="$PWD/target/oxl-llvm$EXE"
     echo "  llvm l4: toolchain compiled end-to-end under --target llvm"
-    "$LLVMOXL" run bootstrap/cmd/codegen -- --emit llvm cmd/oxl > "$scratch/drv2.ll" || { echo "FAIL llvm l4: drv2 emit"; exit 1; }
+    "$LLVMOXL" run --target llvm bootstrap/cmd/codegen -- --emit llvm cmd/oxl > "$scratch/drv2.ll" || { echo "FAIL llvm l4: drv2 emit"; exit 1; }
     diff "$scratch/drv1.ll" "$scratch/drv2.ll" >/dev/null || { echo "FAIL llvm l4: IR fixpoint"; diff "$scratch/drv1.ll" "$scratch/drv2.ll" | head -20; exit 1; }
     echo "  llvm l4: IR fixpoint clean"
     # the llvm-built driver is itself a conformance subject: the smoke

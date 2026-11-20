@@ -866,23 +866,6 @@ fn llvm_triple_abi() -> int {
     return 1
 }
 
-// a live `@sym` reference in emitted IR — declare/call lines only.
-// String constants ride `@.str_* = private constant [...] c"..."`
-// lines, so a bare substring scan would treat printed text like
-// "rt_sqlite_open" as a feature use.
-fn llsrc_uses(llsrc: str, sym: str) -> bool {
-    needle := "@" + sym
-    lines := strings.split(llsrc, "\n")
-    for lines != nil {
-        ln := lines.v
-        if strings.contains(ln, needle) && strings.startswith(ln, "@.str_") == false {
-            return true
-        }
-        lines = lines.next
-    }
-    return false
-}
-
 // --triple passes through to `clang -target` for BOTH inputs — the
 // emitted .ll stays triple-neutral (no `target triple`/`datalayout`
 // lines) so clang supplies the datalayout each side compiles under.
@@ -930,24 +913,53 @@ fn emit_and_llvm(llsrc: str, out: str, entry: str) -> int {
     // uses them — the scan must see live symbol refs (declare/call
     // lines spell `@name`), not raw text: `println("rt_sqlite_open")`
     // puts that text in a c"..." string constant and would flip
-    // OXL_SQLITE on for a program that never calls it
-    needs_sqlite := llsrc_uses(llsrc, "rt_sqlite_")
+    // OXL_SQLITE on for a program that never calls it. ONE pass sets
+    // every feature flag — a per-needle split of the IR costs a fresh
+    // node list per call (the L3 lane's ~40s test-mode emit and the CI
+    // timeout it blew); @.str_ lines still skip so a c"..." constant
+    // holding "@sym" text can't flip a feature on.
+    needs_sqlite := false
     needs_net := 0
+    needs_math := false
+    needs_crypto := false
     nets := mkslice(str, 0)
-    nets = push(nets, "rt_sock_")
-    nets = push(nets, "rt_bind_any")
-    nets = push(nets, "rt_set_reuseaddr")
-    nets = push(nets, "rt_set_rcvtimo")
-    nets = push(nets, "rt_set_sndtimo")
-    nets = push(nets, "rt_htons")
-    nets = push(nets, "rt_htonl")
-    nets = push(nets, "rt_lookup_ipv4")
+    nets = push(nets, "@rt_sock_")
+    nets = push(nets, "@rt_bind_any")
+    nets = push(nets, "@rt_set_reuseaddr")
+    nets = push(nets, "@rt_set_rcvtimo")
+    nets = push(nets, "@rt_set_sndtimo")
+    nets = push(nets, "@rt_htons")
+    nets = push(nets, "@rt_htonl")
+    nets = push(nets, "@rt_lookup_ipv4")
     i := 0
-    for i < len(nets) {
-        if llsrc_uses(llsrc, nets[i]) {
-            needs_net = 1
+    lines := strings.split(llsrc, "\n")
+    for lines != nil {
+        ln := lines.v
+        if strings.startswith(ln, "@.str_") == false {
+            if needs_sqlite == false && strings.contains(ln, "@rt_sqlite_") {
+                needs_sqlite = true
+            }
+            if needs_net == 0 {
+                i = 0
+                for i < len(nets) {
+                    if strings.contains(ln, nets[i]) {
+                        needs_net = 1
+                        break
+                    }
+                    i = i + 1
+                }
+            }
+            if needs_math == false && strings.contains(ln, "@rt_m_") {
+                needs_math = true
+            }
+            if needs_crypto == false && strings.contains(ln, "@rt_csrand") {
+                needs_crypto = true
+            }
+            if needs_sqlite && needs_net == 1 && needs_math && needs_crypto {
+                break
+            }
         }
-        i = i + 1
+        lines = lines.next
     }
     args := mkslice(str, 0)
     args = push(args, "-O2")
@@ -1009,7 +1021,7 @@ fn emit_and_llvm(llsrc: str, out: str, entry: str) -> int {
     }
     // -DOXL_MATH compiles the rt_m_* wrappers and -lm links them,
     // together (sqlite pattern). Windows skips both.
-    if llsrc_uses(llsrc, "rt_m_") {
+    if needs_math {
         args = push(args, "-DOXL_MATH")
         if !twin {
             args = push(args, "-lm")
@@ -1017,7 +1029,7 @@ fn emit_and_llvm(llsrc: str, out: str, entry: str) -> int {
     }
     // @rt_csrand( verbatim — a real call site, not the driver's own
     // source text (the emit_and_cc needle)
-    if llsrc_uses(llsrc, "rt_csrand") {
+    if needs_crypto {
         args = push(args, "-DOXL_CRYPTO")
         if twin {
             args = push(args, "-lbcrypt")

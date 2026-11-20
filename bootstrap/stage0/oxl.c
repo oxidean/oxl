@@ -1524,7 +1524,6 @@ int64_t o_f_clang_major(OxlStr line);
 OxlStr o_f_clang_triple(OxlStr clang, OxlStr t);
 OxlStr o_f_llvm_toolchain(void);
 int64_t o_f_llvm_triple_abi(void);
-int o_f_llsrc_uses(OxlStr llsrc, OxlStr sym);
 int64_t o_f_emit_and_llvm(OxlStr llsrc, OxlStr out, OxlStr entry);
 int64_t o_f_emit_and_js(OxlStr jssrc, OxlStr out, OxlStr entry);
 OxlStr o_f_js_html(OxlStr out);
@@ -43987,23 +43986,6 @@ int64_t o_f_llvm_triple_abi(void) {
     rt_defer_drain_to(_dmark);
 }
 
-int o_f_llsrc_uses(OxlStr llsrc, OxlStr sym) {
-    RtDefer *_dmark = rt_defer_mark();
-    OxlStr needle = rt_strcat(rt_str_lit("@"), sym);
-    struct o_s_strings_StrList* lines = ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_strings_split }; ((struct o_s_strings_StrList* (*)(void*, OxlStr, OxlStr))_fv.fp)(_fv.env, llsrc, rt_str_lit("\n")); });
-    while ((lines != 0)) {
-    OxlStr ln = lines->f_v;
-    if ((({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_strings_contains }; ((int (*)(void*, OxlStr, OxlStr))_fv.fp)(_fv.env, ln, needle); }) && (({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_strings_startswith }; ((int (*)(void*, OxlStr, OxlStr))_fv.fp)(_fv.env, ln, rt_str_lit("@.str_")); }) == 0))) {
-    rt_defer_drain_to(_dmark);
-    return 1;
-    }
-    lines = lines->f_next;
-    }
-    rt_defer_drain_to(_dmark);
-    return 0;
-    rt_defer_drain_to(_dmark);
-}
-
 int64_t o_f_emit_and_llvm(OxlStr llsrc, OxlStr out, OxlStr entry) {
     RtDefer *_dmark = rt_defer_mark();
     OxlStr clang = o_f_llvm_toolchain();
@@ -44048,23 +44030,48 @@ int64_t o_f_emit_and_llvm(OxlStr llsrc, OxlStr out, OxlStr entry) {
     rt_defer_drain_to(_dmark);
     return 0LL;
     }
-    int needs_sqlite = o_f_llsrc_uses(llsrc, rt_str_lit("rt_sqlite_"));
+    int needs_sqlite = 0;
     int64_t needs_net = 0LL;
+    int needs_math = 0;
+    int needs_crypto = 0;
     RtSlice nets = rt_mkslice(0LL, sizeof(OxlStr));
-    nets = ({ OxlStr _pv = rt_str_lit("rt_sock_"); rt_slice_push(nets, sizeof(OxlStr), &_pv); });
-    nets = ({ OxlStr _pv = rt_str_lit("rt_bind_any"); rt_slice_push(nets, sizeof(OxlStr), &_pv); });
-    nets = ({ OxlStr _pv = rt_str_lit("rt_set_reuseaddr"); rt_slice_push(nets, sizeof(OxlStr), &_pv); });
-    nets = ({ OxlStr _pv = rt_str_lit("rt_set_rcvtimo"); rt_slice_push(nets, sizeof(OxlStr), &_pv); });
-    nets = ({ OxlStr _pv = rt_str_lit("rt_set_sndtimo"); rt_slice_push(nets, sizeof(OxlStr), &_pv); });
-    nets = ({ OxlStr _pv = rt_str_lit("rt_htons"); rt_slice_push(nets, sizeof(OxlStr), &_pv); });
-    nets = ({ OxlStr _pv = rt_str_lit("rt_htonl"); rt_slice_push(nets, sizeof(OxlStr), &_pv); });
-    nets = ({ OxlStr _pv = rt_str_lit("rt_lookup_ipv4"); rt_slice_push(nets, sizeof(OxlStr), &_pv); });
+    nets = ({ OxlStr _pv = rt_str_lit("@rt_sock_"); rt_slice_push(nets, sizeof(OxlStr), &_pv); });
+    nets = ({ OxlStr _pv = rt_str_lit("@rt_bind_any"); rt_slice_push(nets, sizeof(OxlStr), &_pv); });
+    nets = ({ OxlStr _pv = rt_str_lit("@rt_set_reuseaddr"); rt_slice_push(nets, sizeof(OxlStr), &_pv); });
+    nets = ({ OxlStr _pv = rt_str_lit("@rt_set_rcvtimo"); rt_slice_push(nets, sizeof(OxlStr), &_pv); });
+    nets = ({ OxlStr _pv = rt_str_lit("@rt_set_sndtimo"); rt_slice_push(nets, sizeof(OxlStr), &_pv); });
+    nets = ({ OxlStr _pv = rt_str_lit("@rt_htons"); rt_slice_push(nets, sizeof(OxlStr), &_pv); });
+    nets = ({ OxlStr _pv = rt_str_lit("@rt_htonl"); rt_slice_push(nets, sizeof(OxlStr), &_pv); });
+    nets = ({ OxlStr _pv = rt_str_lit("@rt_lookup_ipv4"); rt_slice_push(nets, sizeof(OxlStr), &_pv); });
     int64_t i = 0LL;
+    struct o_s_strings_StrList* lines = ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_strings_split }; ((struct o_s_strings_StrList* (*)(void*, OxlStr, OxlStr))_fv.fp)(_fv.env, llsrc, rt_str_lit("\n")); });
+    while ((lines != 0)) {
+    OxlStr ln = lines->f_v;
+    if ((({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_strings_startswith }; ((int (*)(void*, OxlStr, OxlStr))_fv.fp)(_fv.env, ln, rt_str_lit("@.str_")); }) == 0)) {
+    if (((needs_sqlite == 0) && ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_strings_contains }; ((int (*)(void*, OxlStr, OxlStr))_fv.fp)(_fv.env, ln, rt_str_lit("@rt_sqlite_")); }))) {
+    needs_sqlite = 1;
+    }
+    if ((needs_net == 0LL)) {
+    i = 0LL;
     while ((i < (nets).len)) {
-    if (o_f_llsrc_uses(llsrc, (*({ RtSlice _ms = nets; int64_t _mi = i; if (_mi < 0 || _mi >= _ms.len) rt_trap(10); (OxlStr*)_ms.ptr + _mi; })))) {
+    if (({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_strings_contains }; ((int (*)(void*, OxlStr, OxlStr))_fv.fp)(_fv.env, ln, (*({ RtSlice _ms = nets; int64_t _mi = i; if (_mi < 0 || _mi >= _ms.len) rt_trap(10); (OxlStr*)_ms.ptr + _mi; }))); })) {
     needs_net = 1LL;
+    break;
     }
     i = ((int64_t)((uint64_t)(i) + (uint64_t)(1LL)));
+    }
+    }
+    if (((needs_math == 0) && ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_strings_contains }; ((int (*)(void*, OxlStr, OxlStr))_fv.fp)(_fv.env, ln, rt_str_lit("@rt_m_")); }))) {
+    needs_math = 1;
+    }
+    if (((needs_crypto == 0) && ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_strings_contains }; ((int (*)(void*, OxlStr, OxlStr))_fv.fp)(_fv.env, ln, rt_str_lit("@rt_csrand")); }))) {
+    needs_crypto = 1;
+    }
+    if ((((needs_sqlite && (needs_net == 1LL)) && needs_math) && needs_crypto)) {
+    break;
+    }
+    }
+    lines = lines->f_next;
     }
     RtSlice args = rt_mkslice(0LL, sizeof(OxlStr));
     args = ({ OxlStr _pv = rt_str_lit("-O2"); rt_slice_push(args, sizeof(OxlStr), &_pv); });
@@ -44108,13 +44115,13 @@ int64_t o_f_emit_and_llvm(OxlStr llsrc, OxlStr out, OxlStr entry) {
     if ((needs_net == 1LL)) {
     args = ({ OxlStr _pv = rt_str_lit("-DOXL_NET"); rt_slice_push(args, sizeof(OxlStr), &_pv); });
     }
-    if (o_f_llsrc_uses(llsrc, rt_str_lit("rt_m_"))) {
+    if (needs_math) {
     args = ({ OxlStr _pv = rt_str_lit("-DOXL_MATH"); rt_slice_push(args, sizeof(OxlStr), &_pv); });
     if ((!twin)) {
     args = ({ OxlStr _pv = rt_str_lit("-lm"); rt_slice_push(args, sizeof(OxlStr), &_pv); });
     }
     }
-    if (o_f_llsrc_uses(llsrc, rt_str_lit("rt_csrand"))) {
+    if (needs_crypto) {
     args = ({ OxlStr _pv = rt_str_lit("-DOXL_CRYPTO"); rt_slice_push(args, sizeof(OxlStr), &_pv); });
     if (twin) {
     args = ({ OxlStr _pv = rt_str_lit("-lbcrypt"); rt_slice_push(args, sizeof(OxlStr), &_pv); });

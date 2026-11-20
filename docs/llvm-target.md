@@ -85,12 +85,12 @@ Two different things travel under one flag:
   stack-copy convention vs AAPCS64/win64's pointer-to-caller-copy in
   an arg register, plus `sret` for indirect returns. The emitter
   therefore spells call sites for one ABI: host autodetect by
-  default; `--triple` overrides it (`aarch64`/`arm64` → `aapcs64`;
+  default; `--triple` overrides it (matched OS-tail first —
   `windows`/`win64`/`mingw` → `win64` when the arch is also 64-bit
-  — `aarch64`/`arm64`/`x86_64`/`amd64` — and `sysv` for a 32-bit
-  arch under either OS family; everything else → `sysv`). The pick
-  must match the clang target — clang compiles both inputs under
-  it.
+  (`aarch64`/`arm64`/`x86_64`/`amd64`) and `sysv` for a 32-bit
+  arch; otherwise `aarch64`/`arm64` → `aapcs64`; everything else →
+  `sysv`). The pick must match the clang target — clang compiles
+  both inputs under it.
 
 Cross reach is the local clang's configured reach: headers, libs,
 and the sysroot for the target are the installed toolchain's

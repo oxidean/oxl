@@ -1,0 +1,50 @@
+package main
+
+// L2 coverage: non-susp spawn callee forms — dotted method (receiver
+// slot leads the env), fn value (the %RtFnv pair rides as a0), and a
+// generic callee (inst name + queue). go/spawnBlocking take the same
+// env+trunk path. Each asserts through the scope join before the
+// marker prints.
+struct Acc { s: shared }
+
+fn (a Acc) add(v: int) {
+    sadd(a.s, v)
+}
+
+fn bump(s: shared, v: int) {
+    sadd(s, v)
+}
+
+fn gmark[T any](s: shared, v: T) {
+    sadd(s, 1)
+}
+
+fn main() {
+    s := mkshared(0)
+    a := Acc{s: s}
+    // dotted method — receiver slot leads the env
+    scope {
+        spawn a.add(3)
+    }
+    assert(sadd(s, 0) == 3)
+    // fn value — %RtFnv pair rides the env, thunk calls through fp
+    f := bump
+    scope {
+        spawn f(s, 5)
+    }
+    assert(sadd(s, 0) == 8)
+    // generic callee — inst binds T=int, queues gmark__int
+    scope {
+        spawn gmark(s, 7)
+    }
+    assert(sadd(s, 0) == 9)
+    // go + spawnBlocking share the same env/thunk path
+    scope {
+        spawn bump(s, 1)
+    }
+    scope {
+        spawnBlocking bump(s, 1)
+    }
+    assert(sadd(s, 0) == 11)
+    println("spawn forms ok")
+}

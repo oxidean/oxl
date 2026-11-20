@@ -1,0 +1,60 @@
+package main
+
+// susp-declared iface methods with own->mut/ref args park the borrow
+// ledger in the caller's frame — susp_ownarg's single-eval assertions
+// through an RtSuspDesc slot instead of a direct susp call. The
+// callee's poll drains the parked marks; without them `mk()` runs
+// once per mark site and the callee reads an unborrowed object.
+interface Store { susp put(e: mut Ev), susp get(e: ref Ev) -> int }
+
+struct Ev { x: int }
+
+let made: int = 0
+
+fn mk() -> own Ev {
+    made = made + 1
+    e := new(Ev)
+    e.x = made
+    return e
+}
+
+struct S { n: int }
+
+fn (s mut S) put(e: mut Ev) {
+    msleep(1)
+    if e.x < 1 {
+        println("FAIL put arg unreadable")
+        exit(1)
+    }
+    s.n = s.n + e.x
+}
+
+fn (s mut S) get(e: ref Ev) -> int {
+    msleep(1)
+    return e.x + s.n
+}
+
+fn drive_put(w: Store) {
+    w.put(mk())
+}
+
+fn drive_get(w: Store) -> int {
+    return w.get(mk())
+}
+
+fn main() {
+    s := S{n: 10}
+    made = 0
+    drive_put(s)
+    if made != 1 {
+        println("FAIL put evals=" + itoa(made))
+        exit(1)
+    }
+    made = 0
+    v := drive_get(s)
+    if made != 1 || v != 11 {
+        println("FAIL get evals=" + itoa(made) + " v=" + itoa(v))
+        exit(1)
+    }
+    println("iface susp ownarg ok")
+}

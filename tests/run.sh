@@ -1627,7 +1627,7 @@ cgen() {  # cgen <src> <name> — emit C via codegen.oxl, compile it
     grep -q 'rt_csrand(' "$cgen_dir/$2.c" && { cdef="-DOXL_CRYPTO"; clib="$CRYPTO_LIBS"; }
     "$CC" -O2 $THREAD_FLAG -Iruntime $def $net $mdef $cdef "$cgen_dir/$2.c" runtime/rt.c $lib $mlib $clib $NET_LIBS -o "$cgen_dir/$2$EXE" || { echo "FAIL codegen cc $1"; exit 1; }
 }
-for f in examples/hello.oxl examples/features.oxl tests/match.oxl tests/chanbuf.oxl tests/methods.oxl tests/pairfwd.oxl tests/iface_susp.oxl tests/iface_susp_shim.oxl tests/iface_susp_pair.oxl tests/iface_susp_nested.oxl tests/iface_susp_rewrap.oxl tests/iface_susp_prop.oxl tests/iface_susp_convdest.oxl tests/iface_susp_cancel.oxl tests/vtab_fn.oxl tests/reflect.oxl tests/fmt_v.oxl tests/enc_xml.oxl tests/text_template.oxl tests/enc_gob.oxl tests/db_sql.oxl; do
+for f in examples/hello.oxl examples/features.oxl tests/match.oxl tests/chanbuf.oxl tests/methods.oxl tests/pairfwd.oxl tests/spawn_forms.oxl tests/iface_susp.oxl tests/iface_susp_shim.oxl tests/iface_susp_pair.oxl tests/iface_susp_nested.oxl tests/iface_susp_rewrap.oxl tests/iface_susp_prop.oxl tests/iface_susp_convdest.oxl tests/iface_susp_cancel.oxl tests/iface_susp_ownarg.oxl tests/vtab_fn.oxl tests/reflect.oxl tests/fmt_v.oxl tests/enc_xml.oxl tests/text_template.oxl tests/enc_gob.oxl tests/db_sql.oxl; do
     n=$(basename "$f" .oxl)
     cgen "$f" "$n"
     got=$("$cgen_dir/$n$EXE")
@@ -1848,6 +1848,74 @@ if command -v clang >/dev/null 2>&1; then
     echo "  llvm abi: ok"
 else
     echo "  clang not found — skipping llvm abi probe"
+fi
+
+echo "== llvm lane (l2) =="
+# L2 conformance gate: the concurrency whitelist plus the non-conc
+# corpus through the manual `--emit llvm` path — codegen emits .ll,
+# clang compiles it against rt.c, each file's success marker is
+# grepped (the js lane's marker table). Trap-expectation files
+# (select_cancel/cancel_join) must print `escaped top scope` and exit
+# non-zero — the native lane's abort shape. Same runtime, same
+# observable behavior, IR instead of C.
+if command -v clang >/dev/null 2>&1; then
+    llibs="$THREAD_FLAG"
+    case "$(uname -s)" in
+        MINGW*|MSYS*|CYGWIN*) llibs="-ladvapi32 -lshell32" ;;
+    esac
+    for f in conc_ping conc_scale select select_fair chan_own chanbuf chanbuf_close scope_exit orphan_join defer_order pairfwd susp_closure zero_str match methods fnval d5_qual stdmods_test susp_ownarg spawn_forms iface_susp iface_susp_shim iface_susp_pair iface_susp_nested iface_susp_rewrap iface_susp_prop iface_susp_convdest iface_susp_cancel iface_susp_ownarg vtab_fn closure_mcall closure_fnfield closure_shadow; do
+        case "$f" in
+            conc_ping)      marker='bounces=' ;;
+            conc_scale)     marker='done' ;;
+            select)         marker='select done' ;;
+            select_fair)    marker='select fair ok' ;;
+            chan_own)       marker='chan_own done' ;;
+            chanbuf)        marker='chanbuf done' ;;
+            chanbuf_close)  marker='chanbuf close ok' ;;
+            scope_exit)     marker='scope-exit ok' ;;
+            orphan_join)    marker='orphan-join ok' ;;
+            defer_order)    marker='defer order ok' ;;
+            pairfwd)        marker='pairfwd ok' ;;
+            match)          marker='match ok' ;;
+            methods)        marker='methods ok' ;;
+            fnval)          marker='fnval ok' ;;
+            d5_qual)        marker='d5 qual ok' ;;
+            stdmods_test)   marker='done' ;;
+            susp_closure)   marker='susp closure ok' ;;
+            closure_mcall)  marker='closure mcall ok' ;;
+            closure_fnfield) marker='closure fnfield ok' ;;
+            closure_shadow) marker='closure shadow ok' ;;
+            zero_str)       marker='zero str ok' ;;
+            susp_ownarg)    marker='susp ownarg ok' ;;
+            spawn_forms)    marker='spawn forms ok' ;;
+            iface_susp)         marker='iface susp ok' ;;
+            iface_susp_shim)    marker='iface susp shim ok' ;;
+            iface_susp_pair)    marker='iface susp pair ok' ;;
+            iface_susp_nested)  marker='iface susp nested ok' ;;
+            iface_susp_rewrap)  marker='iface susp rewrap ok' ;;
+            iface_susp_prop)    marker='iface susp prop ok' ;;
+            iface_susp_convdest) marker='iface susp convdest ok' ;;
+            iface_susp_cancel)  marker='iface susp cancel ok' ;;
+            iface_susp_ownarg)  marker='iface susp ownarg ok' ;;
+            vtab_fn)            marker='vtab fn ok' ;;
+        esac
+        "$OXL" run bootstrap/cmd/codegen -- --emit llvm "tests/$f.oxl" > "$scratch/$f.ll" || { echo "FAIL llvm lane $f: emit"; exit 1; }
+        clang -O0 -Iruntime "$scratch/$f.ll" runtime/rt.c $llibs -o "$scratch/$f$EXE" || { echo "FAIL llvm lane $f: cc"; exit 1; }
+        out=$(with_timeout 60 "$scratch/$f$EXE" 2>&1) || { echo "FAIL llvm lane $f: $out"; exit 1; }
+        grep -q "$marker" <<<"$out" || { echo "FAIL llvm lane $f marker '$marker': $out"; exit 1; }
+        echo "  llvm l2: $f ok"
+    done
+    for f in select_cancel cancel_join; do
+        "$OXL" run bootstrap/cmd/codegen -- --emit llvm "tests/$f.oxl" > "$scratch/$f.ll" || { echo "FAIL llvm lane $f: emit"; exit 1; }
+        clang -O0 -Iruntime "$scratch/$f.ll" runtime/rt.c $llibs -o "$scratch/$f$EXE" || { echo "FAIL llvm lane $f: cc"; exit 1; }
+        rc=0
+        out=$(with_timeout 30 "$scratch/$f$EXE" 2>&1) || rc=$?
+        [ "$rc" -ne 0 ] || { echo "FAIL llvm lane $f: expected trap exit"; exit 1; }
+        grep -q 'escaped top scope' <<<"$out" || { echo "FAIL llvm lane $f: trap line: $out"; exit 1; }
+        echo "  llvm l2: $f ok"
+    done
+else
+    echo "  (skipped: clang not installed)"
 fi
 
 echo "== toolchain driver in .oxl (t2) =="
@@ -2422,7 +2490,7 @@ echo "== susp iface vtable (descriptor ABI) =="
 # (make/poll/res_off) — sync impls ride ready-shim frames, pair rets
 # read through res_off, rewraps forward the inner pair's descriptor,
 # and susp reaches callers by declaration through the fixpoint
-for t in iface_susp iface_susp_shim iface_susp_pair iface_susp_nested iface_susp_rewrap iface_susp_prop iface_susp_convdest iface_susp_cancel vtab_fn; do
+for t in iface_susp iface_susp_shim iface_susp_pair iface_susp_nested iface_susp_rewrap iface_susp_prop iface_susp_convdest iface_susp_cancel iface_susp_ownarg vtab_fn; do
     out=$("$OXL" run tests/$t.oxl)
     [ "$(tail -1 <<<"$out")" = "${t//_/ } ok" ] || { echo "FAIL $t: $out"; exit 1; }
 done
@@ -3062,7 +3130,7 @@ if command -v node >/dev/null 2>&1; then
     # each file's last-line success marker is grepped — an err-path
     # regression that prints + exits 0 (gui_dom's `run err:` shape)
     # can't pass silently
-    for f in conc_ping conc_scale select select_fair chan_own chanbuf chanbuf_close scope_exit orphan_join defer_order pairfwd match methods fnval d5_qual stdmods_test susp_closure closure_mcall closure_fnfield closure_shadow zero_str susp_ownarg iface_susp iface_susp_shim iface_susp_pair iface_susp_nested iface_susp_rewrap iface_susp_prop iface_susp_convdest iface_susp_cancel vtab_fn gui_mock gui_lifecycle gui_overflow gui_select gui_stress gui_cancel gui_dom gui_delay_stop js_ident; do
+    for f in conc_ping conc_scale select select_fair chan_own chanbuf chanbuf_close scope_exit orphan_join defer_order pairfwd match methods fnval d5_qual stdmods_test susp_closure closure_mcall closure_fnfield closure_shadow zero_str susp_ownarg iface_susp iface_susp_shim iface_susp_pair iface_susp_nested iface_susp_rewrap iface_susp_prop iface_susp_convdest iface_susp_cancel iface_susp_ownarg vtab_fn gui_mock gui_lifecycle gui_overflow gui_select gui_stress gui_cancel gui_dom gui_delay_stop js_ident; do
         case "$f" in
             conc_ping)      marker='bounces=' ;;
             conc_scale)     marker='done' ;;
@@ -3103,6 +3171,7 @@ if command -v node >/dev/null 2>&1; then
             iface_susp_prop)    marker='iface susp prop ok' ;;
             iface_susp_convdest) marker='iface susp convdest ok' ;;
             iface_susp_cancel)  marker='iface susp cancel ok' ;;
+            iface_susp_ownarg)  marker='iface susp ownarg ok' ;;
             vtab_fn)            marker='vtab fn ok' ;;
         esac
         out=$(with_timeout 60 "$SELFOXL" run --target js "tests/$f.oxl" 2>&1) || { echo "FAIL js lane $f: $out"; exit 1; }

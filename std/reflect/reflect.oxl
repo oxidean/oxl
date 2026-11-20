@@ -709,7 +709,6 @@ fn (v Value) alloc_elem(i: int) -> [Value, err] {
     return f, nil
 }
 
-
 /// set_slice copies the slice header src describes into the slot v
 /// addresses — {ptr,len,cap,heap} land whole, so v's slice then aliases
 /// src's backing (the caller hands the backing's ownership across: it

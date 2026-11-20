@@ -37651,13 +37651,14 @@ OxlStr o_f_codegen_lxas(struct o_s_codegen_G* g, struct o_en_parser_Node* inner,
     return r;
     }
     OxlStr tn = ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_check_ty_str }; ((OxlStr (*)(void*, struct o_en_parser_Node*))_fv.fp)(_fv.env, ty); });
-    struct o_s_codegen_GEV ev = o_f_codegen_gev(g, ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_check_resolve_named }; ((OxlStr (*)(void*, struct o_s_check_Ck*, OxlStr))_fv.fp)(_fv.env, g->f_ck, tn); }));
+    OxlStr qn = ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_check_resolve_named }; ((OxlStr (*)(void*, struct o_s_check_Ck*, OxlStr))_fv.fp)(_fv.env, g->f_ck, tn); });
+    struct o_s_codegen_GEV ev = o_f_codegen_gev(g, qn);
     if ((!ev.f_ok)) {
     rt_defer_drain_to(_dmark);
     return iv;
     }
     OxlStr enty = rt_strcat(rt_str_lit("%o_en_"), o_f_codegen_cname(ev.f_en));
-    OxlStr vty = rt_strcat(rt_str_lit("%o_s_"), o_f_codegen_cname(tn));
+    OxlStr vty = rt_strcat(rt_str_lit("%o_s_"), o_f_codegen_cname(qn));
     OxlStr mp = rt_str_lit("");
     if (deref) {
     mp = iv;
@@ -40463,7 +40464,6 @@ void o_f_codegen_lemit_enum_ty(struct o_s_codegen_G* g, int64_t i) {
     RtDefer *_dmark = rt_defer_mark();
     ({ struct o_en_parser_Node* _ms = (*({ RtSlice _ms = g->f_its; int64_t _mi = i; if (_mi < 0 || _mi >= _ms.len) rt_trap(10); (struct o_s_check_It*)_ms.ptr + _mi; })).f_node; if ((*_ms).tag == 36) { struct o_s_parser_NList* vars = (*_ms).u.v36.f_vars; OxlStr name = (*_ms).u.v36.f_name;     OxlStr qn = ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_check_qname }; ((OxlStr (*)(void*, OxlStr, OxlStr))_fv.fp)(_fv.env, (*({ RtSlice _ms = g->f_its; int64_t _mi = i; if (_mi < 0 || _mi >= _ms.len) rt_trap(10); (struct o_s_check_It*)_ms.ptr + _mi; })).f_mod, name); });
     int64_t vi = 0LL;
-    OxlStr pty = rt_str_lit("i8");
     int64_t psz = 0LL;
     struct o_s_parser_NList* vl = vars;
     while ((vl != 0)) {
@@ -40488,7 +40488,6 @@ void o_f_codegen_lemit_enum_ty(struct o_s_codegen_G* g, int64_t i) {
     int64_t vs = ({ int64_t __rc; struct o_s_check_FList* _ba2118 = fields; rt_borrow_read(_ba2118); __rc = o_f_codegen_lsize_fields(g, _ba2118); rt_unborrow(_ba2118); __rc; });
     if ((vs > psz)) {
     psz = vs;
-    pty = rt_strcat(rt_str_lit("%o_s_"), o_f_codegen_cname(sn));
     }
     }
     }
@@ -40497,7 +40496,11 @@ void o_f_codegen_lemit_enum_ty(struct o_s_codegen_G* g, int64_t i) {
     vi = ((int64_t)((uint64_t)(vi) + (uint64_t)(1LL)));
     vl = vl->f_next;
     }
-    o_f_codegen_lunit(g, 0LL, rt_strcat(rt_strcat(rt_strcat(rt_strcat(rt_str_lit("%o_en_"), o_f_codegen_cname(qn)), rt_str_lit(" = type { i32, [4 x i8], ")), pty), rt_str_lit(", i64 }\n")), rt_strcat(rt_str_lit("o_en_"), o_f_codegen_cname(qn)));
+    OxlStr member = rt_str_lit("i8");
+    if ((psz > 0LL)) {
+    member = rt_strcat(rt_strcat(rt_str_lit("["), rt_itoa((((int64_t)((uint64_t)(psz) + (uint64_t)(7LL))) / 8LL))), rt_str_lit(" x i64]"));
+    }
+    o_f_codegen_lunit(g, 0LL, rt_strcat(rt_strcat(rt_strcat(rt_strcat(rt_str_lit("%o_en_"), o_f_codegen_cname(qn)), rt_str_lit(" = type { i32, [4 x i8], ")), member), rt_str_lit(", i64 }\n")), rt_strcat(rt_str_lit("o_en_"), o_f_codegen_cname(qn)));
 } else { } });
     rt_defer_drain_to(_dmark);
 }

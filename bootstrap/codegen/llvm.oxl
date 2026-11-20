@@ -450,7 +450,12 @@ fn labi(g: mut G) -> int {
     if g.labi == 0 {
         g.labi = 1
         if rt_is_windows() != 0 {
+            // Windows ARM64 keeps the AArch64 aggregate rules — only
+            // x64 spells the byref ABI
             g.labi = 3
+            if rt_host_arch() == "aarch64" {
+                g.labi = 2
+            }
         } else if rt_host_arch() == "aarch64" {
             g.labi = 2
         }
@@ -3042,26 +3047,13 @@ fn ls(g: mut G, s: ref parser.Node) {
         }
         parser.Node.Assign{target, val} => {
             if g.inframe == 1 && len(g_call_susp(g, val)) > 0 {
-                // target's susp calls park first (eval order), but the
-                // fills inside lfsusp_go pop before laddr runs — their
-                // result members queue behind the val args' so the
-                // FIFO stays aligned with pop order
-                saveq := g.lhq
-                savec := g.lhqn
-                g.lhq = mkslice(int, 0)
-                g.lhqn = 0
+                // target's susp calls park first (eval order); their
+                // slots are keyed by node so laddr's pops find them
+                // regardless of the fills lfsusp_go parked between
                 lscan_susp(g, target)
-                tq := g.lhq
-                g.lhq = saveq
-                g.lhqn = savec
                 dt := xty(g, target)
                 h := lfpush(g, lfty(g, dt))
                 lfsusp_go(g, val, 1, h, -1, dt)
-                ti := 0
-                for ti < len(tq) {
-                    g.lhq = push(g.lhq, tq[ti])
-                    ti = ti + 1
-                }
                 p := laddr(g, target)
                 hv := lload(g, lfty(g, dt), lfgep(g, h))
                 lstore(g, lfty(g, dt), hv, p)
@@ -3759,17 +3751,47 @@ fn lspawn(g: mut G, sc: ref parser.Node, e: ref parser.Node, blocking: bool) {
             lw(g, v + " = call " + lty(g, rt1) + " " + pf + "(" + argl + ")")
         }
     } else {
+        // an extern callee spells its args through the same ABI plan a
+        // direct call builds — a >16B composite (e.g. []byte) rides a
+        // caller-side copy, and a >laggt composite ret the hidden sret
+        // slot, even though the thunk discards the value
+        plan := mkslice(int, 0)
+        sretty := ""
+        sig := g.ck.fnsv[fi]
+        if sig.is_extern == 1 {
+            if retk == 1 {
+                sretty = lsret_ty(g, rt1)
+            }
+            gp0 := 0
+            if len(sretty) > 0 {
+                gp0 = 1
+            }
+            plan = lextern_plan(g, sig.params, bind, gp0)
+        }
         targs := ""
         k = i
+        pnum := 0
         for k < len(slots) {
             if len(targs) > 0 {
                 targs = targs + ", "
             }
-            targs = targs + lty(g, slots[k]) + " " + lxname(g, "_a" + itoa(k))
+            if pnum < len(plan) && plan[pnum] == 1 {
+                targs = targs + lagg_copy(g, lty(g, slots[k]), lxname(g, "_a" + itoa(k)))
+            } else {
+                targs = targs + lty(g, slots[k]) + " " + lxname(g, "_a" + itoa(k))
+            }
+            pnum = pnum + 1
             k = k + 1
         }
         if retk == 0 {
             lcallv(g, callee, targs)
+        } else if len(sretty) > 0 {
+            dst := lalloc(g, sretty)
+            sep := ""
+            if len(targs) > 0 {
+                sep = ", "
+            }
+            lcallv(g, callee, "ptr sret(" + sretty + ") " + dst + sep + targs)
         } else {
             rty := lty(g, rt1)
             if retk == 2 {
@@ -6355,8 +6377,11 @@ fn lfsusp_vcall(g: mut G, call: ref parser.Node, dk: int, da: int, db: int, dt: 
 
 // leaf suspends — recv/send/sleep/msleep/sjoin park on the runtime
 // wait queues; sjoin polls + finishes ahead of cancel delivery (the
-// join's second half can't be skipped — gfsusp_leaf mirror)
-fn lfsusp_leaf(g: mut G, name: str, args: ref parser.NList, dk: int, da: int, db: int) {
+// join's second half can't be skipped — gfsusp_leaf mirror). dt is
+// the destination member's ty — a received word narrows to it before
+// the store (a `let x: byte = recv(ch)` parks an i8 member, and an
+// i64 store would spill into the neighbouring members)
+fn lfsusp_leaf(g: mut G, name: str, args: ref parser.NList, dk: int, da: int, db: int, dt: int) {
     argvs := lav(g, args)
     a0 := gav_at(argvs, 0)
     k := g.staten
@@ -6428,12 +6453,17 @@ fn lfsusp_leaf(g: mut G, name: str, args: ref parser.NList, dk: int, da: int, db
                 rt = tyi(g, ct)
             }
         }
-        if rt >= 0 {
-            rv := lunword(g, res, rt)
-            lstore(g, lfty(g, rt), rv, lfgep(g, da))
-        } else {
-            lstore(g, "i64", res, lfgep(g, da))
+        wdt := dt
+        if wdt < 0 {
+            wdt = check.t_int(g.ck)
         }
+        if rt < 0 {
+            // untyped chan — the i64 word narrows straight to the
+            // destination member's ty
+            rt = wdt
+        }
+        rv := lfit(g, lunword(g, res, rt), rt, wdt)
+        lstore(g, lfty(g, wdt), rv, lfgep(g, da))
     }
 }
 
@@ -6453,7 +6483,7 @@ fn lfsusp_go(g: mut G, call: ref parser.Node, dk: int, da: int, db: int, dt: int
                     lscan_susp(g, al.v)
                     al = al.next
                 }
-                lfsusp_leaf(g, sn, args, dk, da, db)
+                lfsusp_leaf(g, sn, args, dk, da, db, dt)
             } else {
                 if sn == "!vtab" {
                     al := args
@@ -6478,15 +6508,18 @@ fn lfsusp_go(g: mut G, call: ref parser.Node, dk: int, da: int, db: int, dt: int
     }
 }
 
-// park one nested susp call into a fresh _h member and queue it — the
-// pop side of lx reads the slot back as the call's operand
-fn lxsusp_park(g: mut G, e: ref parser.Node, sn: str) {
+// park one nested susp call into a fresh _h member, keyed to the call
+// site — the pop side of lx reads the slot back for THAT node (guarded
+// && / || rhs scans run inside the arm, so queue position can't
+// express the association: a skipped recv would otherwise read the
+// next sibling's slot)
+fn lxsusp_park(g: mut G, e: ref parser.Node, sn: str) -> int {
     rt := xty(g, e)
     h := lfpush(g, lfty(g, rt))
     match e {
         parser.Node.Call{args} => {
             if check.is_susp_builtin(sn) {
-                lfsusp_leaf(g, sn, args, 1, h, -1)
+                lfsusp_leaf(g, sn, args, 1, h, -1, rt)
             } else {
                 lfsusp_call(g, e, sn, 1, h, -1, rt)
             }
@@ -6494,17 +6527,54 @@ fn lxsusp_park(g: mut G, e: ref parser.Node, sn: str) {
         _ => {
         }
     }
-    g.lhq = push(g.lhq, h)
+    k := lsusp_key(g, e)
+    if len(k) > 0 {
+        collections.map_set(g.lhm, k, h)
+    } else {
+        // a callee expr with no source position (synthesized AST) can't
+        // key — the lkq FIFO carries it in park order like before
+        g.lkq = push(g.lkq, h)
+    }
+    return h
 }
 
-// lx's susp-call operand — pop the next parked slot; a scan miss falls
-// back to an inline park (safe only at eval-head position)
-fn lxsusp_pop(g: mut G, e: ref parser.Node, sn: str) -> str {
-    if g.lhqn >= len(g.lhq) {
-        lxsusp_park(g, e, sn)
+// a susp Call's slot key — the callee's source position, qualified by
+// the emitting file; "" when the callee expr carries no position
+fn lsusp_key(g: mut G, e: ref parser.Node) -> str {
+    match e {
+        parser.Node.Call{f} => {
+            lo := parser.nlo(f)
+            if lo >= 0 {
+                return g.ck.cur_file + "#" + itoa(lo)
+            }
+        }
+        _ => {
+        }
     }
-    idx := g.lhq[g.lhqn]
-    g.lhqn = g.lhqn + 1
+    return ""
+}
+
+// lx's susp-call operand — load the member parked for THIS node; a
+// scan miss falls back to an inline park (safe only at eval-head
+// position — an operand reg spelled across a later park would dangle
+// past the resume edge)
+fn lxsusp_pop(g: mut G, e: ref parser.Node, sn: str) -> str {
+    idx := -1
+    k := lsusp_key(g, e)
+    if len(k) > 0 {
+        if collections.map_has(g.lhm, k) {
+            [v, err] = collections.map_get(g.lhm, k)
+            if err == nil {
+                idx = v
+            }
+        }
+    } else if g.lkqn < len(g.lkq) {
+        idx = g.lkq[g.lkqn]
+        g.lkqn = g.lkqn + 1
+    }
+    if idx < 0 {
+        idx = lxsusp_park(g, e, sn)
+    }
     rt := xty(g, e)
     return lload(g, lfty(g, rt), lfgep(g, idx))
 }
@@ -6878,6 +6948,11 @@ fn lfselect(g: mut G, arms: ref parser.NList) {
         match a.v {
             parser.Node.SArm{kind, ch, bind, body} => {
                 llb(g, alabs[aidx])
+                // the arm scope opens BEFORE the recv bind — binding
+                // first would overwrite an enclosing same-name var in
+                // the outer scope, and the pop couldn't restore it
+                // (checker's sel_stmt order)
+                lenv_push(g)
                 if kind == "recv" && len(bind) > 0 {
                     bt := check.t_int(g.ck)
                     ct := xty(g, ch)
@@ -6889,7 +6964,6 @@ fn lfselect(g: mut G, arms: ref parser.NList) {
                     bv := lunword(g, td, bt)
                     lstore(g, lfty(g, bt), bv, lfgep(g, fd))
                 }
-                lenv_push(g)
                 lblk(g, body)
                 lenv_pop(g)
                 lfin(g, lend)
@@ -6951,8 +7025,9 @@ fn lframe(g: mut G, qn: str, recv: ref parser.Node, params: ref parser.NList, re
     g.loops = mkslice(GLab, 0)
     g.sopen = mkslice(int, 0)
     g.defers = nil
-    g.lhq = mkslice(int, 0)
-    g.lhqn = 0
+    g.lhm = collections.map_new()
+    g.lkq = mkslice(int, 0)
+    g.lkqn = 0
     g.lall = mkslice(str, 0)
     g.lfn = 1
     g.lterm = 0

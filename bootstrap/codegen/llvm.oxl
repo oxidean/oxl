@@ -282,8 +282,8 @@ fn lsize(g: mut G, t: int) -> int {
         return 8
     }
     if k == check.k_enum() {
-        // { i32, [4 x i8], payload, i64 }: payload at 8, the i64
-        // anchor keeps the largest-variant tail 8-aligned
+        // { i32, [4 x i8], [N x i64], i64 }: payload at 8, the i64
+        // members keep the largest-variant tail 8-aligned
         return lalign_up(8 + lenum_payload(g, g.ck.tyv[t].name), 8) + 8
     }
     return 8
@@ -1902,14 +1902,15 @@ fn lxas(g: mut G, inner: ref parser.Node, ty: ref parser.Node) -> str {
         return r
     }
     tn := check.ty_str(ty)
-    ev := gev(g, check.resolve_named(g.ck, tn))
+    qn := check.resolve_named(g.ck, tn)
+    ev := gev(g, qn)
     if !ev.ok {
         return iv
     }
     // enum payload extract — tag check (trap 9) then the variant
     // struct out of the payload member
     enty := "%o_en_" + cname(ev.en)
-    vty := "%o_s_" + cname(tn)
+    vty := "%o_s_" + cname(qn)
     mp := ""
     if deref {
         mp = iv
@@ -4854,7 +4855,6 @@ fn lemit_enum_ty(g: mut G, i: int) {
         parser.Node.Enum{name, vars} => {
             qn := check.qname(g.its[i].mod, name)
             vi := 0
-            pty := "i8"
             psz := 0
             vl := vars
             for vl != nil {
@@ -4879,7 +4879,6 @@ fn lemit_enum_ty(g: mut G, i: int) {
                                     vs := lsize_fields(g, fields)
                                     if vs > psz {
                                         psz = vs
-                                        pty = "%o_s_" + cname(sn)
                                     }
                                 }
                             }
@@ -4891,7 +4890,18 @@ fn lemit_enum_ty(g: mut G, i: int) {
                 vi = vi + 1
                 vl = vl.next
             }
-            lunit(g, 0, "%o_en_" + cname(qn) + " = type { i32, [4 x i8], " + pty + ", i64 }\n", "o_en_" + cname(qn))
+            // payload member: an i64 byte-array, not the largest
+            // variant's struct type — a struct-typed member's internal
+            // padding isn't transferred by the by-value aggregate ABI,
+            // but a smaller variant's live data can sit in exactly
+            // those bytes (the C lane's union copies them). i64 keeps
+            // the slot 8-aligned with every byte live; accesses always
+            // re-gep through the real variant type.
+            member := "i8"
+            if psz > 0 {
+                member = "[" + itoa((psz + 7) / 8) + " x i64]"
+            }
+            lunit(g, 0, "%o_en_" + cname(qn) + " = type { i32, [4 x i8], " + member + ", i64 }\n", "o_en_" + cname(qn))
         }
         _ => {
         }

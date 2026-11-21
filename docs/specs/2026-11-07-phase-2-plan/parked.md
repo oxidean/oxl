@@ -5,14 +5,26 @@ firing moves the item into the milestone map via a new work item.
 
 ## LLVM backend
 
-- **Status: trigger fired.** Milestone W is in flight on
-  `feat/milestone-w` (PR #66) with a second emit lane
-  (`--target js`); the `interfaces.md` codegen seam has a second
-  consumer in flight and a third is pattern work; clang-only
-  platform reach (wasm, target SDKs — the trigger's "platform
-  target requires it" arm) is the standing justification. Spec:
-  `docs/specs/2026-11-11-llvm-backend/` (milestone L, WI-0010).
-  This section retires when L merges.
+- **Status: shipped** — milestone L landed the lane:
+  `bootstrap/codegen/llvm.oxl` behind the `CkRes` seam,
+  `oxl build/run/test --target llvm` with `--triple`/`--emit-llvm`,
+  rt.c under clang (>=15), the IR fixpoint + cross-lane parity
+  gate. Docs `docs/llvm-target.md`; spec
+  `docs/specs/2026-11-11-llvm-backend/`. What the milestone
+  deliberately left parked (full text: the spec's `plan.md`
+  §Parking rules):
+  - `llvm.coro.*` native splitting — trigger: measured poll-
+    dispatch overhead mem2reg/regalloc can't recover, or an
+    async-ABI consumer
+  - wasm32/wasi rt port — trigger: a wasm product target + an rt
+    port design (rt.c's pthread/POSIX surface has no wasi spelling)
+  - DWARF/`DIBuilder` debug info — trigger: native-debugger
+    workflows on lane-compiled binaries
+  - opt-metadata pass (`noalias`/`nonnull`/TBAA/`inbounds`) —
+    trigger: a measured win, each attribute audited against
+    borrow-check semantics first
+  - `--emit-bc`/LTO/lld plumbing — trigger: a size/link-time
+    consumer
 
 ## D4 shape-based generics
 

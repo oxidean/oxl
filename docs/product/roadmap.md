@@ -57,10 +57,11 @@ Milestone map: [docs/specs/2026-11-07-phase-2-plan/](../specs/2026-11-07-phase-2
 - **W — web compilation target**: shipped — `--target js` emit
   (node + browser flavors), `extra/gui/dom` backend, `web-todo`
   reference app; spec: `docs/specs/2026-11-10-web-target/`
-- **L — LLVM emit lane**: spec — `bootstrap/codegen/llvm.oxl`
-  textual-IR emitter behind the `CkRes` seam, `--target llvm` +
-  `--triple`, shared frame/poll suspension lowering, rt.c under
-  clang, IR fixpoint; spec:
+- **L — LLVM emit lane**: shipped — `bootstrap/codegen/llvm.oxl`
+  textual-IR emitter behind the `CkRes` seam, `oxl build/run/test
+  --target llvm` + `--triple`/`--emit-llvm`, shared frame/poll
+  suspension lowering, rt.c under clang (>=15), IR fixpoint +
+  cross-lane parity gate; docs `docs/llvm-target.md`; spec:
   `docs/specs/2026-11-11-llvm-backend/`
 - **X — TLS/x509**: shipped — TLS 1.3 client `std/net/tls`,
   `std/crypto/x509`, the crypto stack beneath (`crypto/rand`,

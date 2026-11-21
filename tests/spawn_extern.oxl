@@ -1,0 +1,19 @@
+package main
+
+// L3 review — a named non-susp spawn of an extern callee spells the
+// extern ABI plan (lextern_plan): a >16B composite ret rides the
+// hidden sret slot (rt_mkslice's []int) and str params the plan's
+// spelling — not the raw per-slot form a plain-fn thunk uses. Under
+// the wrong spelling the callee reads the first int arg as the sret
+// pointer and writes through it.
+extern fn rt_mkslice(n: int, esz: int) -> []int
+
+extern fn rt_streq(a: str, b: str) -> int
+
+fn main() {
+    scope {
+        spawn rt_mkslice(2, 8)
+        spawn rt_streq("ab", "ab")
+    }
+    println("spawn extern ok")
+}

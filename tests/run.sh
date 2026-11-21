@@ -50,12 +50,25 @@ with_timeout() {
     elif command -v gtimeout >/dev/null 2>&1; then gtimeout "$@"
     else
         local secs=$1; shift
-        "$@" & local pid=$!
+        # setsid makes the child a process-group leader so the watchdog
+        # can kill the whole tree — `oxl run`'s compiled binary is a
+        # grandchild of the driver, and killing only the direct pid
+        # orphans it holding the caller's capture pipe open
+        if command -v setsid >/dev/null 2>&1; then
+            setsid "$@" & local pid=$!
+        else
+            "$@" & local pid=$!
+        fi
         # watchdog redirects away from the caller's capture pipe: inside
         # out=$(with_timeout ..) the subshell would inherit that pipe, and
         # a killed dog can orphan its sleep child still holding it open —
-        # the $() then hangs past the deadline it was enforcing
-        ( sleep "$secs"; kill -KILL "$pid" 2>/dev/null ) >/dev/null 2>&1 & local dog=$!
+        # the $() then hangs past the deadline it was enforcing. Kills
+        # the process group when setsid made one (kill -- -pid), then the
+        # direct pid, then a one-level pkill -P sweep for the no-setsid
+        # path — best-effort, GNU timeout's own tree kill is deeper.
+        ( sleep "$secs"
+          kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null
+          pkill -KILL -P "$pid" 2>/dev/null ) >/dev/null 2>&1 & local dog=$!
         local rc=0
         wait "$pid" 2>/dev/null || rc=$?
         if kill -0 "$dog" 2>/dev/null; then
@@ -1850,6 +1863,54 @@ else
     echo "  clang not found — skipping llvm abi probe"
 fi
 
+# fixture + success-marker table shared by the L2 (manual --emit llvm
+# + clang) and L3 (driver --target llvm) gates — add a conformance
+# file once and both lanes pick it up; a missing marker case is a
+# suite bug, not a silent pass
+LLVM_FIXTURES="conc_ping conc_scale select select_fair chan_own chanbuf chanbuf_close scope_exit orphan_join defer_order pairfwd susp_closure zero_str match methods fnval d5_qual stdmods_test susp_ownarg spawn_forms spawn_extern recv_narrow select_shadow susp_guard iface_susp iface_susp_shim iface_susp_pair iface_susp_nested iface_susp_rewrap iface_susp_prop iface_susp_convdest iface_susp_cancel iface_susp_ownarg vtab_fn closure_mcall closure_fnfield closure_shadow"
+llvm_fixture_marker() {
+    case "$1" in
+        conc_ping)      marker='bounces=' ;;
+        conc_scale)     marker='done' ;;
+        select)         marker='select done' ;;
+        select_fair)    marker='select fair ok' ;;
+        chan_own)       marker='chan_own done' ;;
+        chanbuf)        marker='chanbuf done' ;;
+        chanbuf_close)  marker='chanbuf close ok' ;;
+        scope_exit)     marker='scope-exit ok' ;;
+        orphan_join)    marker='orphan-join ok' ;;
+        defer_order)    marker='defer order ok' ;;
+        pairfwd)        marker='pairfwd ok' ;;
+        match)          marker='match ok' ;;
+        methods)        marker='methods ok' ;;
+        fnval)          marker='fnval ok' ;;
+        d5_qual)        marker='d5 qual ok' ;;
+        stdmods_test)   marker='done' ;;
+        susp_closure)   marker='susp closure ok' ;;
+        closure_mcall)  marker='closure mcall ok' ;;
+        closure_fnfield) marker='closure fnfield ok' ;;
+        closure_shadow) marker='closure shadow ok' ;;
+        zero_str)       marker='zero str ok' ;;
+        susp_ownarg)    marker='susp ownarg ok' ;;
+        spawn_forms)    marker='spawn forms ok' ;;
+        spawn_extern)   marker='spawn extern ok' ;;
+        recv_narrow)    marker='recv narrow ok' ;;
+        select_shadow)  marker='select shadow ok' ;;
+        susp_guard)     marker='susp guard ok' ;;
+        iface_susp)         marker='iface susp ok' ;;
+        iface_susp_shim)    marker='iface susp shim ok' ;;
+        iface_susp_pair)    marker='iface susp pair ok' ;;
+        iface_susp_nested)  marker='iface susp nested ok' ;;
+        iface_susp_rewrap)  marker='iface susp rewrap ok' ;;
+        iface_susp_prop)    marker='iface susp prop ok' ;;
+        iface_susp_convdest) marker='iface susp convdest ok' ;;
+        iface_susp_cancel)  marker='iface susp cancel ok' ;;
+        iface_susp_ownarg)  marker='iface susp ownarg ok' ;;
+        vtab_fn)            marker='vtab fn ok' ;;
+        *)                  marker='' ;;
+    esac
+}
+
 echo "== llvm lane (l2) =="
 # L2 conformance gate: the concurrency whitelist plus the non-conc
 # corpus through the manual `--emit llvm` path — codegen emits .ll,
@@ -1863,42 +1924,9 @@ if command -v clang >/dev/null 2>&1; then
     case "$(uname -s)" in
         MINGW*|MSYS*|CYGWIN*) llibs="-ladvapi32 -lshell32" ;;
     esac
-    for f in conc_ping conc_scale select select_fair chan_own chanbuf chanbuf_close scope_exit orphan_join defer_order pairfwd susp_closure zero_str match methods fnval d5_qual stdmods_test susp_ownarg spawn_forms iface_susp iface_susp_shim iface_susp_pair iface_susp_nested iface_susp_rewrap iface_susp_prop iface_susp_convdest iface_susp_cancel iface_susp_ownarg vtab_fn closure_mcall closure_fnfield closure_shadow; do
-        case "$f" in
-            conc_ping)      marker='bounces=' ;;
-            conc_scale)     marker='done' ;;
-            select)         marker='select done' ;;
-            select_fair)    marker='select fair ok' ;;
-            chan_own)       marker='chan_own done' ;;
-            chanbuf)        marker='chanbuf done' ;;
-            chanbuf_close)  marker='chanbuf close ok' ;;
-            scope_exit)     marker='scope-exit ok' ;;
-            orphan_join)    marker='orphan-join ok' ;;
-            defer_order)    marker='defer order ok' ;;
-            pairfwd)        marker='pairfwd ok' ;;
-            match)          marker='match ok' ;;
-            methods)        marker='methods ok' ;;
-            fnval)          marker='fnval ok' ;;
-            d5_qual)        marker='d5 qual ok' ;;
-            stdmods_test)   marker='done' ;;
-            susp_closure)   marker='susp closure ok' ;;
-            closure_mcall)  marker='closure mcall ok' ;;
-            closure_fnfield) marker='closure fnfield ok' ;;
-            closure_shadow) marker='closure shadow ok' ;;
-            zero_str)       marker='zero str ok' ;;
-            susp_ownarg)    marker='susp ownarg ok' ;;
-            spawn_forms)    marker='spawn forms ok' ;;
-            iface_susp)         marker='iface susp ok' ;;
-            iface_susp_shim)    marker='iface susp shim ok' ;;
-            iface_susp_pair)    marker='iface susp pair ok' ;;
-            iface_susp_nested)  marker='iface susp nested ok' ;;
-            iface_susp_rewrap)  marker='iface susp rewrap ok' ;;
-            iface_susp_prop)    marker='iface susp prop ok' ;;
-            iface_susp_convdest) marker='iface susp convdest ok' ;;
-            iface_susp_cancel)  marker='iface susp cancel ok' ;;
-            iface_susp_ownarg)  marker='iface susp ownarg ok' ;;
-            vtab_fn)            marker='vtab fn ok' ;;
-        esac
+    for f in $LLVM_FIXTURES; do
+        llvm_fixture_marker "$f"
+        [ -n "$marker" ] || { echo "FAIL llvm lane $f: no marker in the shared table"; exit 1; }
         "$OXL" run bootstrap/cmd/codegen -- --emit llvm "tests/$f.oxl" > "$scratch/$f.ll" || { echo "FAIL llvm lane $f: emit"; exit 1; }
         clang -O0 -Iruntime "$scratch/$f.ll" runtime/rt.c $llibs -o "$scratch/$f$EXE" || { echo "FAIL llvm lane $f: cc"; exit 1; }
         out=$(with_timeout 60 "$scratch/$f$EXE" 2>&1) || { echo "FAIL llvm lane $f: $out"; exit 1; }
@@ -1910,12 +1938,183 @@ if command -v clang >/dev/null 2>&1; then
         clang -O0 -Iruntime "$scratch/$f.ll" runtime/rt.c $llibs -o "$scratch/$f$EXE" || { echo "FAIL llvm lane $f: cc"; exit 1; }
         rc=0
         out=$(with_timeout 30 "$scratch/$f$EXE" 2>&1) || rc=$?
-        [ "$rc" -ne 0 ] || { echo "FAIL llvm lane $f: expected trap exit"; exit 1; }
+        # 124 is the watchdog's hang sentinel, not a trap — count it as
+        # a hang like the native probes do, not a passing trap exit
+        if [ "$rc" -eq 0 ] || [ "$rc" -eq 124 ]; then
+            echo "FAIL llvm lane $f: expected trap exit, got rc=$rc"; exit 1
+        fi
         grep -q 'escaped top scope' <<<"$out" || { echo "FAIL llvm lane $f: trap line: $out"; exit 1; }
         echo "  llvm l2: $f ok"
     done
 else
     echo "  (skipped: clang not installed)"
+fi
+
+echo "== llvm lane (l3) =="
+# L3 driver gate: the L1+L2 whitelist through the product driver's own
+# `--target llvm` — compile_res picks emit_llvm, emit_and_llvm drives
+# clang on out.ll+rt.c in one shot, run execs the produced native
+# binary directly (no launcher — unlike the js lane's node). The
+# _test corpus goes through `test --target llvm`, the trap files
+# through `build --target llvm` + exec, and the flag surface probes
+# --emit-llvm (out.ll kept beside -o, triple-neutral), the
+# --triple/--emit-llvm/--html wrong-lane rejections, a host --triple
+# passthrough, and pick_clang's named floor error under a stale
+# LANG_CLANG. Gated on clang like the node gate — a runner without it
+# skips with the reason spelled out.
+if command -v clang >/dev/null 2>&1; then
+    for f in $LLVM_FIXTURES; do
+        llvm_fixture_marker "$f"
+        [ -n "$marker" ] || { echo "FAIL llvm l3 $f: no marker in the shared table"; exit 1; }
+        out=$(with_timeout 180 "$OXL" run --target llvm "tests/$f.oxl" 2>&1) || { echo "FAIL llvm l3 $f: $out"; exit 1; }
+        grep -q "$marker" <<<"$out" || { echo "FAIL llvm l3 $f marker '$marker': $out"; exit 1; }
+        echo "  llvm l3 run: $f ok"
+    done
+    # the _test corpus through `test --target llvm` — the testm=1
+    # wrappers (dynamic RtScope allocas) through the same driver path.
+    # Output goes to a file, not $( ) — a capture pipe whose write end a
+    # spawned grandchild inherits can't hold the substitution open past
+    # the watchdog, and on timeout the survivors report themselves
+    for f in stdlib_test float_test regexp_test util_test enc_test; do
+        lf="$scratch/l3test-$f.out"
+        if ! with_timeout 180 "$OXL" test --target llvm "tests/$f.oxl" >"$lf" 2>&1; then
+            echo "FAIL llvm l3 test $f:"
+            cat "$lf"
+            ps -axo pid,ppid,pgid,stat,etime,command 2>/dev/null | head -50
+            exit 1
+        fi
+        grep -q ' \.\.\. ok' "$lf" || { echo "FAIL llvm l3 test $f:"; cat "$lf"; exit 1; }
+        echo "  llvm l3 test: $f ok"
+    done
+    # trap files through build + exec — the produced native binary
+    # must carry the abort shape itself
+    for f in select_cancel cancel_join; do
+        "$OXL" build --target llvm "tests/$f.oxl" -o "$scratch/$f-l3$EXE" || { echo "FAIL llvm l3 $f: build"; exit 1; }
+        rc=0
+        out=$(with_timeout 30 "$scratch/$f-l3$EXE" 2>&1) || rc=$?
+        # same as the native probes: 124 is the watchdog's hang
+        # sentinel — a hang is a fail, not a trap exit
+        if [ "$rc" -eq 0 ] || [ "$rc" -eq 124 ]; then
+            echo "FAIL llvm l3 $f: expected trap exit, got rc=$rc"; exit 1
+        fi
+        grep -q 'escaped top scope' <<<"$out" || { echo "FAIL llvm l3 $f: trap line: $out"; exit 1; }
+        echo "  llvm l3: $f ok"
+    done
+    # --emit-llvm keeps <out>.ll beside the binary — and the kept IR
+    # must stay triple-neutral (no `target triple`/`datalayout` lines:
+    # clang supplies both from -target, an emitted triple would
+    # override the --triple passthrough)
+    "$OXL" build --target llvm tests/select.oxl -o "$scratch/el$EXE" || { echo "FAIL llvm l3 build"; exit 1; }
+    [ ! -f "$scratch/el$EXE.ll" ] || { echo "FAIL llvm l3: .ll kept without --emit-llvm"; exit 1; }
+    "$OXL" build --target llvm --emit-llvm tests/select.oxl -o "$scratch/el$EXE" || { echo "FAIL llvm l3 --emit-llvm build"; exit 1; }
+    [ -f "$scratch/el$EXE.ll" ] || { echo "FAIL llvm l3: --emit-llvm kept no .ll"; exit 1; }
+    grep -qE '^target (triple|datalayout)' "$scratch/el$EXE.ll" && { echo "FAIL llvm l3: .ll not triple-neutral"; exit 1; }
+    # a second --emit-llvm build to a different -o lands its own .ll
+    # (the fixed out.ll name used to overwrite across builds)
+    "$OXL" build --target llvm --emit-llvm tests/select.oxl -o "$scratch/el2$EXE" || { echo "FAIL llvm l3 --emit-llvm second build"; exit 1; }
+    [ -f "$scratch/el2$EXE.ll" ] || { echo "FAIL llvm l3: second build kept no .ll"; exit 1; }
+    # --triple passthrough: the lane's own reach claim is the local
+    # clang's configured reach — smoke the flag with the host triple
+    # (cross sysroots are the runner's clang's problem)
+    host_triple=$(clang -print-target-triple 2>/dev/null || true)
+    if [ -n "$host_triple" ]; then
+        "$OXL" build --target llvm --triple "$host_triple" tests/select.oxl -o "$scratch/tr$EXE" || { echo "FAIL llvm l3 --triple host: build"; exit 1; }
+        out=$(with_timeout 30 "$scratch/tr$EXE") || { echo "FAIL llvm l3 --triple host: run"; exit 1; }
+        grep -q 'select done' <<<"$out" || { echo "FAIL llvm l3 --triple host: $out"; exit 1; }
+        # the triple must reach the SELECTED clang's argv — a dropped
+        # -target compiles for the compiler's default while the ABI
+        # spelling targets --triple. A LANG_CLANG spy logs every argv
+        # and delegates to the real clang; POSIX-only like the floor
+        # probe (CreateProcess can't exec a shell script)
+        case "$(uname -s)" in
+            MINGW*|MSYS*|CYGWIN*) ;;
+            *)
+                cat > "$scratch/clangspy" <<EOF
+#!/bin/sh
+echo "\$@" >> "$scratch/clangspy.args"
+for a in "\$@"; do
+    if [ "\$a" = "--version" ]; then
+        echo "clang version 17.0.0 (spy)"
+        exit 0
+    fi
+done
+exec clang "\$@"
+EOF
+                chmod +x "$scratch/clangspy"
+                : > "$scratch/clangspy.args"
+                out=$(LANG_CLANG="$scratch/clangspy" "$OXL" build --target llvm --triple "$host_triple" tests/select.oxl -o "$scratch/tr2$EXE" 2>&1) || { echo "FAIL llvm l3 --triple spy build: $out"; exit 1; }
+                # the link invocation (the argv carrying -o) must spell
+                # -target with the resolved triple
+                awk -v t="$host_triple" 'index($0, "-o ") && index($0, "-target " t) {ok=1} END{exit !ok}' "$scratch/clangspy.args" || { echo "FAIL llvm l3 --triple: selected clang got no -target: $(cat "$scratch/clangspy.args")"; exit 1; }
+                out=$(with_timeout 30 "$scratch/tr2$EXE") || { echo "FAIL llvm l3 --triple spy: run"; exit 1; }
+                grep -q 'select done' <<<"$out" || { echo "FAIL llvm l3 --triple spy: $out"; exit 1; }
+                # feature detection keys off live @sym refs, not string
+                # data — printing "rt_sqlite_open" et al must not flip
+                # OXL_SQLITE/OXL_NET/OXL_CRYPTO in the clang argv
+                cat > "$scratch/strsqlite.oxl" <<'EOF'
+package main
+fn main() {
+    println("rt_sqlite_open rt_sock_connect rt_csrand rt_m_sin")
+}
+EOF
+                : > "$scratch/clangspy.args"
+                out=$(LANG_CLANG="$scratch/clangspy" "$OXL" build --target llvm "$scratch/strsqlite.oxl" -o "$scratch/strsqlite$EXE" 2>&1) || { echo "FAIL llvm l3 strsqlite build: $out"; exit 1; }
+                if grep -qE -- '-DOXL_(SQLITE|NET|CRYPTO|MATH)|-lsqlite3|-lws2_32|-lbcrypt' "$scratch/clangspy.args"; then
+                    echo "FAIL llvm l3: string constant flipped a feature flag: $(cat "$scratch/clangspy.args")"; exit 1
+                fi
+                out=$(with_timeout 30 "$scratch/strsqlite$EXE") || { echo "FAIL llvm l3 strsqlite: run"; exit 1; }
+                grep -q 'rt_sqlite_open' <<<"$out" || { echo "FAIL llvm l3 strsqlite: $out"; exit 1; }
+                ;;
+        esac
+    fi
+    # malformed --triple forms are usage errors — an empty, missing,
+    # or flag-shaped value must not silently mean "build for host",
+    # while a --triple past `--` is the child's own argv
+    out=$("$OXL" build --target llvm tests/select.oxl --triple -o "$scratch/x" 2>&1) && { echo "FAIL llvm l3: flag-valued --triple accepted"; exit 1; }
+    grep -q -- '--triple needs a target triple' <<<"$out" || { echo "FAIL llvm l3 --triple flag-value msg: $out"; exit 1; }
+    out=$("$OXL" build --target llvm tests/select.oxl --triple= -o "$scratch/x" 2>&1) && { echo "FAIL llvm l3: --triple= accepted"; exit 1; }
+    grep -q -- '--triple needs a target triple' <<<"$out" || { echo "FAIL llvm l3 --triple= msg: $out"; exit 1; }
+    out=$("$OXL" build --target llvm tests/select.oxl -o "$scratch/x" --triple 2>&1) && { echo "FAIL llvm l3: valueless --triple accepted"; exit 1; }
+    grep -q -- '--triple needs a target triple' <<<"$out" || { echo "FAIL llvm l3 --triple missing msg: $out"; exit 1; }
+    # llvm_gate: box/errors.as fold to descriptor machinery with no
+    # LLVM lowering — a clear diagnostic, not an @box call dying at
+    # the IR parse
+    out=$("$OXL" build tests/errors_as.oxl --target llvm -o "$scratch/x" 2>&1) && { echo "FAIL llvm l3: box accepted"; exit 1; }
+    grep -q 'not supported under --target llvm' <<<"$out" || { echo "FAIL llvm l3 box msg: $out"; exit 1; }
+    echo "  llvm l3: gate probes ok"
+    # a --triple past `--` is the child's own argv — the driver's
+    # malformed-value scan and flag_value both stop at the boundary
+    out=$("$OXL" run tests/child_args.oxl -- --triple x86_64-pc-win32-msvc 2>&1) || { echo "FAIL child -- args: $out"; exit 1; }
+    grep -q 'x86_64-pc-win32-msvc' <<<"$out" || { echo "FAIL llvm l3: -- ate the child's --triple: $out"; exit 1; }
+    echo "  llvm l3: child -- boundary ok"
+    # wrong-lane flag rejections — errors, not warnings
+    out=$("$OXL" build tests/select.oxl --triple x -o "$scratch/x" 2>&1) && { echo "FAIL llvm l3: --triple accepted on native"; exit 1; }
+    grep -q -- '--triple needs' <<<"$out" || { echo "FAIL llvm l3 --triple msg: $out"; exit 1; }
+    out=$("$OXL" build tests/select.oxl --target js --triple x -o "$scratch/x" 2>&1) && { echo "FAIL llvm l3: --triple accepted on js"; exit 1; }
+    out=$("$OXL" build tests/select.oxl --emit-llvm -o "$scratch/x" 2>&1) && { echo "FAIL llvm l3: --emit-llvm accepted on native"; exit 1; }
+    grep -q -- '--emit-llvm needs' <<<"$out" || { echo "FAIL llvm l3 --emit-llvm off-lane msg: $out"; exit 1; }
+    out=$("$OXL" run tests/select.oxl --target llvm --emit-llvm 2>&1) && { echo "FAIL llvm l3: --emit-llvm accepted on run"; exit 1; }
+    grep -q -- "only applies to" <<<"$out" || { echo "FAIL llvm l3 --emit-llvm scope msg: $out"; exit 1; }
+    out=$("$OXL" build tests/select.oxl --target llvm --html -o "$scratch/x" 2>&1) && { echo "FAIL llvm l3: --html accepted on llvm"; exit 1; }
+    out=$("$OXL" build tests/select.oxl --target bogus -o "$scratch/x" 2>&1) && { echo "FAIL llvm l3: bogus --target accepted"; exit 1; }
+    grep -q 'native, js, or llvm' <<<"$out" || { echo "FAIL llvm l3 --target msg: $out"; exit 1; }
+    echo "  llvm l3: flag surface ok"
+    # pick_clang's named floor error — a stale LANG_CLANG fails fast
+    # rather than dying on an IR parse error. POSIX-only: the probe is
+    # a shell script, which CreateProcess can't exec on Windows (the
+    # version-parse logic itself is platform-neutral)
+    case "$(uname -s)" in
+        MINGW*|MSYS*|CYGWIN*) ;;
+        *)
+            printf '#!/bin/sh\necho "clang version 14.0.0 (stale)"\n' > "$scratch/clang14"
+            chmod +x "$scratch/clang14"
+            out=$(LANG_CLANG="$scratch/clang14" "$OXL" build tests/select.oxl --target llvm -o "$scratch/x" 2>&1) && { echo "FAIL llvm l3: stale clang accepted"; exit 1; }
+            grep -q 'clang >= 15' <<<"$out" || { echo "FAIL llvm l3 floor msg: $out"; exit 1; }
+            echo "  llvm l3: toolchain floor ok"
+            ;;
+    esac
+else
+    echo "  (skipped: clang not installed — the lane's only consumer)"
 fi
 
 echo "== toolchain driver in .oxl (t2) =="

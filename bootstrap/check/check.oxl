@@ -11371,6 +11371,169 @@ fn jswalk(ck: mut Ck, n: ref parser.Node) {
     }
 }
 
+// ---------- --target llvm gating (L3) ----------
+// The typed-error-payload lane has no LLVM lowering yet: `box` folds
+// to rt_err_box in the C emit and `errors.as` to the registry probe,
+// but llvm.oxl spells neither — an ungated `box(42)` would reach the
+// unknown-callee path and emit a call to a nonexistent `@box`. Every
+// resolved fold site is a diagnostic under --target llvm instead.
+fn llvm_gate(ck: mut Ck, its: []It) {
+    i := 0
+    for i < len(its) {
+        ck.cur_mod = its[i].mod
+        ck.cur_file = its[i].file
+        match its[i].node {
+            parser.Node.Fn{body} => {
+                lvmwalk(ck, body)
+            }
+            parser.Node.Let{init} => {
+                lvmwalk(ck, init)
+            }
+            _ => {
+            }
+        }
+        i = i + 1
+    }
+    ck.cur_mod = ""
+    ck.cur_file = ""
+}
+
+fn lvmwalk_list(ck: mut Ck, l: ref parser.NList) {
+    for l != nil {
+        lvmwalk(ck, l.v)
+        l = l.next
+    }
+}
+
+fn lvmwalk(ck: mut Ck, n: ref parser.Node) {
+    if n == nil {
+        return
+    }
+    match n {
+        parser.Node.Call{f, args} => {
+            qn2 := resolve_named(ck, callee_name(f))
+            if qn2 == "box" || qn2 == "errors.as" {
+                ck.dpos = parser.nlo(n)
+                diag(ck, "check", "`" + qn2 + "` is not supported under --target llvm — typed error payloads have no LLVM lowering yet")
+            }
+            lvmwalk(ck, f)
+            lvmwalk_list(ck, args)
+        }
+        parser.Node.Lit{obj, fields} => {
+            lvmwalk(ck, obj)
+            lvmwalk_list(ck, fields)
+        }
+        parser.Node.NamedField{val} => {
+            lvmwalk(ck, val)
+        }
+        parser.Node.Field{obj} => {
+            lvmwalk(ck, obj)
+        }
+        parser.Node.Un{e} => {
+            lvmwalk(ck, e)
+        }
+        parser.Node.Bin{l, r} => {
+            lvmwalk(ck, l)
+            lvmwalk(ck, r)
+        }
+        parser.Node.Let{init} => {
+            lvmwalk(ck, init)
+        }
+        parser.Node.Ret{vals} => {
+            lvmwalk_list(ck, vals)
+        }
+        parser.Node.Scope{body} => {
+            lvmwalk(ck, body)
+        }
+        parser.Node.Spawn{e} => {
+            lvmwalk(ck, e)
+        }
+        parser.Node.SpawnBlocking{e} => {
+            lvmwalk(ck, e)
+        }
+        parser.Node.Go{e} => {
+            lvmwalk(ck, e)
+        }
+        parser.Node.GoIn{sc, e} => {
+            lvmwalk(ck, sc)
+            lvmwalk(ck, e)
+        }
+        parser.Node.Let2{call} => {
+            lvmwalk(ck, call)
+        }
+        parser.Node.Bind{init} => {
+            lvmwalk(ck, init)
+        }
+        parser.Node.ExprStmt{e} => {
+            lvmwalk(ck, e)
+        }
+        parser.Node.If{cond, then, els} => {
+            lvmwalk(ck, cond)
+            lvmwalk(ck, then)
+            lvmwalk(ck, els)
+        }
+        parser.Node.For{cond, body} => {
+            lvmwalk(ck, cond)
+            lvmwalk(ck, body)
+        }
+        parser.Node.List{items} => {
+            lvmwalk_list(ck, items)
+        }
+        parser.Node.Match{e, arms} => {
+            lvmwalk(ck, e)
+            lvmwalk_list(ck, arms)
+        }
+        parser.Node.MArm{pat, body} => {
+            lvmwalk(ck, pat)
+            lvmwalk(ck, body)
+        }
+        parser.Node.Pat{binds} => {
+            lvmwalk_list(ck, binds)
+        }
+        parser.Node.PatLit{v} => {
+            lvmwalk(ck, v)
+        }
+        parser.Node.Assign{target, val} => {
+            lvmwalk(ck, target)
+            lvmwalk(ck, val)
+        }
+        parser.Node.Select{arms} => {
+            lvmwalk_list(ck, arms)
+        }
+        parser.Node.SArm{ch, ms, body} => {
+            lvmwalk(ck, ch)
+            lvmwalk(ck, ms)
+            lvmwalk(ck, body)
+        }
+        parser.Node.Closure{body} => {
+            lvmwalk(ck, body)
+        }
+        parser.Node.Index{obj, idx} => {
+            lvmwalk(ck, obj)
+            lvmwalk(ck, idx)
+        }
+        parser.Node.Slice{obj, lo, hi} => {
+            lvmwalk(ck, obj)
+            lvmwalk(ck, lo)
+            lvmwalk(ck, hi)
+        }
+        parser.Node.Defer{call} => {
+            lvmwalk(ck, call)
+        }
+        parser.Node.Unsafe{body} => {
+            lvmwalk(ck, body)
+        }
+        parser.Node.As{e} => {
+            lvmwalk(ck, e)
+        }
+        parser.Node.Fn{body} => {
+            lvmwalk(ck, body)
+        }
+        _ => {
+        }
+    }
+}
+
 fn check_file(path: str, need_main: int) -> own CkRes {
     return check_file_over(path, need_main, nil)
 }

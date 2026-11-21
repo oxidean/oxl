@@ -247,8 +247,9 @@ struct G {
     // lane's G1 mark — parallel to g.units
     lffields: []str, // frame member tys after the 4-slot header
     lfrty: str, // current frame's named ty (%o_frm_*)
-    lhq: []int, // susp-result field indices — FIFO for lx's nested pops
-    lhqn: int, // lhq read cursor
+    lhm: own collections.Map, // susp-call site (file#callee-lo) -> result member idx — lx pops by node, not FIFO
+    lkq: []int, // keyless susp parks (no callee position) — FIFO fallback
+    lkqn: int, // lkq read cursor
 }
 
 fn wl(g: mut G, s: str) {
@@ -6854,7 +6855,7 @@ fn run() {
         exit(1)
     }
     if lvm == 1 {
-        print(emit_llvm(r, testm))
+        print(emit_llvm(r, testm, 0))
     } else if jsm == 1 {
         check.js_gate(r.ck, r.items)
         if len(r.ck.diags) > 0 {

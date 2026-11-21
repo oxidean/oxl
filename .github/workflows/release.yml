@@ -20,7 +20,11 @@ concurrency:
 jobs:
   version:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # Poll bound plus tag/emit headroom: the bump PR's required checks
+    # include the windows leg whose ci.yml cap is 150min, so the job must
+    # outlive it with margin or the poll always exits on "never reached a
+    # clean state" before the leg reports.
+    timeout-minutes: 240
     # Job-level grants replace the workflow-level block — all three are
     # restated: contents (tag/branch pushes), pull-requests (bump PR),
     # actions (approve held runs on the bot-authored bump PR).
@@ -257,10 +261,12 @@ jobs:
           merged_gate=0
           updates=0
           reran=""
-          # ~50min of polling inside the 60min job timeout — observed CI is
-          # ~21.5min but slower legs must not hit "never reached a clean
-          # state" while the job still has budget.
-          deadline=$((SECONDS + 3000))
+          # ~200min of polling inside the 240min job timeout — the bound must
+          # exceed the slowest required leg on the bump PR (windows build-test
+          # caps at 150min under ci.yml, observed ~1h51m) plus queue and
+          # rerun-failed-jobs slack, or the version job dies on "never reached
+          # a clean state" while a green-in-progress leg still pends.
+          deadline=$((SECONDS + 12000))
           while [ "$SECONDS" -lt "$deadline" ]; do
             # Held runs surface under different markers across API shapes —
             # match all reported forms, and scope to the current head SHA so

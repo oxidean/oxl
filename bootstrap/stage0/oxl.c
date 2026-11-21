@@ -44047,9 +44047,14 @@ int64_t o_f_emit_and_llvm(OxlStr llsrc, OxlStr out, OxlStr entry) {
     nets = ({ OxlStr _pv = rt_str_lit("@rt_htonl"); rt_slice_push(nets, sizeof(OxlStr), &_pv); });
     nets = ({ OxlStr _pv = rt_str_lit("@rt_lookup_ipv4"); rt_slice_push(nets, sizeof(OxlStr), &_pv); });
     int64_t i = 0LL;
-    struct o_s_strings_StrList* lines = ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_strings_split }; ((struct o_s_strings_StrList* (*)(void*, OxlStr, OxlStr))_fv.fp)(_fv.env, llsrc, rt_str_lit("\n")); });
-    while ((lines != 0)) {
-    OxlStr ln = lines->f_v;
+    int64_t lln = rt_len(llsrc);
+    int64_t pos = 0LL;
+    while ((pos < lln)) {
+    int64_t e = pos;
+    while (((e < lln) && (rt_byteat(llsrc, e) != 10LL))) {
+    e = ((int64_t)((uint64_t)(e) + (uint64_t)(1LL)));
+    }
+    OxlStr ln = rt_substr(llsrc, pos, e);
     if ((({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_strings_startswith }; ((int (*)(void*, OxlStr, OxlStr))_fv.fp)(_fv.env, ln, rt_str_lit("@.str_")); }) == 0)) {
     if (((needs_sqlite == 0) && ({ RtFnv _fv = (RtFnv){ 0, (void*)o_fnv_wrap_strings_contains }; ((int (*)(void*, OxlStr, OxlStr))_fv.fp)(_fv.env, ln, rt_str_lit("@rt_sqlite_")); }))) {
     needs_sqlite = 1;
@@ -44074,7 +44079,7 @@ int64_t o_f_emit_and_llvm(OxlStr llsrc, OxlStr out, OxlStr entry) {
     break;
     }
     }
-    lines = lines->f_next;
+    pos = ((int64_t)((uint64_t)(e) + (uint64_t)(1LL)));
     }
     RtSlice args = rt_mkslice(0LL, sizeof(OxlStr));
     args = ({ OxlStr _pv = rt_str_lit("-O2"); rt_slice_push(args, sizeof(OxlStr), &_pv); });

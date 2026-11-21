@@ -916,8 +916,11 @@ fn emit_and_llvm(llsrc: str, out: str, entry: str) -> int {
     // OXL_SQLITE on for a program that never calls it. ONE pass sets
     // every feature flag — a per-needle split of the IR costs a fresh
     // node list per call (the L3 lane's ~40s test-mode emit and the CI
-    // timeout it blew); @.str_ lines still skip so a c"..." constant
-    // holding "@sym" text can't flip a feature on.
+    // timeout it blew), and strings.split itself substr-copies the
+    // remainder per line: O(n²) live bytes, ~47GB peak on the driver's
+    // ~30MB IR — OOM-killed on every CI OS. byteat walks line bounds
+    // in place; @.str_ lines still skip so a c"..." constant holding
+    // "@sym" text can't flip a feature on.
     needs_sqlite := false
     needs_net := 0
     needs_math := false
@@ -932,9 +935,14 @@ fn emit_and_llvm(llsrc: str, out: str, entry: str) -> int {
     nets = push(nets, "@rt_htonl")
     nets = push(nets, "@rt_lookup_ipv4")
     i := 0
-    lines := strings.split(llsrc, "\n")
-    for lines != nil {
-        ln := lines.v
+    lln := len(llsrc)
+    pos := 0
+    for pos < lln {
+        e := pos
+        for e < lln && byteat(llsrc, e) != 10 {
+            e = e + 1
+        }
+        ln := substr(llsrc, pos, e)
         if strings.startswith(ln, "@.str_") == false {
             if needs_sqlite == false && strings.contains(ln, "@rt_sqlite_") {
                 needs_sqlite = true
@@ -959,7 +967,7 @@ fn emit_and_llvm(llsrc: str, out: str, entry: str) -> int {
                 break
             }
         }
-        lines = lines.next
+        pos = e + 1
     }
     args := mkslice(str, 0)
     args = push(args, "-O2")

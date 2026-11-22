@@ -63,7 +63,19 @@ fn pt(x: int, y: int) -> Point {
 
 /// rect builds a Rect — image.Rect(x0, y0, x1, y1).
 fn rect(x0: int, y0: int, x1: int, y1: int) -> Rect {
-    return Rect{min: Point{x: x0, y: y0}, max: Point{x: x1, y: y1}}
+    xlo := x0
+    xhi := x1
+    if x0 > x1 {
+        xlo = x1
+        xhi = x0
+    }
+    ylo := y0
+    yhi := y1
+    if y0 > y1 {
+        ylo = y1
+        yhi = y0
+    }
+    return Rect{min: Point{x: xlo, y: ylo}, max: Point{x: xhi, y: yhi}}
 }
 
 /// add is p + q — image.Point.Add.

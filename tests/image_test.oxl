@@ -192,6 +192,11 @@ fn test_rect() {
     testing.expect_eq(clip.max.y, 4, "clip maxy")
     none := r.intersect(image.rect(9, 9, 10, 10))
     testing.expect(none.empty(), "clip disjoint")
+    reversed := image.rect(5, 8, 1, 2)
+    testing.expect_eq(reversed.min.x, 1, "rect reversed minx")
+    testing.expect_eq(reversed.min.y, 2, "rect reversed miny")
+    testing.expect_eq(reversed.dx(), 4, "rect reversed dx")
+    testing.expect_eq(reversed.dy(), 6, "rect reversed dy")
 }
 
 fn test_color_premul() {
@@ -254,13 +259,20 @@ fn test_png_rgb() {
 
 // python: ct0 4x1 gray, samples 0/85/170/255
 fn test_png_gray() {
-    [m, e] = png.decodebytes(hx("89504e470d0a1a0a0000000d4948445200000004000000010800000000dc5750110000000d4944415478da6360085df51f00035701fff23860ff0000000049454e44ae426082"))
+    gray_png := hx("89504e470d0a1a0a0000000d4948445200000004000000010800000000dc5750110000000d4944415478da6360085df51f00035701fff23860ff0000000049454e44ae426082")
+    [m, e] = png.decodebytes(gray_png)
     ck(e, "png ct0")
     p := atn(m, 1, 0)
     testing.expect_eq(p.r, 85, "ct0 g1")
     testing.expect_eq(p.a, 255, "ct0 a")
     p3 := atn(m, 3, 0)
     testing.expect_eq(p3.r, 255, "ct0 g3")
+    transparent := append_png(gray_png[0:8], gray_png[8:33])
+    transparent = append_png(transparent, png_chunk_bytes("tRNS", hx("0155")))
+    transparent = append_png(transparent, gray_png[33:len(gray_png)])
+    [tm, te] = png.decodebytes(transparent)
+    ck(te, "ct0 tRNS unused bits")
+    testing.expect_eq(atn(tm, 1, 0).a, 0, "ct0 tRNS masked")
 }
 
 // python: ct3 4x1 palette + tRNS — indices 0..3, palette

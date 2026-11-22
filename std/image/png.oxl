@@ -199,6 +199,19 @@ fn pgray(row: []byte, i: int, depth: int) -> int {
     return v
 }
 
+fn ptrans(v: int, depth: int) -> int {
+    if depth == 16 {
+        return v
+    }
+    mask := 1
+    i := 0
+    for i < depth {
+        mask = mask * 2
+        i = i + 1
+    }
+    return v % mask
+}
+
 // pdraw decodes the unfiltered pixels into pix — the destination
 // buffer's packed bytes (dbpp bytes per pixel, stride w*dbpp), so
 // the one routine serves both the Gray and NRGBA models. Modes:
@@ -222,7 +235,7 @@ fn pdraw(pix: []byte, dbpp: int, mode: int, raw: []byte, w: int, h: int, ch: int
                 // precision (its 16-bit field carries the raw
                 // sample value)
                 v := pgray(raw[row:], x, depth)
-                if len(trns) >= 2 && praw(raw[row:], x, depth) == binary.be_u16(trns, 0) {
+                if len(trns) >= 2 && praw(raw[row:], x, depth) == ptrans(binary.be_u16(trns, 0), depth) {
                     a = 0
                 }
                 r = v
@@ -234,7 +247,7 @@ fn pdraw(pix: []byte, dbpp: int, mode: int, raw: []byte, w: int, h: int, ch: int
                 continue
             } else if mode == 2 {
                 // truecolor — tRNS picks one transparent RGB triple
-                if len(trns) >= 6 && raw[i] == binary.be_u16(trns, 0) && raw[i + 1] == binary.be_u16(trns, 2) && raw[i + 2] == binary.be_u16(trns, 4) {
+                if len(trns) >= 6 && raw[i] == ptrans(binary.be_u16(trns, 0), depth) && raw[i + 1] == ptrans(binary.be_u16(trns, 2), depth) && raw[i + 2] == ptrans(binary.be_u16(trns, 4), depth) {
                     a = 0
                 }
                 r = raw[i]

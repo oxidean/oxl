@@ -778,6 +778,10 @@ fn (d mut Reader) drain(b: []byte) -> [int, err] {
     return n + m, e
 }
 
+fn (d Reader) unread() -> int {
+    return d.sn - d.si
+}
+
 /// reset re-arms the decoder for another stream on the same pump —
 /// the gzip multi-member path. Buffered bytes are kept; decode state
 /// (block position, history, errors) is not.

@@ -448,7 +448,7 @@ fn png_run(b: []byte) -> [Image, err] {
     if re != nil {
         return nil, re
     }
-    if cursor[0] != len(idat) {
+    if cursor[0] - z.unread() != len(idat) {
         return nil, errors.new("png: trailing zlib data")
     }
     if len(raw0) != need {

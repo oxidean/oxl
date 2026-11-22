@@ -45,12 +45,18 @@ fn hxs(s: str) -> str {
 }
 
 fn append_png(dst: []byte, src: []byte) -> []byte {
+    out := mkslice(byte, 0)
     i := 0
-    for i < len(src) {
-        dst = push(dst, src[i])
+    for i < len(dst) {
+        out = push(out, dst[i])
         i = i + 1
     }
-    return dst
+    i = 0
+    for i < len(src) {
+        out = push(out, src[i])
+        i = i + 1
+    }
+    return out
 }
 
 fn png_chunk_bytes(typ: str, data: []byte) -> []byte {
@@ -428,7 +434,7 @@ fn test_png_chunk_order() {
     [_m6, e6] = png.decodebytes(bad_trans)
     testing.expect(e6 != nil, "png transparency on rgba")
 
-    truecolor_header := valid[8:33]
+    truecolor_header := append_png(mkslice(byte, 0), valid[8:33])
     truecolor_header[17] = 2
     binary.put_be_u32(truecolor_header, 21, hash.crc32(truecolor_header[4:21]))
     bad_order := append_png(sig, truecolor_header)

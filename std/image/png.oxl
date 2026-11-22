@@ -25,22 +25,23 @@ import "std/image/color"
 
 let png_errsig: str = "png: bad signature"
 
-struct png_input { b: []byte, i: int }
+struct png_input { b: []byte, pos: []int }
 
 fn (r mut png_input) read(dst: []byte) -> [int, err] {
-    if r.i >= len(r.b) {
+    pos := r.pos[0]
+    if pos >= len(r.b) {
         return 0, io.eof()
     }
-    n := len(r.b) - r.i
+    n := len(r.b) - pos
     if n > len(dst) {
         n = len(dst)
     }
     i := 0
     for i < n {
-        dst[i] = r.b[r.i + i]
+        dst[i] = r.b[pos + i]
         i = i + 1
     }
-    r.i = r.i + n
+    r.pos[0] = r.pos[0] + n
     return n, nil
 }
 
@@ -345,7 +346,7 @@ fn png_run(b: []byte) -> [Image, err] {
                 return nil, errors.new("png: bad dimensions")
             }
         } else if typ == "PLTE" {
-            if seen_plte == 1 || seen_idat == 1 || n < 3 || n % 3 != 0 || n / 3 > 256 {
+            if seen_plte == 1 || seen_trns == 1 || seen_idat == 1 || n < 3 || n % 3 != 0 || n / 3 > 256 {
                 return nil, errors.new("png: bad PLTE")
             }
             if ctype == 0 || ctype == 4 {
@@ -437,7 +438,8 @@ fn png_run(b: []byte) -> [Image, err] {
         bpp = 1
     }
     need := h * (1 + rowbytes)
-    src := png_input{b: idat, i: 0}
+    cursor := mkslice(int, 1)
+    src := png_input{b: idat, pos: cursor}
     [z, ze] = zlib.newreader(src.asreader())
     if ze != nil {
         return nil, ze
@@ -445,6 +447,9 @@ fn png_run(b: []byte) -> [Image, err] {
     [raw0, re] = io.readall(io.limitreader(z.asreader(), need + 1))
     if re != nil {
         return nil, re
+    }
+    if cursor[0] != len(idat) {
+        return nil, errors.new("png: trailing zlib data")
     }
     if len(raw0) != need {
         return nil, errors.new("png: invalid decompressed size")

@@ -427,6 +427,23 @@ fn test_png_chunk_order() {
     bad_trans = append_png(bad_trans, valid[33:len(valid)])
     [_m6, e6] = png.decodebytes(bad_trans)
     testing.expect(e6 != nil, "png transparency on rgba")
+
+    truecolor_header := valid[8:33]
+    truecolor_header[17] = 2
+    binary.put_be_u32(truecolor_header, 21, hash.crc32(truecolor_header[4:21]))
+    bad_order := append_png(sig, truecolor_header)
+    bad_order = append_png(bad_order, png_chunk_bytes("tRNS", hx("000000000000")))
+    bad_order = append_png(bad_order, png_chunk_bytes("PLTE", hx("000000")))
+    bad_order = append_png(bad_order, valid[33:len(valid)])
+    [_m7, e7] = png.decodebytes(bad_order)
+    testing.expect(e7 != nil, "png palette after transparency")
+
+    zdata := append_png(valid[41:66], hx("00"))
+    trailing_zlib := append_png(sig, valid[8:33])
+    trailing_zlib = append_png(trailing_zlib, png_chunk_bytes("IDAT", zdata))
+    trailing_zlib = append_png(trailing_zlib, valid[len(valid) - 12:len(valid)])
+    [_m8, e8] = png.decodebytes(trailing_zlib)
+    testing.expect(e8 != nil, "png trailing zlib data")
 }
 
 fn test_png_limits() {

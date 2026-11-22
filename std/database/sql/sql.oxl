@@ -5,11 +5,11 @@ package sql
 // process-wide registry — re-registering a name REPLACES its driver
 // (last-wins, documented rather than Go's panic, since an err return
 // on register would be dead weight for a programmer-side bug).
-// open(name, conn_str) resolves the name through the registry and
-// returns the driver's connection; open_sqlite(path) reaches the
-// sqlite driver without a lookup, like the R6 lite surface. The
-// sqlite driver registers itself as "sqlite3" and "sqlite" on first
-// use. A driver supplies the Conn/Stmt pair below: Conn.query hands
+// open_driver(name, conn_str) resolves the name through the registry
+// and returns the driver's connection; open(path) and open_sqlite(path)
+// reach the sqlite driver. The sqlite driver registers itself as
+// "sqlite3" and "sqlite" on first use. A driver supplies the Conn/Stmt
+// pair below: Conn.query hands
 // back a Stmt — a live cursor the scan lane steps forward and reads
 // through the normalized col_* accessors (drivers map their column
 // types onto the col_integer..col_null codes). Named parameters stay
@@ -346,46 +346,79 @@ fn (c mut sq_conn) close() {
 }
 
 fn (s sq_stmt) step() -> int {
+    if s.st == nil {
+        return -1
+    }
     return rt_sqlite_step(s.st)
 }
 
 fn (s sq_stmt) reset() -> int {
+    if s.st == nil {
+        return -1
+    }
     return rt_sqlite_reset(s.st)
 }
 
 fn (s sq_stmt) readonly() -> int {
+    if s.st == nil {
+        return 0
+    }
     return rt_sqlite_readonly(s.st)
 }
 
 fn (s sq_stmt) ncols() -> int {
+    if s.st == nil {
+        return 0
+    }
     return rt_sqlite_cols(s.st)
 }
 
 fn (s sq_stmt) col_type(i: int) -> int {
+    if s.st == nil {
+        return 0
+    }
     return rt_sqlite_col_type(s.st, i)
 }
 
 fn (s sq_stmt) col_int(i: int) -> int {
+    if s.st == nil {
+        return 0
+    }
     return rt_sqlite_col_int(s.st, i)
 }
 
 fn (s sq_stmt) col_f64(i: int) -> float {
+    if s.st == nil {
+        return 0.0
+    }
     return rt_sqlite_col_f64(s.st, i)
 }
 
 fn (s sq_stmt) col_text(i: int) -> str {
+    if s.st == nil {
+        return ""
+    }
     return rt_sqlite_col_text(s.st, i)
 }
 
 fn (s sq_stmt) col_name(i: int) -> str {
+    if s.st == nil {
+        return ""
+    }
     return rt_sqlite_col_name(s.st, i)
 }
 
 fn (s sq_stmt) col_decl(i: int) -> str {
+    if s.st == nil {
+        return ""
+    }
     return rt_sqlite_col_decl(s.st, i)
 }
 
 fn (s sq_stmt) errstr(rc: int) -> str {
+    if s.st == nil {
+        return "sql: statement is closed"
+    }
     return rt_sqlite_errstr_rc(rc)
 }
 

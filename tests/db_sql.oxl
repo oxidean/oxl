@@ -244,6 +244,21 @@ fn main() {
     }
     closed_out := new(mkslice(Item, 0))
     want_err(sql.scan(closed_stmt_rows, closed_out), "scan closed rows")
+    [deferred_db, deferred_open_err] = sql.open(":memory:")
+    want_ok(deferred_open_err, "open deferred close")
+    [deferred_rows, deferred_query_err] = deferred_db.query("SELECT 7")
+    want_ok(deferred_query_err, "query deferred close")
+    deferred_db.close()
+    deferred_scalar := new(0)
+    [deferred_ok, deferred_scan_err] = deferred_rows.scan_into(deferred_scalar)
+    want_ok(deferred_scan_err, "scan after connection close")
+    deferred_value := value_of_mut(deferred_scalar)
+    [deferred_n, deferred_value_err] = deferred_value.int()
+    want_ok(deferred_value_err, "read deferred close value")
+    if !deferred_ok || deferred_n != 7 {
+        fails("row after connection close " + itoa(deferred_n))
+    }
+    deferred_rows.close()
     // an aliased expression column reports its spelled name and "" decl
     [rowsx, qex] = db.query("SELECT COUNT(*) AS total FROM items")
     want_ok(qex, "query expr")

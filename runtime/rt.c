@@ -4192,7 +4192,7 @@ OxlStr rt_sqlite_query(void *db, const char *sql) {
     free(buf);
     return (OxlStr){ p, (int64_t)n };
 }
-void rt_sqlite_close(void *db) { sqlite3_close((sqlite3 *)db); }
+void rt_sqlite_close(void *db) { sqlite3_close_v2((sqlite3 *)db); }
 
 /* cursor lane for database/sql's descriptor-driven scan — a prepared
  * stmt is the rows object: step/cols/col_* read the live row, reset

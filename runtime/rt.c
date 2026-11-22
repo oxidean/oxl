@@ -4234,6 +4234,32 @@ OxlStr rt_sqlite_col_text(void *st, int64_t i) {
     p[n] = 0;
     return (OxlStr){ p, (int64_t)n };
 }
+OxlStr rt_sqlite_col_name(void *st, int64_t i) {
+    /* sqlite3_column_name's buffer is stmt-owned — scope-copy so the
+     * name outlives the cursor */
+    const char *t = sqlite3_column_name((sqlite3_stmt *)st, (int)i);
+    size_t n;
+    char *p;
+    if (!t) return rt_str("");
+    n = strlen(t);
+    p = rt_alloc((int64_t)n + 1);
+    memcpy(p, t, n);
+    p[n] = 0;
+    return (OxlStr){ p, (int64_t)n };
+}
+OxlStr rt_sqlite_col_decl(void *st, int64_t i) {
+    /* sqlite3_column_decltype is NULL for expression columns — report
+     * "" so the sql lane's declared-type field degrades to absent */
+    const char *t = sqlite3_column_decltype((sqlite3_stmt *)st, (int)i);
+    size_t n;
+    char *p;
+    if (!t) return rt_str("");
+    n = strlen(t);
+    p = rt_alloc((int64_t)n + 1);
+    memcpy(p, t, n);
+    p[n] = 0;
+    return (OxlStr){ p, (int64_t)n };
+}
 void rt_sqlite_finalize(void *st) { sqlite3_finalize((sqlite3_stmt *)st); }
 OxlStr rt_sqlite_errstr(void *db) {
     /* errmsg's buffer is sqlite-owned — scope-copy before the next db

@@ -90,13 +90,13 @@ jobs:
           fi
           # A manifest-bump merge self-triggers this run with a range of
           # only its own chore commit — nothing new to release (#203).
-          # A rerun of a publish that died after tagging re-enters with
-          # its tag already at SHA, so that case falls through to the
-          # normal recovery path below.
-          if [ -z "$(git tag --points-at "$SHA" | grep -xE 'v[0-9]+\.[0-9]+\.[0-9]+')" ] \
-          && [ -z "$(git log --format=%s "$range" | grep -vE '^chore\(release\):')" ]; then
-            echo "sha=$SHA" >> "$GITHUB_OUTPUT"
-            exit 0
+          # Flag it rather than exiting: the extras lane below still ships
+          # pending extra/ changes, and a tag recovered at SHA or on the
+          # bump child (a rerun of a publish that died after tagging)
+          # still republishes — only a freshly computed tag is suppressed.
+          chore_only=0
+          if [ -z "$(git log --format=%s "$range" | grep -vE '^chore\(release\):')" ]; then
+            chore_only=1
           fi
           # lane split: the toolchain releases when anything outside
           # extra/ moved since the last bare v* tag; extras get their own
@@ -141,26 +141,32 @@ jobs:
           # tag. A manual dispatch bypasses the path check only for tag
           # recovery — an untagged sha has nothing to recover, so an
           # extras-only dispatch must not mint a new toolchain release.
-          if { [ -n "$changed" ] && printf '%s\n' "$changed" | grep -qv '^extra/'; } || { [ "$EVENT_NAME" = "workflow_dispatch" ] && [ -n "$tag" ]; }; then
+          if { { [ -n "$changed" ] && printf '%s\n' "$changed" | grep -qv '^extra/'; } \
+               || { [ "$EVENT_NAME" = "workflow_dispatch" ] && [ -n "$tag" ]; } ; } \
+          && { [ "$chore_only" = 0 ] || [ -n "$tag" ]; }; then
             do_tool=true
             [ -n "$tagsha" ] && SHA=$tagsha
             if [ -z "$tag" ]; then
               tag=$(scripts/release-version.sh next "$range")
+              # Manifest floor (#203): the manifest can run ahead of the
+              # tag series when a prior run stamped the version but died
+              # before tagging. `next` over this push's range then
+              # computes below the declared version, and the sha step
+              # would stamp a downgrade bump PR. Suppress instead — the
+              # next feature push recomputes over the tag series and
+              # converges on it. Only freshly computed tags are gated: a
+              # tag recovered above is a fixed tree being republished.
+              mver="$(git show "origin/main:docs/site/manifest.yaml" 2>/dev/null \
+                | sed -nE 's/^version[[:space:]]*:[[:space:]]*"?([^"[:space:]]*)"?[[:space:]]*$/\1/p' | head -1 || true)"
+              if [ -n "$mver" ] && [ "${tag#v}" != "$mver" ] \
+              && [ "$(printf '%s\n%s\n' "$mver" "${tag#v}" | sort -V | tail -1)" = "$mver" ]; then
+                echo "computed tag $tag is below manifest version $mver — stale-range downgrade suppressed (#203)" >&2
+                tag=""
+              fi
             fi
-            # Manifest floor (#203): the manifest can run ahead of the tag
-            # series when a prior run stamped the version but died before
-            # tagging. `next` over this push's range then computes below
-            # the declared version, and the sha step would stamp a
-            # downgrade bump PR. Suppress instead — the next feature push
-            # recomputes over the tag series and converges on it.
-            mver="$(git show "origin/main:docs/site/manifest.yaml" 2>/dev/null \
-              | sed -nE 's/^version[[:space:]]*:[[:space:]]*"?([^"[:space:]]*)"?[[:space:]]*$/\1/p' | head -1 || true)"
-            if [ -z "$mver" ] || [ "${tag#v}" = "$mver" ] \
-            || [ "$(printf '%s\n%s\n' "$mver" "${tag#v}" | sort -V | tail -1)" != "$mver" ]; then
+            if [ -n "$tag" ]; then
               echo "do_tool=true" >> "$GITHUB_OUTPUT"
               echo "tag=$tag" >> "$GITHUB_OUTPUT"
-            else
-              echo "computed tag $tag is below manifest version $mver — stale-range downgrade suppressed (#203)" >&2
             fi
           fi
           if [ -n "$echanged" ]; then

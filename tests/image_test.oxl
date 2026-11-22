@@ -1,0 +1,643 @@
+package main
+
+// image acceptance: std/image + std/image/{color,draw,png,bmp} —
+// buffer models and geometry, PNG decode across color types /
+// filters / sub-byte depths / PLTE+tRNS, BMP decode both bit depths
+// and row orders, magic-byte dispatch, encode→decode round-trips,
+// draw's src-over compositing, and the hostile-input errors.
+// PNG fixtures are python zlib.compress output over hand-built
+// scanlines (provenance noted per blob); BMP fixtures are byte-built.
+import "std/image"
+
+import "std/image/color"
+
+import "std/image/draw"
+
+import "std/image/png"
+
+import "std/image/bmp"
+
+import "std/io"
+
+import "std/errors"
+
+import "std/hash"
+
+import "std/encoding/hex"
+
+import "std/encoding/binary"
+
+import "std/testing"
+
+fn ck(e: err, m: str) {
+    testing.expect(e == nil, m + ": " + errors.msg(e))
+}
+
+fn hx(s: str) -> []byte {
+    [b, e] = hex.decode(s)
+    ck(e, "hex decode")
+    return b[0:len(b)]
+}
+
+// hxs is the str-shaped variant — decode inputs take []byte views.
+fn hxs(s: str) -> str {
+    return hx(s) as str
+}
+
+// memwr is the minimal io.Writer over a growable byte sink — the
+// encode(w, m) tests' destination.
+struct memwr { b: []byte }
+
+fn (w mut memwr) write(b: []byte) -> [int, err] {
+    i := 0
+    for i < len(b) {
+        w.b = push(w.b, b[i])
+        i = i + 1
+    }
+    return len(b), nil
+}
+
+fn (w mut memwr) aswriter() -> io.Writer {
+    return w
+}
+
+// atn reads pixel (x, y) of m back as straight-alpha NRGBA — the
+// premultiplied 16-bit at() space unpremultiplied, so expected
+// values spell like the stored samples.
+fn atn(m: image.Image, x: int, y: int) -> color.NRGBA {
+    c := m.at(x, y)
+    return color.unpremul16(c.rgba())
+}
+
+// slice reader for the io.Reader decode entries
+struct slicereader { b: []byte, i: int }
+
+fn (s mut slicereader) read(b: []byte) -> [int, err] {
+    if s.i >= len(s.b) {
+        return 0, io.eof()
+    }
+    n := len(s.b) - s.i
+    if n > len(b) {
+        n = len(b)
+    }
+    j := 0
+    for j < n {
+        b[j] = s.b[s.i + j]
+        j = j + 1
+    }
+    s.i = s.i + n
+    return n, nil
+}
+
+fn (s mut slicereader) asreader() -> io.Reader {
+    return s
+}
+
+// ---------- buffers, geometry, color ----------
+fn test_rgba_buffer() {
+    m := image.new_rgba(image.rect(0, 0, 4, 3))
+    b := m.bounds()
+    testing.expect_eq(b.dx(), 4, "rgba dx")
+    testing.expect_eq(b.dy(), 3, "rgba dy")
+    red := color.RGBA{r: 200, g: 10, b: 20, a: 255}
+    m.setrgba(2, 1, red)
+    got := m.atrgba(2, 1)
+    testing.expect_eq(got.r, 200, "rgba at r")
+    testing.expect_eq(got.a, 255, "rgba at a")
+    // out-of-bounds reads the zero color; writes are a no-op
+    oob := m.atrgba(9, 9)
+    testing.expect_eq(oob.a, 0, "rgba oob")
+    m.setrgba(9, 9, red)
+    // set through the generic path keeps premultiplied bytes
+    half := color.NRGBA{r: 100, g: 0, b: 0, a: 128}
+    m.set(1, 1, half.ascolor())
+    hp := m.atrgba(1, 1)
+    testing.expect_eq(hp.r, 100 * 128 / 255, "rgba set premul r")
+    testing.expect_eq(hp.a, 128, "rgba set a")
+}
+
+fn test_nrgba_gray_buffer() {
+    n := image.new_nrgba(image.rect(0, 0, 2, 2))
+    c := color.NRGBA{r: 10, g: 20, b: 30, a: 200}
+    n.setnrgba(0, 1, c)
+    got := n.atnrgba(0, 1)
+    testing.expect_eq(got.g, 20, "nrgba g")
+    testing.expect_eq(got.a, 200, "nrgba a")
+    // generic set on NRGBA unpremultiplies back to straight bytes
+    pre := color.RGBA{r: 50, g: 0, b: 0, a: 100}
+    n.set(1, 1, pre.ascolor())
+    back := n.atnrgba(1, 1)
+    testing.expect_eq(back.r, 50 * 255 / 100, "nrgba unpremul r")
+    testing.expect_eq(back.a, 100, "nrgba unpremul a")
+    g := image.new_gray(image.rect(0, 0, 2, 2))
+    gc := color.Gray{y: 77}
+    g.setgray(1, 1, gc)
+    testing.expect_eq(g.atgray(1, 1).y, 77, "gray y")
+    // white set() lands on max luminance
+    wh := color.NRGBA{r: 255, g: 255, b: 255, a: 255}
+    g.set(0, 0, wh.ascolor())
+    testing.expect_eq(g.atgray(0, 0).y, 255, "gray white")
+}
+
+fn test_rect() {
+    r := image.rect(1, 2, 5, 8)
+    testing.expect_eq(r.dx(), 4, "rect dx")
+    testing.expect_eq(r.dy(), 6, "rect dy")
+    testing.expect(!r.empty(), "rect nonempty")
+    e := image.rect(3, 3, 3, 9)
+    testing.expect(e.empty(), "rect empty")
+    clip := r.intersect(image.rect(4, 0, 9, 4))
+    testing.expect_eq(clip.min.x, 4, "clip minx")
+    testing.expect_eq(clip.max.y, 4, "clip maxy")
+    none := r.intersect(image.rect(9, 9, 10, 10))
+    testing.expect(none.empty(), "clip disjoint")
+}
+
+fn test_color_premul() {
+    // NRGBA{100,50,200,128} -> 16-bit premultiplied
+    n := color.NRGBA{r: 100, g: 50, b: 200, a: 128}
+    q := n.rgba()
+    testing.expect_eq(q.r, 100 * 257 * 128 / 255, "premul r")
+    testing.expect_eq(q.a, 128 * 257, "premul a")
+    // opaque is a plain widen
+    o := color.NRGBA{r: 7, g: 8, b: 9, a: 255}
+    qo := o.rgba()
+    testing.expect_eq(qo.r, 7 * 257, "opaque r")
+    // gray is equal channels, always opaque
+    gy := color.Gray{y: 5}
+    qg := gy.rgba()
+    testing.expect_eq(qg.r, 5 * 257, "gray r")
+    testing.expect_eq(qg.a, 65535, "gray a")
+}
+
+// ---------- PNG decode ----------
+
+// python: ct6 3x2, filter 0 rows, zlib.compress(level 9)
+fn test_png_rgba() {
+    [m, e] = png.decodebytes(hx("89504e470d0a1a0a0000000d49484452000000030000000208060000009d74661a000000194944415478da63f8cfc0f01f0c19feff07a10620e100e20300a13e0cb54f5b7a210000000049454e44ae426082"))
+    ck(e, "png ct6")
+    b := m.bounds()
+    testing.expect_eq(b.dx(), 3, "ct6 w")
+    testing.expect_eq(b.dy(), 2, "ct6 h")
+    p := atn(m, 0, 0)
+    testing.expect_eq(p.r, 255, "ct6 p0 r")
+    testing.expect_eq(p.a, 255, "ct6 p0 a")
+    p1 := atn(m, 1, 0)
+    testing.expect_eq(p1.g, 255, "ct6 p1 g")
+    p3 := atn(m, 0, 1)
+    testing.expect_eq(p3.r, 255, "ct6 p3 r")
+    testing.expect_eq(p3.g, 255, "ct6 p3 g")
+    testing.expect_eq(p3.a, 128, "ct6 p3 a")
+    // a=0 flushes the stored rgb on the premultiplied read-back —
+    // only alpha is checkable there
+    p5 := atn(m, 2, 1)
+    testing.expect_eq(p5.a, 0, "ct6 p5 a")
+    p4 := atn(m, 1, 1)
+    testing.expect_eq(p4.g, 255, "ct6 p4 g")
+    testing.expect_eq(p4.b, 255, "ct6 p4 b")
+    testing.expect_eq(p4.a, 64, "ct6 p4 a")
+}
+
+// python: ct2 2x2 truecolor
+fn test_png_rgb() {
+    [m, e] = png.decodebytes(hx("89504e470d0a1a0a0000000d4948445200000002000000020802000000fdd49a73000000164944415478da63e01291d330b261700b884ac9ab00000f18030db9b9e8640000000049454e44ae426082"))
+    ck(e, "png ct2")
+    p := atn(m, 0, 0)
+    testing.expect_eq(p.r, 10, "ct2 r")
+    testing.expect_eq(p.g, 20, "ct2 g")
+    testing.expect_eq(p.b, 30, "ct2 b")
+    testing.expect_eq(p.a, 255, "ct2 opaque")
+    p3 := atn(m, 1, 1)
+    testing.expect_eq(p3.b, 120, "ct2 p3 b")
+}
+
+// python: ct0 4x1 gray, samples 0/85/170/255
+fn test_png_gray() {
+    [m, e] = png.decodebytes(hx("89504e470d0a1a0a0000000d4948445200000004000000010800000000dc5750110000000d4944415478da6360085df51f00035701fff23860ff0000000049454e44ae426082"))
+    ck(e, "png ct0")
+    p := atn(m, 1, 0)
+    testing.expect_eq(p.r, 85, "ct0 g1")
+    testing.expect_eq(p.a, 255, "ct0 a")
+    p3 := atn(m, 3, 0)
+    testing.expect_eq(p3.r, 255, "ct0 g3")
+}
+
+// python: ct3 4x1 palette + tRNS — indices 0..3, palette
+// red/green/blue/white, alpha 255/128/64/0
+fn test_png_pal() {
+    [m, e] = png.decodebytes(hx("89504e470d0a1a0a0000000d4948445200000004000000010803000000cee2ffff0000000c504c5445ff000000ff000000fffffffffb0060f60000000474524e53ff8040007cda34ee0000000d4944415478da63606064620600000f00075bd08b7d0000000049454e44ae426082"))
+    ck(e, "png ct3")
+    p0 := atn(m, 0, 0)
+    testing.expect_eq(p0.r, 255, "pal0 r")
+    testing.expect_eq(p0.a, 255, "pal0 a")
+    p2 := atn(m, 2, 0)
+    testing.expect_eq(p2.b, 255, "pal2 b")
+    testing.expect_eq(p2.a, 64, "pal2 a")
+    p3 := atn(m, 3, 0)
+    testing.expect_eq(p3.a, 0, "pal3 a")
+}
+
+// python: ct4 2x1 gray+alpha
+fn test_png_graya() {
+    [m, e] = png.decodebytes(hx("89504e470d0a1a0a0000000d49484452000000020000000108040000005e2bb7010000000d4944415478da6338f13fa50100076a02ac90f74c010000000049454e44ae426082"))
+    ck(e, "png ct4")
+    p := atn(m, 0, 0)
+    testing.expect_eq(p.r, 200, "ct4 g")
+    testing.expect_eq(p.a, 255, "ct4 a")
+    p1 := atn(m, 1, 0)
+    testing.expect_eq(p1.r, 100, "ct4 g1")
+    testing.expect_eq(p1.a, 128, "ct4 a1")
+}
+
+// python: ct6 3x5 — one row per filter type (None, Sub, Up,
+// Average, Paeth); the encoder wrote each row's filter honestly
+fn test_png_filters() {
+    [m, e] = png.decodebytes(hx("89504e470d0a1a0a0000000d4948445200000003000000050806000000807156a2000000354944415478da63606060f8af2127f23fc046e33f239788dc752087018499809c1b30cc2ca26163202929f906845920a2220c200c00e3070da772d618bc0000000049454e44ae426082"))
+    ck(e, "png filters")
+    // expected raw rows: x*40+y*10, x*30+y*20, x*20+y*30, 255-y*40
+    y := 0
+    for y < 5 {
+        x := 0
+        for x < 3 {
+            p := atn(m, x, y)
+            want_r := (x * 40 + y * 10) % 256
+            want_g := (x * 30 + y * 20) % 256
+            want_b := (x * 20 + y * 30) % 256
+            want_a := (255 - y * 40) % 256
+            // premul->unpremul round-off tolerance: the source rows
+            // were straight-alpha so atn lands within ±1
+            dr := p.r - want_r
+            if dr < 0 {
+                dr = -dr
+            }
+            dg := p.g - want_g
+            if dg < 0 {
+                dg = -dg
+            }
+            db := p.b - want_b
+            if db < 0 {
+                db = -db
+            }
+            da := p.a - want_a
+            if da < 0 {
+                da = -da
+            }
+            testing.expect(dr <= 1 && dg <= 1 && db <= 1 && da <= 1, "filter px " + itoa(x) + "," + itoa(y) + " r=" + itoa(p.r) + " g=" + itoa(p.g) + " b=" + itoa(p.b) + " a=" + itoa(p.a))
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+// python: ct0 depth-1 8x1 — sample bits 10110010 -> 0xB2
+fn test_png_subbyte() {
+    [m, e] = png.decodebytes(hx("89504e470d0a1a0a0000000d4948445200000008000000010100000000cb7bd2ee0000000a4944415478da63d8040000b400b38990cd2f0000000049454e44ae426082"))
+    ck(e, "png depth1")
+    p0 := atn(m, 0, 0)
+    testing.expect_eq(p0.r, 255, "d1 bit0")
+    p1 := atn(m, 1, 0)
+    testing.expect_eq(p1.r, 0, "d1 bit1")
+    p4 := atn(m, 4, 0)
+    testing.expect_eq(p4.r, 0, "d1 bit4")
+    // ct0 depth-2 4x1 — samples 0,1,2,3 -> 0x1B -> 0/85/170/255
+    [m2, e2] = png.decodebytes(hx("89504e470d0a1a0a0000000d494844520000000400000001020000000096e748b00000000a4944415478da63900600001d001c237c8fac0000000049454e44ae426082"))
+    ck(e2, "png depth2")
+    q0 := atn(m2, 0, 0)
+    testing.expect_eq(q0.r, 0, "d2 s0")
+    q2 := atn(m2, 2, 0)
+    testing.expect_eq(q2.r, 170, "d2 s2")
+    q3 := atn(m2, 3, 0)
+    testing.expect_eq(q3.r, 255, "d2 s3")
+    // ct3 depth-4 4x1 — nibbles 0,1,2,3 -> bytes 0x01 0x23
+    [m3, e3] = png.decodebytes(hx("89504e470d0a1a0a0000000d49484452000000040000000104030000000b1212fe0000000c504c54450a000000140000001e282828c95fd1820000000b4944415478da636054060000280025a96762080000000049454e44ae426082"))
+    ck(e3, "png pal depth4")
+    r0 := atn(m3, 0, 0)
+    testing.expect_eq(r0.r, 10, "d4 p0 r")
+    r2 := atn(m3, 2, 0)
+    testing.expect_eq(r2.b, 30, "d4 p2 b")
+    r3 := atn(m3, 3, 0)
+    testing.expect_eq(r3.r, 40, "d4 p3 r")
+}
+
+fn test_png_errors() {
+    // truncated signature
+    [_m, e] = png.decodebytes(hx("89504e"))
+    testing.expect(e != nil, "png short sig")
+    testing.expect_streq(errors.msg(e), "png: bad signature", "sig msg")
+    // non-PNG bytes
+    [_m2, e2] = png.decodebytes(hx("5a5a5a5a5a5a5a5a0000000d49484452"))
+    testing.expect(e2 != nil, "png non-png")
+    // truncated mid-IDAT
+    [_m3, e3] = png.decodebytes(hx("89504e470d0a1a0a0000000d49484452000000030000000208060000009d74661a0000001949444154"))
+    testing.expect(e3 != nil, "png truncated chunk")
+    // corrupt a byte inside IDAT data — the crc gate fires first
+    bad := hx("89504e470d0a1a0a0000000d49484452000000030000000208060000009d74661a000000194944415478da63f8cfc0f01f0c19feff07a10620e100e20300a13e0cb54f5b7a210000000049454e44ae426082")
+    bad[50] = bad[50] + 1
+    [_m4, e4] = png.decodebytes(bad)
+    testing.expect(e4 != nil, "png corrupt")
+    testing.expect_streq(errors.msg(e4), "png: bad chunk crc", "crc msg")
+    // interlaced — patch IHDR's interlace byte and re-crc the chunk
+    il := hx("89504e470d0a1a0a0000000d49484452000000030000000208060000009d74661a000000194944415478da63f8cfc0f01f0c19feff07a10620e100e20300a13e0cb54f5b7a210000000049454e44ae426082")
+    il[28] = 1
+    sum := hash.crc32(il[12:29])
+    binary.put_be_u32(il, 29, sum)
+    [_m5, e5] = png.decodebytes(il)
+    testing.expect(e5 != nil, "png interlaced")
+    testing.expect_streq(errors.msg(e5), "png: interlaced images not supported", "interlace msg")
+    // 16-bit depth — patch + re-crc; unsupported
+    d16 := hx("89504e470d0a1a0a0000000d49484452000000030000000208060000009d74661a000000194944415478da63f8cfc0f01f0c19feff07a10620e100e20300a13e0cb54f5b7a210000000049454e44ae426082")
+    d16[24] = 16
+    sum2 := hash.crc32(d16[12:29])
+    binary.put_be_u32(d16, 29, sum2)
+    [_m6, e6] = png.decodebytes(d16)
+    testing.expect(e6 != nil, "png 16bit")
+    testing.expect_streq(errors.msg(e6), "png: unsupported bit depth", "depth msg")
+}
+
+fn test_png_limits() {
+    oversized := hx("89504e470d0a1a0a0000000d49484452000000030000000208060000009d74661a000000194944415478da63f8cfc0f01f0c19feff07a10620e100e20300a13e0cb54f5b7a210000000049454e44ae426082")
+    binary.put_be_u32(oversized, 16, 32769)
+    binary.put_be_u32(oversized, 29, hash.crc32(oversized[12:29]))
+    [_m, e] = png.decodebytes(oversized)
+    testing.expect(e != nil, "png dimension limit")
+
+    excess := hx("89504e470d0a1a0a0000000d49484452000000030000000208060000009d74661a000000194944415478da63f8cfc0f01f0c19feff07a10620e100e20300a13e0cb54f5b7a210000000049454e44ae426082")
+    binary.put_be_u32(excess, 16, 1)
+    binary.put_be_u32(excess, 20, 1)
+    binary.put_be_u32(excess, 29, hash.crc32(excess[12:29]))
+    [_m2, e2] = png.decodebytes(excess)
+    testing.expect(e2 != nil, "png excess decompressed data")
+}
+
+// ---------- PNG encode ----------
+fn test_png_roundtrip() {
+    // build an NRGBA with a gradient + transparent corner, encode,
+    // decode, pixel-compare
+    src := image.new_nrgba(image.rect(0, 0, 5, 4))
+    y := 0
+    for y < 4 {
+        x := 0
+        for x < 5 {
+            a := 255
+            if x == 0 && y == 0 {
+                a = 0
+            }
+            if x == 4 && y == 3 {
+                a = 100
+            }
+            src.setnrgba(x, y, color.NRGBA{r: x * 50 % 256, g: y * 60 % 256, b: (x * 17 + y * 31) % 256, a: a})
+            x = x + 1
+        }
+        y = y + 1
+    }
+    [enc, ee] = png.encodebytes(src.asimage())
+    ck(ee, "png encode")
+    [back, de] = png.decodebytes(enc[0:len(enc)])
+    ck(de, "png re-decode")
+    y = 0
+    for y < 4 {
+        x := 0
+        for x < 5 {
+            want := src.atnrgba(x, y)
+            gotp := atn(back, x, y)
+            dr := gotp.r - want.r
+            if dr < 0 {
+                dr = -dr
+            }
+            dg := gotp.g - want.g
+            if dg < 0 {
+                dg = -dg
+            }
+            db := gotp.b - want.b
+            if db < 0 {
+                db = -db
+            }
+            da := gotp.a - want.a
+            if da < 0 {
+                da = -da
+            }
+            // premul->unpremul can drift one unit on partial alpha
+            testing.expect(dr <= 1 && dg <= 1 && db <= 1 && da <= 1, "rt px " + itoa(x) + "," + itoa(y))
+            x = x + 1
+        }
+        y = y + 1
+    }
+    // the encoded blob is a real PNG — signature + decodable chunks
+    testing.expect_eq(enc[1], 80, "rt sig P")
+    // encode through the io.Writer surface lands the same bytes
+    w := memwr{b: mkslice(byte, 0)}
+    we := png.encode(w.aswriter(), src.asimage())
+    ck(we, "png encode w")
+    testing.expect_eq(len(w.b), len(enc), "writer bytes")
+    testing.expect_streq(w.b as str, enc as str, "writer content")
+}
+
+// ---------- BMP ----------
+
+// byte-built: 24-bit 2x2 bottom-up — TL red, TR green, BL blue,
+// BR white (fixture rows stored bottom first)
+fn test_bmp24() {
+    [m, e] = bmp.decodebytes(hx("424d460000000000000036000000280000000200000002000000010018000000000010000000130b0000130b00000000000000000000ff0000ffffff00000000ff00ff000000"))
+    ck(e, "bmp24")
+    p := atn(m, 0, 0)
+    testing.expect_eq(p.r, 255, "bmp tl r")
+    p1 := atn(m, 1, 0)
+    testing.expect_eq(p1.g, 255, "bmp tr g")
+    p2 := atn(m, 0, 1)
+    testing.expect_eq(p2.b, 255, "bmp bl b")
+    p3 := atn(m, 1, 1)
+    testing.expect_eq(p3.r + p3.g + p3.b, 765, "bmp br white")
+    testing.expect_eq(p3.a, 255, "bmp opaque")
+}
+
+// byte-built: 32-bit 2x1 — (10,20,30,200) (40,50,60,128); the
+// stored fourth byte decodes as alpha
+fn test_bmp32() {
+    [m, e] = bmp.decodebytes(hx("424d3e0000000000000036000000280000000200000001000000010020000000000008000000130b0000130b000000000000000000001e140ac83c322880"))
+    ck(e, "bmp32")
+    p := atn(m, 0, 0)
+    testing.expect_eq(p.r, 10, "bmp32 r")
+    testing.expect_eq(p.a, 200, "bmp32 a")
+    p1 := atn(m, 1, 0)
+    testing.expect_eq(p1.g, 50, "bmp32 g1")
+    testing.expect_eq(p1.a, 128, "bmp32 a1")
+}
+
+// byte-built: 24-bit 2x2 TOP-DOWN (negative height) — rows stored
+// top first: (1,2,3)(4,5,6) / (7,8,9)(10,11,12)
+fn test_bmp_topdown() {
+    [m, e] = bmp.decodebytes(hx("424d4600000000000000360000002800000002000000feffffff010018000000000010000000130b0000130b0000000000000000000003020106050400000908070c0b0a0000"))
+    ck(e, "bmp topdown")
+    p := atn(m, 0, 0)
+    testing.expect_eq(p.r, 1, "td tl r")
+    p1 := atn(m, 1, 0)
+    testing.expect_eq(p1.r, 4, "td tr r")
+    p2 := atn(m, 0, 1)
+    testing.expect_eq(p2.r, 7, "td bl r")
+    p3 := atn(m, 1, 1)
+    testing.expect_eq(p3.b, 12, "td br b")
+}
+
+fn test_bmp_errors() {
+    [_m, e] = bmp.decodebytes(hx("5a5a4600"))
+    testing.expect(e != nil, "bmp bad magic")
+    // 8-bit indexed — patch bpp field of the 24-bit fixture
+    idx := hx("424d460000000000000036000000280000000200000002000000010018000000000010000000130b0000130b00000000000000000000ff0000ffffff00000000ff00ff000000")
+    idx[28] = 8
+    [_m2, e2] = bmp.decodebytes(idx)
+    testing.expect(e2 != nil, "bmp indexed")
+    testing.expect_streq(errors.msg(e2), "bmp: unsupported bit depth", "bpp msg")
+    // compressed flag on
+    cmp := hx("424d460000000000000036000000280000000200000002000000010018000000000010000000130b0000130b00000000000000000000ff0000ffffff00000000ff00ff000000")
+    cmp[30] = 1
+    [_m3, e3] = bmp.decodebytes(cmp)
+    testing.expect(e3 != nil, "bmp compressed")
+    // pixel data truncated — shrink the file tail
+    tr := hx("424d460000000000000036000000280000000200000002000000010018000000000010000000130b0000130b00000000000000000000ff0000ffffff00000000ff00ff000000")
+    [_m4, e4] = bmp.decodebytes(tr[0:60])
+    testing.expect(e4 != nil, "bmp truncated")
+}
+
+fn test_bmp_limits() {
+    b := hx("424d460000000000000036000000280000000200000002000000010018000000000010000000130b0000130b0000130b00000000000000000000ff0000ffffff00000000ff00ff000000")
+    binary.put_le_u32(b, 18, 32769)
+    [_m, e] = bmp.decodebytes(b)
+    testing.expect(e != nil, "bmp dimension limit")
+}
+
+fn test_image_size_limits() {
+    r := image.new_rgba(image.rect(0, 0, 4097, 4097))
+    testing.expect_eq(len(r.pix), 0, "rgba pixel limit")
+    n := image.new_nrgba(image.rect(0, 0, 32769, 1))
+    testing.expect_eq(len(n.pix), 0, "nrgba dimension limit")
+    g := image.new_gray(image.rect(0, 0, 32769, 1))
+    testing.expect_eq(len(g.pix), 0, "gray dimension limit")
+}
+
+fn test_bmp_roundtrip() {
+    src := image.new_nrgba(image.rect(0, 0, 3, 3))
+    y := 0
+    for y < 3 {
+        x := 0
+        for x < 3 {
+            src.setnrgba(x, y, color.NRGBA{r: x * 80 % 256, g: y * 90 % 256, b: (x + y) * 40 % 256, a: 255})
+            x = x + 1
+        }
+        y = y + 1
+    }
+    [enc, ee] = bmp.encodebytes(src.asimage())
+    ck(ee, "bmp encode")
+    testing.expect_eq(len(enc), 54 + 12 * 3, "bmp size")
+    [back, de] = bmp.decodebytes(enc[0:len(enc)])
+    ck(de, "bmp re-decode")
+    y = 0
+    for y < 3 {
+        x := 0
+        for x < 3 {
+            want := src.atnrgba(x, y)
+            gotp := atn(back, x, y)
+            testing.expect_eq(gotp.r, want.r, "bmp rt r")
+            testing.expect_eq(gotp.g, want.g, "bmp rt g")
+            testing.expect_eq(gotp.b, want.b, "bmp rt b")
+            testing.expect_eq(gotp.a, 255, "bmp rt a")
+            x = x + 1
+        }
+        y = y + 1
+    }
+    w := memwr{b: mkslice(byte, 0)}
+    we := bmp.encode(w.aswriter(), src.asimage())
+    ck(we, "bmp encode w")
+    testing.expect_streq(w.b as str, enc as str, "bmp writer")
+}
+
+// ---------- magic dispatch + io.Reader entries ----------
+fn test_decode_dispatch() {
+    sr := slicereader{b: hx("89504e470d0a1a0a0000000d4948445200000004000000010800000000dc5750110000000d4944415478da6360085df51f00035701fff23860ff0000000049454e44ae426082"), i: 0}
+    [m, e] = image.decode(sr.asreader())
+    ck(e, "decode png stream")
+    b := m.bounds()
+    testing.expect_eq(b.dx(), 4, "dispatch png w")
+    sr2 := slicereader{b: hx("424d460000000000000036000000280000000200000002000000010018000000000010000000130b0000130b00000000000000000000ff0000ffffff00000000ff00ff000000"), i: 0}
+    [m2, e2] = image.decode(sr2.asreader())
+    ck(e2, "decode bmp stream")
+    p := atn(m2, 0, 0)
+    testing.expect_eq(p.r, 255, "dispatch bmp px")
+    [_m3, e3] = image.decodebytes(hx("5a5a5a5a5a5a5a5a5a5a"))
+    testing.expect(e3 != nil, "unknown fmt")
+    testing.expect_streq(errors.msg(e3), "image: unknown format", "unknown msg")
+    // the in-memory entry on each format package too
+    [m4, e4] = image.decodebytes(hx("89504e470d0a1a0a0000000d4948445200000002000000020802000000fdd49a73000000164944415478da63e01291d330b261700b884ac9ab00000f18030db9b9e8640000000049454e44ae426082"))
+    ck(e4, "decodebytes png")
+    p4 := atn(m4, 0, 0)
+    testing.expect_eq(p4.r, 10, "decodebytes px")
+}
+
+// ---------- draw ----------
+fn test_draw_src() {
+    dst := image.new_nrgba(image.rect(0, 0, 4, 4))
+    src := image.new_nrgba(image.rect(0, 0, 2, 2))
+    red := color.NRGBA{r: 255, g: 0, b: 0, a: 255}
+    draw.fill(src.aswimage(), red.ascolor())
+    draw.draw(dst.aswimage(), image.rect(1, 1, 3, 3), src.asimage(), image.pt(0, 0), draw.op_src)
+    got := dst.atnrgba(1, 1)
+    testing.expect_eq(got.r, 255, "draw src px")
+    untouched := dst.atnrgba(0, 0)
+    testing.expect_eq(untouched.a, 0, "draw src untouched")
+    // an r hanging off dst's corner clips both ways: dst(0,0)
+    // lands on src(1,1) and nothing out-of-range is read
+    draw.draw(dst.aswimage(), image.rect(-1, -1, 3, 3), src.asimage(), image.pt(0, 0), draw.op_src)
+    c2 := dst.atnrgba(0, 0)
+    testing.expect_eq(c2.r, 255, "draw clip px")
+    // a fully out-of-range draw is a no-op, not a trap
+    draw.draw(dst.aswimage(), image.rect(9, 9, 11, 11), src.asimage(), image.pt(0, 0), draw.op_src)
+}
+
+fn test_draw_over() {
+    dst := image.new_nrgba(image.rect(0, 0, 2, 2))
+    src := image.new_nrgba(image.rect(0, 0, 2, 2))
+    blue := color.NRGBA{r: 0, g: 0, b: 255, a: 255}
+    half := color.NRGBA{r: 255, g: 0, b: 0, a: 128}
+    draw.fill(dst.aswimage(), blue.ascolor())
+    draw.fill(src.aswimage(), half.ascolor())
+    draw.draw(dst.aswimage(), image.rect(0, 0, 2, 2), src.asimage(), image.pt(0, 0), draw.op_over)
+    m := dst.atnrgba(0, 0)
+    // 50% red over opaque blue -> ~ (128, 0, 127, 255)
+    dr := m.r - 128
+    if dr < 0 {
+        dr = -dr
+    }
+    db := m.b - 127
+    if db < 0 {
+        db = -db
+    }
+    testing.expect(dr <= 1 && db <= 1, "over mix " + itoa(m.r) + "," + itoa(m.b))
+    testing.expect_eq(m.a, 255, "over a")
+    // over onto a premul RGBA dst — the composition math is model
+    // agnostic through the 16-bit space
+    d2 := image.new_rgba(image.rect(0, 0, 1, 1))
+    draw.fill(d2.aswimage(), blue.ascolor())
+    draw.draw(d2.aswimage(), image.rect(0, 0, 1, 1), src.asimage(), image.pt(0, 0), draw.op_over)
+    m2 := d2.atrgba(0, 0)
+    testing.expect_eq(m2.a, 255, "over rgba a")
+    dr2 := m2.r - 128
+    if dr2 < 0 {
+        dr2 = -dr2
+    }
+    testing.expect(dr2 <= 1, "over rgba r")
+}
+
+fn test_draw_copy() {
+    dst := image.new_nrgba(image.rect(0, 0, 4, 4))
+    src := image.new_nrgba(image.rect(0, 0, 2, 2))
+    green := color.NRGBA{r: 0, g: 255, b: 0, a: 255}
+    draw.fill(src.aswimage(), green.ascolor())
+    n := draw.copy(dst.aswimage(), image.pt(3, 3), src.asimage(), image.rect(0, 0, 2, 2), draw.op_src)
+    // only (3,3) fits inside dst — a partial blit reports its count
+    testing.expect_eq(n, 1, "copy clipped count")
+    got := dst.atnrgba(3, 3)
+    testing.expect_eq(got.g, 255, "copy px")
+    n2 := draw.copy(dst.aswimage(), image.pt(0, 0), src.asimage(), image.rect(0, 0, 2, 2), draw.op_src)
+    testing.expect_eq(n2, 4, "copy full count")
+}
+
+fn main() {}

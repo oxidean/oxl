@@ -1,0 +1,188 @@
+package image
+
+// std/image bmp — the BMP half of package image's codec surface
+// (see image.oxl for why the formats live here). Decode covers the
+// common uncompressed shape: BITMAPINFOHEADER-and-later DIB headers
+// at 24 or 32 bits, BI_RGB, bottom-up or top-down rows — OS/2 CORE
+// headers, bitfield/compressed modes, and indexed palettes are
+// rejected. A 32-bit BI_RGB file's fourth byte is decoded as stored
+// (alpha as written, often 0 on files that treat it as padding —
+// decode honors it; encode never writes it). Encode always emits
+// 24-bit bottom-up BI_RGB.
+import "std/io"
+
+import "std/errors"
+
+import "std/encoding/binary"
+
+import "std/image/color"
+
+// bmp_run parses the file + DIB headers and expands pixels into an
+// NRGBA — BMP stores straight BGR(A) triples, the non-premultiplied
+// buffer's layout.
+fn bmp_run(b: []byte) -> [Image, err] {
+    if len(b) < 18 || b[0] != 66 || b[1] != 77 {
+        return nil, errors.new("bmp: bad signature")
+    }
+    pixoff := binary.le_u32(b, 10)
+    hdrsize := binary.le_u32(b, 14)
+    if hdrsize < 40 {
+        return nil, errors.new("bmp: unsupported DIB header")
+    }
+    if len(b) < 14 + hdrsize {
+        return nil, errors.new("bmp: truncated header")
+    }
+    if pixoff < 14 + hdrsize {
+        return nil, errors.new("bmp: invalid pixel offset")
+    }
+    w := binary.le_u32(b, 18)
+    h := binary.le_u32(b, 22)
+    topdown := 0
+    // int32 height signs the row order — le_u32 reads the two's
+    // complement pattern, so a negative height wraps high
+    if h > 2147483647 {
+        topdown = 1
+        h = 4294967296 - h
+    }
+    if w <= 0 || h <= 0 || !image_dims_ok(w, h) {
+        return nil, errors.new("bmp: image dimensions exceed limits")
+    }
+    if binary.le_u16(b, 26) != 1 {
+        return nil, errors.new("bmp: bad plane count")
+    }
+    bpp := binary.le_u16(b, 28)
+    if bpp != 24 && bpp != 32 {
+        return nil, errors.new("bmp: unsupported bit depth")
+    }
+    if binary.le_u32(b, 30) != 0 {
+        return nil, errors.new("bmp: compression not supported")
+    }
+    bypp := bpp / 8
+    rowlen := (w * bypp + 3) / 4 * 4
+    if pixoff + rowlen * h > len(b) {
+        return nil, errors.new("bmp: truncated pixel data")
+    }
+    // own-boxed so the returned iface stays valid past this frame —
+    // see png_run for the borrow-dangle details
+    m := new(new_nrgba(rect(0, 0, w, h)))
+    y := 0
+    for y < h {
+        src := y
+        if topdown == 0 {
+            src = h - 1 - y
+        }
+        row := pixoff + src * rowlen
+        x := 0
+        for x < w {
+            i := row + x * bypp
+            a := 255
+            if bypp == 4 {
+                a = b[i + 3]
+            }
+            m.setnrgba(x, y, color.NRGBA{r: b[i + 2], g: b[i + 1], b: b[i], a: a})
+            x = x + 1
+        }
+        y = y + 1
+    }
+    let mi: Image = m
+    return mi, nil
+}
+
+/// bmp_decode decodes a BMP stream — the io.Reader entry over
+/// bmp_decodebytes.
+fn bmp_decode(r: io.Reader) -> [Image, err] {
+    [data, e] = image_readall(r)
+    if e != nil {
+        return nil, e
+    }
+    return bmp_decodebytes(data as []byte)
+}
+
+/// bmp_decodebytes decodes a BMP held in memory.
+fn bmp_decodebytes(b: []byte) -> [Image, err] {
+    return bmp_run(b)
+}
+
+// bmp_bytes renders m as a 24-bit bottom-up BI_RGB BMP — alpha is
+// dropped (24-bit carries none; callers wanting alpha pick PNG).
+fn bmp_bytes(m: Image) -> []byte {
+    r := m.bounds()
+    w := r.dx()
+    h := r.dy()
+    rowlen := (w * 3 + 3) / 4 * 4
+    out := mkslice(byte, 0)
+    // BITMAPFILEHEADER — "BM", file size, reserved, data offset
+    out = push(out, 66)
+    out = push(out, 77)
+    size := 54 + rowlen * h
+    j := 0
+    for j < 4 {
+        out = push(out, size / pw2(j * 8) % 256)
+        j = j + 1
+    }
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 54)
+    out = push(out, 0)
+    out = push(out, 0)
+    out = push(out, 0)
+    // BITMAPINFOHEADER — 40 bytes, bottom-up (positive height)
+    hdr := mkslice(byte, 40)
+    binary.put_le_u32(hdr, 0, 40)
+    binary.put_le_u32(hdr, 4, w)
+    binary.put_le_u32(hdr, 8, h)
+    binary.put_le_u16(hdr, 12, 1)
+    binary.put_le_u16(hdr, 14, 24)
+    binary.put_le_u32(hdr, 20, rowlen * h)
+    binary.put_le_u32(hdr, 24, 2835) // 72 dpi
+    binary.put_le_u32(hdr, 28, 2835)
+    j = 0
+    for j < 40 {
+        out = push(out, hdr[j])
+        j = j + 1
+    }
+    y := h - 1
+    for y >= 0 {
+        x := 0
+        pad := rowlen
+        for x < w {
+            c := m.at(r.min.x + x, r.min.y + y)
+            n := color.unpremul16(c.rgba())
+            out = push(out, n.b)
+            out = push(out, n.g)
+            out = push(out, n.r)
+            pad = pad - 3
+            x = x + 1
+        }
+        for pad > 0 {
+            out = push(out, 0)
+            pad = pad - 1
+        }
+        y = y - 1
+    }
+    return out
+}
+
+/// bmp_encode writes m to w as a 24-bit BMP.
+fn bmp_encode(w: io.Writer, m: Image) -> err {
+    out := bmp_bytes(m)
+    pos := 0
+    for pos < len(out) {
+        [n, e] = w.write(out[pos:])
+        if e != nil {
+            return e
+        }
+        if n <= 0 {
+            return io.noprogress()
+        }
+        pos = pos + n
+    }
+    return nil
+}
+
+/// bmp_encodebytes renders m to an in-RAM BMP.
+fn bmp_encodebytes(m: Image) -> [own []byte, err] {
+    return new(bmp_bytes(m)), nil
+}

@@ -743,6 +743,14 @@ for t in test_dist_oob test_overlap_ok test_btype3 test_oversub test_stored_badl
     grep -q "$t ... ok" <<<"$out" || { echo "FAIL hostile: $out"; exit 1; }
 done
 
+echo "== oxl test: image =="
+out=$("$OXL" test tests/image_test.oxl)
+printf '%s
+' "$out" >&2
+for t in test_rgba_buffer test_nrgba_gray_buffer test_rect test_color_premul test_png_rgba test_png_rgb test_png_gray test_png_pal test_png_graya test_png_filters test_png_subbyte test_png_errors test_png_limits test_png_roundtrip test_bmp24 test_bmp32 test_bmp_topdown test_bmp_errors test_bmp_limits test_image_size_limits test_bmp_roundtrip test_decode_dispatch test_draw_src test_draw_over test_draw_copy; do
+    grep -q "$t ... ok" <<<"$out" || { echo "FAIL image: $out"; exit 1; }
+done
+
 echo "== oxl test: regexp (s5) =="
 out=$("$OXL" test tests/regexp_test.oxl)
 printf '%s
@@ -1087,7 +1095,8 @@ echo "== bootstrap checker =="
 # methods in package main — without the gate the self checker would
 # misread the builtins as method calls.
 for f in bootstrap/check bootstrap/codegen examples/features.oxl tests/match.oxl tests/container_heap.oxl std/collections \
-    std/container/heap std/container/list std/container/ring; do
+    std/container/heap std/container/list std/container/ring \
+    std/image std/image/color std/image/draw std/image/png std/image/bmp; do
     out=$("$OXL" run bootstrap/cmd/check -- "$f")
     [ "$out" = "ok" ] || { echo "FAIL checker $f: $out"; exit 1; }
 done

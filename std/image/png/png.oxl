@@ -1,0 +1,35 @@
+package png
+
+// std/image/png — the spelled PNG surface over package image's
+// codec. The implementation lives in package image (png.oxl there)
+// because image.decode's magic-byte dispatch can't reach down into
+// format packages — oxl bans import cycles and has no init-time
+// registration mechanism for Go's image/png side-effect import.
+// Coverage: non-interlaced PNG, color types 0/2/3/4/6 at depth 8
+// (plus sub-byte gray/palette), PLTE + tRNS; 16-bit depths and
+// Adam7 interlacing are rejected. Encode always emits color type 6
+// depth 8 through a stored-deflate zlib stream.
+import "std/io"
+
+import "std/image"
+
+/// decode reads a PNG stream — png.Decode over image.png_decode.
+fn decode(r: io.Reader) -> [image.Image, err] {
+    return image.png_decode(r)
+}
+
+/// decodebytes decodes a PNG held in memory.
+fn decodebytes(b: []byte) -> [image.Image, err] {
+    return image.png_decodebytes(b)
+}
+
+/// encode writes m to w as a PNG — png.Encode (always color type 6,
+/// depth 8, filter None, stored deflate blocks).
+fn encode(w: io.Writer, m: image.Image) -> err {
+    return image.png_encode(w, m)
+}
+
+/// encodebytes renders m to an in-RAM PNG.
+fn encodebytes(m: image.Image) -> [own []byte, err] {
+    return image.png_encodebytes(m)
+}

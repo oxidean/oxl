@@ -156,8 +156,21 @@ jobs:
               # next feature push recomputes over the tag series and
               # converges on it. Only freshly computed tags are gated: a
               # tag recovered above is a fixed tree being republished.
-              mver="$(git show "origin/main:docs/site/manifest.yaml" 2>/dev/null \
-                | sed -nE 's/^version[[:space:]]*:[[:space:]]*"?([^"[:space:]]*)"?[[:space:]]*$/\1/p' | head -1 || true)"
+              mver_ref=refs/remotes/origin/release-floor-main
+              if ! git fetch --no-tags origin "+refs/heads/main:$mver_ref"; then
+                echo "failed to fetch current main for the release manifest floor" >&2
+                exit 1
+              fi
+              if git cat-file -e "$mver_ref:docs/site/manifest.yaml" 2>/dev/null; then
+                mver="$(git show "$mver_ref:docs/site/manifest.yaml" \
+                  | sed -nE 's/^version[[:space:]]*:[[:space:]]*"?([^"[:space:]]*)"?[[:space:]]*$/\1/p' | head -1)"
+                if [ -z "$mver" ]; then
+                  echo "could not parse docs/site/manifest.yaml version from current main" >&2
+                  exit 1
+                fi
+              else
+                mver=""
+              fi
               if [ -n "$mver" ] && [ "${tag#v}" != "$mver" ] \
               && [ "$(printf '%s\n%s\n' "$mver" "${tag#v}" | sort -V | tail -1)" = "$mver" ]; then
                 echo "computed tag $tag is below manifest version $mver — stale-range downgrade suppressed (#203)" >&2
@@ -656,7 +669,7 @@ jobs:
                 || { echo "::notice::oxidean/nvim-oxl does not exist — create it (or set OXLEDITOR_MIRROR_TOKEN with repo-create rights) to enable mirroring"; exit 0; }
               git clone --depth 1 "https://x-access-token:${MIRROR_TOKEN}@github.com/oxidean/nvim-oxl.git" /tmp/nvim-oxl
             }
-          rsync -a --delete editors/nvim/ /tmp/nvim-oxl/
+          rsync -a --delete --exclude='/.git/' editors/nvim/ /tmp/nvim-oxl/
           cd /tmp/nvim-oxl
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"

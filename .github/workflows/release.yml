@@ -88,16 +88,6 @@ jobs:
           else
             range="$EVENT_BEFORE..$SHA"
           fi
-          # A manifest-bump merge self-triggers this run with a range of
-          # only its own chore commit — nothing new to release (#203).
-          # Flag it rather than exiting: the extras lane below still ships
-          # pending extra/ changes, and a tag recovered at SHA or on the
-          # bump child (a rerun of a publish that died after tagging)
-          # still republishes — only a freshly computed tag is suppressed.
-          chore_only=0
-          if [ -z "$(git log --format=%s "$range" | grep -vE '^chore\(release\):')" ]; then
-            chore_only=1
-          fi
           # lane split: the toolchain releases when anything outside
           # extra/ moved since the last bare v* tag; extras get their own
           # extra/v* tag series when paths under extra/ moved since the
@@ -141,46 +131,14 @@ jobs:
           # tag. A manual dispatch bypasses the path check only for tag
           # recovery — an untagged sha has nothing to recover, so an
           # extras-only dispatch must not mint a new toolchain release.
-          if { { [ -n "$changed" ] && printf '%s\n' "$changed" | grep -qv '^extra/'; } \
-               || { [ "$EVENT_NAME" = "workflow_dispatch" ] && [ -n "$tag" ]; } ; } \
-          && { [ "$chore_only" = 0 ] || [ -n "$tag" ]; }; then
+          if { [ -n "$changed" ] && printf '%s\n' "$changed" | grep -qv '^extra/'; } || { [ "$EVENT_NAME" = "workflow_dispatch" ] && [ -n "$tag" ]; }; then
             do_tool=true
             [ -n "$tagsha" ] && SHA=$tagsha
             if [ -z "$tag" ]; then
               tag=$(scripts/release-version.sh next "$range")
-              # Manifest floor (#203): the manifest can run ahead of the
-              # tag series when a prior run stamped the version but died
-              # before tagging. `next` over this push's range then
-              # computes below the declared version, and the sha step
-              # would stamp a downgrade bump PR. Suppress instead — the
-              # next feature push recomputes over the tag series and
-              # converges on it. Only freshly computed tags are gated: a
-              # tag recovered above is a fixed tree being republished.
-              mver_ref=refs/remotes/origin/release-floor-main
-              if ! git fetch --no-tags origin "+refs/heads/main:$mver_ref"; then
-                echo "failed to fetch current main for the release manifest floor" >&2
-                exit 1
-              fi
-              if git cat-file -e "$mver_ref:docs/site/manifest.yaml" 2>/dev/null; then
-                mver="$(git show "$mver_ref:docs/site/manifest.yaml" \
-                  | sed -nE 's/^version[[:space:]]*:[[:space:]]*"?([^"[:space:]]*)"?[[:space:]]*$/\1/p' | head -1)"
-                if [ -z "$mver" ]; then
-                  echo "could not parse docs/site/manifest.yaml version from current main" >&2
-                  exit 1
-                fi
-              else
-                mver=""
-              fi
-              if [ -n "$mver" ] && [ "${tag#v}" != "$mver" ] \
-              && [ "$(printf '%s\n%s\n' "$mver" "${tag#v}" | sort -V | tail -1)" = "$mver" ]; then
-                echo "computed tag $tag is below manifest version $mver — stale-range downgrade suppressed (#203)" >&2
-                tag=""
-              fi
             fi
-            if [ -n "$tag" ]; then
-              echo "do_tool=true" >> "$GITHUB_OUTPUT"
-              echo "tag=$tag" >> "$GITHUB_OUTPUT"
-            fi
+            echo "do_tool=true" >> "$GITHUB_OUTPUT"
+            echo "tag=$tag" >> "$GITHUB_OUTPUT"
           fi
           if [ -n "$echanged" ]; then
             etag=$(git tag --points-at "$SHA" | grep -xE 'extra/v[0-9]+\.[0-9]+\.[0-9]+' | sort -V | tail -1 || true)

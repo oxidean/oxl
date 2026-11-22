@@ -27,7 +27,7 @@ let image_max_dim: int = 32768
 
 let image_max_pixels: int = 16777216
 
-let image_max_encoded: int = 67108864
+let image_max_encoded: int = 75497472
 
 fn image_dims_ok(w: int, h: int) -> bool {
     if w < 0 || h < 0 || w > image_max_dim || h > image_max_dim {
@@ -357,6 +357,9 @@ fn decode(r: io.Reader) -> [Image, err] {
 /// decodebytes decodes an image held in memory — the in-RAM twin of
 /// decode(r).
 fn decodebytes(b: []byte) -> [Image, err] {
+    if len(b) > image_max_encoded {
+        return nil, errors.new("image: encoded input exceeds size limit")
+    }
     if len(b) >= 8 && b[0] == 137 && b[1] == 80 && b[2] == 78 && b[3] == 71 {
         return png_decodebytes(b)
     }

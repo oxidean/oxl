@@ -11,6 +11,8 @@ import "std/image"
 
 import "std/image/color"
 
+import "std/errors"
+
 /// op_over composites src over dst — Go's draw.Over (source-over
 /// alpha blending, the operator Cairo/Porter-Duff call "over").
 let op_over: int = 0
@@ -35,17 +37,20 @@ fn blend(s: color.RGBA64, d: color.RGBA64, op: int) -> color.RGBA64 {
 /// onto dst per op. r clips against dst's bounds; the matching clip
 /// applies to src's bounds so out-of-range reads never happen
 /// (Go's draw.Draw semantics).
-fn draw(dst: image.WImage, r: image.Rect, src: image.Image, sp: image.Point, op: int) {
+fn draw(dst: image.WImage, r: image.Rect, src: image.Image, sp: image.Point, op: int) -> err {
+    if op != op_src && op != op_over {
+        return errors.new("draw: invalid operator")
+    }
     clip := r.intersect(dst.bounds())
     if clip.empty() {
-        return
+        return nil
     }
     // translate the dst clip back into src space and clip there too —
     // Go's draw.Draw does the same so the src read is always in range
     sr := image.rect(clip.min.x - r.min.x + sp.x, clip.min.y - r.min.y + sp.y, clip.max.x - r.min.x + sp.x, clip.max.y - r.min.y + sp.y)
     sr = sr.intersect(src.bounds())
     if sr.empty() {
-        return
+        return nil
     }
     // walk in src space; dst point = src - sp + r.min
     y := sr.min.y
@@ -62,6 +67,7 @@ fn draw(dst: image.WImage, r: image.Rect, src: image.Image, sp: image.Point, op:
         }
         y = y + 1
     }
+    return nil
 }
 
 /// fill paints c over dst's whole bounds — Go's idiom of Draw with
@@ -86,13 +92,16 @@ fn fill(dst: image.WImage, c: color.Color) {
 /// written. dst/src may share backing: reads go through at() before
 /// the matching set(), so a strictly-overlapping self-copy can
 /// smear — callers needing memmove semantics snapshot first.
-fn copy(dst: image.WImage, dp: image.Point, src: image.Image, sr: image.Rect, op: int) -> int {
+fn copy(dst: image.WImage, dp: image.Point, src: image.Image, sr: image.Rect, op: int) -> [int, err] {
+    if op != op_src && op != op_over {
+        return 0, errors.new("draw: invalid operator")
+    }
     dr := image.rect(dp.x, dp.y, dp.x + sr.dx(), dp.y + sr.dy())
     clip := dr.intersect(dst.bounds())
     sclip := image.rect(clip.min.x - dp.x + sr.min.x, clip.min.y - dp.y + sr.min.y, clip.max.x - dp.x + sr.min.x, clip.max.y - dp.y + sr.min.y)
     sclip = sclip.intersect(sr.intersect(src.bounds()))
     if sclip.empty() {
-        return 0
+        return 0, nil
     }
     n := 0
     y := sclip.min.y
@@ -111,5 +120,5 @@ fn copy(dst: image.WImage, dp: image.Point, src: image.Image, sr: image.Rect, op
         }
         y = y + 1
     }
-    return n
+    return n, nil
 }

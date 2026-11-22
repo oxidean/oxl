@@ -5,10 +5,8 @@ package image
 // common uncompressed shape: BITMAPINFOHEADER-and-later DIB headers
 // at 24 or 32 bits, BI_RGB, bottom-up or top-down rows — OS/2 CORE
 // headers, bitfield/compressed modes, and indexed palettes are
-// rejected. A 32-bit BI_RGB file's fourth byte is decoded as stored
-// (alpha as written, often 0 on files that treat it as padding —
-// decode honors it; encode never writes it). Encode always emits
-// 24-bit bottom-up BI_RGB.
+// rejected. A 32-bit BI_RGB file's fourth byte is ignored. Encode
+// always emits 24-bit bottom-up BI_RGB.
 import "std/io"
 
 import "std/errors"
@@ -26,7 +24,7 @@ fn bmp_run(b: []byte) -> [Image, err] {
     }
     pixoff := binary.le_u32(b, 10)
     hdrsize := binary.le_u32(b, 14)
-    if hdrsize < 40 {
+    if hdrsize != 40 && hdrsize != 52 && hdrsize != 56 && hdrsize != 108 && hdrsize != 124 {
         return nil, errors.new("bmp: unsupported DIB header")
     }
     if len(b) < 14 + hdrsize {
@@ -76,9 +74,6 @@ fn bmp_run(b: []byte) -> [Image, err] {
         for x < w {
             i := row + x * bypp
             a := 255
-            if bypp == 4 {
-                a = b[i + 3]
-            }
             m.setnrgba(x, y, color.NRGBA{r: b[i + 2], g: b[i + 1], b: b[i], a: a})
             x = x + 1
         }
@@ -100,15 +95,21 @@ fn bmp_decode(r: io.Reader) -> [Image, err] {
 
 /// bmp_decodebytes decodes a BMP held in memory.
 fn bmp_decodebytes(b: []byte) -> [Image, err] {
+    if len(b) > image_max_encoded {
+        return nil, errors.new("image: encoded input exceeds size limit")
+    }
     return bmp_run(b)
 }
 
 // bmp_bytes renders m as a 24-bit bottom-up BI_RGB BMP — alpha is
 // dropped (24-bit carries none; callers wanting alpha pick PNG).
-fn bmp_bytes(m: Image) -> []byte {
+fn bmp_bytes(m: Image) -> [[]byte, err] {
     r := m.bounds()
     w := r.dx()
     h := r.dy()
+    if w <= 0 || h <= 0 || !image_dims_ok(w, h) {
+        return nil, errors.new("bmp: image dimensions exceed limits")
+    }
     rowlen := (w * 3 + 3) / 4 * 4
     out := mkslice(byte, 0)
     // BITMAPFILEHEADER — "BM", file size, reserved, data offset
@@ -162,12 +163,15 @@ fn bmp_bytes(m: Image) -> []byte {
         }
         y = y - 1
     }
-    return out
+    return out, nil
 }
 
 /// bmp_encode writes m to w as a 24-bit BMP.
 fn bmp_encode(w: io.Writer, m: Image) -> err {
-    out := bmp_bytes(m)
+    [out, e] = bmp_bytes(m)
+    if e != nil {
+        return e
+    }
     pos := 0
     for pos < len(out) {
         [n, e] = w.write(out[pos:])
@@ -184,5 +188,9 @@ fn bmp_encode(w: io.Writer, m: Image) -> err {
 
 /// bmp_encodebytes renders m to an in-RAM BMP.
 fn bmp_encodebytes(m: Image) -> [own []byte, err] {
-    return new(bmp_bytes(m)), nil
+    [out, e] = bmp_bytes(m)
+    if e != nil {
+        return nil, e
+    }
+    return new(out), nil
 }

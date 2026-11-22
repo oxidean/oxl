@@ -747,7 +747,7 @@ echo "== oxl test: image =="
 out=$("$OXL" test tests/image_test.oxl)
 printf '%s
 ' "$out" >&2
-for t in test_rgba_buffer test_nrgba_gray_buffer test_rect test_color_premul test_png_rgba test_png_rgb test_png_gray test_png_pal test_png_graya test_png_filters test_png_subbyte test_png_errors test_png_limits test_png_roundtrip test_bmp24 test_bmp32 test_bmp_topdown test_bmp_errors test_bmp_limits test_image_size_limits test_bmp_roundtrip test_decode_dispatch test_draw_src test_draw_over test_draw_copy; do
+for t in test_rgba_buffer test_nrgba_gray_buffer test_rect test_color_premul test_png_rgba test_png_rgb test_png_gray test_png_pal test_png_graya test_png_filters test_png_subbyte test_png_errors test_png_chunk_order test_png_limits test_png_roundtrip test_bmp24 test_bmp32 test_bmp_topdown test_bmp_errors test_bmp_limits test_image_size_limits test_decode_size_limit test_bmp_roundtrip test_decode_dispatch test_draw_src test_draw_over test_draw_copy; do
     grep -q "$t ... ok" <<<"$out" || { echo "FAIL image: $out"; exit 1; }
 done
 

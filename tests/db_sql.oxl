@@ -11,6 +11,10 @@ import "std/database/sql"
 
 import "std/errors"
 
+import "std/os"
+
+import "std/time"
+
 struct Item { id: int, name: str, price: float, active: bool, code: byte }
 
 struct Count { n: int }
@@ -155,10 +159,75 @@ fn want_sentinel(e: err, sentinel: err, msg: str) {
     }
 }
 
+fn release_sql_lock(db: sql.DB, done: chan) {
+    time.sleep_ms(80)
+    e := db.exec("COMMIT")
+    if e != nil {
+        send(done, 0)
+        return
+    }
+    send(done, 1)
+}
+
+fn remove_test_file(path: str) {
+    if os.exists(path) {
+        os.remove(path)
+    }
+}
+
 fn main() {
     [db, oe] = sql.open_driver("sqlite3", ":memory:")
     want_ok(oe, "open :memory:")
     want_ok(db.exec("CREATE TABLE items(id INTEGER, name TEXT, price REAL, active INTEGER, code INTEGER)"), "create table")
+    stamp := itoa(time.unix_ms())
+    main_db_path := os.temp_dir() + "/oxl_sql_exec_main_" + stamp + ".db"
+    lock_db_path := os.temp_dir() + "/oxl_sql_exec_lock_" + stamp + ".db"
+    [lock_db, lock_open_err] = sql.open(lock_db_path)
+    want_ok(lock_open_err, "open shared lock db")
+    want_ok(lock_db.exec("PRAGMA journal_mode=DELETE"), "set lock journal mode")
+    [script_db, script_open_err] = sql.open(main_db_path)
+    want_ok(script_open_err, "open shared script db")
+    want_ok(script_db.exec("ATTACH DATABASE '" + lock_db_path + "' AS aux"), "attach lock db")
+    want_ok(script_db.exec("PRAGMA aux.journal_mode=DELETE"), "set attached journal mode")
+    want_ok(script_db.exec("CREATE TABLE first(x); CREATE TABLE aux.locked(x); INSERT INTO aux.locked VALUES(1); PRAGMA busy_timeout=0"), "create lock tables")
+    want_ok(lock_db.exec("BEGIN"), "begin read lock")
+    [lock_rows, lock_query_err] = lock_db.query("SELECT x FROM locked")
+    want_ok(lock_query_err, "query lock table")
+    lock_value := new(0)
+    [lock_has_row, lock_scan_err] = lock_rows.scan_into(lock_value)
+    want_ok(lock_scan_err, "scan lock table")
+    if !lock_has_row {
+        fails("lock table was empty")
+    }
+    lock_rows.close()
+    done := mkchan(1)
+    spawn release_sql_lock(lock_db, done)
+    exec_err := script_db.exec("INSERT INTO first VALUES(1); INSERT INTO aux.locked VALUES(2)")
+    want_err(exec_err, "busy multi-statement exec")
+    msg := errors.msg(exec_err)
+    if find(msg, "locked") < 0 && find(msg, "busy") < 0 {
+        fails("multi-statement exec error: " + msg)
+    }
+    if recv(done) != 1 {
+        fails("release sql lock")
+    }
+    lock_db.close()
+    [first_rows, first_query_err] = script_db.query("SELECT COUNT(*) FROM first")
+    want_ok(first_query_err, "query first statement count")
+    first_count := new(Count)
+    [first_has_row, first_scan_err] = first_rows.scan_into(first_count)
+    want_ok(first_scan_err, "scan first statement count")
+    if !first_has_row || first_count.n != 1 {
+        fails("busy multi-statement exec replayed first statement")
+    }
+    first_rows.close()
+    script_db.close()
+    remove_test_file(main_db_path + "-wal")
+    remove_test_file(main_db_path + "-shm")
+    remove_test_file(lock_db_path + "-wal")
+    remove_test_file(lock_db_path + "-shm")
+    remove_test_file(main_db_path)
+    remove_test_file(lock_db_path)
     // exec reports a driver error
     want_err(db.exec("INSERT INTO nope VALUES(1)"), "exec bad sql")
     [badrows, bqe] = db.query("SELECT FROM")

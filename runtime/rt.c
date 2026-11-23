@@ -4135,16 +4135,7 @@ void *rt_sqlite_open(const char *path) {
     return db;
 }
 int64_t rt_sqlite_exec(void *db, const char *sql) {
-    /* busy_timeout doesn't retry SQLITE_BUSY_SNAPSHOT; a bounded retry
-     * loop covers both busy flavors under concurrent writers */
-    for (int i = 0; i < 500; i++) {
-        int rc = sqlite3_exec((sqlite3 *)db, sql, NULL, NULL, NULL);
-        if (rc != SQLITE_BUSY && rc != SQLITE_LOCKED) {
-            return rc;
-        }
-        sleep_us(10000);
-    }
-    return SQLITE_BUSY;
+    return sqlite3_exec((sqlite3 *)db, sql, NULL, NULL, NULL);
 }
 /* prepared-statement insert for request-supplied values — body text is
  * bound, never concatenated into SQL */

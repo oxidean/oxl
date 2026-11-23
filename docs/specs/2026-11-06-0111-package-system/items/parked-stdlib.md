@@ -55,8 +55,8 @@ each with its own trigger rather than a blanket wait on reflection:
 
 ## Doesn't pay at this scale
 
-- `image`, `image/color`, `image/draw` — needs a real use case first
-  (the GUI pilot goes through GTK, not an image buffer).
+- `image`, `image/color`, `image/draw` — shipped as `std/image` with
+  bounded PNG/BMP support; the GUI pilot itself remains GTK-backed.
 - `compress/{gzip,zlib,flate}`, `archive/{tar,zip}` — C-FFI wrap is
   trivial when needed; pure-.oxl ports wait for `[]byte` to settle.
 - `net/http/httputil`, `pprof`, `net/url` (small — folds into

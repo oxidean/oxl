@@ -1,0 +1,124 @@
+package draw
+
+// std/image/draw — Go's image/draw: pixel loops over the
+// Image/WImage surface with the two composition operators. draw is
+// the general form (a rect of src lands at a point of dst), fill
+// paints one color over dst's bounds, copy is the spelled-out
+// blit. Everything composites in 16-bit premultiplied space through
+// Color.rgba — the same math Go runs, so partially transparent
+// sources land identically.
+import "std/image"
+
+import "std/image/color"
+
+import "std/errors"
+
+/// op_over composites src over dst — Go's draw.Over (source-over
+/// alpha blending, the operator Cairo/Porter-Duff call "over").
+let op_over: int = 0
+
+/// op_src replaces dst with src — Go's draw.Src.
+let op_src: int = 1
+
+// blend is the per-pixel composition in 16-bit premultiplied
+// space: src + dst·(1 - srcA) for over, src alone for src. The
+// (x*0xffff + 0x8000)/0xffff rounding is Go's — plain /0xffff
+// truncates and bleeds a unit on round values.
+fn blend(s: color.RGBA64, d: color.RGBA64, op: int) -> color.RGBA64 {
+    if op == op_src {
+        return s
+    }
+    a := 65535 - s.a
+    return color.RGBA64{r: s.r + (d.r * a + 32767) / 65535, g: s.g + (d.g * a + 32767) / 65535, b: s.b + (d.b * a + 32767) / 65535, a: s.a + (d.a * a + 32767) / 65535}
+}
+
+/// draw copies the part of src that lands inside r — pixels read at
+/// src point (x - r.min.x + sp.x, y - r.min.y + sp.y) — composited
+/// onto dst per op. r clips against dst's bounds; the matching clip
+/// applies to src's bounds so out-of-range reads never happen
+/// (Go's draw.Draw semantics).
+fn draw(dst: image.WImage, r: image.Rect, src: image.Image, sp: image.Point, op: int) -> err {
+    if op != op_src && op != op_over {
+        return errors.new("draw: invalid operator")
+    }
+    clip := r.intersect(dst.bounds())
+    if clip.empty() {
+        return nil
+    }
+    // translate the dst clip back into src space and clip there too —
+    // Go's draw.Draw does the same so the src read is always in range
+    sr := image.rect(clip.min.x - r.min.x + sp.x, clip.min.y - r.min.y + sp.y, clip.max.x - r.min.x + sp.x, clip.max.y - r.min.y + sp.y)
+    sr = sr.intersect(src.bounds())
+    if sr.empty() {
+        return nil
+    }
+    // walk in src space; dst point = src - sp + r.min
+    y := sr.min.y
+    for y < sr.max.y {
+        dy := y - sp.y + r.min.y
+        x := sr.min.x
+        for x < sr.max.x {
+            dx := x - sp.x + r.min.x
+            sc := src.at(x, y)
+            dc := dst.at(dx, dy)
+            out := blend(sc.rgba(), dc.rgba(), op)
+            dst.set(dx, dy, out.ascolor())
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return nil
+}
+
+/// fill paints c over dst's whole bounds — Go's idiom of Draw with
+/// an image.Uniform under op_src: every pixel becomes c, no
+/// compositing. Uniform over op_over is just draw() with a
+/// one-pixel source if a caller wants it.
+fn fill(dst: image.WImage, c: color.Color) {
+    r := dst.bounds()
+    y := r.min.y
+    for y < r.max.y {
+        x := r.min.x
+        for x < r.max.x {
+            dst.set(x, y, c)
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+/// copy blits sr of src onto dst at dp — the explicit form of
+/// draw(dst, sr moved to dp, src, sr.min, op); returns the pixels
+/// written. dst/src may share backing: reads go through at() before
+/// the matching set(), so a strictly-overlapping self-copy can
+/// smear — callers needing memmove semantics snapshot first.
+fn copy(dst: image.WImage, dp: image.Point, src: image.Image, sr: image.Rect, op: int) -> [int, err] {
+    if op != op_src && op != op_over {
+        return 0, errors.new("draw: invalid operator")
+    }
+    dr := image.rect(dp.x, dp.y, dp.x + sr.dx(), dp.y + sr.dy())
+    clip := dr.intersect(dst.bounds())
+    sclip := image.rect(clip.min.x - dp.x + sr.min.x, clip.min.y - dp.y + sr.min.y, clip.max.x - dp.x + sr.min.x, clip.max.y - dp.y + sr.min.y)
+    sclip = sclip.intersect(sr.intersect(src.bounds()))
+    if sclip.empty() {
+        return 0, nil
+    }
+    n := 0
+    y := sclip.min.y
+    for y < sclip.max.y {
+        // dst point = dp + (src - sr.min)
+        dy := y - sr.min.y + dp.y
+        x := sclip.min.x
+        for x < sclip.max.x {
+            dx := x - sr.min.x + dp.x
+            sc := src.at(x, y)
+            dc := dst.at(dx, dy)
+            out := blend(sc.rgba(), dc.rgba(), op)
+            dst.set(dx, dy, out.ascolor())
+            n = n + 1
+            x = x + 1
+        }
+        y = y + 1
+    }
+    return n, nil
+}

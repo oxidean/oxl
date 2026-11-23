@@ -49,11 +49,10 @@ Milestone map: [docs/specs/2026-11-07-phase-2-plan/](../specs/2026-11-07-phase-2
 - **G — portable GUI layer** in the language (charter path) as
   `extra/gui` + `extra/gui/gtk` — shipped; spec:
   `docs/specs/2026-11-09-gui-layer/`
-- **R — runtime type descriptors + reflection**: spec merged —
+- **R — runtime type descriptors + reflection**: shipped —
   compiler-emitted `TypeDesc` table, `std/reflect` lite, `fmt %v`
-  (#28), typed `errors.As` (#27), then `gob`/`xml`/`template`/`sql`;
-  impl WI-0008 in flight — spec:
-  `docs/specs/2026-11-11-type-descriptors/`
+  (#28), typed `errors.As` (#27), `gob`/`xml`/`template`/`sql` lite;
+  spec: `docs/specs/2026-11-11-type-descriptors/`
 - **W — web compilation target**: shipped — `--target js` emit
   (node + browser flavors), `extra/gui/dom` backend, `web-todo`
   reference app; spec: `docs/specs/2026-11-10-web-target/`

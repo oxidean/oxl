@@ -6,6 +6,7 @@ on:
   pull_request:
     # edited re-fires the gate on title/body changes — otherwise a
     # post-green metadata edit could land attribution unchecked.
+    # (edited also fires on a base retarget — see the matrix gate below.)
     types: [opened, synchronize, reopened, edited]
 
 permissions:
@@ -14,8 +15,12 @@ permissions:
 jobs:
   build-test:
     # edited re-fires only commit-lint — the matrix doesn't need to
-    # re-run on title/body changes
-    if: github.event.action != 'edited'
+    # re-run on title/body changes. A retarget fires edited too but must
+    # re-run the matrix: GitHub treats the required legs as unreported on
+    # a moved base and the PR wedges BLOCKED regardless of green checks
+    # (changes.base is set only when the base branch moved, not on
+    # title/body edits).
+    if: github.event.action != 'edited' || github.event.changes.base
     runs-on: ${{ matrix.os }}
     # bound the legs: a hung test deadlocks the runner silently otherwise —
     # observed once at 68min on a docs-only diff vs ~20min normal (#117).

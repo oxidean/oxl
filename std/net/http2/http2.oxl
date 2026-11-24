@@ -69,14 +69,12 @@ fn decode_frame_header(raw: []byte, max_frame_size: int) -> [FrameHeader, err] {
     if max_frame_size < 16384 || max_frame_size > MAX_FRAME_SIZE {
         return bad, errors.new("http2: invalid maximum frame size")
     }
-    if raw[5] >= 128 {
-        return bad, errors.new("http2: reserved stream id bit set")
-    }
     length := raw[0] * 65536 + raw[1] * 256 + raw[2]
     if length > max_frame_size {
         return bad, errors.new("http2: frame exceeds maximum size")
     }
-    stream_id := raw[5] * 16777216 + raw[6] * 65536 + raw[7] * 256 + raw[8]
+    // RFC 7540 §4.1: the stream-id R bit MUST be ignored on receipt
+    stream_id := raw[5] % 128 * 16777216 + raw[6] * 65536 + raw[7] * 256 + raw[8]
     return FrameHeader{length: length, kind: raw[3], flags: raw[4], stream_id: stream_id}, nil
 }
 
@@ -308,9 +306,7 @@ fn validate_frame(frame: Frame) -> err {
         if h.stream_id == 0 || available - start < 4 {
             return errors.new("http2: invalid PUSH_PROMISE frame")
         }
-        if (frame.payload[start] & 128) != 0 {
-            return errors.new("http2: reserved promised stream id bit set")
-        }
+        // §6.6: the promised stream id R bit is ignored on receipt
     } else if h.kind == 6 {
         if h.stream_id != 0 || h.length != 8 {
             return errors.new("http2: invalid PING frame")
@@ -319,9 +315,7 @@ fn validate_frame(frame: Frame) -> err {
         if h.stream_id != 0 || h.length < 8 {
             return errors.new("http2: invalid GOAWAY frame")
         }
-        if (frame.payload[0] & 128) != 0 {
-            return errors.new("http2: reserved last stream id bit set")
-        }
+        // §6.7: the last-stream-id R bit is ignored on receipt
     } else if h.kind == 8 {
         if h.length != 4 {
             return errors.new("http2: invalid WINDOW_UPDATE frame")

@@ -137,6 +137,19 @@ class Handler(socketserver.BaseRequestHandler):
                 sock.sendall(b"\x81\x81\x00\x00\x00\x00x")
                 expect_protocol_close(sock)
                 return
+            if mode == "ping-small-limit":
+                # legal ping larger than the client's configured max_frame:
+                # control frames must be exempt from the message limit
+                send_frame(sock, 9, b"pongme")
+                pong = read_frame(sock)
+                if pong != (True, 10, b"pongme"):
+                    raise AssertionError("missing pong for legal ping: %r" % (pong,))
+                send_frame(sock, 1, b"x")
+                close = read_frame(sock)
+                if close[1] != 8:
+                    raise AssertionError("missing close response")
+                send_frame(sock, 8, close[2])
+                return
             if mode == "reserved-opcode":
                 sock.sendall(b"\x83\x00")
                 expect_protocol_close(sock)

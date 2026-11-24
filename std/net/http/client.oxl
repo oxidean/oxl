@@ -1060,6 +1060,21 @@ fn (cl ref Client) http2_exchange(req: Request, u: Url, conn: mut http2.Conn) ->
     req_headers = push(req_headers, http2.Header{name: ":scheme", value: scheme_name(u)})
     req_headers = push(req_headers, http2.Header{name: ":path", value: u.path})
     req_headers = push(req_headers, http2.Header{name: ":authority", value: url_authority(u)})
+    if req.decompress {
+        // advertise gzip like the h1 path — never double-set a
+        // caller-supplied accept-encoding
+        has_ae := false
+        j := 0
+        for j < len(req.headers) {
+            if lwr(req.headers[j].name) == "accept-encoding" {
+                has_ae = true
+            }
+            j = j + 1
+        }
+        if !has_ae {
+            req_headers = push(req_headers, http2.Header{name: "accept-encoding", value: "gzip"})
+        }
+    }
     if len(req.body) > 0 {
         req_headers = push(req_headers, http2.Header{name: "content-length", value: itoa(len(req.body))})
     }

@@ -23,21 +23,24 @@ let LB: int = 26
 
 let B: int = 67108864
 
-let P2: own []int = nil
+// powers of two 0..26 — eager table (a lazy fill would publish a shared
+// slice before its init completes under concurrent first use)
+fn mkp2() -> own []int {
+    t := mkslice(int, 27)
+    v := 1
+    i := 0
+    for i < 27 {
+        t[i] = v
+        v = v * 2
+        i = i + 1
+    }
+    return slices.clone(t)
+}
+
+let P2: own []int = mkp2()
 
 // powers of two 0..26 — no shift operators, so bit work is / * &
 fn p2() -> own []int {
-    if P2 == nil {
-        t := mkslice(int, 27)
-        v := 1
-        i := 0
-        for i < 27 {
-            t[i] = v
-            v = v * 2
-            i = i + 1
-        }
-        P2 = slices.clone(t)
-    }
     return P2
 }
 

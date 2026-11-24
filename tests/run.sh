@@ -88,9 +88,14 @@ srv_pid=""
 relsrv=""
 ws_peer_pid=""
 cleanup() {
-    if [ -n "$srv_pid" ]; then kill "$srv_pid" 2>/dev/null || true; fi
-    if [ -n "$relsrv" ]; then kill "$relsrv" 2>/dev/null || true; wait "$relsrv" 2>/dev/null || true; fi
-    if [ -n "$ws_peer_pid" ]; then kill "$ws_peer_pid" 2>/dev/null || true; wait "$ws_peer_pid" 2>/dev/null || true; fi
+    # every fixture server the suite can spawn — a mid-suite failure
+    # must not orphan node/python/openssl peers holding ports (they
+    # poison later runs on the same machine)
+    for p in $srv_pid $relsrv $ws_peer_pid $h2_srv $h2_proxy_srv $grpc_srv $peer_pid \
+             $isrv $hsrv $tsrv $rsa_srv $vsrv $ssrv $rsrv $csrv $origin_srv $proxy_srv \
+             $sigpid $base_pid $scale_pid $scale_dog; do
+        [ -n "$p" ] && kill "$p" 2>/dev/null || true
+    done
     # v2's sealed module-cache slots are read-only — restore write
     # permission or rm leaves them behind
     chmod -R u+w "$scratch" 2>/dev/null
@@ -725,7 +730,7 @@ tls_probe_base="${TLS_INTEROP_PORT:-24443}"
 tls12_peer_probe() { # <client scenario> <peer mode> <port> <marker>
     local scenario=$1 mode=$2 port=$3 marker=$4 out tries
     "$PY" tests/tls/tls12_peer.py "$port" "$mode" >"$scratch/tls12-peer.out" 2>&1 &
-    local peer_pid=$!
+    peer_pid=$! # global on purpose — the EXIT trap sweeps it
     tries=0
     while ! grep -q '^READY$' "$scratch/tls12-peer.out" 2>/dev/null && [ "$tries" -lt 50 ]; do
         sleep 0.05
@@ -1163,7 +1168,7 @@ out=$(OXL_WS_PORT="$ws_port" OXL_WSS_PORT="$wss_port" OXL_WS_ERRORS="$scratch/ws
 ' "$out" >&2; cat "$scratch/ws-errors" >&2; exit 1; }
 printf '%s
 ' "$out" >&2
-for t in test_ws_upgrade_and_frames test_ws_upgrade_rejections test_ws_optional_subprotocol_and_empty_reason test_ws_bad_server_frames test_ws_extended_server_length test_ws_64bit_client_length test_ws_read_deadline test_ws_write_deadline test_wss_identity_and_interop; do
+for t in test_ws_upgrade_and_frames test_ws_upgrade_rejections test_ws_optional_subprotocol_and_empty_reason test_ws_bad_server_frames test_ws_control_frame_under_small_limit test_ws_extended_server_length test_ws_64bit_client_length test_ws_read_deadline test_ws_write_deadline test_wss_identity_and_interop; do
     grep -q "$t ... ok" <<<"$out" || { echo "FAIL websocket $t: $out"; exit 1; }
 done
 [ ! -s "$scratch/ws-errors" ] || { cat "$scratch/ws-errors" >&2; echo "FAIL websocket peer assertions"; exit 1; }

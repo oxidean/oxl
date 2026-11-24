@@ -150,7 +150,7 @@ fn check_pub(n: []int, e: []int) -> err {
     if e[0] % 2 == 0 || bignum.cmp(e, bignum.from_int(3)) < 0 {
         return errors.new("rsa: public exponent out of range")
     }
-    if bignum.bitlen(e) > 64 || bignum.cmp(e, n) >= 0 || bignum.bitlen(n) > 8192 {
+    if bignum.bitlen(e) > 64 || bignum.cmp(e, n) >= 0 || bignum.bitlen(n) > 8192 || bignum.bitlen(n) < 1024 {
         return errors.new("rsa: key parameters out of range")
     }
     return nil
@@ -567,6 +567,9 @@ fn sign_pss(pk: PrivKey, hf: fn() -> hash.Hash, msg: []byte, saltlen: int) -> [o
     k := (bignum.bitlen(pk.n) + 7) / 8
     mhash := digest(hf, msg)
     hlen := len(mhash)
+    if saltlen < 0 {
+        return nil, errors.new("rsa: negative salt length")
+    }
     embits := bignum.bitlen(pk.n) - 1
     emlen := (embits + 7) / 8
     if emlen < hlen + saltlen + 2 {

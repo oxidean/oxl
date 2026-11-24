@@ -50,8 +50,9 @@ fn test_http2_frame_header_rejects_invalid_input() {
     [reserved, re] = http2.encode_frame_header(http2.FrameHeader{length: 0, kind: 0, flags: 0, stream_id: 1})
     testing.expect(re == nil, "encode header for reserved-bit test")
     reserved[5] = reserved[5] + 128
-    [_, e6] = http2.decode_frame_header(reserved, 16384)
-    testing.expect(e6 != nil, "reject reserved bit on input")
+    [masked, e6] = http2.decode_frame_header(reserved, 16384)
+    testing.expect(e6 == nil, "reserved bit ignored on input per RFC 7540 §4.1")
+    testing.expect(masked.stream_id == 1, "reserved bit masked from stream id")
 }
 
 fn test_http2_frame_payload() {

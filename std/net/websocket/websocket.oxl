@@ -648,6 +648,9 @@ fn (c mut Conn) write_message_inner(op: int, b: []byte) -> err {
 }
 
 fn (c mut Conn) ping(payload: []byte) -> err {
+    if c.closed != 0 || c.close_sent != 0 {
+        return fail("write on closed connection")
+    }
     if len(payload) > 125 {
         return fail("ping payload exceeds 125 bytes")
     }
@@ -899,7 +902,7 @@ fn (c mut Conn) read_frame() -> [Frame, err] {
             return Frame{fin: false, opcode: 0, data: nil}, c.protocol_fail("non-minimal frame length")
         }
     }
-    if n > c.max_frame {
+    if op < 8 && n > c.max_frame {
         return Frame{fin: false, opcode: 0, data: nil}, c.protocol_fail("frame exceeds configured limit")
     }
     if op >= 8 && (!fin || n > 125) {
@@ -937,10 +940,11 @@ fn (c mut Conn) read_exact(n: int) -> [own []byte, err] {
             c.readbuf = c.readbuf[take:len(c.readbuf)]
             continue
         }
-        scratch := mkslice(byte, n - len(out))
-        if len(scratch) > 4096 {
-            scratch = scratch[0:4096]
+        take := n - len(out)
+        if take > 4096 {
+            take = 4096
         }
+        scratch := mkslice(byte, take)
         [got, e] = c.wire.read(scratch)
         if e != nil {
             return nil, e

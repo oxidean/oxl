@@ -52,6 +52,7 @@ struct Conn {
     peer_max_header_list: int,
     peer_max_concurrent: int,
     goaway: int,
+    ctrl_skips: int,
 }
 
 struct TLSDialResult {
@@ -106,7 +107,7 @@ fn new_conn_timeout(rw: io.ReadWriter, timeout_fd: int, timeout_ms: int) -> [own
     if timeout_fd >= 0 && timeout_ms > 0 {
         deadline = now_ms() + timeout_ms
     }
-    c := new(Conn{rw: rw, closer: nil, timeout_fd: timeout_fd, deadline_ms: deadline, decoder: decoder, streams: mkslice(StreamState, 0), cancelled_streams: mkslice(int, 0), pending_events: mkslice(Event, 0), pending_bytes: 0, goaway_last_stream: 2147483647, next_stream_id: 1, conn_send_window: 65535, conn_recv_window: 65535, peer_initial_window: 65535, peer_max_frame_size: 16384, local_max_frame_size: 16384, local_max_header_list: 65536, peer_max_header_list: 65536, peer_max_concurrent: 100, goaway: 0})
+    c := new(Conn{rw: rw, closer: nil, timeout_fd: timeout_fd, deadline_ms: deadline, decoder: decoder, streams: mkslice(StreamState, 0), cancelled_streams: mkslice(int, 0), pending_events: mkslice(Event, 0), pending_bytes: 0, goaway_last_stream: 2147483647, next_stream_id: 1, conn_send_window: 65535, conn_recv_window: 65535, peer_initial_window: 65535, peer_max_frame_size: 16384, local_max_frame_size: 16384, local_max_header_list: 65536, peer_max_header_list: 65536, peer_max_concurrent: 100, goaway: 0, ctrl_skips: 0})
     e := write_all_deadline(rw, CLIENT_PREFACE as []byte, timeout_fd, deadline)
     if e != nil {
         return nil, errors.wrap("http2: write connection preface", e)
@@ -431,7 +432,9 @@ fn (c mut Conn) send_data(id: int, payload: []byte, end_stream: bool) -> err {
     if i < 0 || c.streams[i].local_closed != 0 {
         return errors.new("http2: invalid or closed stream")
     }
-    if len(payload) > c.peer_max_frame_size || len(payload) > c.conn_send_window || len(payload) > c.streams[i].send_window {
+    // RFC 7540 §6.1: a zero-length DATA carries no flow-control
+    // cost, so it must send even against an exhausted window
+    if len(payload) > c.peer_max_frame_size || len(payload) > 0 && (len(payload) > c.conn_send_window || len(payload) > c.streams[i].send_window) {
         return errors.new("http2: DATA exceeds frame or flow-control window")
     }
     flags := 0
@@ -650,6 +653,7 @@ fn (c mut Conn) read_event() -> [Event, err] {
                     c.streams[i].local_closed = 1
                     c.streams[i].remote_closed = 1
                     c.remember_cancelled(sid)
+                    c.discard_pending_stream_events(sid)
                     ce := c.reclaim_stream_recv_credit(i)
                     if ce != nil {
                         return bad_event(ce)
@@ -838,6 +842,13 @@ fn (c mut Conn) read_event() -> [Event, err] {
             return bad_event(errors.new("http2: server push is disabled"))
         } else if h.kind == 9 {
             return bad_event(errors.new("http2: unexpected CONTINUATION"))
+        }
+        // cumulative bound across calls — only control and ignored
+        // frames reach this point, so a peer drip-feeding controls
+        // between data frames cannot escape the per-call bound
+        c.ctrl_skips = c.ctrl_skips + 1
+        if c.ctrl_skips > 65536 {
+            return bad_event(errors.new("http2: control frame flood"))
         }
     }
     return bad_event(errors.new("http2: invalid connection state"))

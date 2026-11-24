@@ -269,6 +269,14 @@ fn (client ref Client) begin(path: str, metadata: []Metadata) -> [own Call, err]
     if len(path) < 2 || byteat(path, 0) != 47 || find(path, "?") >= 0 || find(path, "#") >= 0 || find(path, "\r") >= 0 || find(path, "\n") >= 0 {
         return nil, errors.new("grpc: method path must be /service/method")
     }
+    i := 0
+    for i < len(path) {
+        b := byteat(path, i)
+        if b <= 32 || b == 127 {
+            return nil, errors.new("grpc: method path must be /service/method")
+        }
+        i = i + 1
+    }
     me := metadata_error(metadata)
     if me != nil {
         return nil, me
@@ -608,9 +616,9 @@ fn (call mut Call) read_until_event() -> err {
     for !call.finished {
         [event, ee] = call.conn.next_event()
         if ee != nil {
+            call.finished = true
             if deadline_error(ee) {
                 call.status = status(STATUS_DEADLINE_EXCEEDED, "deadline exceeded")
-                call.finished = true
             }
             return errors.wrap("grpc: receive", ee)
         }
@@ -626,7 +634,7 @@ fn (call mut Call) read_until_event() -> err {
             return errors.new("grpc: unexpected HTTP/2 stream event")
         }
         if event.kind == 3 {
-            call.status = status(STATUS_CANCELLED, "HTTP/2 stream reset")
+            call.status = status(STATUS_UNAVAILABLE, "HTTP/2 stream reset")
             call.finished = true
             return errors.new("grpc: RPC stream reset")
         } else if event.kind == 1 {

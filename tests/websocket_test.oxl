@@ -133,6 +133,20 @@ fn test_ws_bad_server_frames() {
     }
 }
 
+fn test_ws_control_frame_under_small_limit() {
+    port := atoi(os.getenv("OXL_WS_PORT"))
+    o := ws_options()
+    o.max_frame_size = 1
+    [c, e] = websocket.dial(ws_url(port, "/ping-small-limit"), o)
+    testing.expect(e == nil, "ping-small-limit fixture handshake")
+    if e == nil {
+        [m, re] = c.read_message()
+        testing.expect(re == nil && m.kind == 1 && m.data as str == "x", "legal ping survives under tiny max_frame")
+        e = c.close(1000, "done")
+        testing.expect(e == nil, "close after control frame")
+    }
+}
+
 fn test_ws_extended_server_length() {
     port := atoi(os.getenv("OXL_WS_PORT"))
     [c, e] = websocket.dial(ws_url(port, "/extended"), ws_options())

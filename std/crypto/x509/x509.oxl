@@ -1146,7 +1146,7 @@ fn pss_params(der: []byte, t: tlv) -> [int, err] {
             if e7 != nil {
                 return 0, e7
             }
-            if mh != hash_oid && !(hash_oid == "1.3.14.3.2.26" && mh == "1.3.14.3.2.26") {
+            if mh != hash_oid {
                 return 0, errors.wrap("x509: pss mgf hash mismatch", err_alg())
             }
             hash_oid = mh

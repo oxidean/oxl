@@ -200,6 +200,9 @@ fn parse_sec1(der: []byte, fallback_alg: int) -> [PrivKey, err] {
                 [os, e6] = oid_str(der, ot)
                 if e6 == nil {
                     alg = curve_alg(os)
+                    if alg == 0 {
+                        return z, errors.wrap("x509: ec private key on unsupported curve", err_alg())
+                    }
                 }
             }
         }

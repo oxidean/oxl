@@ -50,6 +50,30 @@ fn test_http2_connection_streams_and_trailers() {
     testing.expect(te2 == nil && tail.stream_id == id && tail.trailers && tail.headers[0].name == "x-check" && tail.headers[0].value == "done", "read response trailers")
 }
 
+fn test_http2_send_after_remote_end_stream() {
+    buf := bytes.newbuffer()
+    writer := buf.aswriter()
+    [settings, se] = http2.encode_frame(http2.FrameHeader{length: 0, kind: 4, flags: 0, stream_id: 0}, mkslice(byte, 0))
+    testing.expect(se == nil, "encode peer SETTINGS")
+    [_, we] = writer.write(settings)
+    testing.expect(we == nil, "queue peer SETTINGS")
+    [status, ste] = hex.decode("88")
+    testing.expect(ste == nil, "encode response status")
+    testing.expect(http2.write_frame(writer, http2.FrameHeader{length: 1, kind: 1, flags: 5, stream_id: 1}, status) == nil, "queue response HEADERS with END_STREAM")
+    [conn, ce] = http2.new_conn(buf.asreadwriter())
+    testing.expect(ce == nil, "initialize half-closed connection")
+    req := mkslice(http2.Header, 0)
+    req = push(req, http2.Header{name: ":method", value: "POST"})
+    req = push(req, http2.Header{name: ":scheme", value: "http"})
+    req = push(req, http2.Header{name: ":path", value: "/"})
+    req = push(req, http2.Header{name: ":authority", value: "127.0.0.1"})
+    [id, oe] = conn.open_stream(req, false)
+    testing.expect(oe == nil && id == 1, "open request stream before response")
+    [head, he] = conn.next_event()
+    testing.expect(he == nil && head.stream_id == id && head.headers[0].value == "200", "receive response END_STREAM")
+    testing.expect(conn.send_data(id, "body" as []byte, true) == nil, "send request DATA after remote END_STREAM")
+}
+
 fn test_http2_connection_multiplexes_stream_ids() {
     buf := bytes.newbuffer()
     writer := buf.aswriter()

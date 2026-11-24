@@ -44,6 +44,8 @@ pass. Exclude unrelated PR #215.
 
 ## Stage 5 — #221 mTLS security gate
 
+- `mtls-audit.md` records that main has no client-auth flight and the existing
+  draft is stale, uncommitted, server-focused, and untested.
 - Verify actual client CertificateRequest/CertificateVerify behavior, supported
   key families, certificate/key matching, and HTTPS integration.
 - Do not ship until private-key validation and variable-time signing posture
@@ -52,6 +54,10 @@ pass. Exclude unrelated PR #215.
 
 ## Stage 6 — #219 QUIC/HTTP/3 architecture gate
 
+- The draft spike is recorded in `quic-architecture-spike.md`; independent
+  review found required additions for key updates, Retry/CID lifecycle, address
+  family, PMTU/ECN, licensing, and explicit crypto timing posture. Amend and
+  re-review it before asking for design decisions.
 - No implementation before an independently reviewed design for UDP runtime,
   transport-independent TLS 1.3 handshake, packet protection, loss/congestion
   control, flow control, stream limits, QPACK, bounds, licensing, vectors, and

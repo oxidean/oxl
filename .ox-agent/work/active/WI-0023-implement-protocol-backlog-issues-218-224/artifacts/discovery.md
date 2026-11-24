@@ -7,8 +7,9 @@
   origin TLS starts only after a valid 200 response.
 - `std/net/tls` is a pure-Oxl TLS 1.3 stack. TLS record framing is coupled to
   stream transport, and `std/net` has no UDP/datagram API.
-- `tests/run.sh` is the repository-wide gate. HTTP/2 interop uses Node's
-  independent `http2` server; TLS and CONNECT use local Python/OpenSSL fixtures.
+- `tests/run.sh` is the repository-wide gate. The Node HTTP/2 peer is a required
+  hard-fail lane; the OpenSSL TLS interop lane currently skips if OpenSSL is
+  absent. CONNECT uses local Python/OpenSSL fixtures.
 - Existing code uses bounded parsers and explicit errors. The TLS-server/key
   signing draft is not client mTLS and requires a crypto audit before reuse.
 - `std/net/http2` contains the frame/HPACK codec and connection state machine;
@@ -29,7 +30,9 @@
   transport-independent TLS are missing, and QUIC protection, loss recovery,
   congestion/flow control, and QPACK need deterministic vectors and review.
 - #221 must implement actual CertificateRequest/CertificateVerify behavior.
-  The existing draft does not, and private-key timing/validation needs review.
+  The existing draft is uncommitted, stale, untested, and server-focused;
+  private-key timing/validation requires crypto review. See
+  `artifacts/mtls-audit.md`.
 - #223 depends on stable event ownership, multiplexing, and flow control in
   #218.
 - Two duplicate Ox-Agent event IDs in the current base were assigned unique

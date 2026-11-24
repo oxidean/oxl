@@ -57,8 +57,8 @@ struct Request {
     // added there, and new_client covers the default). redirects:
     // -1 = CLIENT_REDIRECTS default, 0 = never follow, >0 = hop
     // budget. decompress: advertise+decode gzip. proxy: "" = honor
-    // HTTP_PROXY env, "direct" = bypass, otherwise an http:// proxy
-    // URL.
+    // scheme proxy env then ALL_PROXY, "direct" = bypass, otherwise
+    // an http:// proxy URL.
     redirects: int,
     decompress: bool,
     proxy: str,
@@ -126,13 +126,8 @@ fn bearer_auth(token: str) -> Header {
 /// a redirect loop can't spin forever
 let CLIENT_REDIRECTS = 10
 
-/// proxy_from_env reads the proxy environment for host — curl's
-/// convention: plain http consults HTTP_PROXY then http_proxy; a
-/// secure URL consults https_proxy then HTTPS_PROXY only (an
-/// HTTP_PROXY setting never covers https — CONNECT-less forwarding
-/// would be cleartext, so going direct is honest). NO_PROXY/no_proxy
-/// is a comma-separated suffix list (".internal.example" or
-/// "example.com" both match subdomains). "" means connect directly.
+/// proxy_from_env reads the scheme-specific proxy before ALL_PROXY and
+/// applies NO_PROXY/no_proxy to environment-selected proxies.
 fn proxy_from_env(host: str, secure: int) -> str {
     p := ""
     if secure != 0 {
@@ -140,10 +135,16 @@ fn proxy_from_env(host: str, secure: int) -> str {
         if len(p) == 0 {
             p = os.getenv("HTTPS_PROXY")
         }
-    } else {
+    } else if len(os.getenv("REQUEST_METHOD")) == 0 {
         p = os.getenv("HTTP_PROXY")
         if len(p) == 0 {
             p = os.getenv("http_proxy")
+        }
+    }
+    if len(p) == 0 {
+        p = os.getenv("all_proxy")
+        if len(p) == 0 {
+            p = os.getenv("ALL_PROXY")
         }
     }
     if len(p) == 0 {
@@ -162,6 +163,156 @@ fn proxy_from_env(host: str, secure: int) -> str {
         return ""
     }
     return p
+}
+
+fn connect_authority(u: Url) -> str {
+    host := u.host
+    if find(host, ":") >= 0 {
+        host = "[" + host + "]"
+    }
+    return host + ":" + itoa(u.port)
+}
+
+fn connect_response_status(head: str) -> [int, err] {
+    end := find(head, "\r\n\r\n")
+    if end < 0 || end + 4 != len(head) {
+        return 0, errors.new("http: malformed CONNECT response")
+    }
+    line_end := find(head, "\r\n")
+    if line_end < 0 {
+        return 0, errors.new("http: malformed CONNECT status line")
+    }
+    line := substr(head, 0, line_end)
+    sp := find(line, " ")
+    if sp < 0 {
+        return 0, errors.new("http: malformed CONNECT status line")
+    }
+    version := substr(line, 0, sp)
+    if version != "HTTP/1.0" && version != "HTTP/1.1" {
+        return 0, errors.new("http: malformed CONNECT HTTP version")
+    }
+    rest := substr(line, sp + 1, len(line))
+    sp2 := find(rest, " ")
+    code := rest
+    if sp2 >= 0 {
+        code = substr(rest, 0, sp2)
+    }
+    if len(code) != 3 {
+        return 0, errors.new("http: malformed CONNECT status code")
+    }
+    i := 0
+    for i < 3 {
+        b := byteat(code, i)
+        if b < 48 || b > 57 {
+            return 0, errors.new("http: malformed CONNECT status code")
+        }
+        i = i + 1
+    }
+    [status, se] = strconv.atoi(code)
+    if se != nil || status < 100 || status > 599 {
+        return 0, errors.new("http: malformed CONNECT status code")
+    }
+    pos := line_end + 2
+    for pos < end {
+        eol := find_from(head, "\r\n", pos)
+        if eol < 0 || eol > end {
+            return 0, errors.new("http: malformed CONNECT headers")
+        }
+        if eol == pos {
+            break
+        }
+        field := substr(head, pos, eol)
+        colon := find(field, ":")
+        if colon <= 0 {
+            return 0, errors.new("http: malformed CONNECT header")
+        }
+        name := substr(field, 0, colon)
+        value := substr(field, colon + 1, len(field))
+        lo := 0
+        for lo < len(value) && (byteat(value, lo) == 32 || byteat(value, lo) == 9) {
+            lo = lo + 1
+        }
+        hi := len(value)
+        for hi > lo && (byteat(value, hi - 1) == 32 || byteat(value, hi - 1) == 9) {
+            hi = hi - 1
+        }
+        value = substr(value, lo, hi)
+        if !header_value_ok(name, value) {
+            return 0, errors.new("http: malformed CONNECT header")
+        }
+        name = lwr(name)
+        if name == "transfer-encoding" && len(value) > 0 {
+            return 0, errors.new("http: invalid CONNECT transfer encoding")
+        }
+        if name == "content-length" {
+            [length, le] = strconv.atoi(value)
+            if le != nil || length != 0 {
+                return 0, errors.new("http: invalid CONNECT content length")
+            }
+        }
+        pos = eol + 2
+    }
+    if status != 200 && (status < 100 || status >= 200 || status == 101) {
+        return status, errors.new("http: proxy CONNECT returned status " + itoa(status))
+    }
+    return status, nil
+}
+
+fn connect_proxy(c: net.Conn, u: Url, tmo: int) -> err {
+    if tmo <= 0 {
+        return errors.new("http: proxy CONNECT timeout")
+    }
+    authority := connect_authority(u)
+    wire := "CONNECT " + authority + " HTTP/1.1\r\nhost: " + authority + "\r\nproxy-connection: keep-alive\r\n\r\n"
+    set_sndtimo(c.rawfd(), (tmo + 999) / 1000)
+    we := write_all(c, wire)
+    if we != nil {
+        return errors.wrap("http: proxy CONNECT write", we)
+    }
+    response := ""
+    read_bytes := 0
+    scan_from := 0
+    deadline := now_ms() + tmo
+    buf := mkslice(byte, 1)
+    for read_bytes < 32768 {
+        if tmo > 0 {
+            remaining := deadline - now_ms()
+            if remaining <= 0 {
+                return errors.new("http: proxy CONNECT timeout")
+            }
+            set_rcvtimo_ms(c.rawfd(), remaining)
+        }
+        [n, re] = c.read(buf)
+        if n > 0 {
+            response = response + buf[0:n] as str
+            read_bytes = read_bytes + n
+            head_end := find_from(response, "\r\n\r\n", scan_from)
+            if head_end >= 0 {
+                [status, pe] = connect_response_status(response)
+                if pe != nil {
+                    return pe
+                }
+                if status >= 100 && status < 200 && status != 101 {
+                    response = ""
+                } else {
+                    set_rcvtimo_ms(c.rawfd(), 0)
+                    return nil
+                }
+            } else {
+                scan_from = len(response) - 3
+                if scan_from < 0 {
+                    scan_from = 0
+                }
+            }
+        }
+        if re != nil {
+            return errors.wrap("http: proxy CONNECT read", re)
+        }
+        if n <= 0 {
+            return errors.new("http: proxy CONNECT response ended early")
+        }
+    }
+    return errors.new("http: proxy CONNECT headers too large")
 }
 
 /// is_loopback_host reports whether host names the local machine —
@@ -815,9 +966,8 @@ fn (cl ref Client) do_once(req: Request) -> [Response, err] {
         i = i + 1
     }
     // proxy policy: "" honors the env, "direct" connects straight,
-    // anything else is an http:// proxy URL. The request target stays
-    // absolute-URI through a proxy (plain-HTTP forwarding — CONNECT
-    // is an HTTPS concern).
+    // anything else is an http:// proxy URL. Plain HTTP uses absolute
+    // form; HTTPS establishes CONNECT before TLS.
     pxy := req.proxy
     if len(pxy) == 0 {
         pxy = proxy_from_env(u.host, u.secure)
@@ -842,12 +992,6 @@ fn (cl ref Client) do_once(req: Request) -> [Response, err] {
         dial_port = pu.port
         via_proxy = true
     }
-    // https through an HTTP proxy needs CONNECT tunneling — parked;
-    // a configured proxy on a secure URL errors, never silently goes
-    // direct or cleartext
-    if u.secure != 0 && via_proxy {
-        return bad, errors.new("http: https via proxy unsupported (no CONNECT)")
-    }
     // Host header names the ORIGIN, not the proxy; the port rides
     // only when it differs from the scheme default — no spurious :443
     hosthdr := target_host
@@ -855,7 +999,7 @@ fn (cl ref Client) do_once(req: Request) -> [Response, err] {
         hosthdr = hosthdr + ":" + itoa(target_port)
     }
     target := u.path
-    if via_proxy {
+    if via_proxy && u.secure == 0 {
         target = "http://" + url_authority(u) + u.path
     }
     wire := req.method + " " + target + " HTTP/1.1\r\n" + "host: " + hosthdr + "\r\n" + "connection: close\r\n"
@@ -894,15 +1038,36 @@ fn (cl ref Client) do_once(req: Request) -> [Response, err] {
         if len(cfg.alpn) == 0 {
             cfg.alpn = push(mkslice(str, 0), "http/1.1")
         }
-        [tc, te] = tls.dial_timeout(u.host, u.port, cl.tmo, cfg)
-        if te != nil {
-            return bad, te
+        if via_proxy {
+            [pc, pe] = net.dial_timeout(dial_host, dial_port, cl.tmo)
+            if pe != nil {
+                return bad, pe
+            }
+            pe = connect_proxy(pc, u, cl.tmo)
+            if pe != nil {
+                pc.close()
+                return bad, pe
+            }
+            [tc, te] = tls.client_tmo(pc, cfg, cl.tmo)
+            if te != nil {
+                return bad, te
+            }
+            [rs, re] = exchange(tc, wire, cl.tmo)
+            if re != nil {
+                return bad, re
+            }
+            resp = rs
+        } else {
+            [tc, te] = tls.dial_timeout(u.host, u.port, cl.tmo, cfg)
+            if te != nil {
+                return bad, te
+            }
+            [rs, re] = exchange(tc, wire, cl.tmo)
+            if re != nil {
+                return bad, re
+            }
+            resp = rs
         }
-        [rs, re] = exchange(tc, wire, cl.tmo)
-        if re != nil {
-            return bad, re
-        }
-        resp = rs
     } else {
         [c, de] = net.dial_timeout(dial_host, dial_port, cl.tmo)
         if de != nil {

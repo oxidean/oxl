@@ -186,8 +186,17 @@ scheme default — no spurious `:443`. Redirect resolution
 Locations, scheme-relative `//h/p` on a secure base, and relative
 merges all keep the scheme, and `same_origin` includes `secure` so
 credentials never cross an http→https hop. HTTPS through an HTTP
-proxy needs CONNECT tunneling — parked — so a configured proxy on a
-secure URL errors rather than silently going direct or cleartext.
+proxy uses a bounded CONNECT exchange, then wraps the same socket with
+origin-verified TLS; proxy failures never fall back to direct or cleartext
+requests. HTTPS proxies and SOCKS remain out of scope. An empty
+`Request.proxy` uses `https_proxy` then `HTTPS_PROXY` for secure URLs,
+`HTTP_PROXY` then `http_proxy` for plain HTTP, and `all_proxy` then
+`ALL_PROXY` as fallback. `NO_PROXY`/`no_proxy` is a comma-separated
+host/suffix list for environment-selected proxies; an explicit proxy
+URL takes precedence, while `Request.proxy = "direct"` bypasses env
+proxies. HTTP proxy variables are ignored when `REQUEST_METHOD` is set
+to avoid CGI `HTTP_PROXY` injection. Proxy authentication is not
+implemented.
 `serve` is untouched; a TLS listener is not part of this surface.
 
 ## Error taxonomy

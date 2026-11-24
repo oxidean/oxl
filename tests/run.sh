@@ -695,6 +695,92 @@ else
     echo "  openssl not found — skipping live interop"
 fi
 
+if command -v "$PY" >/dev/null 2>&1 && "$PY" -c 'import ssl' 2>/dev/null; then
+    origin_port="${TLS_INTEROP_PORT:-24443}"
+    proxy_port=$((origin_port + 4))
+    connect_capture=$(mktemp)
+    "$PY" tests/tls/https_origin.py "$origin_port" tests/tls/server.pem tests/tls/server-key.pem >/dev/null 2>&1 &
+    origin_srv=$!
+    "$PY" tests/tls/connect_proxy.py "$proxy_port" "$origin_port" "$connect_capture" >/dev/null 2>&1 &
+    proxy_srv=$!
+    origin_ready=0
+    for i in $(seq 1 50); do
+        kill -0 "$origin_srv" 2>/dev/null || break
+        (exec 3<>"/dev/tcp/127.0.0.1/$origin_port") 2>/dev/null && { exec 3>&- 3<&-; origin_ready=1; break; }
+        sleep 0.1
+    done
+    proxy_ready=0
+    for i in $(seq 1 50); do
+        kill -0 "$proxy_srv" 2>/dev/null || break
+        (exec 3<>"/dev/tcp/127.0.0.1/$proxy_port") 2>/dev/null && { exec 3>&- 3<&-; proxy_ready=1; break; }
+        sleep 0.1
+    done
+    if [ "$origin_ready" != 1 ] || [ "$proxy_ready" != 1 ]; then
+        echo "FAIL https CONNECT: local fixtures did not listen" >&2
+        kill "$proxy_srv" "$origin_srv" 2>/dev/null || true
+        rm -f "$connect_capture"
+        exit 1
+    fi
+    proxy_test() {
+        local mode="$1" hp="$2" ap="$3" np="$4" hproxy="$5" request_method="$6" lhp="${7:-}" lap="${8:-}" lnp="${9:-}" lhttp="${10:-}" pout
+        : > "$connect_capture"
+        pout=$(OXL_HTTPS_TEST_PORT="$origin_port" OXL_HTTPS_PROXY_PORT="$proxy_port" \
+            OXL_HTTPS_TEST_CA=tests/tls/ca.pem OXL_PROXY_CAPTURE="$connect_capture" \
+            OXL_PROXY_MODE="$mode" HTTP_PROXY="$hproxy" http_proxy="$lhttp" REQUEST_METHOD="$request_method" \
+            HTTPS_PROXY="$hp" https_proxy="$lhp" ALL_PROXY="$ap" all_proxy="$lap" NO_PROXY="$np" no_proxy="$lnp" \
+            "$OXL" test tests/https_proxy_test.oxl) || {
+            printf '%s\n' "$pout" >&2
+            kill "$proxy_srv" "$origin_srv" 2>/dev/null || true
+            rm -f "$connect_capture"
+            exit 1
+        }
+        grep -q "test_https_proxy_connect ... ok" <<<"$pout" || {
+            echo "FAIL https CONNECT $mode: $pout" >&2
+            kill "$proxy_srv" "$origin_srv" 2>/dev/null || true
+            rm -f "$connect_capture"
+            exit 1
+        }
+        printf '%s\n' "$pout" >&2
+    }
+    proxy_url="http://127.0.0.1:$proxy_port"
+    case "$(uname -s)" in
+        MINGW*|MSYS*|CYGWIN*) ;;
+        *)
+            proxy_test env_precedence http://scheme.invalid http://fallback.invalid "" "" "" "" "" ""
+            proxy_test env_http_precedence "" "" "" http://uppercase.invalid "" "" "" "" http://lowercase.invalid
+            proxy_test env_https_precedence http://uppercase.invalid "" "" "" "" http://lowercase.invalid "" ""
+            proxy_test proxy_bypass_lower "" "" "" "" "" http://lowercase.invalid "" example.invalid
+            proxy_test env_https_lower "" "" "" "" "" "$proxy_url" "" ""
+            proxy_test env_all_lower "" "" "" "" "" "" "$proxy_url" ""
+            ;;
+    esac
+    proxy_test explicit "" "" "" "" ""
+    proxy_test origin_sni "" "" "" "" ""
+    proxy_test env_https "$proxy_url" "" "" "" ""
+    proxy_test zero_timeout "" "" "" "" ""
+    proxy_test env_all "" "$proxy_url" "" "" ""
+    proxy_test no_proxy "$proxy_url" "" "127.0.0.1" "" ""
+    proxy_test proxy_bypass_rule "$proxy_url" "" "example.invalid" "" ""
+    proxy_test http_proxy_cgi_guard "" "" "" "$proxy_url" GET
+    proxy_test explicit_override "$proxy_url" "" "example.invalid" "" ""
+    proxy_test direct "$proxy_url" "" "" "" ""
+    proxy_test reject "" "" "" "" ""
+    proxy_test badgateway "" "" "" "" ""
+    proxy_test interim "" "" "" "" ""
+    proxy_test malformed "" "" "" "" ""
+    proxy_test badcl "" "" "" "" ""
+    proxy_test badte "" "" "" "" ""
+    proxy_test cumulative "" "" "" "" ""
+    proxy_test truncated "" "" "" "" ""
+    proxy_test oversized "" "" "" "" ""
+    proxy_test badname "" "" "" "" ""
+    proxy_test badroot "" "" "" "" ""
+    kill "$proxy_srv" "$origin_srv" 2>/dev/null || true
+    wait "$proxy_srv" "$origin_srv" 2>/dev/null || true
+    rm -f "$connect_capture"
+    echo "  https CONNECT local proxy tests: success, env, bypass, rejection, bounds, trust"
+fi
+
 echo "== oxl test: https (x7) =="
 # parse-level coverage runs everywhere; the live tests see no
 # OXL_HTTPS_TEST_* env here so they skip clean (their markers print

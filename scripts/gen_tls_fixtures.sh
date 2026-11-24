@@ -41,7 +41,18 @@
 #         fails the capture if the client doesn't echo the cookie.
 #         Captures tests/tls/flight_cookie.hex.
 #
-# Usage: gen_tls_fixtures.sh [rsa|x509|flight|flight_hrr|cookie|all]
+#   mtls  tests/fixtures/mtls/ — #221: the client-auth PKI (a
+#         dedicated CA whose key is committed, like tests/tls's) and
+#         client cert+key pairs in every family the CV layer signs —
+#         RSA-2048, ECDSA P-256/P-384, Ed25519 — with the keys in all
+#         three PEM encodings the loader reads (PKCS#8 "PRIVATE KEY",
+#         PKCS#1 "RSA PRIVATE KEY", SEC1 "EC PRIVATE KEY"). Also an
+#         other_rsa pair for the same-family key/cert mismatch test.
+#         openssl names the encodings: genpkey output is PKCS#8,
+#         `openssl rsa -traditional` is PKCS#1, `openssl ec` default
+#         output is SEC1.
+#
+# Usage: gen_tls_fixtures.sh [rsa|x509|flight|flight_hrr|cookie|mtls|all]
 #   — default "all"
 # The openssl version is recorded in tests/fixtures/OPENSSL-VERSION
 # so a future regeneration can tell what minted the fixtures.
@@ -499,12 +510,93 @@ gen_cookie() {
     echo "gen_tls_fixtures: wrote $outdir/flight_cookie.hex ($(wc -c < "$outdir/flight_cookie.hex") hex chars)"
 }
 
+# gen_mtls mints the client-authentication PKI + key material (#221):
+# a dedicated CA (committed with its key, like tests/tls's) and client
+# cert+key pairs for every signature family the client CertificateVerify
+# layer signs. Both the unit tests (key parsing, match checks) and the
+# openssl interop lane (`s_server -Verify 1 -CAfile client-ca.pem`)
+# read these.
+gen_mtls() {
+    local outdir=tests/fixtures/mtls
+    local work
+    work=$(mktemp -d)
+    trap 'rm -rf "$work"' RETURN
+    mkdir -p "$outdir"
+
+    # client-auth CA — EC P-256 like the flight CA; the leaf ext block
+    # is the mirror of serverAuth: digitalSignature + clientAuth
+    cat > "$work/ca.cnf" <<'EOF'
+basicConstraints=critical,CA:TRUE
+keyUsage=critical,keyCertSign,cRLSign
+subjectKeyIdentifier=hash
+authorityKeyIdentifier=keyid
+EOF
+    cat > "$work/leaf.cnf" <<'EOF'
+basicConstraints=critical,CA:FALSE
+keyUsage=critical,digitalSignature
+extendedKeyUsage=clientAuth
+subjectKeyIdentifier=hash
+authorityKeyIdentifier=keyid
+EOF
+    openssl ecparam -name prime256v1 -genkey -noout -out "$work/ca.key"
+    openssl req -x509 -new -key "$work/ca.key" -sha256 -days 3650 \
+        -subj "/CN=Oxl mTLS Test Client CA" \
+        -addext "basicConstraints=critical,CA:TRUE" \
+        -addext "keyUsage=critical,keyCertSign,cRLSign" \
+        -addext "subjectKeyIdentifier=hash" \
+        -out "$work/client-ca.pem"
+
+    # keygen: <name> <genpkey args...> — default output is PKCS#8
+    openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$work/client_rsa.key" 2>/dev/null
+    openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$work/client_ec.key" 2>/dev/null
+    openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-384 -out "$work/client_ec384.key" 2>/dev/null
+    openssl genpkey -algorithm ED25519 -out "$work/client_ed.key" 2>/dev/null
+    # a second RSA identity for the same-family mismatch test
+    openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$work/other_rsa.key" 2>/dev/null
+
+    # issue: leaf cert per key, CN names the key family
+    issue_client() { # <name> <CN>
+        openssl req -new -key "$work/$1.key" -subj "/CN=$2" -out "$work/$1.csr"
+        openssl x509 -req -in "$work/$1.csr" -CA "$work/client-ca.pem" \
+            -CAkey "$work/ca.key" -CAcreateserial -days 3650 -sha256 \
+            -extfile "$work/leaf.cnf" -out "$work/$1.pem"
+    }
+    issue_client client_rsa   "Oxl mTLS RSA Client"
+    issue_client client_ec    "Oxl mTLS P256 Client"
+    issue_client client_ec384 "Oxl mTLS P384 Client"
+    issue_client client_ed    "Oxl mTLS Ed25519 Client"
+    issue_client other_rsa    "Oxl mTLS Other RSA Client"
+
+    # PEM encoding variants — the three grammars the loader reads
+    openssl rsa -in "$work/client_rsa.key" -traditional -out "$work/client_rsa_key_pkcs1.pem" 2>/dev/null
+    openssl ec -in "$work/client_ec.key" -out "$work/client_ec_key_sec1.pem" 2>/dev/null
+
+    # an encrypted PKCS#8 — the loader must say "unsupported", not
+    # dump a DER error on the user
+    openssl pkcs8 -in "$work/client_rsa.key" -topk8 -v2 aes-256-cbc \
+        -passout pass:fixture -out "$work/client_rsa_key_enc.pem" 2>/dev/null
+
+    cp "$work/client-ca.pem" "$outdir/client-ca.pem"
+    cp "$work/ca.key" "$outdir/client-ca-key.pem"
+    for f in client_rsa client_ec client_ec384 client_ed other_rsa; do
+        cp "$work/$f.pem" "$outdir/$f.pem"
+        cp "$work/$f.key" "$outdir/$f.key"
+    done
+    cp "$work/client_rsa_key_pkcs1.pem" "$outdir/client_rsa_key_pkcs1.pem"
+    cp "$work/client_ec_key_sec1.pem" "$outdir/client_ec_key_sec1.pem"
+    cp "$work/client_rsa_key_enc.pem" "$outdir/client_rsa_key_enc.pem"
+
+    openssl version > tests/fixtures/OPENSSL-VERSION
+    echo "gen_tls_fixtures: wrote $outdir ($(cat tests/fixtures/OPENSSL-VERSION))"
+}
+
 case "${1:-all}" in
     rsa) gen_rsa ;;
     x509) gen_x509 ;;
     flight) gen_flight ;;
     flight_hrr) gen_flight_hrr ;;
     cookie) gen_cookie ;;
-    all) gen_rsa; gen_x509; gen_flight; gen_flight_hrr; gen_cookie ;;
-    *) echo "usage: gen_tls_fixtures.sh [rsa|x509|flight|flight_hrr|cookie|all]" >&2; exit 2 ;;
+    mtls) gen_mtls ;;
+    all) gen_rsa; gen_x509; gen_flight; gen_flight_hrr; gen_cookie; gen_mtls ;;
+    *) echo "usage: gen_tls_fixtures.sh [rsa|x509|flight|flight_hrr|cookie|mtls|all]" >&2; exit 2 ;;
 esac

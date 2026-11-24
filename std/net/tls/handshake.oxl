@@ -68,6 +68,8 @@ let X_COOKIE = 44
 
 let X_PSK_MODES = 45
 
+let X_CERT_AUTHS = 47 // certificate_authorities — CertificateRequest
+
 let X_KEY_SHARE = 51
 
 // extension types that matter only to the 1.2 fallback path
@@ -819,21 +821,254 @@ fn send_client_finished(c: mut Conn) -> err {
     return hs_send_t(c, HS_FINISHED, vd)
 }
 
-// client_flight is the post-server-Finished emission: [empty
-// Certificate when a CertificateRequest arrived] + Finished.
-fn client_flight(c: mut Conn) -> err {
+// ---- client mTLS (CertificateRequest answer) --------------------------------
+
+// cr_exts parses the CertificateRequest extension block. The two
+// extensions that constrain our answer are signature_algorithms —
+// REQUIRED by §4.3.2, absent is missing_extension — and
+// certificate_authorities (a leaf outside the listed issuers answers
+// empty). Everything else parses over: "clients MUST ignore
+// unrecognized extensions."
+fn cr_exts(c: mut Conn, exts: []byte) -> err {
+    s := c.s
+    r := mkrd(exts)
+    for r.ok != 0 && r.p < len(exts) {
+        ty := r.u16()
+        d := r.bytes(r.u16())
+        if r.ok == 0 {
+            break
+        }
+        if ty == X_SIG_ALGS {
+            sr := mkrd(d)
+            sl := sr.u16()
+            if sr.ok == 0 || sl % 2 != 0 || sr.left() != sl {
+                return fail(c, AL_DECODE_ERR, "bad signature_algorithms")
+            }
+            s.cr_sa_seen = 1
+            s.cr_sigalgs = mkslice(int, 0)
+            i := 0
+            for i < sl / 2 {
+                s.cr_sigalgs = push(s.cr_sigalgs, sr.u16())
+                i = i + 1
+            }
+        } else if ty == X_CERT_AUTHS {
+            // DistinguishedName list: u16 total + u16-framed DER names
+            ar := mkrd(d)
+            tot := ar.u16()
+            if ar.ok == 0 || ar.left() != tot {
+                return fail(c, AL_DECODE_ERR, "bad certificate_authorities")
+            }
+            end := ar.p + tot
+            s.cr_cas = mkslice([]byte, 0)
+            for ar.ok != 0 && ar.p < end {
+                nm := ar.bytes(ar.u16())
+                if ar.ok == 0 {
+                    break
+                }
+                nb := bclone(nm)
+                s.cr_cas = push(s.cr_cas, nb[0:len(nb)])
+            }
+            if ar.ok == 0 || ar.p != end {
+                return fail(c, AL_DECODE_ERR, "bad certificate_authorities")
+            }
+        }
+        // signature_algorithms_cert (50) constrains signatures ON the
+        // chain, not the CV — our chain is already minted; all other
+        // CR extensions are ignored per §4.3.2
+    }
+    if r.ok == 0 || r.p != len(exts) {
+        return fail(c, AL_DECODE_ERR, "bad certificate_request extensions")
+    }
+    if s.cr_sa_seen == 0 {
+        return fail(c, AL_MISSING_EXT, "certificate_request without signature_algorithms")
+    }
+    return nil
+}
+
+// name_offered reports whether issuer_der is one of the CR's
+// certificate_authorities DER names.
+fn name_offered(issuer_der: []byte, cas: [][]byte) -> bool {
+    i := 0
+    for i < len(cas) {
+        if bequal(issuer_der, cas[i]) {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// cv_alg_for_key intersects the key family's CV-legal scheme list
+// (our preference order) with the CR's offered signature_algorithms —
+// 0 means nothing offered the key can sign with. rsa_pkcs1_* values
+// are deliberately absent from the RSA list: §4.4.3 makes them
+// illegal in CertificateVerify.
+fn cv_alg_for_key(alg: int, sigalgs: []int) -> int {
+    want := mkslice(int, 0)
+    if alg == x509.PK_ec_p256 {
+        want = push(want, SA_ECDSA_P256_SHA256)
+    } else if alg == x509.PK_ec_p384 {
+        want = push(want, SA_ECDSA_P384_SHA384)
+    } else if alg == x509.PK_ed25519 {
+        want = push(want, SA_ED25519)
+    } else if alg == x509.PK_rsa {
+        want = push(want, SA_PSS_SHA256)
+        want = push(want, SA_PSS_SHA384)
+        want = push(want, SA_PSS_SHA512)
+    } else {
+        return 0
+    }
+    i := 0
+    for i < len(want) {
+        j := 0
+        for j < len(sigalgs) {
+            if sigalgs[j] == want[i] {
+                return want[i]
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// pick_cv_alg selects the client CertificateVerify scheme — 0 means
+// "no usable identity" and the answer is then the empty
+// certificate_list. That covers: no configured identity,
+// certificate_authorities sent and our leaf's issuer not listed, and
+// no offered scheme the key can sign with.
+fn pick_cv_alg(c: mut Conn, cfg: Config) -> int {
+    s := c.s
+    if len(cfg.client_cert.chain) == 0 || cfg.client_cert.key.alg == 0 {
+        return 0
+    }
+    if len(s.cr_cas) > 0 {
+        [leaf, le] = x509.parse_cert(cfg.client_cert.chain[0])
+        if le != nil || !name_offered(leaf.issuer_der, s.cr_cas) {
+            return 0
+        }
+    }
+    return cv_alg_for_key(cfg.client_cert.key.alg, s.cr_sigalgs)
+}
+
+// der_int is one DER INTEGER's content+header — drop leading zeros,
+// re-add one when the top bit would read negative.
+fn der_int(w: mut wr, v: []byte) {
+    i := 0
+    for i + 1 < len(v) && v[i] == 0 {
+        i = i + 1
+    }
+    pad := 0
+    if v[i] >= 128 {
+        pad = 1
+    }
+    w.u8(2)
+    w.u8(len(v) - i + pad)
+    if pad == 1 {
+        w.u8(0)
+    }
+    for i < len(v) {
+        w.u8(v[i])
+        i = i + 1
+    }
+}
+
+// cv_sign signs the CertificateVerify content with the identity key —
+// pick_cv_alg already pinned alg to something the key can do.
+fn cv_sign(k: x509.PrivKey, alg: int, content: []byte) -> [own []byte, err] {
+    if alg == SA_ED25519 {
+        return ed25519.sign(k.sk, content)
+    }
+    if alg == SA_PSS_SHA256 {
+        return rsa.sign_pss(k.rk, sha256.new, content, 32)
+    }
+    if alg == SA_PSS_SHA384 {
+        return rsa.sign_pss(k.rk, sha512.new384, content, 48)
+    }
+    if alg == SA_PSS_SHA512 {
+        return rsa.sign_pss(k.rk, sha512.new, content, 64)
+    }
+    // ECDSA — Sig r,s DER-encodes as SEQUENCE { INTEGER, INTEGER }
+    if alg == SA_ECDSA_P256_SHA256 || alg == SA_ECDSA_P384_SHA384 {
+        cv := nistec.p256()
+        hf := sha256.new
+        if alg == SA_ECDSA_P384_SHA384 {
+            cv = nistec.p384()
+            hf = sha512.new384
+        }
+        [sg, e] = nistec.ecdsa_sign(cv, k.sk, hf, content)
+        if e != nil {
+            return nil, e
+        }
+        w := mkwr()
+        seq_off := len(w.b)
+        w.u8(48)
+        w.u8(0)
+        der_int(w, sg.r)
+        der_int(w, sg.s)
+        w.b[seq_off + 1] = (len(w.b) - seq_off - 2) % 256
+        return new(w.b), nil
+    }
+    return nil, errors.new("tls: bad cv alg")
+}
+
+// client_flight is the post-server-Finished emission: the
+// CertificateRequest answer — context echo + configured chain, or
+// the RFC-mandated empty certificate_list when no identity is
+// configured or usable — a CertificateVerify over the transcript when
+// a real chain went out, then Finished.
+fn client_flight(c: mut Conn, cfg: Config) -> err {
     s := c.s
     if s.cr_seen != 0 {
-        // RFC-mandated answer: empty certificate_list, context echoed
-        // — and RFC 8446 forbids CertificateVerify without a
-        // non-empty Certificate, so none follows
+        alg := pick_cv_alg(c, cfg)
         w := mkwr()
         w.u8(len(s.cr_ctx))
         w.put(s.cr_ctx)
-        w.u24(0)
+        if alg == 0 {
+            // RFC 8446 forbids CertificateVerify after an empty
+            // certificate_list — none follows
+            w.u24(0)
+        } else {
+            tot_off := len(w.b)
+            w.u24(0)
+            i := 0
+            for i < len(cfg.client_cert.chain) {
+                w.u24(len(cfg.client_cert.chain[i]))
+                w.put(cfg.client_cert.chain[i])
+                w.u16(0) // no per-entry extensions
+                i = i + 1
+            }
+            w.lenpatch(tot_off, 3)
+        }
         e := hs_send_t(c, HS_CERTIFICATE, w.b)
         if e != nil {
             return e
+        }
+        if alg != 0 {
+            // CV content: 0x20*64 || context string || 0x00 ||
+            // TH(CH..client Certificate) — the transcript already
+            // carries our Certificate via hs_send_t above
+            cw := mkwr()
+            i := 0
+            for i < 64 {
+                cw.u8(32)
+                i = i + 1
+            }
+            cw.putstr("TLS 1.3, client CertificateVerify")
+            cw.u8(0)
+            cw.put(th_sum(c))
+            [sig, se] = cv_sign(cfg.client_cert.key, alg, cw.b)
+            if se != nil {
+                return errors.wrap("tls: client certificate_verify: " + errors.msg(se), err_keys())
+            }
+            vw := mkwr()
+            vw.u16(alg)
+            vw.u16(len(sig))
+            vw.put(sig)
+            e = hs_send_t(c, HS_CERT_VERIFY, vw.b)
+            if e != nil {
+                return e
+            }
         }
     }
     return send_client_finished(c)
@@ -1115,12 +1350,16 @@ fn hs_client(c: mut Conn, cfg: Config) -> err {
             rr := mkrd(body)
             ctx := rr.bytes(rr.u8())
             el := rr.u16()
-            rr.bytes(el) // extensions — ignored, must be well-formed
-            if rr.ok == 0 {
+            exts := rr.bytes(el)
+            if rr.ok == 0 || rr.p != len(body) {
                 return fail(c, AL_DECODE_ERR, "bad certificate_request")
             }
             s.cr_seen = 1
             s.cr_ctx = bclone(ctx)
+            e = cr_exts(c, exts)
+            if e != nil {
+                return e
+            }
             state = 4
         } else if mty == HS_CERTIFICATE {
             if state != 1 && state != 4 {
@@ -1193,7 +1432,7 @@ fn hs_client(c: mut Conn, cfg: Config) -> err {
     // transcript(CH..server Finished) keys the app traffic secrets —
     // snapshot BEFORE our own Finished joins the transcript
     th_app := th_sum(c)
-    e = client_flight(c)
+    e = client_flight(c, cfg)
     if e != nil {
         return e
     }

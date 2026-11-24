@@ -16,6 +16,13 @@ package main
 //           handshake must fail with err_name              → INTEROP_BADNAME
 //   tls12   explicit TLS 1.2-only connection                → INTEROP_TLS12
 //   auto12  explicit [TLS 1.2,TLS 1.3] auto negotiation     → INTEROP_AUTO12
+//   mtls    TLS 1.3 client auth: present cert+key (argv 4,5)
+//           against `s_server -Verify 1`                   → INTEROP_MTLS
+//   mtls_nocert  against `-Verify 1` with no identity — or one the
+//           CR's signature_algorithms leaves unusable; the
+//           certificate_required alert must surface on I/O → INTEROP_MTLS_NOCERT
+//   mtls_nocr    cert configured but the server sends no
+//           CertificateRequest — plain handshake           → INTEROP_MTLS_NOCR
 import "std/crypto/x509"
 
 import "std/errors"
@@ -66,7 +73,7 @@ fn roundtrip(c: tls.Conn) {
 
 fn main() {
     if os.nargs() < 4 {
-        die("usage: interop.oxl <scenario> <port> <ca.pem>")
+        die("usage: interop.oxl <scenario> <port> <ca.pem> [cert.pem key.pem]")
     }
     scen := os.args(1)
     port := atoi(os.args(2))
@@ -87,7 +94,51 @@ fn main() {
         // dial 127.0.0.1 but verify the DNS SAN like a real client
         cfg.server_name = "localhost"
     }
+    if scen == "mtls" || scen == "mtls_nocr" || scen == "mtls_nocert" {
+        // mtls_nocert takes an optional identity: loaded but unusable
+        // (no offered scheme fits the key) still answers empty
+        if os.nargs() >= 6 {
+            [cc, ce] = tls.load_cert_pem(os.readfile_(os.args(4)), os.readfile_(os.args(5)))
+            if ce != nil {
+                die("client identity: " + errors.msg(ce))
+            }
+            cfg.client_cert = cc
+        } else if scen != "mtls_nocert" {
+            die(scen + " needs <cert.pem> <key.pem>")
+        }
+    }
     [c, e] = tls.dial("127.0.0.1", port, cfg)
+
+    if scen == "mtls_nocert" {
+        // a -Verify server tolerates the empty certificate_list
+        // through the client flight — the certificate_required alert
+        // lands after Finished, so it surfaces on write/read, not
+        // necessarily the dial
+        if e != nil {
+            println("INTEROP_MTLS_NOCERT")
+            return
+        }
+        [nw, we] = c.write("GET / HTTP/1.0\r\nhost: x\r\n\r\n" as []byte)
+        if we == nil && nw > 0 {
+            buf := mkslice(byte, 1024)
+            tries := 0
+            for tries < 8 && we == nil {
+                [nr, re] = c.read(buf)
+                if nr >= 0 {
+                    we = re
+                } else {
+                    we = re
+                }
+                tries = tries + 1
+            }
+        }
+        c.close()
+        if we == nil {
+            die("required client auth never failed")
+        }
+        println("INTEROP_MTLS_NOCERT")
+        return
+    }
 
     if scen == "tls12default" {
         if e == nil {
@@ -154,6 +205,10 @@ fn main() {
     roundtrip(c)
     if scen == "hrr" {
         println("INTEROP_HRR")
+    } else if scen == "mtls" {
+        println("INTEROP_MTLS")
+    } else if scen == "mtls_nocr" {
+        println("INTEROP_MTLS_NOCR")
     } else if scen == "tls12" {
         println("INTEROP_TLS12")
     } else if scen == "tls12rsa" {

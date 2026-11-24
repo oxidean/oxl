@@ -353,6 +353,13 @@ fn (c ref Conn) rawfd() -> int {
     return c.inner.rawfd()
 }
 
+fn (c ref Conn) negotiated_alpn() -> str {
+    if c.s == nil {
+        return ""
+    }
+    return c.s.alpn
+}
+
 /// peer returns a snapshot copy of the verified leaf — every own
 /// field cloned, so mutating it touches neither the conn's stored
 /// cert nor later peer() calls.

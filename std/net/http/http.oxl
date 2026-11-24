@@ -454,7 +454,7 @@ fn new_client(tmo: int) -> Client {
 /// same as before — header injection isn't a formatting choice).
 fn (cl ref Client) request(method: str, url: str, ctype: str, body: str) -> [Resp, err] {
     bad := Resp{status: 0, body: "", ctype: ""}
-    req := Request{method: method, url: url, headers: mkslice(Header, 0), body: body, redirects: 0, decompress: false, proxy: "direct"}
+    req := Request{method: method, url: url, headers: mkslice(Header, 0), body: body, redirects: 0, decompress: false, proxy: "direct", http_version: ""}
     if len(ctype) > 0 && !has_crlf(ctype) {
         req.headers = push(req.headers, Header{name: "content-type", value: ctype})
     }

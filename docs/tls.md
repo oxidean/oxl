@@ -197,6 +197,12 @@ URL takes precedence, while `Request.proxy = "direct"` bypasses env
 proxies. HTTP proxy variables are ignored when `REQUEST_METHOD` is set
 to avoid CGI `HTTP_PROXY` injection. Proxy authentication is not
 implemented.
+`Request.http_version = "2"` offers `h2` and `http/1.1` through ALPN for
+HTTPS and uses HTTP/1.1 only when the peer selects it; TLS or HTTP/2
+protocol failures do not fall back. For cleartext HTTP, set
+`Request.http_version = "2-prior-knowledge"` to require h2c without an
+HTTP/1.1 upgrade or fallback. HTTP/2 proxy transport is not supported.
+HTTP/2 response trailers are returned in `Response.trailers`.
 `serve` is untouched; a TLS listener is not part of this surface.
 
 ## Error taxonomy

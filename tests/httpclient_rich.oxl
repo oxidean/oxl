@@ -294,7 +294,7 @@ fn main() {
     expect(r9.body == "hello gzip", "gzip decoded got len " + itoa(len(r9.body)))
     // decompression off delivers the raw bytes with the header visible
     cl_raw := http.new_client(30000)
-    rq_raw := http.Request{method: "GET", url: base + "/gzip", headers: mkslice(http.Header, 0), body: "", redirects: 0, decompress: false, proxy: "direct"}
+    rq_raw := http.Request{method: "GET", url: base + "/gzip", headers: mkslice(http.Header, 0), body: "", redirects: 0, decompress: false, proxy: "direct", http_version: ""}
     [r10, e10] = get_retry_req(cl_raw, rq_raw)
     ck(e10, "gzip raw")
     expect(r10.body != "hello gzip", "raw gzip not decoded")

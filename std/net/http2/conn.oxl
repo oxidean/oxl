@@ -1,0 +1,837 @@
+package http2
+
+import "std/io"
+
+import "std/errors"
+
+import "std/net"
+
+import "std/net/tls"
+
+let CLIENT_PREFACE = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+
+struct StreamState {
+    id: int,
+    send_window: int,
+    recv_window: int,
+    recv_unacked: int,
+    got_headers: int,
+    local_closed: int,
+    remote_closed: int,
+}
+
+struct Event {
+    stream_id: int,
+    kind: int,
+    flags: int,
+    trailers: bool,
+    flow_bytes: int,
+    last_stream_id: int,
+    headers: []Header,
+    payload: []byte,
+}
+
+struct Conn {
+    rw: io.ReadWriter,
+    closer: io.Closer,
+    timeout_fd: int,
+    deadline_ms: int,
+    decoder: own Decoder,
+    streams: []StreamState,
+    cancelled_streams: []int,
+    pending_events: []Event,
+    pending_bytes: int,
+    goaway_last_stream: int,
+    next_stream_id: int,
+    conn_send_window: int,
+    conn_recv_window: int,
+    peer_initial_window: int,
+    peer_max_frame_size: int,
+    local_max_frame_size: int,
+    local_max_header_list: int,
+    peer_max_header_list: int,
+    peer_max_concurrent: int,
+    goaway: int,
+}
+
+struct TLSDialResult {
+    conn: own Conn,
+    transport: io.ReadWriter,
+    closer: io.Closer,
+    protocol: str,
+}
+
+fn empty_event() -> Event {
+    return Event{last_stream_id: 0, flow_bytes: 0, stream_id: 0, kind: 0, flags: 0, trailers: false, headers: mkslice(Header, 0), payload: mkslice(byte, 0)}
+}
+
+fn read_u32(data: []byte, pos: int) -> int {
+    return data[pos] * 16777216 + data[pos + 1] * 65536 + data[pos + 2] * 256 + data[pos + 3]
+}
+
+fn encode_u32(value: int) -> []byte {
+    out := mkslice(byte, 4)
+    out[0] = value / 16777216 % 256
+    out[1] = value / 65536 % 256
+    out[2] = value / 256 % 256
+    out[3] = value % 256
+    return out
+}
+
+fn write_full(w: io.Writer, data: []byte) -> err {
+    pos := 0
+    for pos < len(data) {
+        [n, e] = w.write(data[pos:len(data)])
+        if e != nil {
+            return e
+        }
+        if n <= 0 {
+            return errors.new("http2: writer made no progress")
+        }
+        pos = pos + n
+    }
+    return nil
+}
+
+fn new_conn(rw: io.ReadWriter) -> [own Conn, err] {
+    return new_conn_timeout(rw, -1, 0)
+}
+
+fn new_conn_timeout(rw: io.ReadWriter, timeout_fd: int, timeout_ms: int) -> [own Conn, err] {
+    [decoder, de] = new_decoder(4096, 65536)
+    if de != nil {
+        return nil, de
+    }
+    deadline := 0
+    if timeout_fd >= 0 && timeout_ms > 0 {
+        deadline = now_ms() + timeout_ms
+    }
+    c := new(Conn{rw: rw, closer: nil, timeout_fd: timeout_fd, deadline_ms: deadline, decoder: decoder, streams: mkslice(StreamState, 0), cancelled_streams: mkslice(int, 0), pending_events: mkslice(Event, 0), pending_bytes: 0, goaway_last_stream: 2147483647, next_stream_id: 1, conn_send_window: 65535, conn_recv_window: 65535, peer_initial_window: 65535, peer_max_frame_size: 16384, local_max_frame_size: 16384, local_max_header_list: 65536, peer_max_header_list: 65536, peer_max_concurrent: 100, goaway: 0})
+    e := write_all_deadline(rw, CLIENT_PREFACE as []byte, timeout_fd, deadline)
+    if e != nil {
+        return nil, errors.wrap("http2: write connection preface", e)
+    }
+    settings := mkslice(byte, 0)
+    settings = push(settings, 0)
+    settings = push(settings, 1)
+    settings = push(settings, 0)
+    settings = push(settings, 0)
+    settings = push(settings, 16)
+    settings = push(settings, 0)
+    settings = push(settings, 0)
+    settings = push(settings, 2)
+    settings = push(settings, 0)
+    settings = push(settings, 0)
+    settings = push(settings, 0)
+    settings = push(settings, 0)
+    settings = push(settings, 0)
+    settings = push(settings, 6)
+    settings = push(settings, 0)
+    settings = push(settings, 1)
+    settings = push(settings, 0)
+    settings = push(settings, 0)
+    e = write_frame_deadline(rw, FrameHeader{length: len(settings), kind: 4, flags: 0, stream_id: 0}, settings, timeout_fd, deadline)
+    if e != nil {
+        return nil, errors.wrap("http2: write client SETTINGS", e)
+    }
+    for true {
+        [f, fe] = read_frame_deadline(rw, c.local_max_frame_size, timeout_fd, deadline)
+        if fe != nil {
+            return nil, fe
+        }
+        if f.header.kind == 4 && f.header.stream_id == 0 && (f.header.flags & 1) == 0 {
+            e = c.apply_settings(f.payload)
+            if e != nil {
+                return nil, e
+            }
+            e = write_frame_deadline(rw, FrameHeader{length: 0, kind: 4, flags: 1, stream_id: 0}, mkslice(byte, 0), timeout_fd, deadline)
+            if e != nil {
+                return nil, errors.wrap("http2: acknowledge server SETTINGS", e)
+            }
+            return c, nil
+        }
+        return nil, errors.new("http2: server first frame must be SETTINGS")
+    }
+    return nil, errors.new("http2: invalid connection state")
+}
+
+fn (c ref Conn) write_frame(header: FrameHeader, payload: []byte) -> err {
+    return write_frame_deadline(c.rw, header, payload, c.timeout_fd, c.deadline_ms)
+}
+
+fn (c mut Conn) apply_settings(payload: []byte) -> err {
+    if len(payload) % 6 != 0 {
+        return errors.new("http2: malformed SETTINGS payload")
+    }
+    pos := 0
+    for pos < len(payload) {
+        id := payload[pos] * 256 + payload[pos + 1]
+        value := read_u32(payload, pos + 2)
+        if id == 2 {
+            return errors.new("http2: server sent SETTINGS_ENABLE_PUSH")
+        } else if id == 3 {
+            c.peer_max_concurrent = value
+            if c.peer_max_concurrent > 100 {
+                c.peer_max_concurrent = 100
+            }
+        } else if id == 4 {
+            if value > 2147483647 {
+                return errors.new("http2: invalid initial window size")
+            }
+            delta := value - c.peer_initial_window
+            i := 0
+            for i < len(c.streams) {
+                next := c.streams[i].send_window + delta
+                if next > 2147483647 || next < -2147483647 {
+                    return errors.new("http2: stream send window overflow")
+                }
+                c.streams[i].send_window = next
+                i = i + 1
+            }
+            c.peer_initial_window = value
+        } else if id == 5 {
+            if value < 16384 || value > 16777215 {
+                return errors.new("http2: invalid maximum frame size")
+            }
+            c.peer_max_frame_size = value
+        } else if id == 6 && value < c.peer_max_header_list {
+            c.peer_max_header_list = value
+        }
+        pos = pos + 6
+    }
+    return nil
+}
+
+fn stream_cancelled(c: ref Conn, id: int) -> bool {
+    i := 0
+    for i < len(c.cancelled_streams) {
+        if c.cancelled_streams[i] == id {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn (c mut Conn) remember_cancelled(id: int) {
+    if len(c.cancelled_streams) >= 256 {
+        c.cancelled_streams = c.cancelled_streams[1:len(c.cancelled_streams)]
+    }
+    c.cancelled_streams = push(c.cancelled_streams, id)
+}
+
+fn stream_index(c: ref Conn, id: int) -> int {
+    i := 0
+    for i < len(c.streams) {
+        if c.streams[i].id == id {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+fn (c mut Conn) prune_streams() {
+    i := 0
+    for i < len(c.streams) {
+        if c.streams[i].local_closed != 0 && c.streams[i].remote_closed != 0 && c.streams[i].recv_unacked == 0 {
+            last := len(c.streams) - 1
+            c.streams[i] = c.streams[last]
+            c.streams = c.streams[0:last]
+        } else {
+            i = i + 1
+        }
+    }
+}
+
+fn (c mut Conn) write_headers(id: int, block: []byte, end_stream: bool) -> err {
+    if len(block) == 0 || len(block) > c.peer_max_header_list {
+        return errors.new("http2: invalid header block size")
+    }
+    pos := 0
+    first := true
+    for pos < len(block) {
+        n := len(block) - pos
+        if n > c.peer_max_frame_size {
+            n = c.peer_max_frame_size
+        }
+        kind := 9
+        flags := 0
+        if first {
+            kind = 1
+            if end_stream {
+                flags = 1
+            }
+        }
+        if pos + n == len(block) {
+            flags = flags + 4
+        }
+        e := c.write_frame(FrameHeader{length: n, kind: kind, flags: flags, stream_id: id}, block[pos:pos + n])
+        if e != nil {
+            return e
+        }
+        pos = pos + n
+        first = false
+    }
+    return nil
+}
+
+fn request_header_error(headers: []Header, max_size: int) -> err {
+    pseudo_done := false
+    header_size := 0
+    method_seen := false
+    scheme_seen := false
+    path_seen := false
+    authority_seen := false
+    i := 0
+    for i < len(headers) {
+        h := headers[i]
+        header_size = header_size + len(h.name) + len(h.value) + 32
+        if header_size > max_size {
+            return errors.new("http2: request header list exceeds peer limit")
+        }
+        if !hpack_valid_header(h) {
+            return errors.new("http2: invalid request header")
+        }
+        pseudo := len(h.name) > 0 && byteat(h.name, 0) == 58
+        if pseudo && pseudo_done {
+            return errors.new("http2: pseudo-header after regular header")
+        }
+        if !pseudo {
+            pseudo_done = true
+            if h.name == "connection" || h.name == "proxy-connection" || h.name == "keep-alive" || h.name == "transfer-encoding" || h.name == "upgrade" {
+                return errors.new("http2: connection-specific request header")
+            }
+            if h.name == "te" && h.value != "trailers" {
+                return errors.new("http2: invalid TE request header")
+            }
+        } else if h.name == ":method" {
+            if method_seen {
+                return errors.new("http2: duplicate :method")
+            }
+            method_seen = true
+        } else if h.name == ":scheme" {
+            if scheme_seen {
+                return errors.new("http2: duplicate :scheme")
+            }
+            scheme_seen = true
+        } else if h.name == ":path" {
+            if path_seen {
+                return errors.new("http2: duplicate :path")
+            }
+            path_seen = true
+        } else if h.name == ":authority" {
+            if authority_seen {
+                return errors.new("http2: duplicate :authority")
+            }
+            authority_seen = true
+        } else {
+            return errors.new("http2: invalid request pseudo-header")
+        }
+        i = i + 1
+    }
+    if !method_seen || !scheme_seen || !path_seen || !authority_seen {
+        return errors.new("http2: missing required request pseudo-header")
+    }
+    return nil
+}
+
+fn (c mut Conn) open_stream(headers: []Header, end_stream: bool) -> [int, err] {
+    c.prune_streams()
+    if c.goaway != 0 || c.next_stream_id > 2147483647 || len(c.streams) >= c.peer_max_concurrent {
+        return 0, errors.new("http2: connection cannot open another stream")
+    }
+    e := request_header_error(headers, c.peer_max_header_list)
+    if e != nil {
+        return 0, e
+    }
+    [block, be] = encode_headers(headers)
+    if be != nil {
+        return 0, be
+    }
+    id := c.next_stream_id
+    c.next_stream_id = c.next_stream_id + 2
+    c.streams = push(c.streams, StreamState{id: id, send_window: c.peer_initial_window, recv_window: 65535, recv_unacked: 0, got_headers: 0, local_closed: 0, remote_closed: 0})
+    e = c.write_headers(id, block, end_stream)
+    if e != nil {
+        return 0, e
+    }
+    if end_stream {
+        i := stream_index(c, id)
+        c.streams[i].local_closed = 1
+    }
+    return id, nil
+}
+
+fn (c mut Conn) cancel_stream(id: int) -> err {
+    i := stream_index(c, id)
+    if i < 0 || c.streams[i].local_closed != 0 && c.streams[i].remote_closed != 0 {
+        return errors.new("http2: invalid or closed stream")
+    }
+    e := c.write_frame(FrameHeader{length: 4, kind: 3, flags: 0, stream_id: id}, encode_u32(8))
+    if e != nil {
+        return e
+    }
+    c.streams[i].local_closed = 1
+    c.streams[i].remote_closed = 1
+    c.remember_cancelled(id)
+    c.prune_streams()
+    return nil
+}
+
+fn (c mut Conn) send_data(id: int, payload: []byte, end_stream: bool) -> err {
+    i := stream_index(c, id)
+    if i < 0 || c.streams[i].local_closed != 0 {
+        return errors.new("http2: invalid or closed stream")
+    }
+    if len(payload) > c.peer_max_frame_size || len(payload) > c.conn_send_window || len(payload) > c.streams[i].send_window {
+        return errors.new("http2: DATA exceeds frame or flow-control window")
+    }
+    flags := 0
+    if end_stream {
+        flags = 1
+    }
+    e := c.write_frame(FrameHeader{length: len(payload), kind: 0, flags: flags, stream_id: id}, payload)
+    if e != nil {
+        return e
+    }
+    c.conn_send_window = c.conn_send_window - len(payload)
+    c.streams[i].send_window = c.streams[i].send_window - len(payload)
+    if end_stream {
+        c.streams[i].local_closed = 1
+    }
+    return nil
+}
+
+fn (c mut Conn) send_body(id: int, payload: []byte) -> err {
+    if len(payload) == 0 {
+        return c.send_data(id, mkslice(byte, 0), true)
+    }
+    pos := 0
+    for pos < len(payload) {
+        i := stream_index(c, id)
+        if i < 0 || c.streams[i].local_closed != 0 {
+            return errors.new("http2: stream closed while sending body")
+        }
+        available := c.conn_send_window
+        if c.streams[i].send_window < available {
+            available = c.streams[i].send_window
+        }
+        if c.peer_max_frame_size < available {
+            available = c.peer_max_frame_size
+        }
+        if available <= 0 {
+            [event, re] = c.read_event()
+            if re != nil {
+                return re
+            }
+            qe := c.queue_event(event)
+            if qe != nil {
+                return qe
+            }
+            if event.kind == 3 && event.stream_id == id {
+                return errors.new("http2: stream closed while waiting for flow control")
+            }
+            if event.kind == 7 && event.last_stream_id < id {
+                return errors.new("http2: peer GOAWAY did not process stream")
+            }
+            continue
+        }
+        n := len(payload) - pos
+        if n > available {
+            n = available
+        }
+        end_stream := pos + n == len(payload)
+        e := c.send_data(id, payload[pos:pos + n], end_stream)
+        if e != nil {
+            return e
+        }
+        pos = pos + n
+    }
+    return nil
+}
+
+fn (c mut Conn) update_window(id: int, n: int) -> err {
+    if n <= 0 || n > 2147483647 {
+        return errors.new("http2: invalid WINDOW_UPDATE increment")
+    }
+    payload := encode_u32(n)
+    return c.write_frame(FrameHeader{length: 4, kind: 8, flags: 0, stream_id: id}, payload)
+}
+
+fn (c mut Conn) ack_data(id: int, n: int) -> err {
+    i := stream_index(c, id)
+    if i < 0 || n <= 0 || n > c.streams[i].recv_unacked {
+        return errors.new("http2: invalid DATA acknowledgement")
+    }
+    if c.conn_recv_window + n > 2147483647 {
+        return errors.new("http2: receive window overflow")
+    }
+    if c.streams[i].remote_closed == 0 && c.streams[i].recv_window + n > 2147483647 {
+        return errors.new("http2: stream receive window overflow")
+    }
+    e := c.update_window(0, n)
+    if e != nil {
+        return e
+    }
+    c.conn_recv_window = c.conn_recv_window + n
+    if c.streams[i].remote_closed == 0 {
+        e = c.update_window(id, n)
+        if e != nil {
+            return e
+        }
+        c.streams[i].recv_window = c.streams[i].recv_window + n
+    }
+    c.streams[i].recv_unacked = c.streams[i].recv_unacked - n
+    c.prune_streams()
+    return nil
+}
+
+fn bad_event(e: err) -> [Event, err] {
+    return empty_event(), e
+}
+
+fn event_size(event: Event) -> int {
+    size := len(event.payload) + 64
+    i := 0
+    for i < len(event.headers) {
+        size = size + len(event.headers[i].name) + len(event.headers[i].value) + 32
+        i = i + 1
+    }
+    return size
+}
+
+fn (c mut Conn) queue_event(event: Event) -> err {
+    size := event_size(event)
+    if len(c.pending_events) >= 100 || c.pending_bytes + size > 65536 {
+        return errors.new("http2: pending event limit exceeded")
+    }
+    c.pending_events = push(c.pending_events, event)
+    c.pending_bytes = c.pending_bytes + size
+    return nil
+}
+
+fn (c mut Conn) next_event() -> [Event, err] {
+    if len(c.pending_events) > 0 {
+        event := c.pending_events[0]
+        c.pending_events = c.pending_events[1:len(c.pending_events)]
+        c.pending_bytes = c.pending_bytes - event_size(event)
+        return event, nil
+    }
+    return c.read_event()
+}
+
+fn (c mut Conn) read_event() -> [Event, err] {
+    for true {
+        [f, fe] = read_frame_deadline(c.rw, c.local_max_frame_size, c.timeout_fd, c.deadline_ms)
+        if fe != nil {
+            return bad_event(fe)
+        }
+        h := f.header
+        if h.kind == 4 {
+            if h.stream_id != 0 {
+                return bad_event(errors.new("http2: SETTINGS on nonzero stream"))
+            }
+            if (h.flags & 1) == 0 {
+                e := c.apply_settings(f.payload)
+                if e != nil {
+                    return bad_event(e)
+                }
+                e = c.write_frame(FrameHeader{length: 0, kind: 4, flags: 1, stream_id: 0}, mkslice(byte, 0))
+                if e != nil {
+                    return bad_event(e)
+                }
+            } else if h.length != 0 {
+                return bad_event(errors.new("http2: SETTINGS ack with payload"))
+            }
+        } else if h.kind == 6 {
+            if h.stream_id != 0 || h.length != 8 {
+                return bad_event(errors.new("http2: malformed PING"))
+            }
+            if (h.flags & 1) == 0 {
+                e := c.write_frame(FrameHeader{length: 8, kind: 6, flags: 1, stream_id: 0}, f.payload)
+                if e != nil {
+                    return bad_event(e)
+                }
+            }
+        } else if h.kind == 8 {
+            if h.length != 4 {
+                return bad_event(errors.new("http2: malformed WINDOW_UPDATE"))
+            }
+            increment := read_u32(f.payload, 0) % 2147483648
+            if increment == 0 {
+                return bad_event(errors.new("http2: zero WINDOW_UPDATE"))
+            }
+            if h.stream_id == 0 {
+                if c.conn_send_window + increment > 2147483647 {
+                    return bad_event(errors.new("http2: connection send window overflow"))
+                }
+                c.conn_send_window = c.conn_send_window + increment
+            } else {
+                if h.stream_id % 2 == 0 {
+                    return bad_event(errors.new("http2: WINDOW_UPDATE on unsupported stream"))
+                }
+                i := stream_index(c, h.stream_id)
+                if i >= 0 {
+                    if c.streams[i].send_window + increment > 2147483647 {
+                        return bad_event(errors.new("http2: stream send window overflow"))
+                    }
+                    c.streams[i].send_window = c.streams[i].send_window + increment
+                } else if h.stream_id >= c.next_stream_id {
+                    return bad_event(errors.new("http2: WINDOW_UPDATE on idle stream"))
+                }
+            }
+        } else if h.kind == 7 {
+            if h.stream_id != 0 || h.length < 8 {
+                return bad_event(errors.new("http2: malformed GOAWAY"))
+            }
+            last_stream := read_u32(f.payload, 0) % 2147483648
+            if c.goaway != 0 && last_stream > c.goaway_last_stream {
+                return bad_event(errors.new("http2: GOAWAY last stream increased"))
+            }
+            c.goaway = 1
+            c.goaway_last_stream = last_stream
+            i := 0
+            for i < len(c.streams) {
+                if c.streams[i].id > last_stream {
+                    sid := c.streams[i].id
+                    c.streams[i].local_closed = 1
+                    c.streams[i].remote_closed = 1
+                    qe := c.queue_event(Event{last_stream_id: 0, flow_bytes: 0, stream_id: sid, kind: 3, flags: 0, trailers: false, headers: mkslice(Header, 0), payload: encode_u32(7)})
+                    if qe != nil {
+                        return bad_event(qe)
+                    }
+                }
+                i = i + 1
+            }
+            c.prune_streams()
+            return Event{last_stream_id: last_stream, flow_bytes: 0, stream_id: 0, kind: 7, flags: h.flags, trailers: false, headers: mkslice(Header, 0), payload: f.payload}, nil
+        } else if h.kind == 1 {
+            if h.stream_id == 0 {
+                return bad_event(errors.new("http2: HEADERS on invalid stream"))
+            }
+            i := stream_index(c, h.stream_id)
+            cancelled := stream_cancelled(c, h.stream_id)
+            if i < 0 && !cancelled || i >= 0 && c.streams[i].remote_closed != 0 && !cancelled {
+                return bad_event(errors.new("http2: HEADERS on invalid stream"))
+            }
+            fragment := f.payload
+            if (h.flags & 8) != 0 {
+                if len(fragment) == 0 {
+                    return bad_event(errors.new("http2: missing HEADERS padding"))
+                }
+                padding := fragment[0]
+                fragment = fragment[1:len(fragment)]
+                if padding > len(fragment) {
+                    return bad_event(errors.new("http2: invalid HEADERS padding"))
+                }
+                fragment = fragment[0:len(fragment) - padding]
+            }
+            if (h.flags & 32) != 0 {
+                if len(fragment) < 5 {
+                    return bad_event(errors.new("http2: truncated HEADERS priority"))
+                }
+                fragment = fragment[5:len(fragment)]
+            }
+            block := hpack_append(mkslice(byte, 0), fragment)
+            end_headers := (h.flags & 4) != 0
+            for !end_headers {
+                [cont, ce] = read_frame_deadline(c.rw, c.local_max_frame_size, c.timeout_fd, c.deadline_ms)
+                if ce != nil || cont.header.kind != 9 || cont.header.stream_id != h.stream_id {
+                    return bad_event(errors.new("http2: invalid CONTINUATION sequence"))
+                }
+                block = hpack_append(block, cont.payload)
+                if len(block) > c.local_max_header_list {
+                    return bad_event(errors.new("http2: header block too large"))
+                }
+                end_headers = (cont.header.flags & 4) != 0
+            }
+            [decoded, de] = decode_headers(c.decoder, block)
+            if de != nil {
+                return bad_event(de)
+            }
+            if cancelled {
+                continue
+            }
+            trailers := c.streams[i].got_headers != 0
+            if trailers && (h.flags & 1) == 0 {
+                return bad_event(errors.new("http2: trailers without END_STREAM"))
+            }
+            status_code := 0
+            if !trailers {
+                status_seen := false
+                pseudo_done := false
+                j := 0
+                for j < len(decoded) {
+                    name := decoded[j].name
+                    pseudo := len(name) > 0 && byteat(name, 0) == 58
+                    if pseudo && pseudo_done {
+                        return bad_event(errors.new("http2: response pseudo-header after regular header"))
+                    }
+                    if !pseudo {
+                        pseudo_done = true
+                        if name == "connection" || name == "proxy-connection" || name == "keep-alive" || name == "transfer-encoding" || name == "upgrade" || name == "te" && decoded[j].value != "trailers" {
+                            return bad_event(errors.new("http2: connection-specific response header"))
+                        }
+                    }
+                    if name == ":status" {
+                        if status_seen || len(decoded[j].value) != 3 {
+                            return bad_event(errors.new("http2: invalid response :status"))
+                        }
+                        status_bytes := decoded[j].value as []byte
+                        if status_bytes[0] < 48 || status_bytes[0] > 57 || status_bytes[1] < 48 || status_bytes[1] > 57 || status_bytes[2] < 48 || status_bytes[2] > 57 {
+                            return bad_event(errors.new("http2: invalid response :status"))
+                        }
+                        status_code = (status_bytes[0] - 48) * 100 + (status_bytes[1] - 48) * 10 + status_bytes[2] - 48
+                        status_seen = true
+                    } else if pseudo {
+                        return bad_event(errors.new("http2: unexpected response pseudo-header"))
+                    }
+                    j = j + 1
+                }
+                if !status_seen || status_code < 100 || status_code >= 600 || status_code == 101 || status_code < 200 && (h.flags & 1) != 0 {
+                    return bad_event(errors.new("http2: missing or invalid response :status"))
+                }
+            } else {
+                j := 0
+                for j < len(decoded) {
+                    name := decoded[j].name
+                    if len(name) > 0 && byteat(name, 0) == 58 || name == "connection" || name == "proxy-connection" || name == "keep-alive" || name == "transfer-encoding" || name == "upgrade" || name == "te" && decoded[j].value != "trailers" {
+                        return bad_event(errors.new("http2: invalid response trailer"))
+                    }
+                    j = j + 1
+                }
+            }
+            if !trailers && (status_code < 100 || status_code >= 200) {
+                c.streams[i].got_headers = 1
+            }
+            if (h.flags & 1) != 0 {
+                c.streams[i].remote_closed = 1
+            }
+            event := Event{last_stream_id: 0, flow_bytes: 0, stream_id: h.stream_id, kind: 1, flags: h.flags, trailers: trailers, headers: decoded, payload: mkslice(byte, 0)}
+            c.prune_streams()
+            return event, nil
+        } else if h.kind == 0 {
+            if h.stream_id == 0 {
+                return bad_event(errors.new("http2: DATA on invalid stream"))
+            }
+            i := stream_index(c, h.stream_id)
+            if i < 0 && stream_cancelled(c, h.stream_id) {
+                if h.length > c.conn_recv_window {
+                    return bad_event(errors.new("http2: DATA exceeds connection receive window"))
+                }
+                c.conn_recv_window = c.conn_recv_window - h.length
+                if h.length > 0 {
+                    e := c.update_window(0, h.length)
+                    if e != nil {
+                        return bad_event(e)
+                    }
+                    c.conn_recv_window = c.conn_recv_window + h.length
+                }
+                continue
+            }
+            if i < 0 || c.streams[i].got_headers == 0 || c.streams[i].remote_closed != 0 {
+                return bad_event(errors.new("http2: DATA on invalid stream"))
+            }
+            payload := f.payload
+            if (h.flags & 8) != 0 {
+                if len(payload) == 0 || payload[0] > len(payload) - 1 {
+                    return bad_event(errors.new("http2: invalid DATA padding"))
+                }
+                padding := payload[0]
+                payload = payload[1:len(payload) - padding]
+            }
+            if h.length > c.conn_recv_window || h.length > c.streams[i].recv_window {
+                return bad_event(errors.new("http2: DATA exceeds receive window"))
+            }
+            c.conn_recv_window = c.conn_recv_window - h.length
+            c.streams[i].recv_window = c.streams[i].recv_window - h.length
+            c.streams[i].recv_unacked = c.streams[i].recv_unacked + h.length
+            if (h.flags & 1) != 0 {
+                c.streams[i].remote_closed = 1
+            }
+            event := Event{last_stream_id: 0, flow_bytes: h.length, stream_id: h.stream_id, kind: 0, flags: h.flags, trailers: false, headers: mkslice(Header, 0), payload: payload}
+            c.prune_streams()
+            return event, nil
+        } else if h.kind == 3 {
+            if h.stream_id == 0 || h.length != 4 {
+                return bad_event(errors.new("http2: malformed RST_STREAM"))
+            }
+            if stream_cancelled(c, h.stream_id) {
+                continue
+            }
+            i := stream_index(c, h.stream_id)
+            if i < 0 {
+                return bad_event(errors.new("http2: RST_STREAM on unknown stream"))
+            }
+            c.streams[i].local_closed = 1
+            c.streams[i].remote_closed = 1
+            c.prune_streams()
+            return Event{last_stream_id: 0, flow_bytes: 0, stream_id: h.stream_id, kind: 3, flags: h.flags, trailers: false, headers: mkslice(Header, 0), payload: f.payload}, nil
+        } else if h.kind == 5 {
+            return bad_event(errors.new("http2: server push is disabled"))
+        } else if h.kind == 9 {
+            return bad_event(errors.new("http2: unexpected CONTINUATION"))
+        }
+    }
+    return bad_event(errors.new("http2: invalid connection state"))
+}
+
+fn dial_h2c(host: str, port: int, timeout_ms: int) -> [own Conn, err] {
+    [socket_value, de] = net.dial_timeout(host, port, timeout_ms)
+    if de != nil {
+        return nil, de
+    }
+    socket := new(socket_value)
+    [c, ce] = new_conn_timeout(socket.asreadwriter(), socket.rawfd(), timeout_ms)
+    if ce != nil {
+        socket.close()
+        return nil, ce
+    }
+    c.closer = socket.ascloser()
+    return c, nil
+}
+
+fn dial_tls(host: str, port: int, timeout_ms: int) -> [TLSDialResult, err] {
+    return dial_tls_config(host, port, timeout_ms, tls.default_cfg())
+}
+
+fn dial_tls_config(host: str, port: int, timeout_ms: int, cfg: tls.Config) -> [TLSDialResult, err] {
+    [socket, de] = net.dial_timeout(host, port, timeout_ms)
+    if de != nil {
+        return TLSDialResult{conn: nil, transport: nil, closer: nil, protocol: ""}, de
+    }
+    cfg.server_name = host
+    protocols := mkslice(str, 0)
+    protocols = push(protocols, "h2")
+    protocols = push(protocols, "http/1.1")
+    cfg.alpn = protocols
+    [secure_value, te] = tls.client_tmo(socket, cfg, timeout_ms)
+    if te != nil {
+        socket.close()
+        return TLSDialResult{conn: nil, transport: nil, closer: nil, protocol: ""}, te
+    }
+    secure := new(secure_value)
+    protocol := secure.negotiated_alpn()
+    if protocol != "h2" {
+        if protocol != "" && protocol != "http/1.1" {
+            secure.close()
+            return TLSDialResult{conn: nil, transport: nil, closer: nil, protocol: protocol}, errors.new("http2: unsupported negotiated ALPN protocol")
+        }
+        return TLSDialResult{conn: nil, transport: secure.asreadwriter(), closer: secure.ascloser(), protocol: protocol}, nil
+    }
+    [c, ce] = new_conn_timeout(secure.asreadwriter(), socket.rawfd(), timeout_ms)
+    if ce != nil {
+        secure.close()
+        return TLSDialResult{conn: nil, transport: nil, closer: nil, protocol: protocol}, ce
+    }
+    c.closer = secure.ascloser()
+    return TLSDialResult{conn: c, transport: nil, closer: nil, protocol: protocol}, nil
+}
+
+fn (c mut Conn) close() -> err {
+    if c.closer == nil {
+        return nil
+    }
+    return c.closer.close()
+}

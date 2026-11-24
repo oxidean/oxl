@@ -1,0 +1,1664 @@
+package http2
+
+import "std/errors"
+
+import "std/io"
+
+let FRAME_HEADER_SIZE = 9
+
+let MAX_FRAME_SIZE = 16777215
+
+struct FrameHeader { length: int, kind: int, flags: int, stream_id: int }
+
+struct Frame { header: FrameHeader, payload: []byte }
+
+fn bad_frame_header() -> FrameHeader {
+    return FrameHeader{length: 0, kind: 0, flags: 0, stream_id: 0}
+}
+
+fn encode_frame_header(h: FrameHeader) -> [[]byte, err] {
+    if h.length < 0 || h.length > MAX_FRAME_SIZE {
+        return mkslice(byte, 0), errors.new("http2: invalid frame length")
+    }
+    if h.kind < 0 || h.kind > 255 || h.flags < 0 || h.flags > 255 {
+        return mkslice(byte, 0), errors.new("http2: invalid frame type or flags")
+    }
+    if h.stream_id < 0 || h.stream_id > 2147483647 {
+        return mkslice(byte, 0), errors.new("http2: invalid stream id")
+    }
+    out := mkslice(byte, FRAME_HEADER_SIZE)
+    out[0] = h.length / 65536 % 256
+    out[1] = h.length / 256 % 256
+    out[2] = h.length % 256
+    out[3] = h.kind
+    out[4] = h.flags
+    out[5] = h.stream_id / 16777216 % 128
+    out[6] = h.stream_id / 65536 % 256
+    out[7] = h.stream_id / 256 % 256
+    out[8] = h.stream_id % 256
+    return out, nil
+}
+
+fn encode_frame(h: FrameHeader, payload: []byte) -> [[]byte, err] {
+    if len(payload) != h.length {
+        return mkslice(byte, 0), errors.new("http2: frame payload length mismatch")
+    }
+    [header, e] = encode_frame_header(h)
+    if e != nil {
+        return mkslice(byte, 0), e
+    }
+    out := mkslice(byte, FRAME_HEADER_SIZE + len(payload))
+    i := 0
+    for i < FRAME_HEADER_SIZE {
+        out[i] = header[i]
+        i = i + 1
+    }
+    j := 0
+    for j < len(payload) {
+        out[FRAME_HEADER_SIZE + j] = payload[j]
+        j = j + 1
+    }
+    return out, nil
+}
+
+fn decode_frame_header(raw: []byte, max_frame_size: int) -> [FrameHeader, err] {
+    bad := bad_frame_header()
+    if len(raw) != FRAME_HEADER_SIZE {
+        return bad, errors.new("http2: invalid frame header length")
+    }
+    if max_frame_size < 16384 || max_frame_size > MAX_FRAME_SIZE {
+        return bad, errors.new("http2: invalid maximum frame size")
+    }
+    if raw[5] >= 128 {
+        return bad, errors.new("http2: reserved stream id bit set")
+    }
+    length := raw[0] * 65536 + raw[1] * 256 + raw[2]
+    if length > max_frame_size {
+        return bad, errors.new("http2: frame exceeds maximum size")
+    }
+    stream_id := raw[5] * 16777216 + raw[6] * 65536 + raw[7] * 256 + raw[8]
+    return FrameHeader{length: length, kind: raw[3], flags: raw[4], stream_id: stream_id}, nil
+}
+
+fn read_exact(r: io.Reader, count: int) -> [[]byte, err] {
+    if count < 0 {
+        return mkslice(byte, 0), errors.new("http2: invalid read length")
+    }
+    out := mkslice(byte, count)
+    off := 0
+    for off < count {
+        [n, e] = r.read(out[off:count])
+        if n > 0 {
+            off = off + n
+        }
+        if off == count {
+            return out, nil
+        }
+        if e != nil {
+            return out, errors.wrap("http2: truncated frame", e)
+        }
+        if n <= 0 {
+            return out, errors.new("http2: reader made no progress")
+        }
+    }
+    return out, nil
+}
+
+fn read_frame(r: io.Reader, max_frame_size: int) -> [Frame, err] {
+    bad := Frame{header: bad_frame_header(), payload: mkslice(byte, 0)}
+    [raw, re] = read_exact(r, FRAME_HEADER_SIZE)
+    if re != nil {
+        return bad, re
+    }
+    [header, he] = decode_frame_header(raw, max_frame_size)
+    if he != nil {
+        return bad, he
+    }
+    [payload, pe] = read_exact(r, header.length)
+    if pe != nil {
+        return bad, pe
+    }
+    frame := Frame{header: header, payload: payload}
+    ve := validate_frame(frame)
+    if ve != nil {
+        return bad, ve
+    }
+    return frame, nil
+}
+
+fn write_all(w: io.Writer, data: []byte) -> err {
+    off := 0
+    for off < len(data) {
+        [n, e] = w.write(data[off:])
+        if n > 0 {
+            off = off + n
+        }
+        if e != nil {
+            return e
+        }
+        if n <= 0 {
+            return errors.new("http2: writer made no progress")
+        }
+    }
+    return nil
+}
+
+fn write_frame(w: io.Writer, header: FrameHeader, payload: []byte) -> err {
+    [wire, e] = encode_frame(header, payload)
+    if e != nil {
+        return e
+    }
+    return write_all(w, wire)
+}
+
+fn read_exact_deadline(r: io.Reader, count: int, fd: int, deadline_ms: int) -> [[]byte, err] {
+    if count < 0 {
+        return mkslice(byte, 0), errors.new("http2: invalid read length")
+    }
+    out := mkslice(byte, count)
+    off := 0
+    for off < count {
+        if fd >= 0 && deadline_ms > 0 {
+            rem := deadline_ms - now_ms()
+            if rem <= 0 {
+                return out, errors.new("http2: read deadline exceeded")
+            }
+            set_rcvtimo_ms(fd, rem)
+        }
+        [n, e] = r.read(out[off:count])
+        if n > 0 {
+            off = off + n
+        }
+        if off == count {
+            return out, nil
+        }
+        if e != nil {
+            if fd >= 0 && deadline_ms > 0 && now_ms() >= deadline_ms {
+                return out, errors.new("http2: read deadline exceeded")
+            }
+            return out, errors.wrap("http2: truncated frame", e)
+        }
+        if n <= 0 {
+            return out, errors.new("http2: reader made no progress")
+        }
+    }
+    return out, nil
+}
+
+fn read_frame_deadline(r: io.Reader, max_frame_size: int, fd: int, deadline_ms: int) -> [Frame, err] {
+    bad := Frame{header: bad_frame_header(), payload: mkslice(byte, 0)}
+    [raw, re] = read_exact_deadline(r, FRAME_HEADER_SIZE, fd, deadline_ms)
+    if re != nil {
+        return bad, re
+    }
+    [header, he] = decode_frame_header(raw, max_frame_size)
+    if he != nil {
+        return bad, he
+    }
+    [payload, pe] = read_exact_deadline(r, header.length, fd, deadline_ms)
+    if pe != nil {
+        return bad, pe
+    }
+    frame := Frame{header: header, payload: payload}
+    ve := validate_frame(frame)
+    if ve != nil {
+        return bad, ve
+    }
+    return frame, nil
+}
+
+fn write_all_deadline(w: io.Writer, data: []byte, fd: int, deadline_ms: int) -> err {
+    off := 0
+    for off < len(data) {
+        if fd >= 0 && deadline_ms > 0 {
+            rem := deadline_ms - now_ms()
+            if rem <= 0 {
+                return errors.new("http2: write deadline exceeded")
+            }
+            set_sndtimo(fd, (rem + 999) / 1000)
+        }
+        [n, e] = w.write(data[off:])
+        if n > 0 {
+            off = off + n
+        }
+        if e != nil {
+            if fd >= 0 && deadline_ms > 0 && now_ms() >= deadline_ms {
+                return errors.new("http2: write deadline exceeded")
+            }
+            return e
+        }
+        if n <= 0 {
+            return errors.new("http2: writer made no progress")
+        }
+    }
+    return nil
+}
+
+fn write_frame_deadline(w: io.Writer, header: FrameHeader, payload: []byte, fd: int, deadline_ms: int) -> err {
+    [wire, e] = encode_frame(header, payload)
+    if e != nil {
+        return e
+    }
+    return write_all_deadline(w, wire, fd, deadline_ms)
+}
+
+fn validate_frame(frame: Frame) -> err {
+    h := frame.header
+    [_, he] = encode_frame_header(h)
+    if he != nil {
+        return he
+    }
+    if len(frame.payload) != h.length {
+        return errors.new("http2: frame payload length mismatch")
+    }
+    pad := 0
+    if h.kind == 0 || h.kind == 1 || h.kind == 5 {
+        if (h.flags & 8) != 0 {
+            if len(frame.payload) == 0 {
+                return errors.new("http2: missing padding length")
+            }
+            pad = frame.payload[0]
+            if pad > len(frame.payload) - 1 {
+                return errors.new("http2: invalid padding length")
+            }
+        }
+    }
+    start := 0
+    if (h.flags & 8) != 0 && (h.kind == 1 || h.kind == 5) {
+        start = 1
+    }
+    available := len(frame.payload) - pad
+    if h.kind == 0 {
+        if h.stream_id == 0 {
+            return errors.new("http2: DATA on stream zero")
+        }
+    } else if h.kind == 1 {
+        if h.stream_id == 0 {
+            return errors.new("http2: HEADERS on stream zero")
+        }
+        if (h.flags & 32) != 0 {
+            if available - start < 5 {
+                return errors.new("http2: short HEADERS priority section")
+            }
+            dependency := (frame.payload[start] & 127) * 16777216 + frame.payload[start + 1] * 65536 + frame.payload[start + 2] * 256 + frame.payload[start + 3]
+            if dependency == h.stream_id {
+                return errors.new("http2: HEADERS depends on itself")
+            }
+        }
+    } else if h.kind == 2 {
+        if h.stream_id == 0 || h.length != 5 {
+            return errors.new("http2: invalid PRIORITY frame")
+        }
+        dependency := (frame.payload[0] & 127) * 16777216 + frame.payload[1] * 65536 + frame.payload[2] * 256 + frame.payload[3]
+        if dependency == h.stream_id {
+            return errors.new("http2: PRIORITY depends on itself")
+        }
+    } else if h.kind == 3 {
+        if h.stream_id == 0 || h.length != 4 {
+            return errors.new("http2: invalid RST_STREAM frame")
+        }
+    } else if h.kind == 4 {
+        if h.stream_id != 0 || h.length % 6 != 0 {
+            return errors.new("http2: invalid SETTINGS frame")
+        }
+        if (h.flags & 1) != 0 && h.length != 0 {
+            return errors.new("http2: non-empty SETTINGS acknowledgment")
+        }
+    } else if h.kind == 5 {
+        if h.stream_id == 0 || available - start < 4 {
+            return errors.new("http2: invalid PUSH_PROMISE frame")
+        }
+        if (frame.payload[start] & 128) != 0 {
+            return errors.new("http2: reserved promised stream id bit set")
+        }
+    } else if h.kind == 6 {
+        if h.stream_id != 0 || h.length != 8 {
+            return errors.new("http2: invalid PING frame")
+        }
+    } else if h.kind == 7 {
+        if h.stream_id != 0 || h.length < 8 {
+            return errors.new("http2: invalid GOAWAY frame")
+        }
+        if (frame.payload[0] & 128) != 0 {
+            return errors.new("http2: reserved last stream id bit set")
+        }
+    } else if h.kind == 8 {
+        if h.length != 4 {
+            return errors.new("http2: invalid WINDOW_UPDATE frame")
+        }
+        increment := (frame.payload[0] & 127) * 16777216 + frame.payload[1] * 65536 + frame.payload[2] * 256 + frame.payload[3]
+        if increment == 0 {
+            return errors.new("http2: zero window increment")
+        }
+    } else if h.kind == 9 {
+        if h.stream_id == 0 {
+            return errors.new("http2: CONTINUATION on stream zero")
+        }
+    }
+    return nil
+}
+
+fn hpack_static_name(index: int) -> str {
+    if index == 1 {
+        return ":authority"
+    }
+    if index == 2 {
+        return ":method"
+    }
+    if index == 3 {
+        return ":method"
+    }
+    if index == 4 {
+        return ":path"
+    }
+    if index == 5 {
+        return ":path"
+    }
+    if index == 6 {
+        return ":scheme"
+    }
+    if index == 7 {
+        return ":scheme"
+    }
+    if index == 8 {
+        return ":status"
+    }
+    if index == 9 {
+        return ":status"
+    }
+    if index == 10 {
+        return ":status"
+    }
+    if index == 11 {
+        return ":status"
+    }
+    if index == 12 {
+        return ":status"
+    }
+    if index == 13 {
+        return ":status"
+    }
+    if index == 14 {
+        return ":status"
+    }
+    if index == 15 {
+        return "accept-charset"
+    }
+    if index == 16 {
+        return "accept-encoding"
+    }
+    if index == 17 {
+        return "accept-language"
+    }
+    if index == 18 {
+        return "accept-ranges"
+    }
+    if index == 19 {
+        return "accept"
+    }
+    if index == 20 {
+        return "access-control-allow-origin"
+    }
+    if index == 21 {
+        return "age"
+    }
+    if index == 22 {
+        return "allow"
+    }
+    if index == 23 {
+        return "authorization"
+    }
+    if index == 24 {
+        return "cache-control"
+    }
+    if index == 25 {
+        return "content-disposition"
+    }
+    if index == 26 {
+        return "content-encoding"
+    }
+    if index == 27 {
+        return "content-language"
+    }
+    if index == 28 {
+        return "content-length"
+    }
+    if index == 29 {
+        return "content-location"
+    }
+    if index == 30 {
+        return "content-range"
+    }
+    if index == 31 {
+        return "content-type"
+    }
+    if index == 32 {
+        return "cookie"
+    }
+    if index == 33 {
+        return "date"
+    }
+    if index == 34 {
+        return "etag"
+    }
+    if index == 35 {
+        return "expect"
+    }
+    if index == 36 {
+        return "expires"
+    }
+    if index == 37 {
+        return "from"
+    }
+    if index == 38 {
+        return "host"
+    }
+    if index == 39 {
+        return "if-match"
+    }
+    if index == 40 {
+        return "if-modified-since"
+    }
+    if index == 41 {
+        return "if-none-match"
+    }
+    if index == 42 {
+        return "if-range"
+    }
+    if index == 43 {
+        return "if-unmodified-since"
+    }
+    if index == 44 {
+        return "last-modified"
+    }
+    if index == 45 {
+        return "link"
+    }
+    if index == 46 {
+        return "location"
+    }
+    if index == 47 {
+        return "max-forwards"
+    }
+    if index == 48 {
+        return "proxy-authenticate"
+    }
+    if index == 49 {
+        return "proxy-authorization"
+    }
+    if index == 50 {
+        return "range"
+    }
+    if index == 51 {
+        return "referer"
+    }
+    if index == 52 {
+        return "refresh"
+    }
+    if index == 53 {
+        return "retry-after"
+    }
+    if index == 54 {
+        return "server"
+    }
+    if index == 55 {
+        return "set-cookie"
+    }
+    if index == 56 {
+        return "strict-transport-security"
+    }
+    if index == 57 {
+        return "transfer-encoding"
+    }
+    if index == 58 {
+        return "user-agent"
+    }
+    if index == 59 {
+        return "vary"
+    }
+    if index == 60 {
+        return "via"
+    }
+    if index == 61 {
+        return "www-authenticate"
+    }
+    return ""
+}
+
+fn hpack_static_value(index: int) -> str {
+    if index == 1 {
+        return ""
+    }
+    if index == 2 {
+        return "GET"
+    }
+    if index == 3 {
+        return "POST"
+    }
+    if index == 4 {
+        return "/"
+    }
+    if index == 5 {
+        return "/index.html"
+    }
+    if index == 6 {
+        return "http"
+    }
+    if index == 7 {
+        return "https"
+    }
+    if index == 8 {
+        return "200"
+    }
+    if index == 9 {
+        return "204"
+    }
+    if index == 10 {
+        return "206"
+    }
+    if index == 11 {
+        return "304"
+    }
+    if index == 12 {
+        return "400"
+    }
+    if index == 13 {
+        return "404"
+    }
+    if index == 14 {
+        return "500"
+    }
+    if index == 15 {
+        return ""
+    }
+    if index == 16 {
+        return "gzip, deflate"
+    }
+    if index == 17 {
+        return ""
+    }
+    if index == 18 {
+        return ""
+    }
+    if index == 19 {
+        return ""
+    }
+    if index == 20 {
+        return ""
+    }
+    if index == 21 {
+        return ""
+    }
+    if index == 22 {
+        return ""
+    }
+    if index == 23 {
+        return ""
+    }
+    if index == 24 {
+        return ""
+    }
+    if index == 25 {
+        return ""
+    }
+    if index == 26 {
+        return ""
+    }
+    if index == 27 {
+        return ""
+    }
+    if index == 28 {
+        return ""
+    }
+    if index == 29 {
+        return ""
+    }
+    if index == 30 {
+        return ""
+    }
+    if index == 31 {
+        return ""
+    }
+    if index == 32 {
+        return ""
+    }
+    if index == 33 {
+        return ""
+    }
+    if index == 34 {
+        return ""
+    }
+    if index == 35 {
+        return ""
+    }
+    if index == 36 {
+        return ""
+    }
+    if index == 37 {
+        return ""
+    }
+    if index == 38 {
+        return ""
+    }
+    if index == 39 {
+        return ""
+    }
+    if index == 40 {
+        return ""
+    }
+    if index == 41 {
+        return ""
+    }
+    if index == 42 {
+        return ""
+    }
+    if index == 43 {
+        return ""
+    }
+    if index == 44 {
+        return ""
+    }
+    if index == 45 {
+        return ""
+    }
+    if index == 46 {
+        return ""
+    }
+    if index == 47 {
+        return ""
+    }
+    if index == 48 {
+        return ""
+    }
+    if index == 49 {
+        return ""
+    }
+    if index == 50 {
+        return ""
+    }
+    if index == 51 {
+        return ""
+    }
+    if index == 52 {
+        return ""
+    }
+    if index == 53 {
+        return ""
+    }
+    if index == 54 {
+        return ""
+    }
+    if index == 55 {
+        return ""
+    }
+    if index == 56 {
+        return ""
+    }
+    if index == 57 {
+        return ""
+    }
+    if index == 58 {
+        return ""
+    }
+    if index == 59 {
+        return ""
+    }
+    if index == 60 {
+        return ""
+    }
+    if index == 61 {
+        return ""
+    }
+    return ""
+}
+
+struct Header { name: str, value: str }
+
+struct Decoder {
+    dynamic: []Header,
+    dynamic_size: int,
+    limit: int,
+    max_size: int,
+    max_header_list: int,
+}
+
+fn new_decoder(max_table_size: int, max_header_list: int) -> [own Decoder, err] {
+    if max_table_size < 0 || max_table_size > 1048576 || max_header_list <= 0 || max_header_list > 1048576 {
+        return new(Decoder{dynamic: mkslice(Header, 0), dynamic_size: 0, limit: 0, max_size: 0, max_header_list: 0}), errors.new("http2: invalid HPACK decoder limits")
+    }
+    return new(Decoder{dynamic: mkslice(Header, 0), dynamic_size: 0, limit: max_table_size, max_size: max_table_size, max_header_list: max_header_list}), nil
+}
+
+struct HpackInt { value: int, next: int }
+
+fn hpack_pow2(n: int) -> int {
+    out := 1
+    for n > 0 {
+        out = out * 2
+        n = n - 1
+    }
+    return out
+}
+
+struct HpackString { value: str, next: int }
+
+struct HpackHuffman { left: []int, right: []int, symbol: []int, size: int }
+
+fn hpack_huffman_lengths() -> []int {
+    lengths := mkslice(int, 0)
+    lengths = push(lengths, 13)
+    lengths = push(lengths, 23)
+    lengths = push(lengths, 28)
+    lengths = push(lengths, 28)
+    lengths = push(lengths, 28)
+    lengths = push(lengths, 28)
+    lengths = push(lengths, 28)
+    lengths = push(lengths, 28)
+    lengths = push(lengths, 28)
+    lengths = push(lengths, 24)
+    lengths = push(lengths, 30)
+    lengths = push(lengths, 28)
+    lengths = push(lengths, 28)
+    lengths = push(lengths, 30)
+    lengths = push(lengths, 28)
+    lengths = push(lengths, 28)
+    lengths = push(lengths, 28)
+    lengths = push(lengths, 28)
+    lengths = push(lengths, 28)
+    lengths = push(lengths, 28)
+    lengths = push(lengths, 28)
+    lengths = push(lengths, 28)
+    lengths = push(lengths, 30)
+    lengths = push(lengths, 28)
+    lengths = push(lengths, 28)
+    lengths = push(lengths, 28)
+    lengths = push(lengths, 28)
+    lengths = push(lengths, 28)
+    lengths = push(lengths, 28)
+    lengths = push(lengths, 28)
+    lengths = push(lengths, 28)
+    lengths = push(lengths, 28)
+    lengths = push(lengths, 6)
+    lengths = push(lengths, 10)
+    lengths = push(lengths, 10)
+    lengths = push(lengths, 12)
+    lengths = push(lengths, 13)
+    lengths = push(lengths, 6)
+    lengths = push(lengths, 8)
+    lengths = push(lengths, 11)
+    lengths = push(lengths, 10)
+    lengths = push(lengths, 10)
+    lengths = push(lengths, 8)
+    lengths = push(lengths, 11)
+    lengths = push(lengths, 8)
+    lengths = push(lengths, 6)
+    lengths = push(lengths, 6)
+    lengths = push(lengths, 6)
+    lengths = push(lengths, 5)
+    lengths = push(lengths, 5)
+    lengths = push(lengths, 5)
+    lengths = push(lengths, 6)
+    lengths = push(lengths, 6)
+    lengths = push(lengths, 6)
+    lengths = push(lengths, 6)
+    lengths = push(lengths, 6)
+    lengths = push(lengths, 6)
+    lengths = push(lengths, 6)
+    lengths = push(lengths, 7)
+    lengths = push(lengths, 8)
+    lengths = push(lengths, 15)
+    lengths = push(lengths, 6)
+    lengths = push(lengths, 12)
+    lengths = push(lengths, 10)
+    lengths = push(lengths, 13)
+    lengths = push(lengths, 6)
+    lengths = push(lengths, 7)
+    lengths = push(lengths, 7)
+    lengths = push(lengths, 7)
+    lengths = push(lengths, 7)
+    lengths = push(lengths, 7)
+    lengths = push(lengths, 7)
+    lengths = push(lengths, 7)
+    lengths = push(lengths, 7)
+    lengths = push(lengths, 7)
+    lengths = push(lengths, 7)
+    lengths = push(lengths, 7)
+    lengths = push(lengths, 7)
+    lengths = push(lengths, 7)
+    lengths = push(lengths, 7)
+    lengths = push(lengths, 7)
+    lengths = push(lengths, 7)
+    lengths = push(lengths, 7)
+    lengths = push(lengths, 7)
+    lengths = push(lengths, 7)
+    lengths = push(lengths, 7)
+    lengths = push(lengths, 7)
+    lengths = push(lengths, 7)
+    lengths = push(lengths, 8)
+    lengths = push(lengths, 7)
+    lengths = push(lengths, 8)
+    lengths = push(lengths, 13)
+    lengths = push(lengths, 19)
+    lengths = push(lengths, 13)
+    lengths = push(lengths, 14)
+    lengths = push(lengths, 6)
+    lengths = push(lengths, 15)
+    lengths = push(lengths, 5)
+    lengths = push(lengths, 6)
+    lengths = push(lengths, 5)
+    lengths = push(lengths, 6)
+    lengths = push(lengths, 5)
+    lengths = push(lengths, 6)
+    lengths = push(lengths, 6)
+    lengths = push(lengths, 6)
+    lengths = push(lengths, 5)
+    lengths = push(lengths, 7)
+    lengths = push(lengths, 7)
+    lengths = push(lengths, 6)
+    lengths = push(lengths, 6)
+    lengths = push(lengths, 6)
+    lengths = push(lengths, 5)
+    lengths = push(lengths, 6)
+    lengths = push(lengths, 7)
+    lengths = push(lengths, 6)
+    lengths = push(lengths, 5)
+    lengths = push(lengths, 5)
+    lengths = push(lengths, 6)
+    lengths = push(lengths, 7)
+    lengths = push(lengths, 7)
+    lengths = push(lengths, 7)
+    lengths = push(lengths, 7)
+    lengths = push(lengths, 7)
+    lengths = push(lengths, 15)
+    lengths = push(lengths, 11)
+    lengths = push(lengths, 14)
+    lengths = push(lengths, 13)
+    lengths = push(lengths, 28)
+    lengths = push(lengths, 20)
+    lengths = push(lengths, 22)
+    lengths = push(lengths, 20)
+    lengths = push(lengths, 20)
+    lengths = push(lengths, 22)
+    lengths = push(lengths, 22)
+    lengths = push(lengths, 22)
+    lengths = push(lengths, 23)
+    lengths = push(lengths, 22)
+    lengths = push(lengths, 23)
+    lengths = push(lengths, 23)
+    lengths = push(lengths, 23)
+    lengths = push(lengths, 23)
+    lengths = push(lengths, 23)
+    lengths = push(lengths, 24)
+    lengths = push(lengths, 23)
+    lengths = push(lengths, 24)
+    lengths = push(lengths, 24)
+    lengths = push(lengths, 22)
+    lengths = push(lengths, 23)
+    lengths = push(lengths, 24)
+    lengths = push(lengths, 23)
+    lengths = push(lengths, 23)
+    lengths = push(lengths, 23)
+    lengths = push(lengths, 23)
+    lengths = push(lengths, 21)
+    lengths = push(lengths, 22)
+    lengths = push(lengths, 23)
+    lengths = push(lengths, 22)
+    lengths = push(lengths, 23)
+    lengths = push(lengths, 23)
+    lengths = push(lengths, 24)
+    lengths = push(lengths, 22)
+    lengths = push(lengths, 21)
+    lengths = push(lengths, 20)
+    lengths = push(lengths, 22)
+    lengths = push(lengths, 22)
+    lengths = push(lengths, 23)
+    lengths = push(lengths, 23)
+    lengths = push(lengths, 21)
+    lengths = push(lengths, 23)
+    lengths = push(lengths, 22)
+    lengths = push(lengths, 22)
+    lengths = push(lengths, 24)
+    lengths = push(lengths, 21)
+    lengths = push(lengths, 22)
+    lengths = push(lengths, 23)
+    lengths = push(lengths, 23)
+    lengths = push(lengths, 21)
+    lengths = push(lengths, 21)
+    lengths = push(lengths, 22)
+    lengths = push(lengths, 21)
+    lengths = push(lengths, 23)
+    lengths = push(lengths, 22)
+    lengths = push(lengths, 23)
+    lengths = push(lengths, 23)
+    lengths = push(lengths, 20)
+    lengths = push(lengths, 22)
+    lengths = push(lengths, 22)
+    lengths = push(lengths, 22)
+    lengths = push(lengths, 23)
+    lengths = push(lengths, 22)
+    lengths = push(lengths, 22)
+    lengths = push(lengths, 23)
+    lengths = push(lengths, 26)
+    lengths = push(lengths, 26)
+    lengths = push(lengths, 20)
+    lengths = push(lengths, 19)
+    lengths = push(lengths, 22)
+    lengths = push(lengths, 23)
+    lengths = push(lengths, 22)
+    lengths = push(lengths, 25)
+    lengths = push(lengths, 26)
+    lengths = push(lengths, 26)
+    lengths = push(lengths, 26)
+    lengths = push(lengths, 27)
+    lengths = push(lengths, 27)
+    lengths = push(lengths, 26)
+    lengths = push(lengths, 24)
+    lengths = push(lengths, 25)
+    lengths = push(lengths, 19)
+    lengths = push(lengths, 21)
+    lengths = push(lengths, 26)
+    lengths = push(lengths, 27)
+    lengths = push(lengths, 27)
+    lengths = push(lengths, 26)
+    lengths = push(lengths, 27)
+    lengths = push(lengths, 24)
+    lengths = push(lengths, 21)
+    lengths = push(lengths, 21)
+    lengths = push(lengths, 26)
+    lengths = push(lengths, 26)
+    lengths = push(lengths, 28)
+    lengths = push(lengths, 27)
+    lengths = push(lengths, 27)
+    lengths = push(lengths, 27)
+    lengths = push(lengths, 20)
+    lengths = push(lengths, 24)
+    lengths = push(lengths, 20)
+    lengths = push(lengths, 21)
+    lengths = push(lengths, 22)
+    lengths = push(lengths, 21)
+    lengths = push(lengths, 21)
+    lengths = push(lengths, 23)
+    lengths = push(lengths, 22)
+    lengths = push(lengths, 22)
+    lengths = push(lengths, 25)
+    lengths = push(lengths, 25)
+    lengths = push(lengths, 24)
+    lengths = push(lengths, 24)
+    lengths = push(lengths, 26)
+    lengths = push(lengths, 23)
+    lengths = push(lengths, 26)
+    lengths = push(lengths, 27)
+    lengths = push(lengths, 26)
+    lengths = push(lengths, 26)
+    lengths = push(lengths, 27)
+    lengths = push(lengths, 27)
+    lengths = push(lengths, 27)
+    lengths = push(lengths, 27)
+    lengths = push(lengths, 27)
+    lengths = push(lengths, 28)
+    lengths = push(lengths, 27)
+    lengths = push(lengths, 27)
+    lengths = push(lengths, 27)
+    lengths = push(lengths, 27)
+    lengths = push(lengths, 27)
+    lengths = push(lengths, 26)
+    lengths = push(lengths, 30)
+    return lengths
+}
+
+fn hpack_huffman_tree() -> HpackHuffman {
+    cap := 8192
+    tree := HpackHuffman{left: mkslice(int, cap), right: mkslice(int, cap), symbol: mkslice(int, cap), size: 1}
+    lengths := hpack_huffman_lengths()
+    counts := mkslice(int, 31)
+    next_code := mkslice(int, 31)
+    i := 0
+    for i < len(lengths) {
+        counts[lengths[i]] = counts[lengths[i]] + 1
+        i = i + 1
+    }
+    code := 0
+    bits := 1
+    for bits <= 30 {
+        code = (code + counts[bits - 1]) * 2
+        next_code[bits] = code
+        bits = bits + 1
+    }
+    sym := 0
+    for sym < len(lengths) {
+        width := lengths[sym]
+        current := next_code[width]
+        next_code[width] = current + 1
+        divisor := hpack_pow2(width - 1)
+        node := 0
+        j := 0
+        for j < width {
+            bit := current / divisor % 2
+            divisor = divisor / 2
+            child := 0
+            if bit == 0 {
+                child = tree.left[node]
+                if child == 0 {
+                    if tree.size >= cap {
+                        tree.size = -1
+                        return tree
+                    }
+                    child = tree.size
+                    tree.size = tree.size + 1
+                    tree.left[node] = child
+                }
+            } else {
+                child = tree.right[node]
+                if child == 0 {
+                    if tree.size >= cap {
+                        tree.size = -1
+                        return tree
+                    }
+                    child = tree.size
+                    tree.size = tree.size + 1
+                    tree.right[node] = child
+                }
+            }
+            node = child
+            j = j + 1
+        }
+        tree.symbol[node] = sym + 1
+        sym = sym + 1
+    }
+    return tree
+}
+
+let HPACK_HUFFMAN_TREE = hpack_huffman_tree()
+
+fn hpack_huffman_decode(data: []byte) -> [str, err] {
+    if len(data) > 1048576 {
+        return "", errors.new("http2: HPACK Huffman string too large")
+    }
+    tree := HPACK_HUFFMAN_TREE
+    if tree.size <= 0 || tree.size > len(tree.left) {
+        return "", errors.new("http2: invalid HPACK Huffman table")
+    }
+    out := mkslice(byte, 0)
+    node := 0
+    tail := 0
+    tail_len := 0
+    i := 0
+    for i < len(data) {
+        bitpos := 7
+        for bitpos >= 0 {
+            bit := data[i] / hpack_pow2(bitpos) % 2
+            child := tree.left[node]
+            if bit != 0 {
+                child = tree.right[node]
+            }
+            if child == 0 {
+                return "", errors.new("http2: invalid HPACK Huffman code")
+            }
+            node = child
+            tail = (tail * 2 + bit) % 256
+            tail_len = tail_len + 1
+            value := tree.symbol[node]
+            if value != 0 {
+                symbol := value - 1
+                if symbol == 256 {
+                    return "", errors.new("http2: HPACK Huffman EOS in string")
+                }
+                out = push(out, symbol)
+                if len(out) > 1048576 {
+                    return "", errors.new("http2: decoded HPACK Huffman string too large")
+                }
+                node = 0
+                tail = 0
+                tail_len = 0
+            }
+            bitpos = bitpos - 1
+        }
+        i = i + 1
+    }
+    if tail_len > 7 || tail != hpack_pow2(tail_len) - 1 {
+        return "", errors.new("http2: invalid HPACK Huffman padding")
+    }
+    return out as str, nil
+}
+
+fn hpack_int(data: []byte, pos: int, prefix: int) -> [HpackInt, err] {
+    if pos < 0 || pos >= len(data) || prefix < 1 || prefix > 8 {
+        return HpackInt{value: 0, next: pos}, errors.new("http2: truncated HPACK integer")
+    }
+    mask := hpack_pow2(prefix) - 1
+    value := data[pos] & mask
+    next := pos + 1
+    if value < mask {
+        return HpackInt{value: value, next: next}, nil
+    }
+    shift := 0
+    for true {
+        if next >= len(data) || shift > 28 {
+            return HpackInt{value: 0, next: next}, errors.new("http2: invalid HPACK integer")
+        }
+        b := data[next]
+        part := (b & 127) * hpack_pow2(shift)
+        if part > 2147483647 - value {
+            return HpackInt{value: 0, next: next}, errors.new("http2: HPACK integer overflow")
+        }
+        value = value + part
+        next = next + 1
+        if (b & 128) == 0 {
+            return HpackInt{value: value, next: next}, nil
+        }
+        shift = shift + 7
+    }
+    return HpackInt{value: 0, next: next}, errors.new("http2: invalid HPACK integer")
+}
+
+fn hpack_string(data: []byte, pos: int) -> [HpackString, err] {
+    if pos < 0 || pos >= len(data) {
+        return HpackString{value: "", next: pos}, errors.new("http2: truncated HPACK string")
+    }
+    huffman := (data[pos] & 128) != 0
+    [length_result, e] = hpack_int(data, pos, 7)
+    if e != nil {
+        return HpackString{value: "", next: length_result.next}, e
+    }
+    length := length_result.value
+    next := length_result.next
+    if length > len(data) - next {
+        return HpackString{value: "", next: next}, errors.new("http2: truncated HPACK string")
+    }
+    if huffman {
+        [decoded, de] = hpack_huffman_decode(data[next:next + length])
+        if de != nil {
+            return HpackString{value: "", next: next + length}, de
+        }
+        return HpackString{value: decoded, next: next + length}, nil
+    }
+    return HpackString{value: data[next:next + length] as str, next: next + length}, nil
+}
+
+fn hpack_lookup(d: ref Decoder, index: int) -> [Header, err] {
+    if index <= 0 {
+        return Header{name: "", value: ""}, errors.new("http2: invalid HPACK index")
+    }
+    if index <= 61 {
+        return Header{name: hpack_static_name(index), value: hpack_static_value(index)}, nil
+    }
+    off := index - 62
+    if off >= len(d.dynamic) {
+        return Header{name: "", value: ""}, errors.new("http2: HPACK index outside dynamic table")
+    }
+    return d.dynamic[len(d.dynamic) - 1 - off], nil
+}
+
+fn hpack_evict(d: mut Decoder) {
+    for d.dynamic_size > d.max_size && len(d.dynamic) > 0 {
+        first := d.dynamic[0]
+        d.dynamic_size = d.dynamic_size - len(first.name) - len(first.value) - 32
+        d.dynamic = d.dynamic[1:]
+    }
+}
+
+fn hpack_add(d: mut Decoder, header: Header) {
+    size := len(header.name) + len(header.value) + 32
+    if size > d.max_size {
+        d.dynamic = mkslice(Header, 0)
+        d.dynamic_size = 0
+        return
+    }
+    d.dynamic = push(d.dynamic, header)
+    d.dynamic_size = d.dynamic_size + size
+    hpack_evict(d)
+}
+
+fn decode_headers(d: mut Decoder, block: []byte) -> [[]Header, err] {
+    if len(block) > d.max_header_list {
+        return mkslice(Header, 0), errors.new("http2: HPACK header block too large")
+    }
+    headers := mkslice(Header, 0)
+    pos := 0
+    total := 0
+    field_seen := false
+    for pos < len(block) {
+        b := block[pos]
+        if (b & 128) != 0 {
+            [ir1, e1] = hpack_int(block, pos, 7)
+            if e1 != nil {
+                return mkslice(Header, 0), e1
+            }
+            [header1, le1] = hpack_lookup(d, ir1.value)
+            if le1 != nil {
+                return mkslice(Header, 0), le1
+            }
+            if !hpack_valid_header(header1) {
+                return mkslice(Header, 0), errors.new("http2: invalid decoded header field")
+            }
+            total = total + len(header1.name) + len(header1.value) + 32
+            if total > d.max_header_list {
+                return mkslice(Header, 0), errors.new("http2: HPACK header list too large")
+            }
+            headers = push(headers, header1)
+            pos = ir1.next
+            field_seen = true
+        } else if (b & 64) != 0 {
+            [ir2, e2] = hpack_int(block, pos, 6)
+            if e2 != nil {
+                return mkslice(Header, 0), e2
+            }
+            next2 := ir2.next
+            name2 := ""
+            if ir2.value == 0 {
+                [sr2, e3] = hpack_string(block, next2)
+                if e3 != nil {
+                    return mkslice(Header, 0), e3
+                }
+                name2 = sr2.value
+                next2 = sr2.next
+            } else {
+                [named2, ne2] = hpack_lookup(d, ir2.value)
+                if ne2 != nil {
+                    return mkslice(Header, 0), ne2
+                }
+                name2 = named2.name
+            }
+            [vr2, e4] = hpack_string(block, next2)
+            if e4 != nil {
+                return mkslice(Header, 0), e4
+            }
+            header2 := Header{name: name2, value: vr2.value}
+            if !hpack_valid_header(header2) {
+                return mkslice(Header, 0), errors.new("http2: invalid decoded header field")
+            }
+            total = total + len(name2) + len(vr2.value) + 32
+            if total > d.max_header_list {
+                return mkslice(Header, 0), errors.new("http2: HPACK header list too large")
+            }
+            headers = push(headers, header2)
+            hpack_add(d, header2)
+            pos = vr2.next
+            field_seen = true
+        } else if (b & 32) != 0 {
+            if field_seen {
+                return mkslice(Header, 0), errors.new("http2: late HPACK table size update")
+            }
+            [ir3, e5] = hpack_int(block, pos, 5)
+            if e5 != nil {
+                return mkslice(Header, 0), e5
+            }
+            if ir3.value > d.limit {
+                return mkslice(Header, 0), errors.new("http2: HPACK table size exceeds limit")
+            }
+            d.max_size = ir3.value
+            hpack_evict(d)
+            pos = ir3.next
+        } else {
+            [ir4, e6] = hpack_int(block, pos, 4)
+            if e6 != nil {
+                return mkslice(Header, 0), e6
+            }
+            next4 := ir4.next
+            name4 := ""
+            if ir4.value == 0 {
+                [sr4, e7] = hpack_string(block, next4)
+                if e7 != nil {
+                    return mkslice(Header, 0), e7
+                }
+                name4 = sr4.value
+                next4 = sr4.next
+            } else {
+                [named4, ne4] = hpack_lookup(d, ir4.value)
+                if ne4 != nil {
+                    return mkslice(Header, 0), ne4
+                }
+                name4 = named4.name
+            }
+            [vr4, e8] = hpack_string(block, next4)
+            if e8 != nil {
+                return mkslice(Header, 0), e8
+            }
+            header4 := Header{name: name4, value: vr4.value}
+            if !hpack_valid_header(header4) {
+                return mkslice(Header, 0), errors.new("http2: invalid decoded header field")
+            }
+            total = total + len(name4) + len(vr4.value) + 32
+            if total > d.max_header_list {
+                return mkslice(Header, 0), errors.new("http2: HPACK header list too large")
+            }
+            headers = push(headers, header4)
+            pos = vr4.next
+            field_seen = true
+        }
+    }
+    return headers, nil
+}
+
+fn hpack_static_name_index(name: str) -> int {
+    if name == ":authority" {
+        return 1
+    }
+    if name == ":method" {
+        return 2
+    }
+    if name == ":path" {
+        return 4
+    }
+    if name == ":scheme" {
+        return 6
+    }
+    if name == ":status" {
+        return 8
+    }
+    if name == "accept-charset" {
+        return 15
+    }
+    if name == "accept-encoding" {
+        return 16
+    }
+    if name == "accept-language" {
+        return 17
+    }
+    if name == "accept-ranges" {
+        return 18
+    }
+    if name == "accept" {
+        return 19
+    }
+    if name == "access-control-allow-origin" {
+        return 20
+    }
+    if name == "age" {
+        return 21
+    }
+    if name == "allow" {
+        return 22
+    }
+    if name == "authorization" {
+        return 23
+    }
+    if name == "cache-control" {
+        return 24
+    }
+    if name == "content-disposition" {
+        return 25
+    }
+    if name == "content-encoding" {
+        return 26
+    }
+    if name == "content-language" {
+        return 27
+    }
+    if name == "content-length" {
+        return 28
+    }
+    if name == "content-location" {
+        return 29
+    }
+    if name == "content-range" {
+        return 30
+    }
+    if name == "content-type" {
+        return 31
+    }
+    if name == "cookie" {
+        return 32
+    }
+    if name == "date" {
+        return 33
+    }
+    if name == "etag" {
+        return 34
+    }
+    if name == "expect" {
+        return 35
+    }
+    if name == "expires" {
+        return 36
+    }
+    if name == "from" {
+        return 37
+    }
+    if name == "host" {
+        return 38
+    }
+    if name == "if-match" {
+        return 39
+    }
+    if name == "if-modified-since" {
+        return 40
+    }
+    if name == "if-none-match" {
+        return 41
+    }
+    if name == "if-range" {
+        return 42
+    }
+    if name == "if-unmodified-since" {
+        return 43
+    }
+    if name == "last-modified" {
+        return 44
+    }
+    if name == "link" {
+        return 45
+    }
+    if name == "location" {
+        return 46
+    }
+    if name == "max-forwards" {
+        return 47
+    }
+    if name == "proxy-authenticate" {
+        return 48
+    }
+    if name == "proxy-authorization" {
+        return 49
+    }
+    if name == "range" {
+        return 50
+    }
+    if name == "referer" {
+        return 51
+    }
+    if name == "refresh" {
+        return 52
+    }
+    if name == "retry-after" {
+        return 53
+    }
+    if name == "server" {
+        return 54
+    }
+    if name == "set-cookie" {
+        return 55
+    }
+    if name == "strict-transport-security" {
+        return 56
+    }
+    if name == "transfer-encoding" {
+        return 57
+    }
+    if name == "user-agent" {
+        return 58
+    }
+    if name == "vary" {
+        return 59
+    }
+    if name == "via" {
+        return 60
+    }
+    if name == "www-authenticate" {
+        return 61
+    }
+    return 0
+}
+
+fn hpack_static_exact_index(name: str, value: str) -> int {
+    if name == ":method" && value == "GET" {
+        return 2
+    }
+    if name == ":method" && value == "POST" {
+        return 3
+    }
+    if name == ":path" && value == "/" {
+        return 4
+    }
+    if name == ":path" && value == "/index.html" {
+        return 5
+    }
+    if name == ":scheme" && value == "http" {
+        return 6
+    }
+    if name == ":scheme" && value == "https" {
+        return 7
+    }
+    if name == ":status" && value == "200" {
+        return 8
+    }
+    if name == ":status" && value == "204" {
+        return 9
+    }
+    if name == ":status" && value == "206" {
+        return 10
+    }
+    if name == ":status" && value == "304" {
+        return 11
+    }
+    if name == ":status" && value == "400" {
+        return 12
+    }
+    if name == ":status" && value == "404" {
+        return 13
+    }
+    if name == ":status" && value == "500" {
+        return 14
+    }
+    if name == "accept-encoding" && value == "gzip, deflate" {
+        return 16
+    }
+    return 0
+}
+
+fn hpack_valid_name(name: str) -> bool {
+    raw := name as []byte
+    if len(raw) == 0 {
+        return false
+    }
+    i := 0
+    for i < len(raw) {
+        c := raw[i]
+        if i == 0 && c == 58 {
+            i = i + 1
+        } else if c >= 97 && c <= 122 || c >= 48 && c <= 57 || c == 33 || c == 35 || c == 36 || c == 37 || c == 38 || c == 39 || c == 42 || c == 43 || c == 45 || c == 46 || c == 94 || c == 95 || c == 96 || c == 124 || c == 126 {
+            i = i + 1
+        } else {
+            return false
+        }
+    }
+    return true
+}
+
+fn hpack_valid_value(value: str) -> bool {
+    raw := value as []byte
+    i := 0
+    for i < len(raw) {
+        c := raw[i]
+        if c == 0 || c == 10 || c == 13 || c == 127 || c < 32 && c != 9 {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn hpack_valid_header(header: Header) -> bool {
+    return hpack_valid_name(header.name) && hpack_valid_value(header.value)
+}
+
+fn hpack_encode_int(value: int, prefix: int, base: int) -> [[]byte, err] {
+    if value < 0 || value > 2147483647 || prefix < 1 || prefix > 8 {
+        return mkslice(byte, 0), errors.new("http2: invalid HPACK integer")
+    }
+    mask := hpack_pow2(prefix) - 1
+    if (base & mask) != 0 {
+        return mkslice(byte, 0), errors.new("http2: invalid HPACK integer prefix")
+    }
+    out := mkslice(byte, 0)
+    if value < mask {
+        return push(out, base + value), nil
+    }
+    out = push(out, base + mask)
+    remaining := value - mask
+    for remaining >= 128 {
+        out = push(out, remaining % 128 + 128)
+        remaining = remaining / 128
+    }
+    out = push(out, remaining)
+    return out, nil
+}
+
+fn hpack_encode_string(value: str) -> [[]byte, err] {
+    raw := value as []byte
+    [out, e] = hpack_encode_int(len(raw), 7, 0)
+    if e != nil {
+        return mkslice(byte, 0), e
+    }
+    i := 0
+    for i < len(raw) {
+        out = push(out, raw[i])
+        i = i + 1
+    }
+    return out, nil
+}
+
+fn hpack_append(dst: []byte, src: []byte) -> []byte {
+    out := dst
+    i := 0
+    for i < len(src) {
+        out = push(out, src[i])
+        i = i + 1
+    }
+    return out
+}
+
+fn encode_headers(headers: []Header) -> [[]byte, err] {
+    out := mkslice(byte, 0)
+    total := 0
+    i := 0
+    for i < len(headers) {
+        h := headers[i]
+        if !hpack_valid_header(h) {
+            return mkslice(byte, 0), errors.new("http2: invalid header field")
+        }
+        total = total + len(h.name) + len(h.value) + 32
+        if total > 65536 {
+            return mkslice(byte, 0), errors.new("http2: header list too large")
+        }
+        exact := hpack_static_exact_index(h.name, h.value)
+        if exact != 0 {
+            [encoded, ee] = hpack_encode_int(exact, 7, 128)
+            if ee != nil {
+                return mkslice(byte, 0), ee
+            }
+            out = hpack_append(out, encoded)
+        } else {
+            name_index := hpack_static_name_index(h.name)
+            [encoded, ee] = hpack_encode_int(name_index, 4, 16)
+            if ee != nil {
+                return mkslice(byte, 0), ee
+            }
+            out = hpack_append(out, encoded)
+            if name_index == 0 {
+                [name_bytes, ne] = hpack_encode_string(h.name)
+                if ne != nil {
+                    return mkslice(byte, 0), ne
+                }
+                out = hpack_append(out, name_bytes)
+            }
+            [value_bytes, ve] = hpack_encode_string(h.value)
+            if ve != nil {
+                return mkslice(byte, 0), ve
+            }
+            out = hpack_append(out, value_bytes)
+        }
+        i = i + 1
+    }
+    return out, nil
+}

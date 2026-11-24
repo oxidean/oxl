@@ -375,6 +375,70 @@ printf '%s
 for t in test_base64 test_hex test_binary test_csv; do
     grep -q "$t ... ok" <<<"$out" || { echo "FAIL enc: $out"; exit 1; }
 done
+out=$("$OXL" test tests/http2_frame_test.oxl)
+printf '%s\n' "$out" >&2
+for t in test_http2_frame_header_roundtrip test_http2_frame_header_rejects_invalid_input test_http2_frame_payload test_http2_frame_io_roundtrip test_http2_frame_type_validation; do
+    grep -q "$t ... ok" <<<"$out" || { echo "FAIL http2 frame: $out"; exit 1; }
+done
+out=$("$OXL" test tests/http2_hpack_test.oxl)
+printf '%s\n' "$out" >&2
+for t in test_http2_hpack_rfc_request_vector test_http2_hpack_rejects_bounds_and_indexes test_http2_hpack_rfc_huffman test_http2_hpack_encode_request; do
+    grep -q "$t ... ok" <<<"$out" || { echo "FAIL http2 HPACK: $out"; exit 1; }
+done
+out=$("$OXL" test tests/http2_conn_test.oxl)
+printf '%s\n' "$out" >&2
+for t in test_http2_connection_streams_and_trailers test_http2_connection_multiplexes_stream_ids test_http2_peer_max_concurrent_streams test_http2_send_body_handles_goaway_for_accepted_stream test_http2_send_body_rejects_goaway_excluded_stream test_http2_goaway_last_stream_is_monotonic test_http2_pending_event_limit test_http2_connection_control_frames; do
+    grep -q "$t ... ok" <<<"$out" || { echo "FAIL http2 connection: $out"; exit 1; }
+done
+if command -v node >/dev/null 2>&1; then
+    h2_port=$((30000 + RANDOM % 15000))
+h2_tls_port=$((h2_port + 1))
+h1_tls_port=$((h2_port + 2))
+h1_port=$((h2_port + 3))
+node tests/http2_server.mjs "$h2_port" "$h2_tls_port" "$h1_tls_port" "$h1_port" >/dev/null 2>&1 &
+h2_srv=$!
+h2_ready=0
+for _ in {1..50}; do
+    kill -0 "$h2_srv" 2>/dev/null || break
+    (exec 3<>"/dev/tcp/127.0.0.1/$h2_port" && exec 4<>"/dev/tcp/127.0.0.1/$h2_tls_port" && exec 5<>"/dev/tcp/127.0.0.1/$h1_tls_port" && exec 6<>"/dev/tcp/127.0.0.1/$h1_port") 2>/dev/null && { exec 3>&- 3<&- 4>&- 4<&- 5>&- 5<&- 6>&- 6<&-; h2_ready=1; break; }
+    sleep 0.1
+done
+if [ "$h2_ready" != 1 ]; then
+    kill "$h2_srv" 2>/dev/null || true
+    wait "$h2_srv" 2>/dev/null || true
+    echo "FAIL http2 interop: local server did not start"
+    exit 1
+fi
+out=$(OXL_HTTP2_PORT="$h2_port" OXL_HTTP2_TLS_PORT="$h2_tls_port" OXL_HTTP1_TLS_PORT="$h1_tls_port" OXL_HTTP1_PORT="$h1_port" "$OXL" test tests/http2_interop_test.oxl) || {
+    kill "$h2_srv" 2>/dev/null || true
+    wait "$h2_srv" 2>/dev/null || true
+    echo "FAIL http2 interop: $out"
+    exit 1
+}
+printf '%s\n' "$out" >&2
+grep -q "test_http2_interop ... ok" <<<"$out" && grep -q "test_http2_tls_alpn ... ok" <<<"$out" || {
+    kill "$h2_srv" 2>/dev/null || true
+    wait "$h2_srv" 2>/dev/null || true
+    echo "FAIL http2 interop: $out"
+    exit 1
+}
+timeout_out=$(with_timeout 60 env OXL_HTTP2_PORT="$h2_port" "$OXL" test tests/http2_timeout_test.oxl) || {
+    kill "$h2_srv" 2>/dev/null || true
+    wait "$h2_srv" 2>/dev/null || true
+    echo "FAIL HTTP/2 deadline test: $timeout_out"
+    exit 1
+}
+printf "%s\n" "$timeout_out" >&2
+grep -q "test_http2_client_deadline ... ok" <<<"$timeout_out" || { echo "FAIL HTTP/2 deadline test: $timeout_out"; exit 1; }
+kill "$h2_srv" 2>/dev/null || true
+wait "$h2_srv" 2>/dev/null || true
+else
+    if [ "${CI:-}" = "true" ]; then
+        echo "FAIL http2 interop: node is required in CI"
+        exit 1
+    fi
+    echo "http2 interop skipped: node unavailable"
+fi
 out=$("$OXL" test tests/hash_test.oxl)
 printf '%s
 ' "$out" >&2

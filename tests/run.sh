@@ -86,9 +86,11 @@ with_timeout() {
 scratch=$(mktemp -d)
 srv_pid=""
 relsrv=""
+ws_peer_pid=""
 cleanup() {
     if [ -n "$srv_pid" ]; then kill "$srv_pid" 2>/dev/null || true; fi
     if [ -n "$relsrv" ]; then kill "$relsrv" 2>/dev/null || true; wait "$relsrv" 2>/dev/null || true; fi
+    if [ -n "$ws_peer_pid" ]; then kill "$ws_peer_pid" 2>/dev/null || true; wait "$ws_peer_pid" 2>/dev/null || true; fi
     # v2's sealed module-cache slots are read-only — restore write
     # permission or rm leaves them behind
     chmod -R u+w "$scratch" 2>/dev/null
@@ -477,6 +479,11 @@ printf '%s
 for t in test_csrand; do
     grep -q "$t ... ok" <<<"$out" || { echo "FAIL crypto_rand: $out"; exit 1; }
 done
+out=$("$OXL" test tests/sha1_test.oxl) || { printf '%s
+' "$out" >&2; exit 1; }
+printf '%s
+' "$out" >&2
+grep -q "test_sha1_vectors ... ok" <<<"$out" || { echo "FAIL sha1: $out"; exit 1; }
 out=$("$OXL" test tests/sha512_test.oxl) || { printf '%s
 ' "$out" >&2; exit 1; }
 printf '%s
@@ -921,6 +928,32 @@ out=$("$OXL" run tests/httpclient_rich.oxl)
 printf '%s
 ' "$out" >&2
 grep -q "httpclient rich done" <<<"$out" || { echo "FAIL httpclient rich: $out"; exit 1; }
+
+echo "== oxl test: websocket client (#220) =="
+"$PY" tests/websocket_peer.py "$scratch/ws-ports" >"$scratch/ws-peer.log" 2>&1 &
+ws_peer_pid=$!
+for i in $(seq 1 100); do
+    [ -s "$scratch/ws-ports" ] && break
+    kill -0 "$ws_peer_pid" 2>/dev/null || { cat "$scratch/ws-peer.log" >&2; echo "FAIL websocket peer startup"; exit 1; }
+    sleep 0.05
+done
+[ -s "$scratch/ws-ports" ] || { echo "FAIL websocket peer did not publish ports"; exit 1; }
+read -r ws_port wss_port < "$scratch/ws-ports"
+: > "$scratch/ws-errors"
+out=$(OXL_WS_PORT="$ws_port" OXL_WSS_PORT="$wss_port" OXL_WS_ERRORS="$scratch/ws-errors" \
+    with_timeout 90 "$OXL" test tests/websocket_test.oxl) || { printf '%s
+' "$out" >&2; cat "$scratch/ws-errors" >&2; exit 1; }
+printf '%s
+' "$out" >&2
+for t in test_ws_upgrade_and_frames test_ws_upgrade_rejections test_ws_optional_subprotocol_and_empty_reason test_ws_bad_server_frames test_ws_extended_server_length test_ws_64bit_client_length test_ws_read_deadline test_ws_write_deadline test_wss_identity_and_interop; do
+    grep -q "$t ... ok" <<<"$out" || { echo "FAIL websocket $t: $out"; exit 1; }
+done
+[ ! -s "$scratch/ws-errors" ] || { cat "$scratch/ws-errors" >&2; echo "FAIL websocket peer assertions"; exit 1; }
+kill "$ws_peer_pid" 2>/dev/null || true
+wait "$ws_peer_pid" 2>/dev/null || true
+ws_peer_pid=""
+out=$("$OXL" test tests/websocket_smoke.oxl)
+grep -q "test_ws_bad_url ... ok" <<<"$out" || { echo "FAIL websocket URL validation: $out"; exit 1; }
 
 echo "== oxl test: exec + fs (t0) =="
 out=$("$OXL" test tests/exec_test.oxl)
@@ -1840,7 +1873,7 @@ done
 # s4 enc/hash/crypto + x1/x3/x4 crypto through the self-hosted emitter +
 # cc — exercises [][]str return emission (csv.read_all), hash/crypto,
 # and the big-limb arithmetic under -test
-for tf in enc hash crypto aesgcm chacha sha512 hkdf crypto_rand bignum rsa x25519 nistec ed25519 x509 tls_keys tls_handshake https; do
+for tf in enc hash crypto aesgcm chacha sha1 sha512 hkdf crypto_rand bignum rsa x25519 nistec ed25519 x509 tls_keys tls_handshake https; do
     "$OXL" run bootstrap/cmd/codegen -- --test "tests/${tf}_test.oxl" > "$cgen_dir/$tf.c"
     tfcrypto=""; tfcryptolib=""; tfnet=""
     grep -q 'rt_csrand(' "$cgen_dir/$tf.c" && { tfcrypto="-DOXL_CRYPTO"; tfcryptolib="$CRYPTO_LIBS"; }
@@ -1865,6 +1898,7 @@ done
 for t in test_chacha20 test_poly1305 test_aead; do
     grep -q "$t ... ok" "$cgen_dir/chacha.out" || { echo "FAIL codegen chacha $t"; cat "$cgen_dir/chacha.out"; exit 1; }
 done
+grep -q "test_sha1_vectors ... ok" "$cgen_dir/sha1.out" || { echo "FAIL codegen sha1"; cat "$cgen_dir/sha1.out"; exit 1; }
 for t in test_sha512 test_sha384 test_hmac_sha512; do
     grep -q "$t ... ok" "$cgen_dir/sha512.out" || { echo "FAIL codegen sha512 $t"; cat "$cgen_dir/sha512.out"; exit 1; }
 done

@@ -1,0 +1,988 @@
+package websocket
+
+// RFC 6455 client API. Dial returns a single-owner Conn; do not copy it
+// while reading because its buffered handshake/frame state is value-owned.
+// read_message reassembles fragmented data messages and automatically answers
+// ping frames. close sends a close frame and waits for the peer close response;
+// abort closes immediately. Message.data owns the complete payload bytes.
+// Client writes are masked and split into bounded continuation frames as needed.
+// Client-only RFC 6455 over TCP/TLS. This package intentionally has no
+// server, HTTP/2, extension, or compression support.
+import "std/net"
+
+import "std/net/tls"
+
+import "std/net/http"
+
+import "std/crypto/rand"
+
+import "std/crypto/sha1"
+
+import "std/encoding/base64"
+
+import "std/errors"
+
+import "std/strconv"
+
+import "std/unicode/utf8"
+
+let DEFAULT_TIMEOUT_MS = 10000
+
+let MAX_TIMEOUT_MS = 300000
+
+let DEFAULT_MAX_FRAME = 1048576
+
+let DEFAULT_MAX_MESSAGE = 4194304
+
+let MAX_HANDSHAKE = 16384
+
+let WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+interface transport {
+    read(b: []byte) -> [int, err],
+    write(b: []byte) -> [int, err],
+    close() -> err,
+    rawfd() -> int,
+}
+
+/// Options control a dial. Zero timeout and size values use safe defaults.
+/// TLS verification is always enabled for wss; tls_cfg may customize roots/name.
+struct Options {
+    timeout_ms: int,
+    max_frame_size: int,
+    max_message_size: int,
+    subprotocols: []str,
+    tls_cfg: tls.Config,
+}
+
+/// Message kind values: TEXT=1, BINARY=2, CLOSE=0.
+struct Message { kind: int, data: []byte }
+
+struct Conn {
+    wire: transport,
+    readbuf: []byte,
+    timeout_ms: int,
+    max_frame: int,
+    max_message: int,
+    deadline: int,
+    protocol: str,
+    fragmented: int,
+    frag_kind: int,
+    frag: []byte,
+    close_sent: int,
+    closed: int,
+}
+
+/// default_options provides bounded defaults and normal TLS verification.
+fn default_options() -> Options {
+    return Options{timeout_ms: DEFAULT_TIMEOUT_MS, max_frame_size: DEFAULT_MAX_FRAME, max_message_size: DEFAULT_MAX_MESSAGE, subprotocols: nil, tls_cfg: tls.default_cfg()}
+}
+
+fn defaults(o: Options) -> Options {
+    if o.timeout_ms <= 0 {
+        o.timeout_ms = DEFAULT_TIMEOUT_MS
+    }
+    if o.timeout_ms > MAX_TIMEOUT_MS {
+        o.timeout_ms = MAX_TIMEOUT_MS
+    }
+    if o.max_frame_size <= 0 {
+        o.max_frame_size = DEFAULT_MAX_FRAME
+    }
+    if o.max_message_size <= 0 {
+        o.max_message_size = DEFAULT_MAX_MESSAGE
+    }
+    if o.max_frame_size > 16777216 {
+        o.max_frame_size = 16777216
+    }
+    if o.max_message_size > 16777216 {
+        o.max_message_size = 16777216
+    }
+    return o
+}
+
+fn fail(msg: str) -> err {
+    return errors.new("websocket: " + msg)
+}
+
+/// dial opens a ws:// or wss:// URL, completes and validates its HTTP/1.1
+/// Upgrade, and returns only after the full handshake is accepted.
+fn dial(url: str, opts: Options) -> [Conn, err] {
+    opts = defaults(opts)
+    [u, ue] = parse_ws_url(url)
+    if ue != nil {
+        return badconn(), fail("invalid URL")
+    }
+    secure := starts(url, "wss://")
+    if !secure && !starts(url, "ws://") {
+        return badconn(), fail("scheme must be ws or wss")
+    }
+    if len(u.host) == 0 || u.port <= 0 {
+        return badconn(), fail("invalid URL authority")
+    }
+    [tcp, de] = net.dial_timeout(u.host, u.port, opts.timeout_ms)
+    if de != nil {
+        return badconn(), de
+    }
+    c := as_transport(tcp)
+    if secure {
+        cfg := opts.tls_cfg
+        if len(cfg.server_name) == 0 {
+            cfg.server_name = u.host
+        }
+        [tc, te] = tls.client_tmo(tcp, cfg, opts.timeout_ms)
+        if te != nil {
+            tcp.close()
+            return badconn(), te
+        }
+        c = as_tls_transport(tc)
+    }
+    deadline := now_ms() + opts.timeout_ms
+    set_sndtimo(c.rawfd(), (opts.timeout_ms + 999) / 1000)
+    [key, ke] = rand.bytes(16)
+    if ke != nil {
+        c.close()
+        return badconn(), ke
+    }
+    nonce := base64.encode(key)
+    path := u.path
+    if len(path) == 0 {
+        path = "/"
+    }
+    wire := "GET " + path + " HTTP/1.1\r\nHost: " + u.host + port_suffix(u.port, secure) + "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: " + nonce + "\r\nSec-WebSocket-Version: 13\r\n"
+    i := 0
+    for i < len(opts.subprotocols) {
+        p := opts.subprotocols[i]
+        if !valid_token(p) {
+            c.close()
+            return badconn(), fail("invalid subprotocol token")
+        }
+        j := 0
+        for j < i {
+            if opts.subprotocols[j] == p {
+                c.close()
+                return badconn(), fail("duplicate offered subprotocol")
+            }
+            j = j + 1
+        }
+        if i == 0 {
+            wire = wire + "Sec-WebSocket-Protocol: "
+        } else {
+            wire = wire + ", "
+        }
+        wire = wire + p
+        i = i + 1
+    }
+    if len(opts.subprotocols) > 0 {
+        wire = wire + "\r\n"
+    }
+    wire = wire + "\r\n"
+    e := write_all_deadline(c, wire, deadline)
+    if e != nil {
+        c.close()
+        return badconn(), e
+    }
+    set_rcvtimo_ms(c.rawfd(), opts.timeout_ms)
+    [hs, re] = read_handshake(c, opts.timeout_ms)
+    if re != nil {
+        c.close()
+        return badconn(), re
+    }
+    [protocol, ve] = validate_handshake(hs.header, nonce, opts.subprotocols)
+    if ve != nil {
+        c.close()
+        return badconn(), ve
+    }
+    return Conn{wire: c, readbuf: hs.tail, timeout_ms: opts.timeout_ms, max_frame: opts.max_frame_size, max_message: opts.max_message_size, deadline: 0, protocol: protocol, fragmented: 0, frag_kind: 0, frag: mkslice(byte, 0), close_sent: 0, closed: 0}, nil
+}
+
+fn as_transport(c: net.Conn) -> transport {
+    return c
+}
+
+fn as_tls_transport(c: tls.Conn) -> transport {
+    return c
+}
+
+fn badconn() -> Conn {
+    return Conn{wire: nil, readbuf: nil, timeout_ms: 0, max_frame: 0, max_message: 0, deadline: 0, protocol: "", fragmented: 0, frag_kind: 0, frag: nil, close_sent: 0, closed: 1}
+}
+
+fn starts(s: str, prefix: str) -> bool {
+    return len(s) >= len(prefix) && substr(s, 0, len(prefix)) == prefix
+}
+
+fn parse_ws_url(raw: str) -> [http.Url, err] {
+    bad := http.Url{host: "", port: 0, path: "", secure: 0}
+    secure := 0
+    rest := raw
+    if starts(raw, "ws://") {
+        rest = substr(raw, 5, len(raw))
+    } else if starts(raw, "wss://") {
+        rest = substr(raw, 6, len(raw))
+        secure = 1
+    } else {
+        return bad, fail("scheme must be ws or wss")
+    }
+    if len(rest) == 0 || find(rest, "#") >= 0 {
+        return bad, fail("invalid URL authority or fragment")
+    }
+    cut := len(rest)
+    slash := find(rest, "/")
+    query := find(rest, "?")
+    if slash >= 0 && slash < cut {
+        cut = slash
+    }
+    if query >= 0 && query < cut {
+        cut = query
+    }
+    authority := substr(rest, 0, cut)
+    if len(authority) == 0 || find(authority, "@") >= 0 {
+        return bad, fail("empty host or userinfo")
+    }
+    host := authority
+    port := 80
+    if secure != 0 {
+        port = 443
+    }
+    colon := find(authority, ":")
+    if colon >= 0 {
+        host = substr(authority, 0, colon)
+        ps := substr(authority, colon + 1, len(authority))
+        if len(ps) == 0 {
+            return bad, fail("empty port")
+        }
+        i := 0
+        for i < len(ps) {
+            if byteat(ps, i) < 48 || byteat(ps, i) > 57 {
+                return bad, fail("invalid port")
+            }
+            i = i + 1
+        }
+        [pv, pe] = strconv.atoi(ps)
+        if pe != nil || pv <= 0 || pv > 65535 {
+            return bad, fail("invalid port")
+        }
+        port = pv
+    }
+    if !valid_host(host) {
+        return bad, fail("invalid host")
+    }
+    path := "/"
+    if cut < len(rest) {
+        if byteat(rest, cut) == 47 {
+            path = substr(rest, cut, len(rest))
+        } else {
+            path = "/" + substr(rest, cut, len(rest))
+        }
+    }
+    if !valid_request_target(path) {
+        return bad, fail("invalid request target")
+    }
+    return http.Url{host: host, port: port, path: path, secure: secure}, nil
+}
+
+fn valid_host(host: str) -> bool {
+    if len(host) == 0 {
+        return false
+    }
+    i := 0
+    for i < len(host) {
+        c := byteat(host, i)
+        if !(c >= 48 && c <= 57 || c >= 65 && c <= 90 || c >= 97 && c <= 122 || c == 45 || c == 46) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn valid_request_target(path: str) -> bool {
+    if len(path) == 0 || byteat(path, 0) != 47 {
+        return false
+    }
+    i := 0
+    for i < len(path) {
+        c := byteat(path, i)
+        if c < 33 || c > 126 || c == 35 || c == 92 {
+            return false
+        }
+        if c == 37 {
+            if i + 2 >= len(path) || !is_hex(byteat(path, i + 1)) || !is_hex(byteat(path, i + 2)) {
+                return false
+            }
+            i = i + 2
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn is_hex(c: int) -> bool {
+    return c >= 48 && c <= 57 || c >= 65 && c <= 70 || c >= 97 && c <= 102
+}
+
+fn port_suffix(port: int, secure: bool) -> str {
+    if secure && port == 443 || !secure && port == 80 {
+        return ""
+    }
+    return ":" + itoa(port)
+}
+
+fn valid_token(s: str) -> bool {
+    if len(s) == 0 {
+        return false
+    }
+    i := 0
+    for i < len(s) {
+        c := byteat(s, i)
+        if !(c >= 48 && c <= 57 || c >= 65 && c <= 90 || c >= 97 && c <= 122 || find("!#$%&'*+-.^_`|~", substr(s, i, i + 1)) >= 0) {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn write_all_deadline(c: transport, s: str, deadline: int) -> err {
+    off := 0
+    for off < len(s) {
+        rem := deadline - now_ms()
+        if rem <= 0 {
+            return fail("write deadline exceeded")
+        }
+        set_sndtimo(c.rawfd(), (rem + 999) / 1000)
+        [n, e] = c.write(substr(s, off, len(s)) as []byte)
+        if e != nil {
+            return e
+        }
+        if n <= 0 {
+            return fail("write made no progress")
+        }
+        off = off + n
+    }
+    return nil
+}
+
+struct HandshakeResult { header: str, tail: []byte }
+
+fn read_handshake(c: transport, timeout_ms: int) -> [HandshakeResult, err] {
+    out := mkslice(byte, 0)
+    scratch := mkslice(byte, 2048)
+    end := -1
+    deadline := now_ms() + timeout_ms
+    for end < 0 {
+        if len(out) >= MAX_HANDSHAKE {
+            return HandshakeResult{header: "", tail: nil}, fail("handshake headers too large")
+        }
+        rem := deadline - now_ms()
+        if rem <= 0 {
+            return HandshakeResult{header: "", tail: nil}, fail("handshake deadline exceeded")
+        }
+        set_rcvtimo_ms(c.rawfd(), rem)
+        [n, e] = c.read(scratch)
+        if e != nil {
+            return HandshakeResult{header: "", tail: nil}, e
+        }
+        if n <= 0 {
+            return HandshakeResult{header: "", tail: nil}, fail("truncated handshake")
+        }
+        i := 0
+        for i < n {
+            out = push(out, scratch[i])
+            i = i + 1
+        }
+        end = find(out as str, "\r\n\r\n")
+    }
+    if end + 4 > MAX_HANDSHAKE {
+        return HandshakeResult{header: "", tail: nil}, fail("handshake headers too large")
+    }
+    header := substr(out as str, 0, end + 2)
+    tail := out[end + 4:len(out)]
+    return HandshakeResult{header: header, tail: tail}, nil
+}
+
+struct HandshakeHeaders {
+    status: int,
+    upgrade: int,
+    upgrade_count: int,
+    connection: int,
+    connection_count: int,
+    accept: str,
+    accept_count: int,
+    protocol: str,
+    protocol_count: int,
+}
+
+fn validate_handshake(h: str, nonce: str, offered: []str) -> [str, err] {
+    nl := find(h, "\r\n")
+    if nl < 0 {
+        return "", fail("bad status line")
+    }
+    statusline := substr(h, 0, nl)
+    if statusline != "HTTP/1.1 101" && !starts(statusline, "HTTP/1.1 101 ") {
+        return "", fail("server did not return HTTP/1.1 101")
+    }
+    hs := HandshakeHeaders{status: 101, upgrade: 0, upgrade_count: 0, connection: 0, connection_count: 0, accept: "", accept_count: 0, protocol: "", protocol_count: 0}
+    pos := nl + 2
+    for pos < len(h) - 2 {
+        line_end := find_from(h, "\r\n", pos)
+        if line_end < 0 || line_end == pos {
+            break
+        }
+        line := substr(h, pos, line_end)
+        if byteat(line, 0) == 32 || byteat(line, 0) == 9 {
+            return "", fail("obsolete folded header")
+        }
+        colon := find(line, ":")
+        if colon <= 0 {
+            return "", fail("malformed response header")
+        }
+        name := lwr(substr(line, 0, colon))
+        value := trim(substr(line, colon + 1, len(line)))
+        if name == "upgrade" {
+            hs.upgrade_count = hs.upgrade_count + 1
+            hs.upgrade = token_has(value, "websocket")
+        }
+        if name == "connection" {
+            hs.connection_count = hs.connection_count + 1
+            hs.connection = token_has(value, "upgrade")
+        }
+        if name == "sec-websocket-extensions" {
+            return "", fail("unsolicited extension response")
+        }
+        if name == "sec-websocket-accept" {
+            hs.accept_count = hs.accept_count + 1
+            hs.accept = value
+        }
+        if name == "sec-websocket-protocol" {
+            hs.protocol_count = hs.protocol_count + 1
+            hs.protocol = value
+        }
+        pos = line_end + 2
+    }
+    if hs.upgrade_count != 1 || hs.connection_count != 1 || hs.upgrade != 1 || hs.connection != 1 {
+        return "", fail("missing Upgrade or Connection token")
+    }
+    if hs.accept_count != 1 {
+        return "", fail("missing or duplicate Sec-WebSocket-Accept")
+    }
+    expected := base64.encode(sha1.sum((nonce + WS_GUID) as []byte))
+    if hs.accept != expected {
+        return "", fail("invalid Sec-WebSocket-Accept")
+    }
+    if hs.protocol_count > 1 {
+        return "", fail("duplicate subprotocol response")
+    }
+    if hs.protocol_count == 1 {
+        found := false
+        i := 0
+        for i < len(offered) {
+            if hs.protocol == offered[i] {
+                found = true
+            }
+            i = i + 1
+        }
+        if !found {
+            return "", fail("server selected unoffered subprotocol")
+        }
+    }
+    return hs.protocol, nil
+}
+
+fn token_has(value: str, wanted: str) -> int {
+    i := 0
+    for i <= len(value) {
+        j := find_from(value, ",", i)
+        if j < 0 {
+            j = len(value)
+        }
+        if lwr(trim(substr(value, i, j))) == wanted {
+            return 1
+        }
+        i = j + 1
+    }
+    return 0
+}
+
+fn trim(s: str) -> str {
+    lo := 0
+    hi := len(s)
+    for lo < hi && (byteat(s, lo) == 32 || byteat(s, lo) == 9) {
+        lo = lo + 1
+    }
+    for hi > lo && (byteat(s, hi - 1) == 32 || byteat(s, hi - 1) == 9) {
+        hi = hi - 1
+    }
+    return substr(s, lo, hi)
+}
+
+fn lwr(s: str) -> str {
+    b := s as []byte
+    out := mkslice(byte, len(s))
+    i := 0
+    for i < len(s) {
+        c := b[i]
+        if c >= 65 && c <= 90 {
+            c = c + 32
+        }
+        out[i] = c
+        i = i + 1
+    }
+    return out as str
+}
+
+fn find_from(s: str, needle: str, from: int) -> int {
+    last := len(s) - len(needle)
+    i := from
+    for i <= last {
+        j := 0
+        for j < len(needle) && byteat(s, i + j) == byteat(needle, j) {
+            j = j + 1
+        }
+        if j == len(needle) {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+fn (c ref Conn) subprotocol() -> str {
+    return c.protocol
+}
+
+/// set_deadline sets a relative read/write budget in milliseconds for subsequent operations.
+fn (c mut Conn) set_deadline(timeout_ms: int) {
+    if timeout_ms <= 0 {
+        c.deadline = 0
+    } else {
+        c.deadline = now_ms() + timeout_ms
+    }
+}
+
+fn (c mut Conn) begin_deadline() -> bool {
+    if c.deadline != 0 {
+        return false
+    }
+    c.deadline = now_ms() + c.timeout_ms
+    return true
+}
+
+fn (c mut Conn) end_deadline(automatic: bool) {
+    if automatic {
+        c.deadline = 0
+    }
+}
+
+fn (c ref Conn) remaining() -> int {
+    if c.deadline == 0 {
+        return c.timeout_ms
+    }
+    rem := c.deadline - now_ms()
+    return rem
+}
+
+fn (c mut Conn) write_text(s: str) -> err {
+    if !utf8.valid(s) {
+        return fail("outgoing text is not valid UTF-8")
+    }
+    return c.write_message(1, s as []byte)
+}
+
+fn (c mut Conn) write_binary(b: []byte) -> err {
+    return c.write_message(2, b)
+}
+
+fn (c mut Conn) write_message(op: int, b: []byte) -> err {
+    automatic := c.begin_deadline()
+    e := c.write_message_inner(op, b)
+    c.end_deadline(automatic)
+    return e
+}
+
+fn (c mut Conn) write_message_inner(op: int, b: []byte) -> err {
+    if c.closed != 0 || c.close_sent != 0 {
+        return fail("write on closed connection")
+    }
+    if op != 1 && op != 2 {
+        return fail("invalid outgoing opcode")
+    }
+    if len(b) > c.max_message {
+        return fail("message exceeds configured limit")
+    }
+    if op == 1 && !utf8.valid(b as str) {
+        return fail("outgoing text is not valid UTF-8")
+    }
+    off := 0
+    first := true
+    if len(b) == 0 {
+        return c.send_frame(op, true, b)
+    }
+    for off < len(b) {
+        take := c.max_frame
+        if take <= 0 {
+            return fail("invalid frame limit")
+        }
+        if take > len(b) - off {
+            take = len(b) - off
+        }
+        fin := off + take == len(b)
+        frame_op := 0
+        if first {
+            frame_op = op
+        }
+        e := c.send_frame(frame_op, fin, b[off:off + take])
+        if e != nil {
+            return e
+        }
+        first = false
+        off = off + take
+    }
+    return nil
+}
+
+fn (c mut Conn) ping(payload: []byte) -> err {
+    if len(payload) > 125 {
+        return fail("ping payload exceeds 125 bytes")
+    }
+    automatic := c.begin_deadline()
+    e := c.send_frame(9, true, payload)
+    c.end_deadline(automatic)
+    return e
+}
+
+fn (c mut Conn) send_frame(op: int, fin: bool, payload: []byte) -> err {
+    if len(payload) > c.max_frame {
+        return fail("outgoing frame exceeds configured limit")
+    }
+    rem := c.remaining()
+    if rem <= 0 {
+        return fail("write deadline exceeded")
+    }
+    deadline := c.deadline
+    if deadline == 0 {
+        deadline = now_ms() + c.timeout_ms
+    }
+    h := mkslice(byte, 0)
+    i := 0
+    first := op
+    if fin {
+        first = first | 128
+    }
+    h = push(h, first)
+    n := len(payload)
+    if n < 126 {
+        h = push(h, 128 | n)
+    } else if n <= 65535 {
+        h = push(h, 254)
+        h = push(h, n / 256)
+        h = push(h, n % 256)
+    } else {
+        h = push(h, 255)
+        i = 7
+        for i >= 0 {
+            h = push(h, n / pow256(i) % 256)
+            i = i - 1
+        }
+    }
+    [mask, me] = rand.bytes(4)
+    if me != nil {
+        return me
+    }
+    i = 0
+    for i < 4 {
+        h = push(h, mask[i])
+        i = i + 1
+    }
+    frame := h
+    i = 0
+    for i < n {
+        frame = push(frame, payload[i] ^ mask[i % 4])
+        i = i + 1
+    }
+    return write_all_deadline(c.wire, frame as str, deadline)
+}
+
+fn pow256(n: int) -> int {
+    p := 1
+    i := 0
+    for i < n {
+        p = p * 256
+        i = i + 1
+    }
+    return p
+}
+
+/// read_message returns complete text/binary messages and consumes ping/pong controls.
+/// A close frame is returned with kind=0 and its validated payload.
+fn (c mut Conn) read_message() -> [Message, err] {
+    automatic := c.begin_deadline()
+    [m, e] = c.read_message_inner()
+    c.end_deadline(automatic)
+    return m, e
+}
+
+fn (c mut Conn) read_message_inner() -> [Message, err] {
+    if c.closed != 0 {
+        return Message{kind: 0, data: nil}, fail("read on closed connection")
+    }
+    for true {
+        [fr, e] = c.read_frame()
+        fin := fr.fin
+        op := fr.opcode
+        data := fr.data
+        if e != nil {
+            return Message{kind: 0, data: nil}, e
+        }
+        if op == 9 {
+            e = c.send_frame(10, true, data)
+            if e != nil {
+                return Message{kind: 0, data: nil}, e
+            }
+            continue
+        }
+        if op == 10 {
+            continue
+        }
+        if op == 8 {
+            if len(data) == 1 {
+                return Message{kind: 0, data: nil}, fail("invalid close payload length")
+            }
+            if len(data) >= 2 {
+                code := byteat(data as str, 0) * 256 + byteat(data as str, 1)
+                if !valid_close_code(code) {
+                    return Message{kind: 0, data: nil}, fail("invalid close status code")
+                }
+                reason := substr(data as str, 2, len(data))
+                if !utf8.valid(reason) {
+                    return Message{kind: 0, data: nil}, fail("invalid UTF-8 close reason")
+                }
+            }
+            if c.close_sent == 0 {
+                e = c.send_frame(8, true, data)
+                if e != nil {
+                    return Message{kind: 0, data: nil}, e
+                }
+                c.close_sent = 1
+            }
+            c.closed = 1
+            c.wire.close()
+            return Message{kind: 0, data: data}, nil
+        }
+        if op == 0 {
+            if c.fragmented == 0 {
+                return Message{kind: 0, data: nil}, fail("unexpected continuation frame")
+            }
+            if len(c.frag) + len(data) > c.max_message {
+                return Message{kind: 0, data: nil}, fail("message exceeds configured limit")
+            }
+            c.frag = append_bytes(c.frag, data)
+            if fin {
+                kind := c.frag_kind
+                assembled := c.frag
+                c.fragmented = 0
+                c.frag_kind = 0
+                c.frag = mkslice(byte, 0)
+                if kind == 1 && !utf8.valid(assembled as str) {
+                    return Message{kind: 0, data: nil}, fail("invalid UTF-8 text message")
+                }
+                return Message{kind: kind, data: assembled}, nil
+            }
+            continue
+        }
+        if op != 1 && op != 2 {
+            return Message{kind: 0, data: nil}, fail("invalid data opcode")
+        }
+        if c.fragmented != 0 {
+            return Message{kind: 0, data: nil}, fail("new data frame during fragmented message")
+        }
+        if len(data) > c.max_message {
+            return Message{kind: 0, data: nil}, fail("message exceeds configured limit")
+        }
+        if fin {
+            if op == 1 && !utf8.valid(data as str) {
+                return Message{kind: 0, data: nil}, fail("invalid UTF-8 text message")
+            }
+            return Message{kind: op, data: data}, nil
+        }
+        c.fragmented = 1
+        c.frag_kind = op
+        c.frag = data
+    }
+}
+
+fn append_bytes(a: []byte, b: []byte) -> []byte {
+    i := 0
+    for i < len(b) {
+        a = push(a, b[i])
+        i = i + 1
+    }
+    return a
+}
+
+fn valid_close_code(code: int) -> bool {
+    if code < 1000 || code >= 5000 {
+        return false
+    }
+    if code == 1004 || code == 1005 || code == 1006 || code == 1015 {
+        return false
+    }
+    if code >= 1016 && code < 3000 {
+        return false
+    }
+    return true
+}
+
+struct Frame { fin: bool, opcode: int, data: []byte }
+
+fn (c mut Conn) read_frame() -> [Frame, err] {
+    [h, e] = c.read_exact(2)
+    if e != nil {
+        return Frame{fin: false, opcode: 0, data: nil}, e
+    }
+    b0 := h[0]
+    b1 := h[1]
+    if (b0 & 112) != 0 {
+        return Frame{fin: false, opcode: 0, data: nil}, fail("RSV bits set without negotiated extension")
+    }
+    fin := (b0 & 128) != 0
+    op := b0 & 15
+    if (b1 & 128) != 0 {
+        return Frame{fin: false, opcode: 0, data: nil}, fail("masked server frame")
+    }
+    n := b1 & 127
+    if n == 126 {
+        [ext, ee] = c.read_exact(2)
+        if ee != nil {
+            return Frame{fin: false, opcode: 0, data: nil}, ee
+        }
+        n = ext[0] * 256 + ext[1]
+        if n < 126 {
+            return Frame{fin: false, opcode: 0, data: nil}, fail("non-minimal frame length")
+        }
+    } else if n == 127 {
+        [ext, ee] = c.read_exact(8)
+        if ee != nil {
+            return Frame{fin: false, opcode: 0, data: nil}, ee
+        }
+        if (ext[0] & 128) != 0 {
+            return Frame{fin: false, opcode: 0, data: nil}, fail("invalid 64-bit frame length")
+        }
+        n = 0
+        i := 0
+        for i < 8 {
+            if n > 16777216 {
+                return Frame{fin: false, opcode: 0, data: nil}, fail("frame exceeds configured limit")
+            }
+            n = n * 256 + ext[i]
+            i = i + 1
+        }
+        if n <= 65535 {
+            return Frame{fin: false, opcode: 0, data: nil}, fail("non-minimal frame length")
+        }
+    }
+    if n > c.max_frame {
+        return Frame{fin: false, opcode: 0, data: nil}, fail("frame exceeds configured limit")
+    }
+    if op >= 8 && (!fin || n > 125) {
+        return Frame{fin: false, opcode: 0, data: nil}, fail("invalid control frame")
+    }
+    if !(op == 0 || op == 1 || op == 2 || op == 8 || op == 9 || op == 10) {
+        return Frame{fin: false, opcode: 0, data: nil}, fail("reserved opcode")
+    }
+    [data, de] = c.read_exact(n)
+    if de != nil {
+        return Frame{fin: false, opcode: 0, data: nil}, de
+    }
+    return Frame{fin: fin, opcode: op, data: data}, nil
+}
+
+fn (c mut Conn) read_exact(n: int) -> [own []byte, err] {
+    out := mkslice(byte, 0)
+    i := 0
+    for len(out) < n {
+        rem := c.remaining()
+        if rem <= 0 {
+            return nil, fail("read deadline exceeded")
+        }
+        set_rcvtimo_ms(c.wire.rawfd(), rem)
+        if len(c.readbuf) > 0 {
+            take := n - len(out)
+            if take > len(c.readbuf) {
+                take = len(c.readbuf)
+            }
+            i = 0
+            for i < take {
+                out = push(out, c.readbuf[i])
+                i = i + 1
+            }
+            c.readbuf = c.readbuf[take:len(c.readbuf)]
+            continue
+        }
+        scratch := mkslice(byte, n - len(out))
+        if len(scratch) > 4096 {
+            scratch = scratch[0:4096]
+        }
+        [got, e] = c.wire.read(scratch)
+        if e != nil {
+            return nil, e
+        }
+        if got <= 0 {
+            return nil, fail("connection closed mid-frame")
+        }
+        i = 0
+        for i < got {
+            out = push(out, scratch[i])
+            i = i + 1
+        }
+    }
+    return new(out), nil
+}
+
+fn (c mut Conn) close(code: int, reason: str) -> err {
+    automatic := c.begin_deadline()
+    e := c.close_inner(code, reason)
+    c.end_deadline(automatic)
+    return e
+}
+
+fn (c mut Conn) close_inner(code: int, reason: str) -> err {
+    if c.closed != 0 {
+        return nil
+    }
+    if !valid_close_code(code) || len(reason) > 123 || !utf8.valid(reason) {
+        return fail("invalid close code or reason")
+    }
+    if c.close_sent == 0 {
+        payload := mkslice(byte, 0)
+        payload = push(payload, code / 256)
+        payload = push(payload, code % 256)
+        payload = append_bytes(payload, reason as []byte)
+        e := c.send_frame(8, true, payload)
+        if e != nil {
+            c.wire.close()
+            c.closed = 1
+            return e
+        }
+        c.close_sent = 1
+    }
+    // Complete the close handshake, answering intervening pings.
+    for c.closed == 0 {
+        [discard, e] = c.read_message()
+        if e != nil {
+            c.wire.close()
+            c.closed = 1
+            return e
+        }
+    }
+    c.wire.close()
+    return nil
+}
+
+fn (c mut Conn) abort() -> err {
+    if c.closed == 0 {
+        c.closed = 1
+        return c.wire.close()
+    }
+    return nil
+}

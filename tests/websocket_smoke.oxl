@@ -1,0 +1,13 @@
+package main
+
+import "std/net/websocket"
+
+import "std/net/tls"
+
+import "std/testing"
+
+fn test_ws_bad_url() {
+    o := websocket.Options{timeout_ms: 100, max_frame_size: 0, max_message_size: 0, subprotocols: nil, tls_cfg: tls.default_cfg()}
+    [_, e] = websocket.dial("ftp://127.0.0.1/", o)
+    testing.expect(e != nil, "reject unsupported URL scheme")
+}

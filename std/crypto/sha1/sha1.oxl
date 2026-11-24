@@ -1,0 +1,125 @@
+package sha1
+
+// SHA-1 is retained only for compatibility protocols such as the
+// WebSocket opening handshake. Never use it for signatures or new designs.
+let M32 = 4294967295
+
+fn pow2(n: int) -> int {
+    p := 1
+    i := 0
+    for i < n {
+        p = p * 2
+        i = i + 1
+    }
+    return p
+}
+
+fn pow256(n: int) -> int {
+    p := 1
+    i := 0
+    for i < n {
+        p = p * 256
+        i = i + 1
+    }
+    return p
+}
+
+fn rotl(x: int, n: int) -> int {
+    p := pow2(n)
+    return (x * p | x / (4294967296 / p)) & M32
+}
+
+/// sum returns the SHA-1 digest. Input is bounded to 16 MiB to keep
+/// padding arithmetic and temporary allocations predictable.
+fn sum(b: []byte) -> own []byte {
+    if len(b) > 16777216 {
+        return nil
+    }
+    padded := mkslice(byte, len(b) + 1)
+    i := 0
+    for i < len(b) {
+        padded[i] = b[i]
+        i = i + 1
+    }
+    padded[len(b)] = 128
+    for len(padded) % 64 != 56 {
+        padded = push(padded, 0)
+    }
+    bits := len(b) * 8
+    i = 7
+    for i >= 0 {
+        padded = push(padded, bits / pow256(i) % 256)
+        i = i - 1
+    }
+    h0 := 1732584193
+    h1 := 4023233417
+    h2 := 2562383102
+    h3 := 271733878
+    h4 := 3285377520
+    off := 0
+    for off < len(padded) {
+        w := mkslice(int, 80)
+        t := 0
+        for t < 16 {
+            j := off + t * 4
+            w[t] = padded[j] * 16777216 + padded[j + 1] * 65536 + padded[j + 2] * 256 + padded[j + 3]
+            t = t + 1
+        }
+        for t < 80 {
+            w[t] = rotl(w[t - 3] ^ w[t - 8] ^ w[t - 14] ^ w[t - 16], 1)
+            t = t + 1
+        }
+        a := h0
+        bb := h1
+        c := h2
+        d := h3
+        e := h4
+        t = 0
+        for t < 80 {
+            f := 0
+            k := 0
+            if t < 20 {
+                f = bb & c | (M32 ^ bb) & d
+                k = 1518500249
+            } else if t < 40 {
+                f = bb ^ c ^ d
+                k = 1859775393
+            } else if t < 60 {
+                f = bb & c | bb & d | c & d
+                k = 2400959708
+            } else {
+                f = bb ^ c ^ d
+                k = 3395469782
+            }
+            temp := rotl(a, 5) + f + e + k + w[t] & M32
+            e = d
+            d = c
+            c = rotl(bb, 30)
+            bb = a
+            a = temp
+            t = t + 1
+        }
+        h0 = h0 + a & M32
+        h1 = h1 + bb & M32
+        h2 = h2 + c & M32
+        h3 = h3 + d & M32
+        h4 = h4 + e & M32
+        off = off + 64
+    }
+    out := mkslice(byte, 20)
+    st := mkslice(int, 5)
+    st[0] = h0
+    st[1] = h1
+    st[2] = h2
+    st[3] = h3
+    st[4] = h4
+    t := 0
+    for t < 5 {
+        out[t * 4] = st[t] / 16777216 % 256
+        out[t * 4 + 1] = st[t] / 65536 % 256
+        out[t * 4 + 2] = st[t] / 256 % 256
+        out[t * 4 + 3] = st[t] % 256
+        t = t + 1
+    }
+    return new(out)
+}

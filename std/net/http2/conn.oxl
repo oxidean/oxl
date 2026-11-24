@@ -569,7 +569,12 @@ fn (c mut Conn) next_event() -> [Event, err] {
 }
 
 fn (c mut Conn) read_event() -> [Event, err] {
+    skips := 0
     for true {
+        skips = skips + 1
+        if skips > 256 {
+            return bad_event(errors.new("http2: control frame flood"))
+        }
         [f, fe] = read_frame_deadline(c.rw, c.local_max_frame_size, c.timeout_fd, c.deadline_ms)
         if fe != nil {
             return bad_event(fe)
@@ -814,6 +819,9 @@ fn (c mut Conn) read_event() -> [Event, err] {
             }
             i := stream_index(c, h.stream_id)
             if i < 0 {
+                if h.stream_id % 2 == 1 && h.stream_id < c.next_stream_id {
+                    continue
+                }
                 return bad_event(errors.new("http2: RST_STREAM on unknown stream"))
             }
             c.streams[i].local_closed = 1
@@ -836,6 +844,9 @@ fn (c mut Conn) read_event() -> [Event, err] {
 }
 
 fn dial_h2c(host: str, port: int, timeout_ms: int) -> [own Conn, err] {
+    if timeout_ms <= 0 {
+        return nil, errors.new("http2: timeout must be positive")
+    }
     [socket_value, de] = net.dial_timeout(host, port, timeout_ms)
     if de != nil {
         return nil, de
@@ -863,6 +874,9 @@ fn dial_tls_config(host: str, port: int, timeout_ms: int, cfg: tls.Config) -> [T
 }
 
 fn dial_tls_over(socket: net.Conn, host: str, timeout_ms: int, cfg: tls.Config) -> [TLSDialResult, err] {
+    if timeout_ms <= 0 {
+        return TLSDialResult{conn: nil, transport: nil, closer: nil, protocol: ""}, errors.new("http2: timeout must be positive")
+    }
     if len(cfg.server_name) == 0 {
         cfg.server_name = host
     }

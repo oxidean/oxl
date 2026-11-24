@@ -6,6 +6,8 @@ import "std/bytes"
 
 import "std/encoding/hex"
 
+import "std/errors"
+
 import "std/testing"
 
 fn test_http2_connection_streams_and_trailers() {
@@ -409,4 +411,66 @@ fn test_http2_connection_control_frames() {
     testing.expect(second_rst >= 0, "emit RST_STREAM cancellation frame")
     [_, ree] = reset_conn.next_event()
     testing.expect(ree != nil, "ignore peer RST for cancelled stream then report peer close")
+}
+
+fn test_http2_rst_after_close_is_ignored() {
+    buf := bytes.newbuffer()
+    writer := buf.aswriter()
+    [settings, se] = http2.encode_frame(http2.FrameHeader{length: 0, kind: 4, flags: 0, stream_id: 0}, mkslice(byte, 0))
+    testing.expect(se == nil, "encode peer SETTINGS")
+    [_, we] = writer.write(settings)
+    testing.expect(we == nil, "queue peer SETTINGS")
+    [status, ste] = hex.decode("88")
+    testing.expect(ste == nil, "encode response status")
+    testing.expect(http2.write_frame(writer, http2.FrameHeader{length: 1, kind: 1, flags: 5, stream_id: 1}, status) == nil, "queue first response HEADERS")
+    rst_payload := mkslice(byte, 0)
+    rst_payload = push(rst_payload, 0)
+    rst_payload = push(rst_payload, 0)
+    rst_payload = push(rst_payload, 0)
+    rst_payload = push(rst_payload, 8)
+    testing.expect(http2.write_frame(writer, http2.FrameHeader{length: 4, kind: 3, flags: 0, stream_id: 1}, rst_payload) == nil, "queue late RST_STREAM")
+    testing.expect(http2.write_frame(writer, http2.FrameHeader{length: 1, kind: 1, flags: 5, stream_id: 3}, status) == nil, "queue second response HEADERS")
+    [conn, ce] = http2.new_conn(buf.asreadwriter())
+    testing.expect(ce == nil, "initialize connection")
+    req := mkslice(http2.Header, 0)
+    req = push(req, http2.Header{name: ":method", value: "GET"})
+    req = push(req, http2.Header{name: ":scheme", value: "http"})
+    req = push(req, http2.Header{name: ":path", value: "/"})
+    req = push(req, http2.Header{name: ":authority", value: "127.0.0.1"})
+    [id1, oe1] = conn.open_stream(req, true)
+    testing.expect(oe1 == nil && id1 == 1, "open first stream")
+    [id3, oe3] = conn.open_stream(req, true)
+    testing.expect(oe3 == nil && id3 == 3, "open second stream")
+    [ev1, he1] = conn.next_event()
+    testing.expect(he1 == nil && ev1.stream_id == 1, "first response delivers")
+    [ev3, he3] = conn.next_event()
+    testing.expect(he3 == nil && ev3.stream_id == 3, "late RST on closed stream ignored before second response")
+}
+
+fn test_http2_dial_rejects_nonpositive_timeout() {
+    [_, ze] = http2.dial_h2c("127.0.0.1", 1, 0)
+    testing.expect(ze != nil, "reject zero timeout")
+    testing.expect_streq(errors.msg(ze), "http2: timeout must be positive", "zero timeout error")
+    [_, ne] = http2.dial_h2c("127.0.0.1", 1, -5)
+    testing.expect(ne != nil && errors.msg(ne) == "http2: timeout must be positive", "reject negative timeout")
+}
+
+fn test_http2_control_frame_flood() {
+    buf := bytes.newbuffer()
+    writer := buf.aswriter()
+    [settings, se] = http2.encode_frame(http2.FrameHeader{length: 0, kind: 4, flags: 0, stream_id: 0}, mkslice(byte, 0))
+    testing.expect(se == nil, "encode peer SETTINGS")
+    [_, we] = writer.write(settings)
+    testing.expect(we == nil, "queue peer SETTINGS")
+    ping_payload := mkslice(byte, 8)
+    i := 0
+    for i < 300 {
+        testing.expect(http2.write_frame(writer, http2.FrameHeader{length: 8, kind: 6, flags: 0, stream_id: 0}, ping_payload) == nil, "queue PING")
+        i = i + 1
+    }
+    [conn, ce] = http2.new_conn(buf.asreadwriter())
+    testing.expect(ce == nil, "initialize connection")
+    [_, fe] = conn.next_event()
+    testing.expect(fe != nil, "bound control frame floods")
+    testing.expect_streq(errors.msg(fe), "http2: control frame flood", "flood error")
 }

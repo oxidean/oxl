@@ -902,8 +902,11 @@ fn name_offered(issuer_der: []byte, cas: [][]byte) -> bool {
 // (our preference order) with the CR's offered signature_algorithms —
 // 0 means nothing offered the key can sign with. rsa_pkcs1_* values
 // are deliberately absent from the RSA list: §4.4.3 makes them
-// illegal in CertificateVerify.
-fn cv_alg_for_key(alg: int, sigalgs: []int) -> int {
+// illegal in CertificateVerify. emlen is the key's PSS encoded-message
+// length — RSA PSS schemes are only offered when the modulus can carry
+// hlen + saltlen + 2 bytes, so an under-sized key answers the empty
+// certificate_list instead of failing mid-flight.
+fn cv_alg_for_key(alg: int, sigalgs: []int, emlen: int) -> int {
     want := mkslice(int, 0)
     if alg == x509.PK_ec_p256 {
         want = push(want, SA_ECDSA_P256_SHA256)
@@ -912,9 +915,15 @@ fn cv_alg_for_key(alg: int, sigalgs: []int) -> int {
     } else if alg == x509.PK_ed25519 {
         want = push(want, SA_ED25519)
     } else if alg == x509.PK_rsa {
-        want = push(want, SA_PSS_SHA256)
-        want = push(want, SA_PSS_SHA384)
-        want = push(want, SA_PSS_SHA512)
+        if emlen >= 66 {
+            want = push(want, SA_PSS_SHA256)
+        }
+        if emlen >= 98 {
+            want = push(want, SA_PSS_SHA384)
+        }
+        if emlen >= 130 {
+            want = push(want, SA_PSS_SHA512)
+        }
     } else {
         return 0
     }
@@ -948,7 +957,11 @@ fn pick_cv_alg(c: mut Conn, cfg: Config) -> int {
             return 0
         }
     }
-    return cv_alg_for_key(cfg.client_cert.key.alg, s.cr_sigalgs)
+    emlen := 0
+    if cfg.client_cert.key.alg == x509.PK_rsa {
+        emlen = rsa.pss_emlen(cfg.client_cert.key.rk)
+    }
+    return cv_alg_for_key(cfg.client_cert.key.alg, s.cr_sigalgs, emlen)
 }
 
 // der_int is one DER INTEGER's content+header — drop leading zeros,
@@ -1059,6 +1072,7 @@ fn client_flight(c: mut Conn, cfg: Config) -> err {
             cw.put(th_sum(c))
             [sig, se] = cv_sign(cfg.client_cert.key, alg, cw.b)
             if se != nil {
+                send_alert(c, 2, AL_INTERNAL)
                 return errors.wrap("tls: client certificate_verify: " + errors.msg(se), err_keys())
             }
             vw := mkwr()

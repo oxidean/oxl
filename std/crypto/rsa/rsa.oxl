@@ -551,6 +551,14 @@ fn sign_v15(pk: PrivKey, hf: fn() -> hash.Hash, msg: []byte) -> [own []byte, err
 /// masked under MGF1(H'), 0xbc trailer, the top unused bits cleared —
 /// then EM^d mod n. saltlen should be the hash length for TLS
 /// CertificateVerify.
+/// pss_emlen is the encoded-message length PSS works over for pk —
+/// (bitlen(n) - 1 bits, rounded up). A PSS signature needs
+/// emlen >= hlen + saltlen + 2, so callers offering a hash must check
+/// the modulus can carry it before committing to the scheme.
+fn pss_emlen(pk: PrivKey) -> int {
+    return (bignum.bitlen(pk.n) + 6) / 8
+}
+
 fn sign_pss(pk: PrivKey, hf: fn() -> hash.Hash, msg: []byte, saltlen: int) -> [own []byte, err] {
     ce := check_priv(pk)
     if ce != nil {

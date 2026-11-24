@@ -48,6 +48,10 @@ def send_frame(sock, opcode, data=b"", fin=True):
         head = bytes((first, 127)) + struct.pack("!Q", n)
     sock.sendall(head + data)
 
+def expect_protocol_close(sock):
+    if read_frame(sock) != (True, 8, b"\x03\xea"):
+        raise AssertionError("client did not send a masked close-1002 frame")
+
 
 class Server(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
@@ -127,44 +131,61 @@ class Handler(socketserver.BaseRequestHandler):
                 return
             if mode == "masked":
                 sock.sendall(b"\x81\x81\x00\x00\x00\x00x")
+                expect_protocol_close(sock)
+                return
+            if mode == "masked-small-limit":
+                sock.sendall(b"\x81\x81\x00\x00\x00\x00x")
+                expect_protocol_close(sock)
                 return
             if mode == "reserved-opcode":
                 sock.sendall(b"\x83\x00")
+                expect_protocol_close(sock)
                 return
             if mode == "bad-utf8":
                 sock.sendall(b"\x81\x01\xff")
+                expect_protocol_close(sock)
                 return
             if mode == "bad-control":
                 sock.sendall(b"\x09\x00")
+                expect_protocol_close(sock)
                 return
             if mode == "bad-close-code":
                 send_frame(sock, 8, b"\x03\xed")  # 1005 is forbidden on wire
+                expect_protocol_close(sock)
                 return
             if mode == "bad-close-length":
                 send_frame(sock, 8, b"\x00")
+                expect_protocol_close(sock)
                 return
             if mode == "oversize":
                 send_frame(sock, 2, b"123456789")
+                expect_protocol_close(sock)
                 return
             if mode == "nonminimal":
                 sock.sendall(b"\x82\x7e\x00\x01x")
+                expect_protocol_close(sock)
                 return
             if mode == "huge-length":
                 sock.sendall(b"\x82\x7f\x80\x00\x00\x00\x00\x00\x00\x00")
+                expect_protocol_close(sock)
                 return
             if mode == "long-control":
                 sock.sendall(b"\x89\x7e\x00\x7e" + b"x" * 126)
+                expect_protocol_close(sock)
                 return
             if mode == "unexpected-continuation":
                 send_frame(sock, 0, b"x")
+                expect_protocol_close(sock)
                 return
             if mode == "new-during-fragment":
                 send_frame(sock, 1, b"first", fin=False)
                 send_frame(sock, 2, b"other")
+                expect_protocol_close(sock)
                 return
             if mode == "fragment-overflow":
                 send_frame(sock, 1, b"12345", fin=False)
                 send_frame(sock, 0, b"6789")
+                expect_protocol_close(sock)
                 return
             if mode == "ok" and self.server.tls_context:
                 send_frame(sock, 1, b"secure")

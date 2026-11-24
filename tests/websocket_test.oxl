@@ -97,6 +97,7 @@ fn test_ws_bad_server_frames() {
     port := atoi(os.getenv("OXL_WS_PORT"))
     paths := mkslice(str, 0)
     paths = push(paths, "/masked")
+    paths = push(paths, "/masked-small-limit")
     paths = push(paths, "/reserved-opcode")
     paths = push(paths, "/bad-utf8")
     paths = push(paths, "/bad-control")
@@ -115,12 +116,17 @@ fn test_ws_bad_server_frames() {
         if paths[i] == "/oversize" || paths[i] == "/fragment-overflow" {
             o.max_frame_size = 8
             o.max_message_size = 8
+        } else if paths[i] == "/masked-small-limit" {
+            o.max_frame_size = 1
         }
         [c, e] = websocket.dial(ws_url(port, paths[i]), o)
         testing.expect(e == nil, "malformed-frame fixture handshake")
         if e == nil {
             [_, re] = c.read_message()
             testing.expect(re != nil, "reject malformed server frame " + paths[i])
+            [_, retry_err] = c.read_message()
+            testing.expect(retry_err != nil, "failed read poisons connection " + paths[i])
+            testing.expect(c.write_text("after failure") != nil, "failed connection rejects writes " + paths[i])
             c.abort()
         }
         i = i + 1

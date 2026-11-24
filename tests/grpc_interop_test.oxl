@@ -1,0 +1,246 @@
+package main
+
+import "std/net/grpc"
+
+import "std/net/tls"
+
+import "std/crypto/x509"
+
+import "std/testing"
+
+import "std/errors"
+
+import "std/os"
+
+fn grpc_client(timeout_ms: int) -> own grpc.Client {
+    port := os.getenv("OXL_GRPC_PORT")
+    [client, e] = grpc.dial("grpc://127.0.0.1:" + port, timeout_ms)
+    testing.expect(e == nil, "dial independent HTTP/2 gRPC fixture: " + errors.msg(e))
+    return client
+}
+
+fn test_grpc_interop_unary_and_metadata() {
+    client := grpc_client(3000)
+    md := mkslice(grpc.Metadata, 0)
+    md = push(md, grpc.Metadata{name: "x-token", value: "abc"})
+    [result, e] = client.unary("/svc/unary", md, "ping" as []byte)
+    testing.expect(e == nil && result.response as str == "ping", "unary echo over independent H2: " + errors.msg(e))
+    testing.expect(result.status.code == grpc.STATUS_OK, "unary grpc-status")
+    testing.expect(len(result.headers) > 0 && result.headers[0].name == "x-response", "response headers surfaced")
+    request_token := ""
+    i := 0
+    for i < len(result.headers) {
+        if result.headers[i].name == "x-request-token" {
+            request_token = result.headers[i].value
+        }
+        i = i + 1
+    }
+    testing.expect(request_token == "abc", "outgoing application metadata sent")
+    testing.expect(len(result.trailers) > 0 && result.trailers[len(result.trailers) - 1].name == "x-finished", "response trailers surfaced")
+}
+
+fn test_grpc_interop_client_streaming() {
+    client := grpc_client(3000)
+    [call, be] = client.begin("/svc/client-stream", mkslice(grpc.Metadata, 0))
+    testing.expect(be == nil, "begin client-streaming RPC")
+    testing.expect(call.send_message("a" as []byte) == nil, "send client stream item one")
+    testing.expect(call.send_message("b" as []byte) == nil, "send client stream item two")
+    testing.expect(call.close_send() == nil, "half-close client stream")
+    [response, re] = call.receive_message()
+    testing.expect(re == nil && response as str == "ab", "receive client-stream aggregate: " + errors.msg(re))
+    [_, eof] = call.receive_message()
+    testing.expect(eof != nil && call.get_status().code == grpc.STATUS_OK, "client-stream status and EOF")
+    call.close()
+
+    [large_call, large_begin_err] = client.begin("/svc/client-stream", mkslice(grpc.Metadata, 0))
+    testing.expect(large_begin_err == nil, "begin chunked client-stream")
+    large_request := mkslice(byte, 20000)
+    i := 0
+    for i < len(large_request) {
+        large_request[i] = 120
+        i = i + 1
+    }
+    testing.expect(large_call.send_message(large_request) == nil, "split message over HTTP/2 DATA frames")
+    testing.expect(large_call.close_send() == nil, "close chunked client-stream")
+    [large_response, large_response_err] = large_call.receive_message()
+    testing.expect(large_response_err == nil && len(large_response) == 20000 && large_response[19999] == 120, "reassemble message split over HTTP/2 DATA frames")
+    large_call.close()
+}
+
+fn test_grpc_interop_server_streaming() {
+    client := grpc_client(3000)
+    [call, be] = client.begin("/svc/server-stream", mkslice(grpc.Metadata, 0))
+    testing.expect(be == nil, "begin server-streaming RPC")
+    testing.expect(call.send_message("request" as []byte) == nil && call.close_send() == nil, "send server-stream request")
+    [first, e1] = call.receive_message()
+    [second, e2] = call.receive_message()
+    [_, eof] = call.receive_message()
+    testing.expect(e1 == nil && first as str == "first", "server stream first message")
+    testing.expect(e2 == nil && second as str == "second", "server stream second message")
+    testing.expect(eof != nil && call.get_status().code == grpc.STATUS_OK, "server stream trailers/status")
+    call.close()
+
+    [trailers_only, toe] = client.begin("/svc/trailers-only", mkslice(grpc.Metadata, 0))
+    testing.expect(toe == nil && trailers_only.close_send() == nil, "start trailers-only response")
+    [_, to_eof] = trailers_only.receive_message()
+    testing.expect(to_eof != nil && trailers_only.get_status().code == grpc.STATUS_OK, "accept trailers-only status err=" + errors.msg(to_eof) + " status=" + itoa(trailers_only.get_status().code))
+    trailers_only.close()
+}
+
+fn test_grpc_interop_bidirectional_streaming() {
+    client := grpc_client(3000)
+    [call, be] = client.begin("/svc/bidi", mkslice(grpc.Metadata, 0))
+    testing.expect(be == nil, "begin bidi RPC")
+    testing.expect(call.send_message("left" as []byte) == nil, "send bidi message one")
+    testing.expect(call.send_message("right" as []byte) == nil, "send bidi message two")
+    testing.expect(call.close_send() == nil, "half-close bidi RPC")
+    [one, e1] = call.receive_message()
+    [two, e2] = call.receive_message()
+    [_, eof] = call.receive_message()
+    testing.expect(e1 == nil && one as str == "left", "bidi response one")
+    testing.expect(e2 == nil && two as str == "right", "bidi response two")
+    testing.expect(eof != nil && call.get_status().code == grpc.STATUS_OK, "bidi response status")
+    call.close()
+}
+
+fn test_grpc_interop_status_trailers_and_oversize() {
+    client := grpc_client(3000)
+    [status_call, se] = client.begin("/svc/status", mkslice(grpc.Metadata, 0))
+    testing.expect(se == nil && status_call.close_send() == nil, "start non-OK status fixture")
+    [_, status_err] = status_call.receive_message()
+    st := status_call.get_status()
+    testing.expect(status_err != nil && st.code == grpc.STATUS_PERMISSION_DENIED && st.message == "permission denied", "grpc status/message mapping")
+    testing.expect(len(status_call.trailers()) > 0, "status trailers available")
+    status_call.close()
+
+    [malformed, me] = client.begin("/svc/malformed", mkslice(grpc.Metadata, 0))
+    testing.expect(me == nil && malformed.close_send() == nil, "start malformed frame fixture")
+    [_, malformed_err] = malformed.receive_message()
+    testing.expect(malformed_err != nil && malformed.get_status().code == grpc.STATUS_INTERNAL, "reject truncated response frame err=" + errors.msg(malformed_err) + " status=" + itoa(malformed.get_status().code))
+    malformed.close()
+
+    [large, le] = client.begin("/svc/oversized", mkslice(grpc.Metadata, 0))
+    testing.expect(le == nil && large.close_send() == nil, "start oversized message fixture")
+    [_, large_err] = large.receive_message()
+    testing.expect(large_err != nil && large.get_status().code == grpc.STATUS_RESOURCE_EXHAUSTED, "reject oversized response message")
+    large.close()
+
+    [compressed, ce] = client.begin("/svc/compressed", mkslice(grpc.Metadata, 0))
+    testing.expect(ce == nil && compressed.close_send() == nil, "start compressed response fixture")
+    [_, compressed_err] = compressed.receive_message()
+    testing.expect(compressed_err != nil && compressed.get_status().code == grpc.STATUS_UNIMPLEMENTED, "compressed response rejected clearly")
+    compressed.close()
+
+    [compressed_frame, cfe] = client.begin("/svc/compressed-frame", mkslice(grpc.Metadata, 0))
+    testing.expect(cfe == nil && compressed_frame.close_send() == nil, "start compressed envelope fixture")
+    [_, cfr] = compressed_frame.receive_message()
+    testing.expect(cfr != nil && compressed_frame.get_status().code == grpc.STATUS_UNIMPLEMENTED, "compressed envelope flag rejected")
+    compressed_frame.close()
+}
+
+fn test_grpc_unknown_status_and_http_response_validation() {
+    client := grpc_client(3000)
+    [future, fe] = client.begin("/svc/unknown-status", mkslice(grpc.Metadata, 0))
+    testing.expect(fe == nil && future.close_send() == nil, "start unknown grpc-status fixture")
+    [_, future_err] = future.receive_message()
+    future_status := future.get_status()
+    testing.expect(future_err != nil && future_status.code == grpc.STATUS_UNKNOWN && future_status.raw_code == 17 && future_status.message == "future status", "preserve unknown grpc-status as UNKNOWN with wire code")
+    future.close()
+
+    [http_error, he] = client.begin("/svc/http-error", mkslice(grpc.Metadata, 0))
+    testing.expect(he == nil && http_error.close_send() == nil, "start non-200 HTTP fixture")
+    [_, http_err] = http_error.receive_message()
+    testing.expect(http_err != nil && http_error.get_status().code == grpc.STATUS_UNIMPLEMENTED, "map HTTP 404 to gRPC UNIMPLEMENTED")
+    http_error.close()
+
+    [bad_type, be] = client.begin("/svc/bad-content-type", mkslice(grpc.Metadata, 0))
+    testing.expect(be == nil && bad_type.close_send() == nil, "start invalid content-type fixture")
+    [_, type_err] = bad_type.receive_message()
+    testing.expect(type_err != nil && bad_type.get_status().code == grpc.STATUS_INTERNAL, "reject non-gRPC content-type")
+    bad_type.close()
+}
+
+fn test_grpcs_interop_uses_h2_alpn() {
+    roots := x509.Roots{cas: nil}
+    [n, re] = roots.load_pem(os.readfile_("tests/tls/ca.pem"))
+    testing.expect(re == nil && n == 1, "load gRPC TLS test CA")
+    cfg := tls.default_cfg()
+    cfg.roots = roots
+    cfg.server_name = "localhost"
+    port := atoi(os.getenv("OXL_GRPCS_PORT"))
+    [client, de] = grpc.dial_config("grpcs://localhost:" + itoa(port), 3000, cfg)
+    testing.expect(de == nil, "dial gRPC TLS peer: " + errors.msg(de))
+    [result, e] = client.unary("/svc/unary", mkslice(grpc.Metadata, 0), "secure" as []byte)
+    testing.expect(e == nil && result.response as str == "secure" && result.status.code == grpc.STATUS_OK, "gRPC TLS uses HTTP/2 ALPN: " + errors.msg(e))
+}
+
+fn test_grpc_deadline_and_cancel() {
+    client := grpc_client(150)
+    [delayed, de] = client.begin("/svc/delay", mkslice(grpc.Metadata, 0))
+    testing.expect(de == nil && delayed.close_send() == nil, "start deadline fixture")
+    [_, deadline_err] = delayed.receive_message()
+    testing.expect(deadline_err != nil && delayed.get_status().code == grpc.STATUS_DEADLINE_EXCEEDED, "map H2 deadline to grpc DEADLINE_EXCEEDED")
+    delayed.close()
+
+    [cancelled, ce] = client.begin("/svc/bidi-cancel", mkslice(grpc.Metadata, 0))
+    testing.expect(ce == nil, "start cancellable RPC")
+    testing.expect(cancelled.cancel() == nil && cancelled.get_status().code == grpc.STATUS_CANCELLED, "cancel active RPC")
+    cancelled.close()
+}
+
+fn test_grpc_concurrent_call_bound() {
+    client := grpc_client(3000)
+    [call0, err0] = client.begin("/svc/bidi-cancel", mkslice(grpc.Metadata, 0))
+    testing.expect(err0 == nil, "open bounded concurrent RPC 1: " + errors.msg(err0))
+    [call1, err1] = client.begin("/svc/bidi-cancel", mkslice(grpc.Metadata, 0))
+    testing.expect(err1 == nil, "open bounded concurrent RPC 2")
+    [call2, err2] = client.begin("/svc/bidi-cancel", mkslice(grpc.Metadata, 0))
+    testing.expect(err2 == nil, "open bounded concurrent RPC 3")
+    [call3, err3] = client.begin("/svc/bidi-cancel", mkslice(grpc.Metadata, 0))
+    testing.expect(err3 == nil, "open bounded concurrent RPC 4")
+    [call4, err4] = client.begin("/svc/bidi-cancel", mkslice(grpc.Metadata, 0))
+    testing.expect(err4 == nil, "open bounded concurrent RPC 5")
+    [call5, err5] = client.begin("/svc/bidi-cancel", mkslice(grpc.Metadata, 0))
+    testing.expect(err5 == nil, "open bounded concurrent RPC 6")
+    [call6, err6] = client.begin("/svc/bidi-cancel", mkslice(grpc.Metadata, 0))
+    testing.expect(err6 == nil, "open bounded concurrent RPC 7")
+    [call7, err7] = client.begin("/svc/bidi-cancel", mkslice(grpc.Metadata, 0))
+    testing.expect(err7 == nil, "open bounded concurrent RPC 8")
+    [call8, err8] = client.begin("/svc/bidi-cancel", mkslice(grpc.Metadata, 0))
+    testing.expect(err8 == nil, "open bounded concurrent RPC 9")
+    [call9, err9] = client.begin("/svc/bidi-cancel", mkslice(grpc.Metadata, 0))
+    testing.expect(err9 == nil, "open bounded concurrent RPC 10")
+    [call10, err10] = client.begin("/svc/bidi-cancel", mkslice(grpc.Metadata, 0))
+    testing.expect(err10 == nil, "open bounded concurrent RPC 11")
+    [call11, err11] = client.begin("/svc/bidi-cancel", mkslice(grpc.Metadata, 0))
+    testing.expect(err11 == nil, "open bounded concurrent RPC 12")
+    [call12, err12] = client.begin("/svc/bidi-cancel", mkslice(grpc.Metadata, 0))
+    testing.expect(err12 == nil, "open bounded concurrent RPC 13")
+    [call13, err13] = client.begin("/svc/bidi-cancel", mkslice(grpc.Metadata, 0))
+    testing.expect(err13 == nil, "open bounded concurrent RPC 14")
+    [call14, err14] = client.begin("/svc/bidi-cancel", mkslice(grpc.Metadata, 0))
+    testing.expect(err14 == nil, "open bounded concurrent RPC 15")
+    [call15, err15] = client.begin("/svc/bidi-cancel", mkslice(grpc.Metadata, 0))
+    testing.expect(err15 == nil, "open bounded concurrent RPC 16")
+    [_, full] = client.begin("/svc/bidi-cancel", mkslice(grpc.Metadata, 0))
+    testing.expect(full != nil && find(errors.msg(full), "limit") >= 0, "reject RPC above concurrent call bound")
+    call0.close()
+    call1.close()
+    call2.close()
+    call3.close()
+    call4.close()
+    call5.close()
+    call6.close()
+    call7.close()
+    call8.close()
+    call9.close()
+    call10.close()
+    call11.close()
+    call12.close()
+    call13.close()
+    call14.close()
+    call15.close()
+    [released, released_err] = client.begin("/svc/bidi-cancel", mkslice(grpc.Metadata, 0))
+    testing.expect(released_err == nil, "release concurrent call slot on close")
+    released.close()
+}

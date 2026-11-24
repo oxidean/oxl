@@ -392,6 +392,11 @@ printf '%s\n' "$out" >&2
 for t in test_http2_connection_streams_and_trailers test_http2_connection_multiplexes_stream_ids test_http2_peer_max_concurrent_streams test_http2_cancel_reclaims_receive_credit_and_slot test_http2_reset_reclaims_receive_credit_and_slot test_http2_send_body_handles_goaway_for_accepted_stream test_http2_send_body_rejects_goaway_excluded_stream test_http2_goaway_last_stream_is_monotonic test_http2_pending_event_limit test_http2_enable_push_setting test_http2_connection_control_frames; do
     grep -q "$t ... ok" <<<"$out" || { echo "FAIL http2 connection: $out"; exit 1; }
 done
+out=$("$OXL" test tests/grpc_wire_test.oxl) || { echo "FAIL gRPC wire unit: $out"; exit 1; }
+printf '%s\n' "$out" >&2
+for t in test_grpc_frame_decode_and_limits test_grpc_metadata_and_target_validation test_grpc_goaway_maps_unprocessed_stream_unavailable; do
+    grep -q "$t ... ok" <<<"$out" || { echo "FAIL gRPC wire unit: $out"; exit 1; }
+done
 if command -v node >/dev/null 2>&1; then
     h2_port=$((30000 + RANDOM % 15000))
 h2_tls_port=$((h2_port + 1))
@@ -432,6 +437,47 @@ timeout_out=$(with_timeout 60 env OXL_HTTP2_PORT="$h2_port" "$OXL" test tests/ht
 }
 printf "%s\n" "$timeout_out" >&2
 grep -q "test_http2_client_deadline ... ok" <<<"$timeout_out" || { echo "FAIL HTTP/2 deadline test: $timeout_out"; exit 1; }
+# Independent gRPC interoperability peer: Node's built-in HTTP/2 stack,
+# separate from the oxl transport and its existing HTTP/2 fixture.
+grpc_port=$((h2_port + 4))
+grpc_tls_port=$((h2_port + 5))
+node tests/grpc_server.mjs "$grpc_port" "$grpc_tls_port" >/dev/null 2>&1 &
+grpc_srv=$!
+grpc_ready=0
+for _ in {1..50}; do
+    kill -0 "$grpc_srv" 2>/dev/null || break
+    (exec 7<>"/dev/tcp/127.0.0.1/$grpc_port" && exec 8<>"/dev/tcp/127.0.0.1/$grpc_tls_port") 2>/dev/null && { exec 7>&- 7<&- 8>&- 8<&-; grpc_ready=1; break; }
+    sleep 0.1
+done
+if [ "$grpc_ready" != 1 ]; then
+    kill "$grpc_srv" 2>/dev/null || true
+    wait "$grpc_srv" 2>/dev/null || true
+    kill "$h2_srv" 2>/dev/null || true
+    wait "$h2_srv" 2>/dev/null || true
+    echo "FAIL gRPC interop: local H2 fixture did not start"
+    exit 1
+fi
+grpc_out=$(with_timeout 40 env OXL_GRPC_PORT="$grpc_port" OXL_GRPCS_PORT="$grpc_tls_port" "$OXL" test tests/grpc_interop_test.oxl) || {
+    kill "$grpc_srv" 2>/dev/null || true
+    wait "$grpc_srv" 2>/dev/null || true
+    kill "$h2_srv" 2>/dev/null || true
+    wait "$h2_srv" 2>/dev/null || true
+    echo "FAIL gRPC interop: $grpc_out"
+    exit 1
+}
+printf '%s\n' "$grpc_out" >&2
+for t in test_grpc_interop_unary_and_metadata test_grpc_interop_client_streaming test_grpc_interop_server_streaming test_grpc_interop_bidirectional_streaming test_grpc_interop_status_trailers_and_oversize test_grpc_unknown_status_and_http_response_validation test_grpcs_interop_uses_h2_alpn test_grpc_deadline_and_cancel test_grpc_concurrent_call_bound; do
+    grep -q "$t ... ok" <<<"$grpc_out" || {
+        kill "$grpc_srv" 2>/dev/null || true
+        wait "$grpc_srv" 2>/dev/null || true
+        kill "$h2_srv" 2>/dev/null || true
+        wait "$h2_srv" 2>/dev/null || true
+        echo "FAIL gRPC interop: $grpc_out"
+        exit 1
+    }
+done
+kill "$grpc_srv" 2>/dev/null || true
+wait "$grpc_srv" 2>/dev/null || true
 kill "$h2_srv" 2>/dev/null || true
 wait "$h2_srv" 2>/dev/null || true
 else

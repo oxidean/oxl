@@ -1,0 +1,111 @@
+package main
+
+import "std/net/grpc"
+
+import "std/bytes"
+
+import "std/net/http2"
+
+import "std/testing"
+
+import "std/errors"
+
+fn test_grpc_frame_decode_and_limits() {
+    frame := mkslice(byte, 0)
+    frame = push(frame, 0)
+    frame = push(frame, 0)
+    frame = push(frame, 0)
+    frame = push(frame, 0)
+    frame = push(frame, 3)
+    frame = push(frame, 97)
+    frame = push(frame, 98)
+    frame = push(frame, 99)
+    [payload, e] = grpc.frame_decode(frame)
+    testing.expect(e == nil && payload as str == "abc", "decode 5-byte gRPC envelope")
+    [_, short] = grpc.frame_decode(frame[0:4])
+    testing.expect(short != nil && find(errors.msg(short), "truncated") >= 0, "reject truncated gRPC header")
+    [_, mismatch] = grpc.frame_decode(frame[0:7])
+    testing.expect(mismatch != nil && find(errors.msg(mismatch), "length") >= 0, "reject malformed gRPC payload size")
+    compressed := frame
+    compressed[0] = 1
+    [_, ce] = grpc.frame_decode(compressed)
+    testing.expect(ce != nil && find(errors.msg(ce), "compressed") >= 0, "reject compressed message clearly")
+    oversized := mkslice(byte, 5)
+    oversized[0] = 0
+    oversized[1] = 0
+    oversized[2] = 64
+    oversized[3] = 0
+    oversized[4] = 1
+    [_, oe] = grpc.frame_decode(oversized)
+    testing.expect(oe != nil && find(errors.msg(oe), "4MiB") >= 0, "reject oversized gRPC message")
+}
+
+fn test_grpc_metadata_and_target_validation() {
+    bad := mkslice(grpc.Metadata, 0)
+    bad = push(bad, grpc.Metadata{name: "Upper", value: "x"})
+    testing.expect(grpc.metadata_error(bad) != nil, "reject invalid metadata name")
+    bad = mkslice(grpc.Metadata, 0)
+    bad = push(bad, grpc.Metadata{name: "grpc-status", value: "0"})
+    testing.expect(grpc.metadata_error(bad) != nil, "reject reserved gRPC metadata")
+    [plain, pe] = grpc.parse_target("grpc://127.0.0.1:50051")
+    testing.expect(pe == nil && !plain.secure && plain.port == 50051, "plaintext grpc target")
+    [secure, se] = grpc.parse_target("grpcs://127.0.0.1:50052")
+    testing.expect(se == nil && secure.secure && secure.port == 50052, "TLS grpcs target")
+    [loopback, le] = grpc.parse_target("127.0.0.1:50053")
+    testing.expect(le == nil && !loopback.secure, "scheme-less loopback target")
+    [localhost, lle] = grpc.parse_target("localhost:50055")
+    testing.expect(lle == nil && !localhost.secure && localhost.port == 50055, "scheme-less localhost with port uses plaintext")
+    [remote, re] = grpc.parse_target("example.com:50054")
+    testing.expect(re == nil && remote.secure, "scheme-less remote target uses TLS")
+}
+
+fn test_grpc_goaway_maps_unprocessed_stream_unavailable() {
+    buf := bytes.newbuffer()
+    writer := buf.aswriter()
+    [settings, se] = http2.encode_frame(http2.FrameHeader{length: 0, kind: 4, flags: 0, stream_id: 0}, mkslice(byte, 0))
+    testing.expect(se == nil, "encode GOAWAY peer SETTINGS")
+    [_, we] = writer.write(settings)
+    testing.expect(we == nil, "queue GOAWAY peer SETTINGS")
+    goaway := mkslice(byte, 8)
+    i := 0
+    for i < len(goaway) {
+        goaway[i] = 0
+        i = i + 1
+    }
+    testing.expect(http2.write_frame(writer, http2.FrameHeader{length: 8, kind: 7, flags: 0, stream_id: 0}, goaway) == nil, "queue GOAWAY")
+    [conn, ce] = http2.new_conn(buf.asreadwriter())
+    testing.expect(ce == nil, "initialize GOAWAY connection")
+    call := new(grpc.Call{conn: conn, stream_id: 1, tx_bytes: 0, rx: mkslice(byte, 0), response_headers: mkslice(grpc.Metadata, 0), response_trailers: mkslice(grpc.Metadata, 0), response_metadata_bytes: 0, response_metadata_fields: 0, status: grpc.Status{code: grpc.STATUS_UNKNOWN, raw_code: grpc.STATUS_UNKNOWN, message: ""}, got_status: false, finished: false, cancelled: false, send_closed: false, slot_owned: false, got_content_type: false})
+    e := call.read_until_event()
+    testing.expect(e != nil && call.status.code == grpc.STATUS_UNAVAILABLE && call.finished, "GOAWAY excluding stream maps to UNAVAILABLE")
+}
+
+fn test_grpc_send_respects_peer_window_and_maps_deadlines() {
+    buf := bytes.newbuffer()
+    writer := buf.aswriter()
+    initial_window := mkslice(byte, 0)
+    initial_window = push(initial_window, 0)
+    initial_window = push(initial_window, 4)
+    initial_window = push(initial_window, 0)
+    initial_window = push(initial_window, 0)
+    initial_window = push(initial_window, 0)
+    initial_window = push(initial_window, 0)
+    testing.expect(http2.write_frame(writer, http2.FrameHeader{length: len(initial_window), kind: 4, flags: 0, stream_id: 0}, initial_window) == nil, "queue zero-window SETTINGS")
+    [conn, ce] = http2.new_conn(buf.asreadwriter())
+    testing.expect(ce == nil, "initialize zero-window connection")
+    headers := mkslice(http2.Header, 0)
+    headers = push(headers, http2.Header{name: ":method", value: "POST"})
+    headers = push(headers, http2.Header{name: ":scheme", value: "http"})
+    headers = push(headers, http2.Header{name: ":path", value: "/svc/method"})
+    headers = push(headers, http2.Header{name: ":authority", value: "localhost:50051"})
+    [stream, oe] = conn.open_stream(headers, false)
+    testing.expect(oe == nil, "open zero-window RPC stream")
+    call := new(grpc.Call{conn: conn, stream_id: stream, tx_bytes: 0, rx: mkslice(byte, 0), response_headers: mkslice(grpc.Metadata, 0), response_trailers: mkslice(grpc.Metadata, 0), response_metadata_bytes: 0, response_metadata_fields: 0, status: grpc.Status{code: grpc.STATUS_UNKNOWN, raw_code: grpc.STATUS_UNKNOWN, message: ""}, got_status: false, finished: false, cancelled: false, send_closed: false, slot_owned: false, got_content_type: false})
+    e := call.send_message("x" as []byte)
+    testing.expect(e != nil && call.tx_bytes == 0, "reject request before partial write under zero peer window")
+    cause := errors.new("write deadline exceeded")
+    se := call.fail_send("send message", cause)
+    testing.expect(se != nil && call.finished && call.status.code == grpc.STATUS_DEADLINE_EXCEEDED, "map send deadline to DEADLINE_EXCEEDED and finish call")
+    retry_err := call.send_message("later" as []byte)
+    testing.expect(retry_err != nil, "reject send retry after partial-write failure")
+}

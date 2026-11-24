@@ -7,9 +7,13 @@ import "std/errors"
 
 import "std/net/http2"
 
+import "std/net"
+
 import "std/net/tls"
 
 import "std/net/url"
+
+import "std/strings"
 
 import "std/strconv"
 
@@ -116,21 +120,20 @@ fn parse_target(target: str) -> [Endpoint, err] {
     if len(target) == 0 {
         return Endpoint{host: "", port: 0, secure: false}, errors.new("grpc: empty target")
     }
+    scheme_less := find(target, "://") < 0
     raw := target
-    if find(target, "://") < 0 {
-        secure := !(target == "localhost" || has_prefix(target, "localhost:") || has_prefix(target, "127.") || has_prefix(target, "[::1]"))
-        prefix := "https://"
-        if !secure {
-            prefix = "http://"
-        }
-        raw = prefix + target
+    if scheme_less {
+        raw = "https://" + target
     }
     [u, ue] = url.parse(raw)
     if ue != nil {
         return Endpoint{host: "", port: 0, secure: false}, errors.wrap("grpc: invalid target", ue)
     }
     secure := false
-    if u.scheme == "grpc" || u.scheme == "http" {
+    if scheme_less {
+        hostname := u.hostname()
+        secure = !(strings.upper(hostname) == "LOCALHOST" || net.isip4(hostname) && has_prefix(hostname, "127."))
+    } else if u.scheme == "grpc" || u.scheme == "http" {
         secure = false
     } else if u.scheme == "grpcs" || u.scheme == "https" {
         secure = true
@@ -141,7 +144,7 @@ fn parse_target(target: str) -> [Endpoint, err] {
     if len(hostname) == 0 || u.hasuser || len(u.path) > 0 && u.path != "/" || len(u.rawquery) > 0 || len(u.fragment) > 0 {
         return Endpoint{host: "", port: 0, secure: false}, errors.new("grpc: target must contain only an authority")
     }
-    if byteat(hostname, 0) == 91 {
+    if net.isip6(hostname) {
         return Endpoint{host: "", port: 0, secure: false}, errors.new("grpc: IPv6 targets are unsupported by std/net")
     }
     port := 443
@@ -463,6 +466,25 @@ fn grpc_content_type(value: str) -> bool {
     return len(value) == len(prefix) || byteat(value, len(prefix)) == 43 || byteat(value, len(prefix)) == 59
 }
 
+fn interim_response(headers: []http2.Header) -> bool {
+    status_count := 0
+    status_code := 0
+    status_valid := false
+    i := 0
+    for i < len(headers) {
+        if headers[i].name == ":status" {
+            status_count = status_count + 1
+            [code, e] = strconv.atoi(headers[i].value)
+            if e == nil {
+                status_code = code
+                status_valid = true
+            }
+        }
+        i = i + 1
+    }
+    return status_count == 1 && status_valid && status_code >= 100 && status_code < 200 && status_code != 101
+}
+
 fn grpc_status_for_http(code: int) -> int {
     if code == 400 {
         return STATUS_INTERNAL
@@ -593,8 +615,19 @@ fn (call mut Call) read_until_event() -> err {
             call.finished = true
             return errors.new("grpc: RPC stream reset")
         } else if event.kind == 1 {
+            if !event.trailers && interim_response(event.headers) {
+                continue
+            }
             e := call.capture_headers(event.headers, event.trailers)
             if e != nil {
+                if !call.finished {
+                    call.finished = true
+                    if !call.cancelled {
+                        call.status = status(STATUS_INTERNAL, errors.msg(e))
+                        call.cancelled = true
+                        call.conn.cancel_stream(call.stream_id)
+                    }
+                }
                 return e
             }
             if !event.trailers && (event.flags & 1) != 0 {
@@ -655,12 +688,12 @@ fn (call mut Call) receive_message() -> [[]byte, err] {
             }
         }
         if call.finished {
+            if call.got_status && call.status.code != STATUS_OK {
+                return mkslice(byte, 0), errors.new("grpc: status " + itoa(call.status.code) + ": " + call.status.message)
+            }
             if len(call.rx) > 0 {
                 call.status = status(STATUS_INTERNAL, "truncated gRPC message frame")
                 return mkslice(byte, 0), errors.new("grpc: truncated message frame")
-            }
-            if call.got_status && call.status.code != STATUS_OK {
-                return mkslice(byte, 0), errors.new("grpc: status " + itoa(call.status.code) + ": " + call.status.message)
             }
             if call.got_status {
                 return mkslice(byte, 0), errors.new("EOF")

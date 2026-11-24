@@ -55,6 +55,12 @@ fn test_grpc_metadata_and_target_validation() {
     testing.expect(le == nil && !loopback.secure, "scheme-less loopback target")
     [localhost, lle] = grpc.parse_target("localhost:50055")
     testing.expect(lle == nil && !localhost.secure && localhost.port == 50055, "scheme-less localhost with port uses plaintext")
+    [upper_localhost, ule] = grpc.parse_target("LOCALHOST:50056")
+    testing.expect(ule == nil && !upper_localhost.secure, "case-insensitive localhost uses plaintext")
+    [spoofed_loopback, sle] = grpc.parse_target("127.attacker.example:50057")
+    testing.expect(sle == nil && spoofed_loopback.secure, "non-numeric 127-prefixed hostname remains secure")
+    [ipv6, ie] = grpc.parse_target("grpc://[::1]:50058")
+    testing.expect(ie != nil, "reject IPv6 targets explicitly")
     [remote, re] = grpc.parse_target("example.com:50054")
     testing.expect(re == nil && remote.secure, "scheme-less remote target uses TLS")
 }

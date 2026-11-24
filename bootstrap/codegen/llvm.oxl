@@ -1263,6 +1263,12 @@ fn lrt_sig(name: str) -> str {
     if name == "rt_sqlite_close" {
         d = "void @rt_sqlite_close(ptr)"
     }
+    if name == "rt_sqlite_col_name" {
+        d = "%OxlStr @rt_sqlite_col_name(ptr, i64)"
+    }
+    if name == "rt_sqlite_col_decl" {
+        d = "%OxlStr @rt_sqlite_col_decl(ptr, i64)"
+    }
     // — libc --
     if name == "close" {
         d = "i32 @close(i32)"

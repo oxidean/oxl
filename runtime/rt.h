@@ -575,6 +575,8 @@ int64_t rt_sqlite_col_type(void *st, int64_t i); /* SQLITE_INTEGER..NULL */
 int64_t rt_sqlite_col_int(void *st, int64_t i);
 double rt_sqlite_col_f64(void *st, int64_t i);
 OxlStr rt_sqlite_col_text(void *st, int64_t i); /* scope-copied — step invalidates */
+OxlStr rt_sqlite_col_name(void *st, int64_t i); /* scope-copied column name */
+OxlStr rt_sqlite_col_decl(void *st, int64_t i); /* scope-copied decltype; "" for expressions */
 void rt_sqlite_finalize(void *st);
 OxlStr rt_sqlite_errstr(void *db); /* scope-copied last-error text */
 OxlStr rt_sqlite_errstr_rc(int64_t rc); /* scope-copied text for a raw sqlite rc */

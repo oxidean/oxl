@@ -1,13 +1,19 @@
 package main
 
-// R6 fixture — std/database/sql lite: open/exec/exec_bind/query over
-// an in-memory sqlite db, then scan[T]'s column-order-onto-fields
-// mapping through descriptors. Covers every scalar lane, NULL → zero,
-// count-mismatch and non-struct errors, the unsupported-kind lanes,
-// and scan-on-exhausted. Asserts in-process, ends with an ok line.
+// db_sql fixture — std/database/sql through the driver registry:
+// sqlite resolves under "sqlite3"/"sqlite" (and open_sqlite), a second
+// in-test driver exercises register/open's last-wins policy, scan[T]'s
+// column-order-onto-fields mapping runs driver-agnostic, scan_into and
+// the scan_any family cover the heterogeneous Scan(any) half, and
+// columns() reports names + declared types. Asserts in-process, ends
+// with an ok line.
 import "std/database/sql"
 
 import "std/errors"
+
+import "std/os"
+
+import "std/time"
 
 struct Item { id: int, name: str, price: float, active: bool, code: byte }
 
@@ -18,6 +24,116 @@ struct Wide { id: int, xs: []int }
 
 // an `own` field reports err_kind before a row is consumed
 struct Owned { id: int, p: own Item }
+
+// scan_into's row shape over the 3-column SELECT
+struct SRow { id: int, name: str, price: float }
+
+// scan_into's field-count-mismatch shape
+struct Narrow { id: int }
+
+// scan[T]'s shape over the mock driver's rows
+struct MRow { id: int, label: str, score: float }
+
+// ---------- mock driver — a second, pure-oxl backend ----------
+// Implements sql.Driver/Conn/Stmt in the test itself, which is what
+// proves the registry is driver-agnostic: no rt_sqlite_* anywhere.
+let g_stmt_closed = 0
+
+let g_conn_closed = 0
+
+struct MockDrv { tag: str }
+
+struct MockConn { tag: str }
+
+struct MockStmt { tag: str, cur: int, n: int }
+
+fn (d MockDrv) open(dsn: str) -> [sql.Conn, err] {
+    if dsn == "reject" {
+        return nil, errors.new("mock: refused dsn")
+    }
+    return MockConn{tag: d.tag}, nil
+}
+
+fn (c MockConn) exec(q: str) -> err {
+    return errors.new("mock[" + c.tag + "] exec " + q)
+}
+
+fn (c MockConn) exec_bind(q: str, param: str) -> err {
+    return errors.new("mock[" + c.tag + "] exec_bind")
+}
+
+fn (c MockConn) query(q: str) -> [sql.Stmt, err] {
+    return MockStmt{tag: c.tag, cur: 0, n: 2}, nil
+}
+
+fn (c MockConn) close() {
+    g_conn_closed = g_conn_closed + 1
+}
+
+fn (s mut MockStmt) step() -> int {
+    if s.cur >= s.n {
+        return 0
+    }
+    s.cur = s.cur + 1
+    return 1
+}
+
+fn (s mut MockStmt) reset() -> int {
+    s.cur = 0
+    return 0
+}
+
+fn (s MockStmt) readonly() -> int {
+    return 1
+}
+
+fn (s MockStmt) ncols() -> int {
+    return 3
+}
+
+fn (s MockStmt) col_type(i: int) -> int {
+    if i == 0 {
+        return sql.col_integer()
+    }
+    if i == 1 {
+        return sql.col_text()
+    }
+    return sql.col_float()
+}
+
+fn (s MockStmt) col_int(i: int) -> int {
+    return s.cur * 10 + i
+}
+
+fn (s MockStmt) col_f64(i: int) -> float {
+    return itof(s.cur) + 0.5
+}
+
+fn (s MockStmt) col_text(i: int) -> str {
+    return s.tag + "r" + itoa(s.cur)
+}
+
+fn (s MockStmt) col_name(i: int) -> str {
+    if i == 0 {
+        return "id"
+    }
+    if i == 1 {
+        return "label"
+    }
+    return "score"
+}
+
+fn (s MockStmt) col_decl(i: int) -> str {
+    return ""
+}
+
+fn (s MockStmt) errstr(rc: int) -> str {
+    return "mock rc " + itoa(rc)
+}
+
+fn (s mut MockStmt) close() {
+    g_stmt_closed = g_stmt_closed + 1
+}
 
 fn fails(msg: str) {
     println("FAIL " + msg)
@@ -43,12 +159,85 @@ fn want_sentinel(e: err, sentinel: err, msg: str) {
     }
 }
 
+fn release_sql_lock(db: sql.DB, done: chan) {
+    time.sleep_ms(80)
+    e := db.exec("COMMIT")
+    if e != nil {
+        send(done, 0)
+        return
+    }
+    send(done, 1)
+}
+
+fn remove_test_file(path: str) {
+    if os.exists(path) {
+        os.remove(path)
+    }
+}
+
 fn main() {
-    [db, oe] = sql.open(":memory:")
+    [db, oe] = sql.open_driver("sqlite3", ":memory:")
     want_ok(oe, "open :memory:")
     want_ok(db.exec("CREATE TABLE items(id INTEGER, name TEXT, price REAL, active INTEGER, code INTEGER)"), "create table")
+    stamp := itoa(time.unix_ms())
+    missing_parent := os.temp_dir() + "/oxl_sql_missing_" + stamp + "/child.db"
+    [missing_db, missing_err] = sql.open_driver("sqlite3", missing_parent)
+    want_err(missing_err, "sqlite open missing parent")
+    main_db_path := os.temp_dir() + "/oxl_sql_exec_main_" + stamp + ".db"
+    lock_db_path := os.temp_dir() + "/oxl_sql_exec_lock_" + stamp + ".db"
+    [lock_db, lock_open_err] = sql.open(lock_db_path)
+    want_ok(lock_open_err, "open shared lock db")
+    want_ok(lock_db.exec("PRAGMA journal_mode=DELETE"), "set lock journal mode")
+    [script_db, script_open_err] = sql.open(main_db_path)
+    want_ok(script_open_err, "open shared script db")
+    want_ok(script_db.exec("ATTACH DATABASE '" + lock_db_path + "' AS aux"), "attach lock db")
+    want_ok(script_db.exec("PRAGMA aux.journal_mode=DELETE"), "set attached journal mode")
+    want_ok(script_db.exec("CREATE TABLE first(x); CREATE TABLE aux.locked(x); INSERT INTO aux.locked VALUES(1); PRAGMA busy_timeout=0"), "create lock tables")
+    want_ok(lock_db.exec("BEGIN"), "begin read lock")
+    [lock_rows, lock_query_err] = lock_db.query("SELECT x FROM locked")
+    want_ok(lock_query_err, "query lock table")
+    lock_value := new(0)
+    [lock_has_row, lock_scan_err] = lock_rows.scan_into(lock_value)
+    want_ok(lock_scan_err, "scan lock table")
+    if !lock_has_row {
+        fails("lock table was empty")
+    }
+    lock_rows.close()
+    done := mkchan(1)
+    spawn release_sql_lock(lock_db, done)
+    exec_err := script_db.exec("INSERT INTO first VALUES(1); INSERT INTO aux.locked VALUES(2)")
+    want_err(exec_err, "busy multi-statement exec")
+    msg := errors.msg(exec_err)
+    if find(msg, "locked") < 0 && find(msg, "busy") < 0 {
+        fails("multi-statement exec error: " + msg)
+    }
+    if recv(done) != 1 {
+        fails("release sql lock")
+    }
+    lock_db.close()
+    [first_rows, first_query_err] = script_db.query("SELECT COUNT(*) FROM first")
+    want_ok(first_query_err, "query first statement count")
+    first_count := new(Count)
+    [first_has_row, first_scan_err] = first_rows.scan_into(first_count)
+    want_ok(first_scan_err, "scan first statement count")
+    if !first_has_row || first_count.n != 1 {
+        fails("busy multi-statement exec replayed first statement")
+    }
+    first_rows.close()
+    script_db.close()
+    remove_test_file(main_db_path + "-wal")
+    remove_test_file(main_db_path + "-shm")
+    remove_test_file(lock_db_path + "-wal")
+    remove_test_file(lock_db_path + "-shm")
+    remove_test_file(main_db_path)
+    remove_test_file(lock_db_path)
     // exec reports a driver error
     want_err(db.exec("INSERT INTO nope VALUES(1)"), "exec bad sql")
+    [badrows, bqe] = db.query("SELECT FROM")
+    want_err(bqe, "query bad sql")
+    if len(badrows.columns()) != 0 {
+        fails("failed query columns not empty")
+    }
     // exec_bind inserts request-supplied text through ?1
     want_ok(db.exec_bind("INSERT INTO items VALUES(1, ?, 9.99, 1, 65)", "hammer"), "bind hammer")
     want_ok(db.exec("INSERT INTO items VALUES(2, 'nail', 0.05, 0, 66)"), "insert nail")
@@ -86,6 +275,21 @@ fn main() {
     if len(out2) != 4 || out2[0].id != 1 || out2[3].id != 4 {
         fails("rescan len " + itoa(len(out2)))
     }
+    // columns() names the query's columns and carries declared types —
+    // sqlite's decltype answers for table columns, "" for expressions
+    cols := rows.columns()
+    if len(cols) != 5 {
+        fails("columns len " + itoa(len(cols)))
+    }
+    if cols[0].name != "id" || cols[0].decl != "INTEGER" {
+        fails("columns[0] " + cols[0].name + "/" + cols[0].decl)
+    }
+    if cols[1].name != "name" || cols[1].decl != "TEXT" {
+        fails("columns[1] " + cols[1].name + "/" + cols[1].decl)
+    }
+    if cols[2].name != "price" || cols[2].decl != "REAL" {
+        fails("columns[2] " + cols[2].name + "/" + cols[2].decl)
+    }
     // an empty result set scans to a zero-length slice
     [rows0, qe0] = db.query("SELECT id, name, price, active, code FROM items WHERE id > 99")
     want_ok(qe0, "query empty")
@@ -97,6 +301,44 @@ fn main() {
     }
     rows0.close()
     rows.close()
+    [closed_stmt_rows, closed_stmt_qe] = db.query("SELECT id FROM items")
+    want_ok(closed_stmt_qe, "query close stmt")
+    closed_stmt_rows.close()
+    closed_stmt_rows.close()
+    if len(closed_stmt_rows.columns()) != 0 {
+        fails("closed rows columns")
+    }
+    closed_dest := new(Count)
+    [closed_scan, closed_scan_err] = closed_stmt_rows.scan_into(closed_dest)
+    want_err(closed_scan_err, "scan into closed rows")
+    if closed_scan {
+        fails("closed rows scanned")
+    }
+    closed_out := new(mkslice(Item, 0))
+    want_err(sql.scan(closed_stmt_rows, closed_out), "scan closed rows")
+    [deferred_db, deferred_open_err] = sql.open(":memory:")
+    want_ok(deferred_open_err, "open deferred close")
+    [deferred_rows, deferred_query_err] = deferred_db.query("SELECT 7")
+    want_ok(deferred_query_err, "query deferred close")
+    deferred_db.close()
+    deferred_scalar := new(0)
+    [deferred_ok, deferred_scan_err] = deferred_rows.scan_into(deferred_scalar)
+    want_ok(deferred_scan_err, "scan after connection close")
+    deferred_value := value_of_mut(deferred_scalar)
+    [deferred_n, deferred_value_err] = deferred_value.int()
+    want_ok(deferred_value_err, "read deferred close value")
+    if !deferred_ok || deferred_n != 7 {
+        fails("row after connection close " + itoa(deferred_n))
+    }
+    deferred_rows.close()
+    // an aliased expression column reports its spelled name and "" decl
+    [rowsx, qex] = db.query("SELECT COUNT(*) AS total FROM items")
+    want_ok(qex, "query expr")
+    colx := rowsx.columns()
+    if len(colx) != 1 || colx[0].name != "total" || colx[0].decl != "" {
+        fails("expr column " + colx[0].name + "/" + colx[0].decl)
+    }
+    rowsx.close()
     // column count vs field count mismatch reports err_cols
     [rows3, qe3] = db.query("SELECT id, name FROM items")
     want_ok(qe3, "query narrow")
@@ -123,6 +365,14 @@ fn main() {
     [rbad, qbad] = db.query("SELECT bogus FROM nowhere")
     want_err(qbad, "bad query")
     rbad.close()
+    // scan_into on a nil-statement Rows reports the shared sentinel —
+    // the nil-stmt rejection the lite surface had on scan[T]
+    nilsc := new(SRow)
+    [nok, ne] = rbad.scan_into(nilsc)
+    want_sentinel(ne, sql.err_nilstmt(), "scan_into nil stmt")
+    if nok {
+        fails("scan_into nil stmt reported a row")
+    }
     // INSERT ... RETURNING is writable — scan must refuse it outright
     // rather than replay the write a second time
     [rw, qw] = db.query("INSERT INTO items (name, price, active, code) VALUES ('dup', 1.0, 1, 'x') RETURNING id")
@@ -142,6 +392,312 @@ fn main() {
         fails("returning write ran " + itoa(outc[0].n) + " times")
     }
     rc1.close()
+
+    // ---------- scan_into — one forward step per call ----------
+    [srows, sqe] = db.query("SELECT id, name, price FROM items ORDER BY id")
+    want_ok(sqe, "query scan_into")
+    sr := new(SRow)
+    [sok, se7] = srows.scan_into(sr)
+    want_ok(se7, "scan_into row1")
+    if !sok || sr.id != 1 || sr.name != "hammer" || sr.price != 9.99 {
+        fails("scan_into row1: " + itoa(sr.id) + " " + sr.name)
+    }
+    [sok2, se8] = srows.scan_into(sr)
+    want_ok(se8, "scan_into row2")
+    if !sok2 || sr.id != 2 || sr.name != "nail" {
+        fails("scan_into row2")
+    }
+    // a NULL column leaves the dest's CURRENT value — the previous
+    // row's name carries through the hole
+    [sok3, se9] = srows.scan_into(sr)
+    want_ok(se9, "scan_into null row")
+    if !sok3 || sr.id != 3 || sr.name != "nail" || sr.price != 1.5 {
+        fails("scan_into null row: '" + sr.name + "'")
+    }
+    [sok4, se10] = srows.scan_into(sr)
+    want_ok(se10, "scan_into row4")
+    if !sok4 || sr.id != 4 || sr.name != "saw" || sr.price != 20.0 {
+        fails("scan_into row4")
+    }
+    [sok5, se11] = srows.scan_into(sr)
+    want_ok(se11, "scan_into exhausted")
+    if sok5 {
+        fails("scan_into produced a fifth row")
+    }
+    srows.close()
+    // a writable RETURNING cursor is legal for scan_into — no replay,
+    // so the write executes exactly once across the forward pass
+    [rw2, qw2] = db.query("INSERT INTO items (id, name, price, active, code) VALUES (9, 'ret', 7.5, 1, 90) RETURNING id, name, price")
+    want_ok(qw2, "query returning scan_into")
+    rr := new(SRow)
+    [rok, re2] = rw2.scan_into(rr)
+    want_ok(re2, "scan_into returning")
+    if !rok || rr.id != 9 || rr.name != "ret" || rr.price != 7.5 {
+        fails("scan_into returning: " + itoa(rr.id))
+    }
+    [rok2, re3] = rw2.scan_into(rr)
+    want_ok(re3, "scan_into returning end")
+    if rok2 {
+        fails("returning produced a second row")
+    }
+    rw2.close()
+    // scan_into shape errors: field-count mismatch reports err_cols,
+    // a non-struct non-scalar T reports err_kind
+    nr := new(Narrow)
+    [ncr, nqe] = db.query("SELECT id, name, price FROM items")
+    want_ok(nqe, "query narrow into")
+    [nok2, ne2] = ncr.scan_into(nr)
+    want_sentinel(ne2, sql.err_cols(), "scan_into col mismatch")
+    if nok2 {
+        fails("scan_into col mismatch reported a row")
+    }
+    ncr.close()
+    xs := new(mkslice(int, 1))
+    [scr, sqe2] = db.query("SELECT id FROM items")
+    want_ok(sqe2, "query slice into")
+    [sok6, se12] = scr.scan_into(xs)
+    want_sentinel(se12, sql.err_kind(), "scan_into slice T")
+    if sok6 {
+        fails("scan_into slice T reported a row")
+    }
+    scr.close()
+    // a scalar T takes a single-column cursor — minted via an own
+    // one-cell box (the only own-of-scalar the language spells)
+    one := new(Count)
+    [one_r, one_qe] = db.query("SELECT COUNT(*) FROM items WHERE id = 9")
+    want_ok(one_qe, "query scalar into")
+    [sok7, se13] = one_r.scan_into(one)
+    want_ok(se13, "scan_into scalar-row")
+    if !sok7 || one.n != 1 {
+        fails("scan_into count " + itoa(one.n))
+    }
+    one_r.close()
+    scalar := new(0)
+    [scalar_r, scalar_qe] = db.query("SELECT id FROM items WHERE id = 1")
+    want_ok(scalar_qe, "query scalar scan_into")
+    [scalar_ok, scalar_e] = scalar_r.scan_into(scalar)
+    want_ok(scalar_e, "scan_into scalar")
+    scalar_v := value_of_mut(scalar)
+    [scalar_value, scalar_value_err] = scalar_v.int()
+    want_ok(scalar_value_err, "scan_into scalar value")
+    if !scalar_ok || scalar_value != 1 {
+        fails("scan_into scalar value " + itoa(scalar_value))
+    }
+    scalar_r.close()
+
+    // ---------- scan_any — reflect.Value dests, varied T per column ----------
+    [ar, aq] = db.query("SELECT id, name, price FROM items ORDER BY id")
+    want_ok(aq, "query scan_any")
+    // one-cell own boxes are the caller's addressable scalar slots —
+    // value_of_mut + index(0) mints the writable Values
+    ic := new(mkslice(int, 1))
+    sc := new(mkslice(str, 1))
+    fc := new(mkslice(float, 1))
+    icv := value_of_mut(ic)
+    [iv, ive] = icv.index(0)
+    want_ok(ive, "int cell")
+    scv := value_of_mut(sc)
+    [sv, sve] = scv.index(0)
+    want_ok(sve, "str cell")
+    fcv := value_of_mut(fc)
+    [fv, fve] = fcv.index(0)
+    want_ok(fve, "float cell")
+    got := 0
+    more := true
+    for more {
+        [aok, ae] = ar.scan_any3(iv, sv, fv)
+        want_ok(ae, "scan_any3")
+        more = aok
+        if more {
+            got = got + 1
+            if got == 1 && (ic[0] != 1 || sc[0] != "hammer" || fc[0] != 9.99) {
+                fails("scan_any row1: " + itoa(ic[0]) + " " + sc[0])
+            }
+            // NULL leaves the dest's previous value — "nail" carries
+            // through row 3's hole rather than zeroing the cell
+            if got == 3 && (ic[0] != 3 || sc[0] != "nail" || fc[0] != 1.5) {
+                fails("scan_any null row: '" + sc[0] + "'")
+            }
+            if got == 4 && (ic[0] != 4 || fc[0] != 20.0) {
+                fails("scan_any row4")
+            }
+            if got == 5 && (ic[0] != 9 || sc[0] != "ret") {
+                fails("scan_any row5")
+            }
+        }
+    }
+    if got != 5 {
+        fails("scan_any drained " + itoa(got) + " rows")
+    }
+    ar.close()
+    [arone, aqone] = db.query("SELECT id FROM items WHERE id = 1")
+    want_ok(aqone, "query scan_any one")
+    [aone, aone_e] = arone.scan_any(iv)
+    want_ok(aone_e, "scan_any one")
+    if !aone || ic[0] != 1 {
+        fails("scan_any one value")
+    }
+    arone.close()
+    [arwide, aqwide] = db.query("SELECT id, name, price, active FROM items WHERE id = 1")
+    want_ok(aqwide, "query scan_any4")
+    bc := new(mkslice(bool, 1))
+    bcv := value_of_mut(bc)
+    [bv, bve] = bcv.index(0)
+    want_ok(bve, "bool cell")
+    [awide, awide_e] = arwide.scan_any4(iv, sv, fv, bv)
+    want_ok(awide_e, "scan_any4")
+    if !awide || ic[0] != 1 || sc[0] != "hammer" || fc[0] != 9.99 || !bc[0] {
+        fails("scan_any4 row")
+    }
+    arwide.close()
+    // scan_any's arity must equal the column count — err_cols
+    [ar2, aq2] = db.query("SELECT id, name FROM items")
+    want_ok(aq2, "query scan_any narrow")
+    [bok, be] = ar2.scan_any3(iv, sv, fv)
+    want_sentinel(be, sql.err_cols(), "scan_any3 arity")
+    if bok {
+        fails("scan_any arity mismatch reported a row")
+    }
+    // and scan_any2 fills two mixed-lane dests of its own
+    [bok2, be2] = ar2.scan_any2(iv, sv)
+    want_ok(be2, "scan_any2")
+    if !bok2 || ic[0] != 1 || sc[0] != "hammer" {
+        fails("scan_any2 row")
+    }
+    ar2.close()
+    // a Value of the wrong shape (the slice header itself, not a
+    // scalar cell) fails dest_check before a row is consumed
+    [ar3, aq3] = db.query("SELECT id FROM items")
+    want_ok(aq3, "query scan_any kind")
+    [cok, ce] = ar3.scan_any(scv)
+    want_sentinel(ce, sql.err_kind(), "scan_any slice dest")
+    if cok {
+        fails("scan_any slice dest reported a row")
+    }
+    ar3.close()
+    // a nil-address Value (nil own target) reports the nil-dest err
+    let np: own []int = nil
+    nv := value_of_mut(np)
+    [ar4, aq4] = db.query("SELECT id FROM items")
+    want_ok(aq4, "query scan_any nil")
+    [dok, de] = ar4.scan_any(nv)
+    want_err(de, "scan_any nil dest")
+    if dok {
+        fails("scan_any nil dest reported a row")
+    }
+    ar4.close()
+
+    // ---------- driver registry ----------
+    // the sqlite builtin registers under both names on first use
+    dn := sql.drivers()
+    saw_sq := false
+    saw_sq3 := false
+    i := 0
+    for i < len(dn) {
+        if dn[i] == "sqlite" {
+            saw_sq = true
+        }
+        if dn[i] == "sqlite3" {
+            saw_sq3 = true
+        }
+        i = i + 1
+    }
+    if !saw_sq || !saw_sq3 {
+        fails("drivers missing sqlite names")
+    }
+    // the "sqlite" alias and both sqlite open entries work
+    [db2, oe2] = sql.open_driver("sqlite", ":memory:")
+    want_ok(oe2, "open sqlite alias")
+    want_ok(db2.exec("CREATE TABLE t(x INTEGER)"), "alias exec")
+    db2.close()
+    db2.close() // idempotent close through the driver
+    want_err(db2.exec("SELECT 1"), "exec after close")
+    want_err(db2.exec_bind("SELECT ?", "x"), "bind after close")
+    [closed_rows, cre] = db2.query("SELECT 1")
+    want_err(cre, "query after close")
+    [db3, oe3] = sql.open_sqlite(":memory:")
+    want_ok(oe3, "open_sqlite")
+    db3.close()
+    [db4, oe4] = sql.open(":memory:")
+    want_ok(oe4, "open path compatibility")
+    db4.close()
+    // an unregistered name reports err, not a nil-conn trap
+    [dbx, oex] = sql.open_driver("nosuchdriver", "x")
+    want_err(oex, "unknown driver")
+    // register a second driver — a pure-oxl impl, no sqlite anywhere
+    sql.register("mock", MockDrv{tag: "m"})
+    [mdb, me] = sql.open_driver("mock", "anything")
+    want_ok(me, "open mock")
+    // a driver-side open failure propagates the driver's own err
+    [mdbr, mer] = sql.open_driver("mock", "reject")
+    want_err(mer, "mock reject")
+    if find(errors.msg(mer), "refused") < 0 {
+        fails("mock reject msg: " + errors.msg(mer))
+    }
+    // last-wins: re-registering "mock" replaces the driver in place —
+    // the next open reaches the new impl, never the first
+    sql.register("mock", MockDrv{tag: "v2"})
+    [mdb3, me3] = sql.open_driver("mock", "x")
+    want_ok(me3, "open mock v2")
+    e3 := mdb3.exec("q")
+    want_err(e3, "mock exec err")
+    if find(errors.msg(e3), "v2") < 0 {
+        fails("last-wins lost: " + errors.msg(e3))
+    }
+    // replaced names don't stack — drivers() still lists "mock" once
+    dn = sql.drivers()
+    nmock := 0
+    i = 0
+    for i < len(dn) {
+        if dn[i] == "mock" {
+            nmock = nmock + 1
+        }
+        i = i + 1
+    }
+    if nmock != 1 {
+        fails("mock registered " + itoa(nmock) + " times")
+    }
+    // scan[T] runs over the mock driver — the scan lane is driver-
+    // agnostic: reset/step/readonly/col_* all come from the impl
+    [mrows, mqe] = mdb3.query("whatever")
+    want_ok(mqe, "mock query")
+    mcols := mrows.columns()
+    if len(mcols) != 3 || mcols[0].name != "id" || mcols[1].name != "label" || mcols[2].name != "score" {
+        fails("mock columns")
+    }
+    if mcols[0].decl != "" || mcols[1].decl != "" || mcols[2].decl != "" {
+        fails("mock decls should be empty")
+    }
+    mout := new(mkslice(MRow, 0))
+    mse := sql.scan(mrows, mout)
+    want_ok(mse, "mock scan")
+    if len(mout) != 2 {
+        fails("mock scan len " + itoa(len(mout)))
+    }
+    if mout[0].id != 10 || mout[0].label != "v2r1" || mout[0].score != 1.5 {
+        fails("mock row0: " + itoa(mout[0].id) + " " + mout[0].label)
+    }
+    if mout[1].id != 20 || mout[1].label != "v2r2" || mout[1].score != 2.5 {
+        fails("mock row1")
+    }
+    mrows.close()
+    if g_stmt_closed != 1 {
+        fails("mock stmt close " + itoa(g_stmt_closed))
+    }
+    mdb3.close()
+    if g_conn_closed != 1 {
+        fails("mock conn close " + itoa(g_conn_closed))
+    }
+    mdb.close()
     db.close()
+    sql.register("sqlite3", MockDrv{tag: "sqlite-override"})
+    [override_db, override_err] = sql.open_driver("sqlite3", "anything")
+    want_ok(override_err, "override builtin driver")
+    override_exec := override_db.exec("q")
+    want_err(override_exec, "builtin override exec")
+    if find(errors.msg(override_exec), "sqlite-override") < 0 {
+        fails("builtin driver override lost: " + errors.msg(override_exec))
+    }
+    override_db.close()
     println("db_sql ok")
 }

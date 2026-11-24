@@ -4135,16 +4135,7 @@ void *rt_sqlite_open(const char *path) {
     return db;
 }
 int64_t rt_sqlite_exec(void *db, const char *sql) {
-    /* busy_timeout doesn't retry SQLITE_BUSY_SNAPSHOT; a bounded retry
-     * loop covers both busy flavors under concurrent writers */
-    for (int i = 0; i < 500; i++) {
-        int rc = sqlite3_exec((sqlite3 *)db, sql, NULL, NULL, NULL);
-        if (rc != SQLITE_BUSY && rc != SQLITE_LOCKED) {
-            return rc;
-        }
-        sleep_us(10000);
-    }
-    return SQLITE_BUSY;
+    return sqlite3_exec((sqlite3 *)db, sql, NULL, NULL, NULL);
 }
 /* prepared-statement insert for request-supplied values — body text is
  * bound, never concatenated into SQL */
@@ -4192,7 +4183,7 @@ OxlStr rt_sqlite_query(void *db, const char *sql) {
     free(buf);
     return (OxlStr){ p, (int64_t)n };
 }
-void rt_sqlite_close(void *db) { sqlite3_close((sqlite3 *)db); }
+void rt_sqlite_close(void *db) { sqlite3_close_v2((sqlite3 *)db); }
 
 /* cursor lane for database/sql's descriptor-driven scan — a prepared
  * stmt is the rows object: step/cols/col_* read the live row, reset
@@ -4229,6 +4220,32 @@ OxlStr rt_sqlite_col_text(void *st, int64_t i) {
     char *p;
     if (!t) return rt_str("");
     n = strlen((const char *)t);
+    p = rt_alloc((int64_t)n + 1);
+    memcpy(p, t, n);
+    p[n] = 0;
+    return (OxlStr){ p, (int64_t)n };
+}
+OxlStr rt_sqlite_col_name(void *st, int64_t i) {
+    /* sqlite3_column_name's buffer is stmt-owned — scope-copy so the
+     * name outlives the cursor */
+    const char *t = sqlite3_column_name((sqlite3_stmt *)st, (int)i);
+    size_t n;
+    char *p;
+    if (!t) return rt_str("");
+    n = strlen(t);
+    p = rt_alloc((int64_t)n + 1);
+    memcpy(p, t, n);
+    p[n] = 0;
+    return (OxlStr){ p, (int64_t)n };
+}
+OxlStr rt_sqlite_col_decl(void *st, int64_t i) {
+    /* sqlite3_column_decltype is NULL for expression columns — report
+     * "" so the sql lane's declared-type field degrades to absent */
+    const char *t = sqlite3_column_decltype((sqlite3_stmt *)st, (int)i);
+    size_t n;
+    char *p;
+    if (!t) return rt_str("");
+    n = strlen(t);
     p = rt_alloc((int64_t)n + 1);
     memcpy(p, t, n);
     p[n] = 0;

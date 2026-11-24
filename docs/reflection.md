@@ -136,10 +136,19 @@ struct Point { x: int, y: int tag "unit:mm" }
 - **`std/fmt`** — `%v` prints Go's default forms (`{v1 v2}` structs,
   `&{…}` pointers, variant names for enums), `%+v` adds field names,
   `%T` the type name, `%#v` the source-literal form.
-- **`std/database/sql`** — `scan(rows, out)` maps each row's columns
-  in declared order onto a struct's fields through the walk above —
-  the descriptor table is the only per-row type information it
-  consults.
+- **`std/database/sql`** — a driver registry (`sql.register` /
+  `sql.open_driver` over `Driver`/`Conn`/`Stmt` interface pairs — sqlite
+  registers as `"sqlite3"`/`"sqlite"`) feeding a shared scan lane.
+  `sql.open(path)` remains the sqlite-compatible entry.
+  `scan(rows, out)` maps each row's columns in declared order onto a
+  struct's fields through the walk above — the descriptor table is
+  the only per-row type information it consults. `rows.scan_into`
+  fills one `mut T` per forward step (struct fields take one column
+  each, heterogeneous T per column) and the `scan_any…scan_any4`
+  family takes caller-minted `reflect.Value` destinations — one per
+  column, each of its own T — since scope-bound Values can't sit in a
+  slice, the family spells arities. `rows.columns()` reports names
+  and declared types.
 
 A consumer that walks `Value`s needs only `import "std/reflect"` and
 the intrinsics — the emitted binary pays for exactly the descriptors

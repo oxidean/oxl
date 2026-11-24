@@ -36962,6 +36962,12 @@ OxlStr o_f_codegen_lrt_sig(OxlStr name) {
     if ((rt_streq(name, rt_str_lit("rt_sqlite_close")))) {
     d = rt_str_lit("void @rt_sqlite_close(ptr)");
     }
+    if ((rt_streq(name, rt_str_lit("rt_sqlite_col_name")))) {
+    d = rt_str_lit("%OxlStr @rt_sqlite_col_name(ptr, i64)");
+    }
+    if ((rt_streq(name, rt_str_lit("rt_sqlite_col_decl")))) {
+    d = rt_str_lit("%OxlStr @rt_sqlite_col_decl(ptr, i64)");
+    }
     if ((rt_streq(name, rt_str_lit("close")))) {
     d = rt_str_lit("i32 @close(i32)");
     }

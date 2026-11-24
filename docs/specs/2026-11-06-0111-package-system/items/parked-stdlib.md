@@ -12,9 +12,9 @@ machinery they need.
 descriptors landed the machinery these packages waited on; R6 closed
 the milestone out. Returned under R2–R6: `fmt` `%v`, `reflect` lite,
 `encoding/gob`, `encoding/xml`, `text/template`, and `database/sql`'s
-`scan[T]` half. Staying parked: `html/template` (out of R's scope)
-and `database/sql`'s driver-registry half (R6 shipped the lite scan
-only — trigger: a second driver or `Scan(any)` consumer).
+`scan[T]` half. The follow-up driver registry and heterogeneous scan
+surface complete `database/sql` after the second-driver and `Scan(any)`
+triggers fired. Staying parked: `html/template` (out of R's scope).
 
 **Re-measured at R6 closeout** — the remaining descriptor-gated items,
 each with its own trigger rather than a blanket wait on reflection:
@@ -28,9 +28,6 @@ each with its own trigger rather than a blanket wait on reflection:
 
 - `html/template` — string-keyed `map[string]any` pipelines; out of
   milestone R's scope (its `text/template` sibling landed).
-- `database/sql` driver-registry + `Scan(any)` — R6's `scan[T]`
-  covers the descriptor half; the registry half waits on a second
-  driver or a heterogeneous-column consumer.
 
 ## Needs machinery the language doesn't have
 

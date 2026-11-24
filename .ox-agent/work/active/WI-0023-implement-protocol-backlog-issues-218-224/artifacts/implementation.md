@@ -21,3 +21,14 @@ WebSocket (#220), gRPC (#223), and TLS 1.2 (#224) are in isolated worktrees and
 must be independently audited before integration. QUIC (#219) and client mTLS
 (#221) remain gated by the spec. No issue is complete merely because code has
 been drafted; each needs its tests, review, and platform CI.
+
+
+## Security gates reviewed
+
+- #219's QUIC spike is now independently approved as a design-gate artifact;
+  it is not implementation approval. Pure-Oxl versus external library, address
+  family, resource caps, and crypto timing posture remain unresolved.
+- #221's mTLS draft audit found no client CertificateVerify path on main and
+  unreviewed variable-time signing code in a stale server draft. Keep the issue
+  open until the client flow, interop tests, and crypto-focused security posture
+  are accepted.

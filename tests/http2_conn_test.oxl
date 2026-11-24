@@ -507,3 +507,39 @@ fn test_http2_continuation_sequence_enforced() {
     [_, ue] = stray_conn.next_event()
     testing.expect(ue != nil && errors.msg(ue) == "http2: unexpected CONTINUATION", "reject CONTINUATION outside header block")
 }
+
+fn test_http2_data_exceeding_recv_window_rejected() {
+    buf := bytes.newbuffer()
+    writer := buf.aswriter()
+    [settings, se] = http2.encode_frame(http2.FrameHeader{length: 0, kind: 4, flags: 0, stream_id: 0}, mkslice(byte, 0))
+    testing.expect(se == nil, "encode peer SETTINGS")
+    [_, we] = writer.write(settings)
+    testing.expect(we == nil, "queue peer SETTINGS")
+    [status, ste] = hex.decode("88")
+    testing.expect(ste == nil, "encode response status")
+    testing.expect(http2.write_frame(writer, http2.FrameHeader{length: 1, kind: 1, flags: 4, stream_id: 1}, status) == nil, "queue response HEADERS")
+    i := 0
+    for i < 4 {
+        testing.expect(http2.write_frame(writer, http2.FrameHeader{length: 16384, kind: 0, flags: 0, stream_id: 1}, mkslice(byte, 16384)) == nil, "queue DATA frame")
+        i = i + 1
+    }
+    [conn, ce] = http2.new_conn(buf.asreadwriter())
+    testing.expect(ce == nil, "initialize connection")
+    req := mkslice(http2.Header, 0)
+    req = push(req, http2.Header{name: ":method", value: "GET"})
+    req = push(req, http2.Header{name: ":scheme", value: "http"})
+    req = push(req, http2.Header{name: ":path", value: "/"})
+    req = push(req, http2.Header{name: ":authority", value: "127.0.0.1"})
+    [_, oe] = conn.open_stream(req, true)
+    testing.expect(oe == nil, "open stream")
+    [_, he] = conn.next_event()
+    testing.expect(he == nil, "receive headers")
+    [_, d1] = conn.next_event()
+    testing.expect(d1 == nil, "receive DATA within window")
+    [_, d2] = conn.next_event()
+    testing.expect(d2 == nil, "receive second DATA within window")
+    [_, d3] = conn.next_event()
+    testing.expect(d3 == nil, "receive third DATA within window")
+    [_, de] = conn.next_event()
+    testing.expect(de != nil && errors.msg(de) == "http2: DATA exceeds receive window", "reject DATA exceeding receive window")
+}

@@ -390,6 +390,12 @@ fn (c mut Conn) open_stream(headers: []Header, end_stream: bool) -> [int, err] {
     c.streams = push(c.streams, StreamState{id: id, send_window: c.peer_initial_window, recv_window: 65535, recv_unacked: 0, got_headers: 0, local_closed: 0, remote_closed: 0})
     e = c.write_headers(id, block, end_stream)
     if e != nil {
+        i := stream_index(c, id)
+        if i >= 0 {
+            c.streams[i].local_closed = 1
+            c.streams[i].remote_closed = 1
+            c.prune_streams()
+        }
         return 0, e
     }
     if end_stream {
@@ -853,6 +859,10 @@ fn dial_tls_config(host: str, port: int, timeout_ms: int, cfg: tls.Config) -> [T
     if de != nil {
         return TLSDialResult{conn: nil, transport: nil, closer: nil, protocol: ""}, de
     }
+    return dial_tls_over(socket, host, timeout_ms, cfg)
+}
+
+fn dial_tls_over(socket: net.Conn, host: str, timeout_ms: int, cfg: tls.Config) -> [TLSDialResult, err] {
     if len(cfg.server_name) == 0 {
         cfg.server_name = host
     }

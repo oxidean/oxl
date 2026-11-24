@@ -975,6 +975,29 @@ fn valid_http2_request(req: Request) -> err {
     return nil
 }
 
+fn dial_http2_request(cl: ref Client, u: Url, pxy: str) -> [http2.TLSDialResult, err] {
+    if len(pxy) == 0 || pxy == "direct" {
+        return http2.dial_tls_config(u.host, u.port, cl.tmo, cl.tlscfg)
+    }
+    [pu, pe] = parse_url(pxy)
+    if pe != nil {
+        return http2.TLSDialResult{conn: nil, transport: nil, closer: nil, protocol: ""}, errors.new("http: bad proxy url " + pxy)
+    }
+    if pu.secure != 0 {
+        return http2.TLSDialResult{conn: nil, transport: nil, closer: nil, protocol: ""}, errors.new("http: proxy url must be http")
+    }
+    [proxy, de] = net.dial_timeout(pu.host, pu.port, cl.tmo)
+    if de != nil {
+        return http2.TLSDialResult{conn: nil, transport: nil, closer: nil, protocol: ""}, de
+    }
+    pe = connect_proxy(proxy, u, cl.tmo)
+    if pe != nil {
+        proxy.close()
+        return http2.TLSDialResult{conn: nil, transport: nil, closer: nil, protocol: ""}, pe
+    }
+    return http2.dial_tls_over(proxy, u.host, cl.tmo, cl.tlscfg)
+}
+
 fn (cl ref Client) do_once_h2(req: Request, u: Url, prior: bool) -> [Response, err] {
     bad := Response{status: 0, reason: "", headers: mkslice(Header, 0), body: "", ctype: "", chunked: false, trailers: mkslice(Header, 0)}
     ve := valid_http2_request(req)
@@ -985,10 +1008,10 @@ fn (cl ref Client) do_once_h2(req: Request, u: Url, prior: bool) -> [Response, e
     if len(pxy) == 0 {
         pxy = proxy_from_env(u.host, u.secure)
     }
-    if len(pxy) > 0 && pxy != "direct" {
-        return bad, errors.new("http: HTTP/2 proxy transport is not supported")
-    }
     if prior {
+        if len(pxy) > 0 && pxy != "direct" {
+            return bad, errors.new("http: h2c through a proxy is not supported")
+        }
         if u.secure != 0 {
             return bad, errors.new("http: prior-knowledge HTTP/2 requires a cleartext URL")
         }
@@ -1009,7 +1032,7 @@ fn (cl ref Client) do_once_h2(req: Request, u: Url, prior: bool) -> [Response, e
     if u.secure == 0 {
         return cl.do_once_http1(req)
     }
-    [result, de] = http2.dial_tls_config(u.host, u.port, cl.tmo, cl.tlscfg)
+    [result, de] = dial_http2_request(cl, u, pxy)
     if de != nil {
         return bad, de
     }
@@ -1289,6 +1312,11 @@ fn (cl ref Client) do_once_http1(req: Request) -> [Response, err] {
             if te != nil {
                 return bad, te
             }
+            protocol := tc.negotiated_alpn()
+            if protocol != "" && protocol != "http/1.1" {
+                tc.close()
+                return bad, errors.new("http: unsupported negotiated ALPN protocol " + protocol)
+            }
             [rs, re] = exchange(tc, wire, cl.tmo)
             if re != nil {
                 return bad, re
@@ -1298,6 +1326,11 @@ fn (cl ref Client) do_once_http1(req: Request) -> [Response, err] {
             [tc, te] = tls.dial_timeout(u.host, u.port, cl.tmo, cfg)
             if te != nil {
                 return bad, te
+            }
+            protocol := tc.negotiated_alpn()
+            if protocol != "" && protocol != "http/1.1" {
+                tc.close()
+                return bad, errors.new("http: unsupported negotiated ALPN protocol " + protocol)
             }
             [rs, re] = exchange(tc, wire, cl.tmo)
             if re != nil {

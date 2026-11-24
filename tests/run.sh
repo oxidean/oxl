@@ -394,41 +394,66 @@ for t in test_http2_connection_streams_and_trailers test_http2_connection_multip
 done
 out=$("$OXL" test tests/grpc_wire_test.oxl) || { echo "FAIL gRPC wire unit: $out"; exit 1; }
 printf '%s\n' "$out" >&2
-for t in test_grpc_frame_decode_and_limits test_grpc_metadata_and_target_validation test_grpc_goaway_maps_unprocessed_stream_unavailable; do
+for t in test_grpc_frame_decode_and_limits test_grpc_metadata_and_target_validation test_grpc_goaway_maps_unprocessed_stream_unavailable test_grpc_send_respects_peer_window_and_maps_deadlines; do
     grep -q "$t ... ok" <<<"$out" || { echo "FAIL gRPC wire unit: $out"; exit 1; }
 done
 if command -v node >/dev/null 2>&1; then
     h2_port=$((30000 + RANDOM % 15000))
-h2_tls_port=$((h2_port + 1))
-h1_tls_port=$((h2_port + 2))
-h1_port=$((h2_port + 3))
-node tests/http2_server.mjs "$h2_port" "$h2_tls_port" "$h1_tls_port" "$h1_port" >/dev/null 2>&1 &
-h2_srv=$!
+    h2_tls_port=$((h2_port + 1))
+    h1_tls_port=$((h2_port + 2))
+    h1_port=$((h2_port + 3))
+    h2_proxy_port=$((h2_port + 6))
+    h2_proxy_capture=$(mktemp)
+    node tests/http2_server.mjs "$h2_port" "$h2_tls_port" "$h1_tls_port" "$h1_port" >/dev/null 2>&1 &
+    h2_srv=$!
+    "$PY" tests/tls/connect_proxy.py "$h2_proxy_port" "$h2_tls_port" "$h2_proxy_capture" >/dev/null 2>&1 &
+    h2_proxy_srv=$!
 h2_ready=0
 for _ in {1..50}; do
     kill -0 "$h2_srv" 2>/dev/null || break
-    (exec 3<>"/dev/tcp/127.0.0.1/$h2_port" && exec 4<>"/dev/tcp/127.0.0.1/$h2_tls_port" && exec 5<>"/dev/tcp/127.0.0.1/$h1_tls_port" && exec 6<>"/dev/tcp/127.0.0.1/$h1_port") 2>/dev/null && { exec 3>&- 3<&- 4>&- 4<&- 5>&- 5<&- 6>&- 6<&-; h2_ready=1; break; }
+    (exec 3<>"/dev/tcp/127.0.0.1/$h2_port" && exec 4<>"/dev/tcp/127.0.0.1/$h2_tls_port" && exec 5<>"/dev/tcp/127.0.0.1/$h1_tls_port" && exec 6<>"/dev/tcp/127.0.0.1/$h1_port" && exec 7<>"/dev/tcp/127.0.0.1/$h2_proxy_port") 2>/dev/null && { exec 3>&- 3<&- 4>&- 4<&- 5<&- 6>&- 6<&- 7>&- 7<&-; h2_ready=1; break; }
     sleep 0.1
 done
 if [ "$h2_ready" != 1 ]; then
-    kill "$h2_srv" 2>/dev/null || true
-    wait "$h2_srv" 2>/dev/null || true
+    kill "$h2_srv" "$h2_proxy_srv" 2>/dev/null || true
+    wait "$h2_srv" "$h2_proxy_srv" 2>/dev/null || true
+    rm -f "$h2_proxy_capture"
     echo "FAIL http2 interop: local server did not start"
     exit 1
 fi
 out=$(OXL_HTTP2_PORT="$h2_port" OXL_HTTP2_TLS_PORT="$h2_tls_port" OXL_HTTP1_TLS_PORT="$h1_tls_port" OXL_HTTP1_PORT="$h1_port" "$OXL" test tests/http2_interop_test.oxl) || {
-    kill "$h2_srv" 2>/dev/null || true
-    wait "$h2_srv" 2>/dev/null || true
+    kill "$h2_srv" "$h2_proxy_srv" 2>/dev/null || true
+    wait "$h2_srv" "$h2_proxy_srv" 2>/dev/null || true
+    rm -f "$h2_proxy_capture"
     echo "FAIL http2 interop: $out"
     exit 1
 }
 printf '%s\n' "$out" >&2
 grep -q "test_http2_interop ... ok" <<<"$out" && grep -q "test_http2_tls_alpn ... ok" <<<"$out" && grep -q "test_http_client_http2 ... ok" <<<"$out" || {
-    kill "$h2_srv" 2>/dev/null || true
-    wait "$h2_srv" 2>/dev/null || true
+    kill "$h2_srv" "$h2_proxy_srv" 2>/dev/null || true
+    wait "$h2_srv" "$h2_proxy_srv" 2>/dev/null || true
+    rm -f "$h2_proxy_capture"
     echo "FAIL http2 interop: $out"
     exit 1
 }
+out=$(OXL_HTTP2_TLS_PORT="$h2_tls_port" OXL_HTTP1_TLS_PORT="$h1_tls_port" OXL_HTTP2_PROXY_PORT="$h2_proxy_port" OXL_HTTP2_PROXY_CAPTURE="$h2_proxy_capture" "$OXL" test tests/http2_proxy_test.oxl) || {
+    kill "$h2_srv" "$h2_proxy_srv" 2>/dev/null || true
+    wait "$h2_srv" "$h2_proxy_srv" 2>/dev/null || true
+    rm -f "$h2_proxy_capture"
+    echo "FAIL HTTP/2 CONNECT proxy: $out"
+    exit 1
+}
+printf '%s\n' "$out" >&2
+grep -q "test_http2_tls_through_connect_proxy ... ok" <<<"$out" && grep -q "test_http1_rejects_h2_alpn ... ok" <<<"$out" && grep -q "test_http2_falls_back_to_http1_alpn ... ok" <<<"$out" || {
+    kill "$h2_srv" "$h2_proxy_srv" 2>/dev/null || true
+    wait "$h2_srv" "$h2_proxy_srv" 2>/dev/null || true
+    rm -f "$h2_proxy_capture"
+    echo "FAIL HTTP/2 CONNECT proxy: $out"
+    exit 1
+}
+kill "$h2_proxy_srv" 2>/dev/null || true
+wait "$h2_proxy_srv" 2>/dev/null || true
+rm -f "$h2_proxy_capture"
 timeout_out=$(with_timeout 60 env OXL_HTTP2_PORT="$h2_port" "$OXL" test tests/http2_timeout_test.oxl) || {
     kill "$h2_srv" 2>/dev/null || true
     wait "$h2_srv" 2>/dev/null || true
@@ -685,7 +710,7 @@ for t in test_handshake test_handshake_hrr test_handshake_cookie test_rawfd_and_
 done
 out=$("$OXL" test tests/tls12_test.oxl) || { printf '%s\n' "$out" >&2; exit 1; }
 printf '%s\n' "$out" >&2
-for t in test_tls12_prf_vectors test_tls12_version_policy_and_sentinels test_tls12_malformed_handshake_vectors test_tls12_gcm_server_finished_record; do
+for t in test_tls12_prf_vectors test_tls12_version_policy_and_sentinels test_tls12_suite_auth_family test_tls12_malformed_handshake_vectors test_tls12_gcm_server_finished_record; do
     grep -q "$t ... ok" <<<"$out" || { echo "FAIL tls12: $out"; exit 1; }
 done
 

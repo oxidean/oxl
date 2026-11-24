@@ -27,7 +27,7 @@ h2c.listen(h2cPort, "127.0.0.1");
 const h2tls = http2.createSecureServer({ key, cert, allowHTTP1: true, ALPNProtocols: ["h2", "http/1.1"] });
 h2tls.on("stream", respond);
 h2tls.listen(h2tlsPort, "127.0.0.1");
-const h1tls = https.createServer({ key, cert }, (_req, res) => res.end("http/1.1"));
+const h1tls = https.createServer({ key, cert, ALPNProtocols: ["http/1.1"] }, (_req, res) => res.end("http/1.1"));
 h1tls.listen(h1tlsPort, "127.0.0.1");
 
 const h1 = http.createServer((_req, res) => res.end("http/1.1"));

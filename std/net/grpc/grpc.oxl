@@ -523,6 +523,21 @@ fn (call mut Call) capture_headers(headers: []http2.Header, trailers: bool) -> e
             content_type_seen = true
             content_type_valid = grpc_content_type(h.value)
         } else if h.name == "grpc-status" {
+            if len(h.value) < 1 || len(h.value) > 3 {
+                return errors.new("grpc: invalid grpc-status")
+            }
+            digits := true
+            i := 0
+            for i < len(h.value) {
+                b := byteat(h.value, i)
+                if b < 48 || b > 57 {
+                    digits = false
+                }
+                i = i + 1
+            }
+            if !digits {
+                return errors.new("grpc: invalid grpc-status")
+            }
             [code, ce] = strconv.atoi(h.value)
             if ce != nil || code < 0 {
                 return errors.new("grpc: invalid grpc-status")
@@ -632,12 +647,14 @@ fn (call mut Call) read_until_event() -> err {
             }
             if !event.trailers && (event.flags & 1) != 0 {
                 if !call.got_status {
+                    call.finished = true
+                    call.status = status(STATUS_INTERNAL, "response ended without grpc-status")
                     return errors.new("grpc: response ended without grpc-status")
                 }
                 call.finished = true
             }
         } else if event.kind == 0 {
-            if len(call.rx) + len(event.payload) > MAX_MESSAGE_SIZE + 5 {
+            if len(call.rx) + len(event.payload) > MAX_MESSAGE_SIZE + 5 + 16384 {
                 call.status = status(STATUS_RESOURCE_EXHAUSTED, "gRPC message exceeds 4MiB limit")
                 call.conn.cancel_stream(call.stream_id)
                 call.finished = true
@@ -652,6 +669,8 @@ fn (call mut Call) read_until_event() -> err {
             }
             if (event.flags & 1) != 0 {
                 if !call.got_status {
+                    call.finished = true
+                    call.status = status(STATUS_INTERNAL, "response ended without grpc-status")
                     return errors.new("grpc: response ended without grpc-status")
                 }
                 call.finished = true
@@ -734,6 +753,11 @@ fn (client ref Client) unary(path: str, metadata: []Metadata, request: []byte) -
     if xe == nil {
         call.close()
         return empty, errors.new("grpc: unary RPC returned multiple messages")
+    }
+    if errors.msg(xe) != "EOF" {
+        result := UnaryResult{response: mkslice(byte, 0), headers: call.response_headers, trailers: call.response_trailers, status: call.status}
+        call.close()
+        return result, xe
     }
     if !call.got_status || call.status.code != STATUS_OK {
         call.close()

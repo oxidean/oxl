@@ -387,7 +387,7 @@ for t in test_http2_hpack_rfc_request_vector test_http2_hpack_rejects_bounds_and
 done
 out=$("$OXL" test tests/http2_conn_test.oxl)
 printf '%s\n' "$out" >&2
-for t in test_http2_connection_streams_and_trailers test_http2_connection_multiplexes_stream_ids test_http2_peer_max_concurrent_streams test_http2_send_body_handles_goaway_for_accepted_stream test_http2_send_body_rejects_goaway_excluded_stream test_http2_goaway_last_stream_is_monotonic test_http2_pending_event_limit test_http2_enable_push_setting test_http2_connection_control_frames; do
+for t in test_http2_connection_streams_and_trailers test_http2_connection_multiplexes_stream_ids test_http2_peer_max_concurrent_streams test_http2_cancel_reclaims_receive_credit_and_slot test_http2_reset_reclaims_receive_credit_and_slot test_http2_send_body_handles_goaway_for_accepted_stream test_http2_send_body_rejects_goaway_excluded_stream test_http2_goaway_last_stream_is_monotonic test_http2_pending_event_limit test_http2_enable_push_setting test_http2_connection_control_frames; do
     grep -q "$t ... ok" <<<"$out" || { echo "FAIL http2 connection: $out"; exit 1; }
 done
 if command -v node >/dev/null 2>&1; then

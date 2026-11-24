@@ -62,7 +62,9 @@ fn test_http2_tls_alpn() {
     cfg := tls.default_cfg()
     cfg.roots = roots
     cfg.server_name = "localhost"
-    cfg.alpn = push(mkslice(str, 0), "custom/1")
+    cfg.alpn = push(mkslice(str, 0), "h2")
+    cfg.alpn = push(cfg.alpn, "http/1.1")
+    cfg.alpn = push(cfg.alpn, "custom/1")
     port := atoi(os.getenv("OXL_HTTP2_TLS_PORT"))
     [result, de] = http2.dial_tls_config("127.0.0.1", port, 5000, cfg)
     testing.expect(de == nil && result.protocol == "h2" && result.conn != nil, "select h2 through TLS ALPN: " + errors.msg(de) + " protocol=" + result.protocol)
@@ -98,6 +100,11 @@ fn test_http2_tls_alpn() {
     }
     testing.expect(body as str == "abc", "read TLS HTTP/2 response body")
     result.conn.close()
+    http1_only := cfg
+    http1_only.alpn = push(mkslice(str, 0), "http/1.1")
+    [restricted, restricted_err] = http2.dial_tls_config("127.0.0.1", port, 5000, http1_only)
+    testing.expect(restricted_err == nil && restricted.protocol == "http/1.1" && restricted.conn == nil && restricted.transport != nil, "respect caller HTTP/1.1-only ALPN")
+    restricted.closer.close()
     fallback_port := atoi(os.getenv("OXL_HTTP1_TLS_PORT"))
     [fallback, fe] = http2.dial_tls_config("127.0.0.1", fallback_port, 5000, cfg)
     testing.expect(fe == nil && fallback.protocol == "http/1.1" && fallback.conn == nil && fallback.transport != nil, "return HTTP/1.1 transport only when ALPN selects it")

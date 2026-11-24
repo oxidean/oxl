@@ -246,6 +246,40 @@ fn (c mut Conn) prune_streams() {
     }
 }
 
+fn (c mut Conn) discard_pending_stream_events(id: int) {
+    i := 0
+    for i < len(c.pending_events) {
+        if c.pending_events[i].stream_id == id {
+            c.pending_bytes = c.pending_bytes - event_size(c.pending_events[i])
+            j := i
+            for j < len(c.pending_events) - 1 {
+                c.pending_events[j] = c.pending_events[j + 1]
+                j = j + 1
+            }
+            c.pending_events = c.pending_events[0:len(c.pending_events) - 1]
+        } else {
+            i = i + 1
+        }
+    }
+}
+
+fn (c mut Conn) reclaim_stream_recv_credit(i: int) -> err {
+    n := c.streams[i].recv_unacked
+    if n == 0 {
+        return nil
+    }
+    if c.conn_recv_window + n > 2147483647 {
+        return errors.new("http2: receive window overflow")
+    }
+    e := c.update_window(0, n)
+    if e != nil {
+        return e
+    }
+    c.conn_recv_window = c.conn_recv_window + n
+    c.streams[i].recv_unacked = 0
+    return nil
+}
+
 fn (c mut Conn) write_headers(id: int, block: []byte, end_stream: bool) -> err {
     if len(block) == 0 || len(block) > c.peer_max_header_list {
         return errors.new("http2: invalid header block size")
@@ -377,6 +411,11 @@ fn (c mut Conn) cancel_stream(id: int) -> err {
     c.streams[i].local_closed = 1
     c.streams[i].remote_closed = 1
     c.remember_cancelled(id)
+    c.discard_pending_stream_events(id)
+    e = c.reclaim_stream_recv_credit(i)
+    if e != nil {
+        return e
+    }
     c.prune_streams()
     return nil
 }
@@ -599,6 +638,11 @@ fn (c mut Conn) read_event() -> [Event, err] {
                     sid := c.streams[i].id
                     c.streams[i].local_closed = 1
                     c.streams[i].remote_closed = 1
+                    c.remember_cancelled(sid)
+                    ce := c.reclaim_stream_recv_credit(i)
+                    if ce != nil {
+                        return bad_event(ce)
+                    }
                     qe := c.queue_event(Event{last_stream_id: 0, flow_bytes: 0, stream_id: sid, kind: 3, flags: 0, trailers: false, headers: mkslice(Header, 0), payload: encode_u32(7)})
                     if qe != nil {
                         return bad_event(qe)
@@ -768,6 +812,12 @@ fn (c mut Conn) read_event() -> [Event, err] {
             }
             c.streams[i].local_closed = 1
             c.streams[i].remote_closed = 1
+            c.remember_cancelled(h.stream_id)
+            c.discard_pending_stream_events(h.stream_id)
+            re := c.reclaim_stream_recv_credit(i)
+            if re != nil {
+                return bad_event(re)
+            }
             c.prune_streams()
             return Event{last_stream_id: 0, flow_bytes: 0, stream_id: h.stream_id, kind: 3, flags: h.flags, trailers: false, headers: mkslice(Header, 0), payload: f.payload}, nil
         } else if h.kind == 5 {
@@ -806,24 +856,12 @@ fn dial_tls_config(host: str, port: int, timeout_ms: int, cfg: tls.Config) -> [T
     if len(cfg.server_name) == 0 {
         cfg.server_name = host
     }
-    protocols := mkslice(str, 0)
-    protocols = push(protocols, "h2")
-    protocols = push(protocols, "http/1.1")
-    i := 0
-    for i < len(cfg.alpn) {
-        protocol := cfg.alpn[i]
-        known := protocol == "h2" || protocol == "http/1.1"
-        j := 0
-        for j < len(protocols) {
-            if protocols[j] == protocol {
-                known = true
-            }
-            j = j + 1
-        }
-        if !known {
-            protocols = push(protocols, protocol)
-        }
-        i = i + 1
+    configured_alpn := len(cfg.alpn) > 0
+    protocols := cfg.alpn
+    if !configured_alpn {
+        protocols = mkslice(str, 0)
+        protocols = push(protocols, "h2")
+        protocols = push(protocols, "http/1.1")
     }
     cfg.alpn = protocols
     [secure_value, te] = tls.client_tmo(socket, cfg, timeout_ms)
@@ -833,6 +871,10 @@ fn dial_tls_config(host: str, port: int, timeout_ms: int, cfg: tls.Config) -> [T
     }
     secure := new(secure_value)
     protocol := secure.negotiated_alpn()
+    if protocol == "" && configured_alpn {
+        secure.close()
+        return TLSDialResult{conn: nil, transport: nil, closer: nil, protocol: ""}, errors.new("http2: no ALPN protocol negotiated")
+    }
     if protocol != "h2" {
         if protocol != "" && protocol != "http/1.1" {
             secure.close()

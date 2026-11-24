@@ -168,7 +168,9 @@ fn (c mut Conn) apply_settings(payload: []byte) -> err {
         id := payload[pos] * 256 + payload[pos + 1]
         value := read_u32(payload, pos + 2)
         if id == 2 {
-            return errors.new("http2: server sent SETTINGS_ENABLE_PUSH")
+            if value != 0 {
+                return errors.new("http2: server sent SETTINGS_ENABLE_PUSH=1")
+            }
         } else if id == 3 {
             c.peer_max_concurrent = value
             if c.peer_max_concurrent > 100 {
@@ -801,10 +803,28 @@ fn dial_tls_config(host: str, port: int, timeout_ms: int, cfg: tls.Config) -> [T
     if de != nil {
         return TLSDialResult{conn: nil, transport: nil, closer: nil, protocol: ""}, de
     }
-    cfg.server_name = host
+    if len(cfg.server_name) == 0 {
+        cfg.server_name = host
+    }
     protocols := mkslice(str, 0)
     protocols = push(protocols, "h2")
     protocols = push(protocols, "http/1.1")
+    i := 0
+    for i < len(cfg.alpn) {
+        protocol := cfg.alpn[i]
+        known := protocol == "h2" || protocol == "http/1.1"
+        j := 0
+        for j < len(protocols) {
+            if protocols[j] == protocol {
+                known = true
+            }
+            j = j + 1
+        }
+        if !known {
+            protocols = push(protocols, protocol)
+        }
+        i = i + 1
+    }
     cfg.alpn = protocols
     [secure_value, te] = tls.client_tmo(socket, cfg, timeout_ms)
     if te != nil {

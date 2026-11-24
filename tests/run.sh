@@ -387,7 +387,7 @@ for t in test_http2_hpack_rfc_request_vector test_http2_hpack_rejects_bounds_and
 done
 out=$("$OXL" test tests/http2_conn_test.oxl)
 printf '%s\n' "$out" >&2
-for t in test_http2_connection_streams_and_trailers test_http2_connection_multiplexes_stream_ids test_http2_peer_max_concurrent_streams test_http2_send_body_handles_goaway_for_accepted_stream test_http2_send_body_rejects_goaway_excluded_stream test_http2_goaway_last_stream_is_monotonic test_http2_pending_event_limit test_http2_connection_control_frames; do
+for t in test_http2_connection_streams_and_trailers test_http2_connection_multiplexes_stream_ids test_http2_peer_max_concurrent_streams test_http2_send_body_handles_goaway_for_accepted_stream test_http2_send_body_rejects_goaway_excluded_stream test_http2_goaway_last_stream_is_monotonic test_http2_pending_event_limit test_http2_enable_push_setting test_http2_connection_control_frames; do
     grep -q "$t ... ok" <<<"$out" || { echo "FAIL http2 connection: $out"; exit 1; }
 done
 if command -v node >/dev/null 2>&1; then
@@ -416,7 +416,7 @@ out=$(OXL_HTTP2_PORT="$h2_port" OXL_HTTP2_TLS_PORT="$h2_tls_port" OXL_HTTP1_TLS_
     exit 1
 }
 printf '%s\n' "$out" >&2
-grep -q "test_http2_interop ... ok" <<<"$out" && grep -q "test_http2_tls_alpn ... ok" <<<"$out" || {
+grep -q "test_http2_interop ... ok" <<<"$out" && grep -q "test_http2_tls_alpn ... ok" <<<"$out" && grep -q "test_http_client_http2 ... ok" <<<"$out" || {
     kill "$h2_srv" 2>/dev/null || true
     wait "$h2_srv" 2>/dev/null || true
     echo "FAIL http2 interop: $out"

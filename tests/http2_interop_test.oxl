@@ -61,9 +61,15 @@ fn test_http2_tls_alpn() {
     testing.expect(re == nil && n == 1, "load local HTTP/2 test CA")
     cfg := tls.default_cfg()
     cfg.roots = roots
+    cfg.server_name = "localhost"
+    cfg.alpn = push(mkslice(str, 0), "custom/1")
     port := atoi(os.getenv("OXL_HTTP2_TLS_PORT"))
     [result, de] = http2.dial_tls_config("127.0.0.1", port, 5000, cfg)
     testing.expect(de == nil && result.protocol == "h2" && result.conn != nil, "select h2 through TLS ALPN: " + errors.msg(de) + " protocol=" + result.protocol)
+    wrong_name := cfg
+    wrong_name.server_name = "wrong.invalid"
+    [_, name_err] = http2.dial_tls_config("127.0.0.1", port, 5000, wrong_name)
+    testing.expect(name_err != nil, "preserve caller TLS server_name for HTTP/2")
     req := mkslice(http2.Header, 0)
     req = push(req, http2.Header{name: ":method", value: "GET"})
     req = push(req, http2.Header{name: ":scheme", value: "https"})

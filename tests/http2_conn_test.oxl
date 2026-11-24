@@ -221,6 +221,35 @@ fn test_http2_pending_event_limit() {
     testing.expect(conn.queue_event(event) != nil, "reject event beyond queue limit")
 }
 
+fn test_http2_enable_push_setting() {
+    zero_buf := bytes.newbuffer()
+    zero_writer := zero_buf.aswriter()
+    zero_push := mkslice(byte, 0)
+    zero_push = push(zero_push, 0)
+    zero_push = push(zero_push, 2)
+    zero_push = push(zero_push, 0)
+    zero_push = push(zero_push, 0)
+    zero_push = push(zero_push, 0)
+    zero_push = push(zero_push, 0)
+    testing.expect(http2.write_frame(zero_writer, http2.FrameHeader{length: 6, kind: 4, flags: 0, stream_id: 0}, zero_push) == nil, "queue SETTINGS_ENABLE_PUSH=0")
+    [zero_conn, zero_err] = http2.new_conn(zero_buf.asreadwriter())
+    testing.expect(zero_err == nil, "accept SETTINGS_ENABLE_PUSH=0")
+    zero_conn.close()
+
+    one_buf := bytes.newbuffer()
+    one_writer := one_buf.aswriter()
+    one_push := mkslice(byte, 0)
+    one_push = push(one_push, 0)
+    one_push = push(one_push, 2)
+    one_push = push(one_push, 0)
+    one_push = push(one_push, 0)
+    one_push = push(one_push, 0)
+    one_push = push(one_push, 1)
+    testing.expect(http2.write_frame(one_writer, http2.FrameHeader{length: 6, kind: 4, flags: 0, stream_id: 0}, one_push) == nil, "queue SETTINGS_ENABLE_PUSH=1")
+    [_, one_err] = http2.new_conn(one_buf.asreadwriter())
+    testing.expect(one_err != nil, "reject SETTINGS_ENABLE_PUSH=1")
+}
+
 fn test_http2_connection_control_frames() {
     buf := bytes.newbuffer()
     writer := buf.aswriter()

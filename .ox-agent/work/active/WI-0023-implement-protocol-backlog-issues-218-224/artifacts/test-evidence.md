@@ -2,7 +2,8 @@
 
 - `./target/oxl fmt --check std/net/http2/conn.oxl tests/http2_conn_test.oxl tests/http2_interop_test.oxl`: passed.
 - `./target/oxl test tests/http2_conn_test.oxl`: passed, including the new
-  SETTINGS_ENABLE_PUSH=0 accept / =1 reject regression.
+  SETTINGS_ENABLE_PUSH=0 accept / =1 reject regressions, and the explicit
+  send-after-remote-END_STREAM half-close case.
 - Node-backed `tests/http2_interop_test.oxl`: passed, including h2c, TLS ALPN,
   custom ALPN retention, caller server-name preservation, HTTP/1.1 fallback,
   TLS verification failure, and client-level HTTP/2 behavior.

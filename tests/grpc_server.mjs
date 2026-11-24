@@ -25,6 +25,10 @@ const parseFrames = (buf) => {
 };
 
 const handle = (stream, headers) => {
+  // client resets and abrupt socket teardown surface as 'error'
+  // events; without listeners node treats them as fatal
+  stream.on('error', () => {});
+  stream.session.on('error', () => {});
   const path = headers[':path'];
   let pending = Buffer.alloc(0);
   const requests = [];

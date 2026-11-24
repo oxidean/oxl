@@ -10,6 +10,10 @@ const h1Port = Number(process.argv[5]);
 const key = fs.readFileSync("tests/tls/server-key.pem");
 const cert = fs.readFileSync("tests/tls/server.pem");
 const respond = (stream, headers) => {
+  // client resets and abrupt socket teardown surface as 'error'
+  // events; without listeners node treats them as fatal
+  stream.on("error", () => {});
+  stream.session.on("error", () => {});
   if (headers[":path"] === "/stall") return;
   if (headers[":path"] === "/goaway-accepted") {
     stream.session.goaway(0, stream.id);

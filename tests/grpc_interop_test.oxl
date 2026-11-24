@@ -12,6 +12,15 @@ import "std/errors"
 
 import "std/os"
 
+fn chain(e: err) -> str {
+    s := ""
+    for e != nil {
+        s = s + errors.msg(e) + "; "
+        e = errors.unwrap(e)
+    }
+    return s
+}
+
 fn grpc_client(timeout_ms: int) -> own grpc.Client {
     port := os.getenv("OXL_GRPC_PORT")
     [client, e] = grpc.dial("grpc://127.0.0.1:" + port, timeout_ms)
@@ -191,7 +200,7 @@ fn test_grpc_deadline_and_cancel() {
 fn test_grpc_concurrent_call_bound() {
     client := grpc_client(3000)
     [call0, err0] = client.begin("/svc/bidi-cancel", mkslice(grpc.Metadata, 0))
-    testing.expect(err0 == nil, "open bounded concurrent RPC 1: " + errors.msg(err0))
+    testing.expect(err0 == nil, "open bounded concurrent RPC 1: " + chain(err0))
     [call1, err1] = client.begin("/svc/bidi-cancel", mkslice(grpc.Metadata, 0))
     testing.expect(err1 == nil, "open bounded concurrent RPC 2")
     [call2, err2] = client.begin("/svc/bidi-cancel", mkslice(grpc.Metadata, 0))

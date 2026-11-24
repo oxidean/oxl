@@ -138,7 +138,9 @@ explicit ask, not a bug report.
 ```oxl
 struct Config { server_name: str, roots: x509.Roots,
                 alpn: []str, verify: Verifier,
-                min_ver: int, max_ver: int }
+                min_ver: int, max_ver: int,
+                client_cert: ClientCert }
+struct ClientCert { chain: [][]byte, key: x509.PrivKey }
 iface Verifier { check(leaf: x509.Cert, untrusted: []x509.Cert) -> err }
 struct Conn { ... }   // net.Conn parity: read/write/close/rawfd +
                       // asreader/aswriter/ascloser/asreadwriter, peer()
@@ -147,6 +149,7 @@ default_cfg() -> Config
 dial(host, port, cfg) -> [Conn, err]             // server_name <- host
 dial_timeout(host, port, tmo_ms, cfg) -> [Conn, err]
 client(inner: net.Conn, cfg) -> [Conn, err]
+load_cert_pem(cert_pem, key_pem) -> [ClientCert, err] // checked identity
 ```
 
 TLS 1.3 is the default and is the only version enabled by a zero-valued
@@ -195,9 +198,26 @@ surfaces `err_eof` — truncation is never silent. `close()` emits a
 best-effort `close_notify` then closes the inner socket and is
 idempotent.
 
+Client certificates (mutual TLS, TLS 1.3 only) are configured through
+`cfg.client_cert`: `load_cert_pem` parses a PEM chain (leaf first)
+plus a PKCS#8, PKCS#1, or SEC1 PEM private key and rejects a key that
+is not the leaf's private half — a mismatch is a config error, never a
+handshake-time surprise. `x509.parse_key_pem`/`parse_key_der` cover
+the standalone key forms; DER holders can fill `ClientCert` directly.
+When the server sends a CertificateRequest the client answers with
+the chain and a CertificateVerify signed over the transcript with a
+scheme the CR's `signature_algorithms` offered and the key can use
+(`rsa_pss_rsae_*`, `ecdsa_secp256r1_sha256`, `ecdsa_secp384r1_sha384`,
+`ed25519` — `rsa_pkcs1_*` stays CV-illegal). No identity, an
+out-of-scope issuer under `certificate_authorities`, or no usable
+offered scheme all answer the RFC-mandated empty certificate_list —
+the server then decides. A CR missing `signature_algorithms` aborts
+`missing_extension`. Post-handshake client auth stays unsupported
+(the ClientHello does not advertise `post_handshake_auth`) and the
+TLS 1.2 fallback ignores `client_cert`.
+
 Explicitly out of scope: server side, resumption/PSK/
-0-RTT, client certificates (a CertificateRequest is answered with
-an empty Certificate per RFC 8446), and OCSP/CRL.
+0-RTT, post-handshake client authentication, and OCSP/CRL.
 
 ## `net/http` seam (X7)
 
@@ -266,11 +286,16 @@ actionable ("add the CA to `OXL_SSL_CERT_FILE`", "clock is wrong").
   error. Orderly `close_notify` is the only clean end.
 - **Side-channel posture is documented, not claimed.** `.oxl`
   arithmetic compiles through C with no constant-time discipline —
-  branches on secret material are written, not eliminated. The
-  exposure is narrow for a client (session keys, not long-term
-  identity keys) and the verify-only design ships no signing
-  oracle. A constant-time pass is parked; trigger: first
-  server-side or signing consumer.
+  branches on secret material are written, not eliminated. mTLS made
+  this real: client-auth signing rides variable-time primitives
+  (unblinded `bignum.modexp` for RSA, `nistec` scalar multiplication
+  for ECDSA — Ed25519/ECDSA nonces are at least deterministic, RFC
+  6979/8032, so no RNG reuse failure exists). The exposure is one
+  signature per handshake on a long-term identity key — acceptable
+  for a client on a local socket boundary, but the constant-time
+  review trigger is now live: a constant-time pass over the signing
+  ops is the standing follow-on work, required before this surface
+  grows (server-side TLS or a signing oracle with repeated use).
 - **Non-goals with their reopen triggers** (each becomes a work
   item when its trigger fires):
   - TLS server (`tls.listen`/`accept`) — first serving consumer
@@ -279,8 +304,8 @@ actionable ("add the CA to `OXL_SSL_CERT_FILE`", "clock is wrong").
     plus a separate cryptographic review.
   - Session resumption / PSK — measured reconnect cost on a real
     workload.
-  - Client certs (mTLS) — first consumer needing mutual auth;
-    brings the signing surface back into scope.
+  - Constant-time signing ops — the mTLS review trigger fired;
+    needed before the signing surface grows again.
   - Revocation (OCSP/CRL) — first consumer needing revocation
     proof.
   - Bundled root list — first consumer on a platform image with

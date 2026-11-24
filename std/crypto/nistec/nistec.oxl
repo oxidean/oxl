@@ -17,6 +17,8 @@ package nistec
 // limitation, not a secrets-free surface.
 import "std/crypto/bignum"
 
+import "std/crypto/hmac"
+
 import "std/encoding/hex"
 
 import "std/errors"
@@ -352,4 +354,108 @@ fn ecdsa_verify(c: Curve, pk: []byte, hf: fn() -> hash.Hash, msg: []byte, r: []b
         return errors.new("nistec: signature mismatch")
     }
     return nil
+}
+
+// ---- ECDSA sign (client mTLS CertificateVerify) ------------------------------
+// RFC 6979 deterministic nonces — a random-k would need an OS draw
+// per signature AND a reuse bug there is a key compromise; the seeded
+// K/V chain keeps signing reproducible and RNG-free. Variable-time
+// like everything above — the file's documented posture covers it.
+
+// hmac_do is HMAC-hf(key, data) — the RFC 6979 K/V update primitive.
+fn hmac_do(hf: fn() -> hash.Hash, key: []byte, data: []byte) -> own []byte {
+    h := hmac.new(hf, key)
+    [wn, we] = h.write(data)
+    return h.sum(nil)
+}
+
+// bjoin concatenates byte strings — V || tag || x || h1 assembly.
+fn bjoin(a: []byte, b: []byte) -> own []byte {
+    out := mkslice(byte, len(a) + len(b))
+    i := 0
+    for i < len(a) {
+        out[i] = a[i]
+        i = i + 1
+    }
+    for i < len(b) {
+        out[len(a) + i] = b[i]
+        i = i + 1
+    }
+    return new(out)
+}
+
+/// Sig is one ECDSA signature — r and s as c.size-byte big-endian
+/// strings (the values the ECDSA-Sig-Value DER SEQUENCE carries).
+struct Sig { r: own []byte, s: own []byte }
+
+/// ecdsa_sign signs msg (hashed with hf) under private scalar sk —
+/// RFC 6979 deterministic k, then s = k^-1 (e + r*d) mod n. sk is the
+/// SEC1 privateKey OCTET STRING (c.size bytes); a scalar that reduces
+/// to zero is an error.
+fn ecdsa_sign(c: Curve, sk: []byte, hf: fn() -> hash.Hash, msg: []byte) -> [Sig, err] {
+    z := Sig{r: nil, s: nil}
+    d := scalar_of(c, sk)
+    if bignum.is_zero(d) {
+        return z, errors.new("nistec: zero private scalar")
+    }
+    h := hf()
+    [wn, we] = h.write(msg)
+    digest := h.sum(nil)
+    hlen := len(digest)
+    e := trunc_e(c, digest)
+    // RFC 6979 §3.2: x = int2octets(d), h1 = bits2octets(H(m))
+    xb := bignum.to_be_bytes(d, c.size)
+    h1 := bignum.to_be_bytes(e, c.size)
+    v := mkslice(byte, hlen)
+    i := 0
+    for i < hlen {
+        v[i] = 1
+        i = i + 1
+    }
+    kb := mkslice(byte, hlen)
+    zero := mkslice(byte, 1)
+    one := mkslice(byte, 1)
+    one[0] = 1
+    xh := bjoin(xb, h1)
+    kb = hmac_do(hf, kb, bjoin(bjoin(v, zero), xh))
+    v = hmac_do(hf, kb, v)
+    kb = hmac_do(hf, kb, bjoin(bjoin(v, one), xh))
+    v = hmac_do(hf, kb, v)
+    for true {
+        // T = V || HMAC_K(V) || ... until c.size bytes — both curves
+        // here have qlen == 8*c.size, so the first c.size bytes are
+        // exactly bits2int(T)
+        t := mkslice(byte, 0)
+        for len(t) < c.size {
+            v = hmac_do(hf, kb, v)
+            i = 0
+            for i < len(v) {
+                t = push(t, v[i])
+                i = i + 1
+            }
+        }
+        k := bignum.from_be_bytes(t[0:c.size])
+        if !bignum.is_zero(k) && bignum.cmp(k, c.n) < 0 {
+            [pt, pe] = to_affine(c, scalarmult(c, k, c.gx, c.gy))
+            if pe == nil {
+                r := bignum.mod(pt.x, c.n)
+                if !bignum.is_zero(r) {
+                    [kinv, ie] = bignum.modinv(k, c.n)
+                    if ie == nil {
+                        // s = k^-1 (e + r d) mod n
+                        s := bignum.modmul(kinv, bignum.mod(bignum.add(bignum.modmul(r, d, c.n), e), c.n), c.n)
+                        if !bignum.is_zero(s) {
+                            z.r = bignum.to_be_bytes(r, c.size)
+                            z.s = bignum.to_be_bytes(s, c.size)
+                            return z, nil
+                        }
+                    }
+                }
+            }
+        }
+        // unusable k: K = HMAC_K(V || 0x00); V = HMAC_K(V); retry
+        kb = hmac_do(hf, kb, bjoin(v, zero))
+        v = hmac_do(hf, kb, v)
+    }
+    return z, errors.new("nistec: unreachable")
 }

@@ -1,0 +1,449 @@
+package x509
+
+// std/crypto/x509 private-key loading — the client-mTLS PEM:
+// PKCS#8 PrivateKeyInfo ("PRIVATE KEY"), PKCS#1 RSAPrivateKey ("RSA
+// PRIVATE KEY") and SEC1 ECPrivateKey ("EC PRIVATE KEY"), all through
+// the same strict definite-length reader the cert parser uses.
+// Encrypted private keys are a clean "unsupported" error.
+import "std/crypto/bignum"
+
+import "std/crypto/ed25519"
+
+import "std/crypto/nistec"
+
+import "std/crypto/rsa"
+
+import "std/encoding/base64"
+
+import "std/errors"
+
+// key families — deliberately the SPKI_* numbering so a leaf's
+// spki_alg compares against key.alg directly.
+let PK_rsa = 1
+
+let PK_ec_p256 = 2
+
+let PK_ec_p384 = 3
+
+let PK_ed25519 = 4
+
+/// PrivKey is a parsed signing key. For RSA the bignum limbs ride rk
+/// (n/e/d — the CRT parameters are parsed over and dropped); for EC
+/// and Ed25519 the scalar/seed bytes ride sk.
+struct PrivKey { alg: int, sk: own []byte, rk: rsa.PrivKey }
+
+fn zkey() -> PrivKey {
+    return PrivKey{alg: 0, sk: nil, rk: rsa.PrivKey{n: nil, e: nil, d: nil}}
+}
+
+// dfield parses the TLV expected at pos, pins its tag, and returns it
+// — the private-key grammars are fixed-shape.
+fn dfield(der: []byte, pos: int, tag: int, what: str) -> [tlv, err] {
+    [t, e] = dnext(der, pos)
+    if e != nil {
+        return t, e
+    }
+    ne := need(t, tag, what)
+    if ne != nil {
+        return t, ne
+    }
+    return t, nil
+}
+
+// IntField is a parsed INTEGER: the positive-magnitude bytes plus the
+// position of the next field (multi-return is [T, err] only, so the
+// triple rides a struct).
+struct IntField { b: own []byte, next: int }
+
+// int_bytes reads the INTEGER expected at pos.
+fn int_bytes(der: []byte, pos: int, what: str) -> [IntField, err] {
+    z := IntField{b: nil, next: 0}
+    [t, e] = dfield(der, pos, 2, what)
+    if e != nil {
+        return z, e
+    }
+    w := int_win(der, t)
+    if !w.ok {
+        return z, errors.wrap("x509: bad " + what, err_der())
+    }
+    out := mkslice(byte, w.len)
+    i := 0
+    for i < w.len {
+        out[i] = der[w.off + i]
+        i = i + 1
+    }
+    z.b = new(out)
+    z.next = tlend(t)
+    return z, nil
+}
+
+// curve_alg maps a named-curve OID to its PK_* number — the only two
+// EC key types the TLS stack can sign with.
+fn curve_alg(oid: str) -> int {
+    if oid == "1.2.840.10045.3.1.7" {
+        return PK_ec_p256
+    }
+    if oid == "1.3.132.0.34" {
+        return PK_ec_p384
+    }
+    return 0
+}
+
+// ---- PKCS#1 RSAPrivateKey ---------------------------------------------------
+// SEQUENCE { version(0|1), n, e, d, p, q, dp, dq, qinv } — the CRT
+// tail is bounds-checked but dropped: rsa.PrivKey carries n/e/d only
+// (signing is one modexp, the CRT split buys nothing at one sign per
+// handshake).
+fn parse_rsa_pkcs1(der: []byte) -> [PrivKey, err] {
+    z := zkey()
+    [seq, e0] = dfield(der, 0, 48, "rsa private key SEQUENCE")
+    if e0 != nil {
+        return z, e0
+    }
+    if tlend(seq) != len(der) {
+        return z, errors.wrap("x509: trailing data after rsa private key", err_der())
+    }
+    [vt, e1] = dfield(der, seq.off, 2, "rsa key version")
+    if e1 != nil {
+        return z, e1
+    }
+    [ver, e2] = dint(der, vt)
+    if e2 != nil || ver != 0 && ver != 1 {
+        return z, errors.wrap("x509: rsa key version not 0/1", err_der())
+    }
+    pos := tlend(vt)
+    [nf, e3] = int_bytes(der, pos, "rsa modulus")
+    if e3 != nil {
+        return z, e3
+    }
+    [ef, e4] = int_bytes(der, nf.next, "rsa publicExponent")
+    if e4 != nil {
+        return z, e4
+    }
+    [df, e5] = int_bytes(der, ef.next, "rsa privateExponent")
+    if e5 != nil {
+        return z, e5
+    }
+    // the five CRT fields are bounds-checked, then dropped
+    pos = df.next
+    i := 0
+    for i < 5 {
+        [t, e6] = dfield(der, pos, 2, "rsa crt parameter")
+        if e6 != nil {
+            return z, e6
+        }
+        pos = tlend(t)
+        i = i + 1
+    }
+    // multi-prime (version 1) carries an otherPrimeInfos SEQUENCE —
+    // unsupported by the n/e/d model; refuse rather than half-load.
+    if pos != tlend(seq) {
+        return z, errors.wrap("x509: multi-prime rsa key unsupported", err_der())
+    }
+    z.alg = PK_rsa
+    z.rk = rsa.PrivKey{n: bignum.from_be_bytes(nf.b), e: bignum.from_be_bytes(ef.b), d: bignum.from_be_bytes(df.b)}
+    // the self-test subsumes the structural pins: n odd-sized, e odd
+    // > 1, d in (1, n), then one sign+verify round-trip proves d pairs
+    // with e — a garbled exponent must die here, not mid-handshake
+    se := rsa.priv_selftest(z.rk)
+    if se != nil {
+        return zkey(), errors.wrap("x509: " + errors.msg(se), err_der())
+    }
+    return z, nil
+}
+
+// ---- SEC1 ECPrivateKey ------------------------------------------------------
+// SEQUENCE { version(1), privateKey OCTET STRING,
+//            [0] ECParameters(namedCurve OID) OPT,
+//            [1] publicKey BIT STRING OPT }
+// curve comes from [0]'s OID when present, else the key length infers
+// it (32 = P-256, 48 = P-384) — RFC 5915 makes parameters optional.
+fn parse_sec1(der: []byte, fallback_alg: int) -> [PrivKey, err] {
+    z := zkey()
+    [seq, e0] = dfield(der, 0, 48, "ec private key SEQUENCE")
+    if e0 != nil {
+        return z, e0
+    }
+    if tlend(seq) != len(der) {
+        return z, errors.wrap("x509: trailing data after ec private key", err_der())
+    }
+    [vt, e1] = dfield(der, seq.off, 2, "ec key version")
+    if e1 != nil {
+        return z, e1
+    }
+    [ver, e2] = dint(der, vt)
+    if e2 != nil || ver != 1 {
+        return z, errors.wrap("x509: ec key version not 1", err_der())
+    }
+    [kt, e3] = dfield(der, tlend(vt), 4, "ec privateKey octet string")
+    if e3 != nil {
+        return z, e3
+    }
+    sk := mkslice(byte, kt.len)
+    i := 0
+    for i < kt.len {
+        sk[i] = der[kt.off + i]
+        i = i + 1
+    }
+    alg := fallback_alg
+    pos := tlend(kt)
+    for pos < tlend(seq) {
+        [t, e4] = dnext(der, pos)
+        if e4 != nil {
+            return z, e4
+        }
+        if t.tag == 160 {
+            // [0] wraps the namedCurve OID (or an explicit
+            // parameters block we can't read — alg stays inferred)
+            [ot, e5] = dnext(der, t.off)
+            if e5 == nil && ot.tag == 6 {
+                [os, e6] = oid_str(der, ot)
+                if e6 == nil {
+                    alg = curve_alg(os)
+                }
+            }
+        }
+        // [1] publicKey is informational — the match check derives
+        // the public half from the scalar anyway
+        pos = tlend(t)
+    }
+    if alg == 0 {
+        if len(sk) == 32 {
+            alg = PK_ec_p256
+        } else if len(sk) == 48 {
+            alg = PK_ec_p384
+        }
+    }
+    if alg == 0 {
+        return z, errors.wrap("x509: ec private key on unsupported curve", err_alg())
+    }
+    // a zero or out-of-range scalar must die at load — derive the
+    // public half now so a bad key can't reach a handshake
+    cv := nistec.p256()
+    if alg == PK_ec_p384 {
+        cv = nistec.p384()
+    }
+    [pp, pe] = nistec.pub_from_priv(cv, sk)
+    if pe != nil || len(pp) != 2 * cv.size + 1 {
+        return z, errors.wrap("x509: ec private scalar unusable", err_der())
+    }
+    z.alg = alg
+    z.sk = new(sk)
+    return z, nil
+}
+
+// ---- PKCS#8 PrivateKeyInfo ---------------------------------------------------
+// SEQUENCE { version(0|1), AlgorithmIdentifier, privateKey OCTET
+// STRING } — the inner bytes are a PKCS#1, SEC1, or CurvePrivateKey
+// OCTET STRING per the algorithm OID.
+let OID_rsa = "1.2.840.113549.1.1.1"
+
+let OID_ec = "1.2.840.10045.2.1"
+
+let OID_ed25519 = "1.3.101.112"
+
+/// parse_key_der decodes one PKCS#8 PrivateKeyInfo.
+fn parse_key_der(der: []byte) -> [PrivKey, err] {
+    z := zkey()
+    [seq, e0] = dfield(der, 0, 48, "private key info SEQUENCE")
+    if e0 != nil {
+        return z, e0
+    }
+    if tlend(seq) != len(der) {
+        return z, errors.wrap("x509: trailing data after private key info", err_der())
+    }
+    [vt, e1] = dfield(der, seq.off, 2, "private key version")
+    if e1 != nil {
+        return z, e1
+    }
+    [ver, e2] = dint(der, vt)
+    if e2 != nil || ver != 0 && ver != 1 {
+        return z, errors.wrap("x509: private key version not 0/1", err_der())
+    }
+    [aid, e3] = dfield(der, tlend(vt), 48, "algorithm identifier")
+    if e3 != nil {
+        return z, e3
+    }
+    [ot, e4] = dfield(der, aid.off, 6, "algorithm oid")
+    if e4 != nil {
+        return z, e4
+    }
+    [alg_oid, e5] = oid_str(der, ot)
+    if e5 != nil {
+        return z, e5
+    }
+    // the EC algorithm's parameters OID is the second aid field
+    aid_alg := 0
+    ppos := tlend(ot)
+    if ppos < tlend(aid) {
+        [pt, e6] = dnext(der, ppos)
+        if e6 == nil && pt.tag == 6 {
+            [ps, e7] = oid_str(der, pt)
+            if e7 == nil {
+                aid_alg = curve_alg(ps)
+            }
+        }
+    }
+    [kt, e8] = dfield(der, tlend(aid), 4, "privateKey octet string")
+    if e8 != nil {
+        return z, e8
+    }
+    inner := der[kt.off:kt.off + kt.len]
+    if alg_oid == OID_rsa {
+        return parse_rsa_pkcs1(inner)
+    }
+    if alg_oid == OID_ec {
+        return parse_sec1(inner, aid_alg)
+    }
+    if alg_oid == OID_ed25519 {
+        // CurvePrivateKey ::= OCTET STRING — one unwrap to the seed
+        [st, e9] = dnext(inner, 0)
+        if e9 != nil {
+            return z, e9
+        }
+        if st.tag != 4 || tlend(st) != len(inner) {
+            return z, errors.wrap("x509: ed25519 key is not a single octet string", err_der())
+        }
+        if st.len != 32 {
+            return z, errors.wrap("x509: ed25519 seed is not 32 bytes", err_der())
+        }
+        sk := mkslice(byte, 32)
+        i := 0
+        for i < 32 {
+            sk[i] = inner[st.off + i]
+            i = i + 1
+        }
+        z.alg = PK_ed25519
+        z.sk = new(sk)
+        return z, nil
+    }
+    return z, errors.wrap("x509: private key algorithm " + alg_oid, err_alg())
+}
+
+// ---- PEM + key/cert match ----------------------------------------------------
+
+// PemKey is the first private-key block found — its DER body window
+// plus the PEM label that selects the inner grammar. An ENCRYPTED
+// PRIVATE KEY is a clean "unsupported" error rather than a confusing
+// DER dump.
+struct PemKey { der: own []byte, label: str }
+
+fn pem_key(text: str) -> [PemKey, err] {
+    z := PemKey{der: nil, label: ""}
+    pos := 0
+    for pos < len(text) {
+        b := find(substr(text, pos, len(text)), "-----BEGIN ")
+        if b < 0 {
+            break
+        }
+        b = b + pos
+        rest := substr(text, b + 11, len(text))
+        he := find(rest, "-----")
+        if he < 0 {
+            return z, errors.wrap("x509: unterminated pem header", err_der())
+        }
+        label := substr(rest, 0, he)
+        body_start := b + 11 + he + 5
+        endmark := "-----END " + label + "-----"
+        ee := find(substr(text, body_start, len(text)), endmark)
+        if ee < 0 {
+            return z, errors.wrap("x509: unterminated pem block", err_der())
+        }
+        body := substr(text, body_start, body_start + ee)
+        pos = body_start + ee + len(endmark)
+        if label == "ENCRYPTED PRIVATE KEY" {
+            return z, errors.wrap("x509: encrypted private keys unsupported", err_der())
+        }
+        if label != "PRIVATE KEY" && label != "RSA PRIVATE KEY" && label != "EC PRIVATE KEY" {
+            continue
+        }
+        [raw, e1] = base64.decode(b64clean(body))
+        if e1 != nil {
+            return z, errors.wrap("x509: key pem base64: " + errors.msg(e1), err_der())
+        }
+        z.der = raw
+        z.label = label
+        return z, nil
+    }
+    return z, errors.wrap("x509: no private key block in pem", err_der())
+}
+
+/// parse_key_pem decodes the first private-key block in text —
+/// PKCS#8, PKCS#1, or SEC1 per its PEM label.
+fn parse_key_pem(text: str) -> [PrivKey, err] {
+    [pk, e] = pem_key(text)
+    if e != nil {
+        return zkey(), e
+    }
+    if pk.label == "RSA PRIVATE KEY" {
+        return parse_rsa_pkcs1(pk.der)
+    }
+    if pk.label == "EC PRIVATE KEY" {
+        return parse_sec1(pk.der, 0)
+    }
+    return parse_key_der(pk.der)
+}
+
+/// check_key_cert reports whether k is the private half of cert's
+/// SPKI — a keypair that doesn't pair is a config error, never a
+/// handshake-time surprise. nil = match.
+fn check_key_cert(k: PrivKey, c: Cert) -> err {
+    if k.alg != c.spki_alg {
+        return errors.new("x509: private key algorithm does not match certificate")
+    }
+    [spk, e1] = spki_key(c.spki)
+    if e1 != nil {
+        return e1
+    }
+    if k.alg == PK_rsa {
+        [pub, e2] = rsa.parse_pub_key(spk)
+        if e2 != nil {
+            return e2
+        }
+        if !bignum.equal(pub.n, k.rk.n) || !bignum.equal(pub.e, k.rk.e) {
+            return errors.new("x509: private key does not match certificate")
+        }
+        // the exponent pair matched — the sign/verify self-test at
+        // parse time already proved d consistent with (n, e)
+        return nil
+    }
+    if k.alg == PK_ec_p256 || k.alg == PK_ec_p384 {
+        cv := nistec.p256()
+        if k.alg == PK_ec_p384 {
+            cv = nistec.p384()
+        }
+        [pub, e3] = nistec.pub_from_priv(cv, k.sk)
+        if e3 != nil {
+            return errors.wrap("x509: ec private scalar unusable: " + errors.msg(e3), err_der())
+        }
+        if len(pub) != len(spk) {
+            return errors.new("x509: private key does not match certificate")
+        }
+        i := 0
+        for i < len(pub) {
+            if pub[i] != spk[i] {
+                return errors.new("x509: private key does not match certificate")
+            }
+            i = i + 1
+        }
+        return nil
+    }
+    if k.alg == PK_ed25519 {
+        [pub, e4] = ed25519.pub_from_seed(k.sk)
+        if e4 != nil {
+            return e4
+        }
+        if len(pub) != len(spk) {
+            return errors.new("x509: private key does not match certificate")
+        }
+        i := 0
+        for i < len(pub) {
+            if pub[i] != spk[i] {
+                return errors.new("x509: private key does not match certificate")
+            }
+            i = i + 1
+        }
+        return nil
+    }
+    return errors.wrap("x509: unknown private key algorithm", err_alg())
+}

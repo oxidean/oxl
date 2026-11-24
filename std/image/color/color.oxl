@@ -1,0 +1,121 @@
+package color
+
+// std/image/color — Go's image/color: the Color contract plus the
+// concrete colors every image trades in. rgba() is the universal
+// read-back — 16 bits per channel, alpha premultiplied (Go's
+// color.Color.RGBA shape, values 0..65535). The 16-bit range keeps
+// compositing math exact: an 8-bit v becomes v*0x101, so a >>8 read
+// lands back on the original byte.
+//
+// oxl has no bare multi-return, so rgba() hands back an RGBA64
+// struct where Go would return four uint32s — same convention,
+// different carrier.
+
+/// RGBA64 is the 16-bit premultiplied exchange color — Go's
+/// color.RGBA64 and the type every Color.rgba() returns.
+struct RGBA64 { r: int, g: int, b: int, a: int }
+
+/// RGBA is an 8-bit premultiplied color — Go's color.RGBA. An alpha
+/// of 255 is opaque; r/g/b can never exceed a.
+struct RGBA { r: int, g: int, b: int, a: int }
+
+/// NRGBA is an 8-bit non-premultiplied color — Go's color.NRGBA.
+/// r/g/b are independent of a.
+struct NRGBA { r: int, g: int, b: int, a: int }
+
+/// Gray is an 8-bit grayscale color — Go's color.Gray; always opaque
+/// in rgba() space.
+struct Gray { y: int }
+
+/// Color is anything reducible to 16-bit premultiplied channels —
+/// Go's color.Color.
+interface Color { rgba() -> RGBA64 }
+
+fn (c RGBA64) rgba() -> RGBA64 {
+    return c
+}
+
+/// rgba premultiplies nothing — RGBA already stores premultiplied
+/// channels; 8→16 is the *0x101 doubling Go uses so >>8 round-trips.
+fn (c RGBA) rgba() -> RGBA64 {
+    return RGBA64{r: c.r * 257, g: c.g * 257, b: c.b * 257, a: c.a * 257}
+}
+
+/// rgba premultiplies: 8-bit channels widen to 16 then scale by
+/// alpha/255 — Go's color.NRGBA.RGBA ordering, which keeps
+/// r16 = (r*0x101 * a) / 0xff exact at a == 0xff.
+fn (c NRGBA) rgba() -> RGBA64 {
+    r := c.r * 257 * c.a / 255
+    g := c.g * 257 * c.a / 255
+    b := c.b * 257 * c.a / 255
+    return RGBA64{r: r, g: g, b: b, a: c.a * 257}
+}
+
+fn (c Gray) rgba() -> RGBA64 {
+    y := c.y * 257
+    return RGBA64{r: y, g: y, b: y, a: 65535}
+}
+
+/// ascolor boxes this color as the Color interface — the bufio
+/// asreader() shape; call it to feed concrete colors into Image.set
+/// and friends.
+fn (c RGBA64) ascolor() -> Color {
+    return c
+}
+
+fn (c RGBA) ascolor() -> Color {
+    return c
+}
+
+fn (c NRGBA) ascolor() -> Color {
+    return c
+}
+
+fn (c Gray) ascolor() -> Color {
+    return c
+}
+
+/// to_rgba64 unpacks any bound Color — the `c := x; c.rgba()` pair
+/// spelled once (a method can't run on an iface-typed temporary, so
+/// callers bind first; this helper collapses the pattern).
+fn to_rgba64(c: Color) -> RGBA64 {
+    return c.rgba()
+}
+
+/// to_rgba64_lossy collapses 16-bit premultiplied channels to an
+/// opaque-free 8-bit NRGBA — the unpremultiply path image.NRGBA.set
+/// and the encoders share: a==0 flushes to transparent black, full
+/// alpha is a >>8, anything between rescales then >>8 (Go's
+/// nrgbaModel math).
+fn unpremul16(c: RGBA64) -> NRGBA {
+    if c.a == 0 {
+        return NRGBA{r: 0, g: 0, b: 0, a: 0}
+    }
+    if c.a == 65535 {
+        return NRGBA{r: c.r / 256, g: c.g / 256, b: c.b / 256, a: 255}
+    }
+    r := c.r * 65535 / c.a / 256
+    g := c.g * 65535 / c.a / 256
+    b := c.b * 65535 / c.a / 256
+    if r > 255 {
+        r = 255
+    }
+    if g > 255 {
+        g = 255
+    }
+    if b > 255 {
+        b = 255
+    }
+    return NRGBA{r: r, g: g, b: b, a: c.a / 256}
+}
+
+/// gray16 reduces 16-bit premultiplied channels to one luminance —
+/// the Rec.601 weights Go's grayModel uses ((19595r + 38470g +
+/// 7471b + 1<<15) >> 24 lands on an 8-bit y).
+fn gray16(c: RGBA64) -> int {
+    y := (19595 * c.r + 38470 * c.g + 7471 * c.b + 32768) / 16777216
+    if y > 255 {
+        y = 255
+    }
+    return y
+}

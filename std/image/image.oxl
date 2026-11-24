@@ -1,0 +1,382 @@
+package image
+
+// std/image — Go's image: geometry (Point/Rect), the Image/WImage
+// surface, and the in-RAM pixel buffers (RGBA, NRGBA, Gray) every
+// codec and draw op shares.
+//
+// The package also hosts the PNG and BMP codecs (png.oxl, bmp.oxl)
+// and a magic-byte decode(r) dispatch: oxl bans import cycles, so
+// image can't reach down into std/image/png for the format switch,
+// and there is no init-time package registration for a Go-style
+// RegisterFormat — the codecs live here and std/image/{png,bmp}
+// re-export spelled png.decode/bmp.encode surfaces over them. GIF
+// and JPEG are deliberately out of scope.
+//
+// Storage shape is Go's: a pix []byte of packed channels, a stride
+// in bytes between rows, and a Rect. at() reads through the Color
+// interface in 16-bit premultiplied space; set() converts back per
+// the buffer's model (RGBA keeps premultiplied bytes, NRGBA
+// unpremultiplies, Gray reduces to luminance).
+import "std/io"
+
+import "std/errors"
+
+import "std/image/color"
+
+let image_max_dim: int = 32768
+
+let image_max_pixels: int = 16777216
+
+let image_max_encoded: int = 75497472
+
+fn image_dims_ok(w: int, h: int) -> bool {
+    if w < 0 || h < 0 || w > image_max_dim || h > image_max_dim {
+        return false
+    }
+    if h == 0 {
+        return true
+    }
+    return w <= image_max_pixels / h
+}
+
+fn image_readall(r: io.Reader) -> [str, err] {
+    [data, e] = io.readall(io.limitreader(r, image_max_encoded + 1))
+    if e != nil {
+        return "", e
+    }
+    if len(data) > image_max_encoded {
+        return "", errors.new("image: encoded input exceeds size limit")
+    }
+    return data, nil
+}
+
+/// Point is a pixel coordinate — Go's image.Point.
+struct Point { x: int, y: int }
+
+/// Rect is the half-open bounds [min, max) — Go's image.Rectangle.
+struct Rect { min: Point, max: Point }
+
+/// pt builds a Point.
+fn pt(x: int, y: int) -> Point {
+    return Point{x: x, y: y}
+}
+
+/// rect builds a Rect — image.Rect(x0, y0, x1, y1).
+fn rect(x0: int, y0: int, x1: int, y1: int) -> Rect {
+    xlo := x0
+    xhi := x1
+    if x0 > x1 {
+        xlo = x1
+        xhi = x0
+    }
+    ylo := y0
+    yhi := y1
+    if y0 > y1 {
+        ylo = y1
+        yhi = y0
+    }
+    return Rect{min: Point{x: xlo, y: ylo}, max: Point{x: xhi, y: yhi}}
+}
+
+/// add is p + q — image.Point.Add.
+fn (p Point) add(q: Point) -> Point {
+    return Point{x: p.x + q.x, y: p.y + q.y}
+}
+
+/// sub is p - q — image.Point.Sub.
+fn (p Point) sub(q: Point) -> Point {
+    return Point{x: p.x - q.x, y: p.y - q.y}
+}
+
+/// in reports whether p lies inside r — image.Point.In.
+fn (p Point) in(r: Rect) -> bool {
+    return p.x >= r.min.x && p.x < r.max.x && p.y >= r.min.y && p.y < r.max.y
+}
+
+/// dx is the rect's width — image.Rectangle.Dx.
+fn (r Rect) dx() -> int {
+    return r.max.x - r.min.x
+}
+
+/// dy is the rect's height — image.Rectangle.Dy.
+fn (r Rect) dy() -> int {
+    return r.max.y - r.min.y
+}
+
+/// empty reports whether the rect covers no pixels —
+/// image.Rectangle.Empty.
+fn (r Rect) empty() -> bool {
+    return r.min.x >= r.max.x || r.min.y >= r.max.y
+}
+
+/// intersect clips r to the overlap with s — image.Rectangle.Intersect.
+fn (r Rect) intersect(s: Rect) -> Rect {
+    out := r
+    if out.min.x < s.min.x {
+        out.min.x = s.min.x
+    }
+    if out.min.y < s.min.y {
+        out.min.y = s.min.y
+    }
+    if out.max.x > s.max.x {
+        out.max.x = s.max.x
+    }
+    if out.max.y > s.max.y {
+        out.max.y = s.max.y
+    }
+    if out.empty() {
+        return rect(0, 0, 0, 0)
+    }
+    return out
+}
+
+// inrect is Point.in as a free fn — oxl can't run a method on a
+// temporary, and the bounds checks below don't want the ceremony.
+fn inrect(r: Rect, x: int, y: int) -> bool {
+    return x >= r.min.x && x < r.max.x && y >= r.min.y && y < r.max.y
+}
+
+/// Image is a read-only pixel source — Go's image.Image. at() hands
+/// back a color.Color; concrete buffers also answer their native
+/// color (atrgba/atnrgba/atgray) for callers that know the model.
+interface Image { bounds() -> Rect, at(x: int, y: int) -> color.Color }
+
+/// WImage is an Image that also takes writes — Go's draw.Image.
+interface WImage {
+    bounds() -> Rect,
+    at(x: int, y: int) -> color.Color,
+    set(x: int, y: int, c: color.Color),
+}
+
+/// RGBA is an in-RAM image of premultiplied 8-bit RGBA — Go's
+/// image.RGBA. pix holds 4 bytes per pixel, stride bytes per row.
+struct RGBA { pix: []byte, stride: int, r: Rect }
+
+/// NRGBA is an in-RAM image of non-premultiplied 8-bit RGBA — Go's
+/// image.NRGBA.
+struct NRGBA { pix: []byte, stride: int, r: Rect }
+
+/// Gray is an in-RAM 8-bit grayscale image — Go's image.Gray.
+struct Gray { pix: []byte, stride: int, r: Rect }
+
+/// new_rgba allocates a zeroed RGBA covering r — image.NewRGBA.
+fn new_rgba(r: Rect) -> RGBA {
+    w := r.dx()
+    h := r.dy()
+    if !image_dims_ok(w, h) {
+        return RGBA{pix: mkslice(byte, 0), stride: 0, r: rect(0, 0, 0, 0)}
+    }
+    return RGBA{pix: mkslice(byte, 4 * w * h), stride: 4 * w, r: r}
+}
+
+/// new_nrgba allocates a zeroed NRGBA covering r — image.NewNRGBA.
+fn new_nrgba(r: Rect) -> NRGBA {
+    w := r.dx()
+    h := r.dy()
+    if !image_dims_ok(w, h) {
+        return NRGBA{pix: mkslice(byte, 0), stride: 0, r: rect(0, 0, 0, 0)}
+    }
+    return NRGBA{pix: mkslice(byte, 4 * w * h), stride: 4 * w, r: r}
+}
+
+/// new_gray allocates a zeroed Gray covering r — image.NewGray.
+fn new_gray(r: Rect) -> Gray {
+    w := r.dx()
+    h := r.dy()
+    if !image_dims_ok(w, h) {
+        return Gray{pix: mkslice(byte, 0), stride: 0, r: rect(0, 0, 0, 0)}
+    }
+    return Gray{pix: mkslice(byte, w * h), stride: w, r: r}
+}
+
+// poffset is the byte index of (x, y) inside a 4-channel buffer —
+// bounds-unchecked; callers gate on Point.in first.
+fn (m RGBA) poffset(x: int, y: int) -> int {
+    return (y - m.r.min.y) * m.stride + (x - m.r.min.x) * 4
+}
+
+fn (m NRGBA) poffset(x: int, y: int) -> int {
+    return (y - m.r.min.y) * m.stride + (x - m.r.min.x) * 4
+}
+
+fn (m Gray) poffset(x: int, y: int) -> int {
+    return (y - m.r.min.y) * m.stride + (x - m.r.min.x)
+}
+
+fn (m RGBA) bounds() -> Rect {
+    return m.r
+}
+
+fn (m NRGBA) bounds() -> Rect {
+    return m.r
+}
+
+fn (m Gray) bounds() -> Rect {
+    return m.r
+}
+
+/// atrgba reads the stored color — image.RGBA.RGBAAt; the zero color
+/// out of bounds.
+fn (m RGBA) atrgba(x: int, y: int) -> color.RGBA {
+    if !inrect(m.r, x, y) {
+        return color.RGBA{r: 0, g: 0, b: 0, a: 0}
+    }
+    i := m.poffset(x, y)
+    return color.RGBA{r: m.pix[i], g: m.pix[i + 1], b: m.pix[i + 2], a: m.pix[i + 3]}
+}
+
+/// atnrgba reads the stored color — image.NRGBA.NRGBAAt.
+fn (m NRGBA) atnrgba(x: int, y: int) -> color.NRGBA {
+    if !inrect(m.r, x, y) {
+        return color.NRGBA{r: 0, g: 0, b: 0, a: 0}
+    }
+    i := m.poffset(x, y)
+    return color.NRGBA{r: m.pix[i], g: m.pix[i + 1], b: m.pix[i + 2], a: m.pix[i + 3]}
+}
+
+/// atgray reads the stored color — image.Gray.GrayAt.
+fn (m Gray) atgray(x: int, y: int) -> color.Gray {
+    if !inrect(m.r, x, y) {
+        return color.Gray{y: 0}
+    }
+    return color.Gray{y: m.pix[m.poffset(x, y)]}
+}
+
+fn (m RGBA) at(x: int, y: int) -> color.Color {
+    c := m.atrgba(x, y)
+    return c.ascolor()
+}
+
+fn (m NRGBA) at(x: int, y: int) -> color.Color {
+    c := m.atnrgba(x, y)
+    return c.ascolor()
+}
+
+fn (m Gray) at(x: int, y: int) -> color.Color {
+    c := m.atgray(x, y)
+    return c.ascolor()
+}
+
+/// setrgba writes a native RGBA — image.RGBA.SetRGBA; a no-op out of
+/// bounds.
+fn (m mut RGBA) setrgba(x: int, y: int, c: color.RGBA) {
+    if !inrect(m.r, x, y) {
+        return
+    }
+    i := m.poffset(x, y)
+    m.pix[i] = c.r
+    m.pix[i + 1] = c.g
+    m.pix[i + 2] = c.b
+    m.pix[i + 3] = c.a
+}
+
+/// set writes any Color — image.RGBA.Set: the 16-bit premultiplied
+/// rgba() >>8 lands back in the premultiplied buffer.
+fn (m mut RGBA) set(x: int, y: int, c: color.Color) {
+    if !inrect(m.r, x, y) {
+        return
+    }
+    q := c.rgba()
+    i := m.poffset(x, y)
+    m.pix[i] = q.r / 256
+    m.pix[i + 1] = q.g / 256
+    m.pix[i + 2] = q.b / 256
+    m.pix[i + 3] = q.a / 256
+}
+
+/// setnrgba writes a native NRGBA — image.NRGBA.SetNRGBA.
+fn (m mut NRGBA) setnrgba(x: int, y: int, c: color.NRGBA) {
+    if !inrect(m.r, x, y) {
+        return
+    }
+    i := m.poffset(x, y)
+    m.pix[i] = c.r
+    m.pix[i + 1] = c.g
+    m.pix[i + 2] = c.b
+    m.pix[i + 3] = c.a
+}
+
+/// set writes any Color — image.NRGBA.Set: the premultiplied rgba()
+/// unpremultiplies back to 8-bit (a==0 flushes to transparent black).
+fn (m mut NRGBA) set(x: int, y: int, c: color.Color) {
+    if !inrect(m.r, x, y) {
+        return
+    }
+    n := color.unpremul16(c.rgba())
+    i := m.poffset(x, y)
+    m.pix[i] = n.r
+    m.pix[i + 1] = n.g
+    m.pix[i + 2] = n.b
+    m.pix[i + 3] = n.a
+}
+
+/// setgray writes a native Gray — image.Gray.SetGray.
+fn (m mut Gray) setgray(x: int, y: int, c: color.Gray) {
+    if !inrect(m.r, x, y) {
+        return
+    }
+    m.pix[m.poffset(x, y)] = c.y
+}
+
+/// set writes any Color — image.Gray.Set: rgba() reduces to the
+/// Rec.601 luminance.
+fn (m mut Gray) set(x: int, y: int, c: color.Color) {
+    if !inrect(m.r, x, y) {
+        return
+    }
+    m.pix[m.poffset(x, y)] = color.gray16(c.rgba())
+}
+
+/// asimage boxes a borrow of this buffer as the Image interface —
+/// the bufio asreader() shape: ops through it share the pix backing,
+/// so the plain struct stays the handle.
+fn (m mut RGBA) asimage() -> Image {
+    return m
+}
+
+fn (m mut NRGBA) asimage() -> Image {
+    return m
+}
+
+fn (m mut Gray) asimage() -> Image {
+    return m
+}
+
+/// aswimage boxes a borrow as the writable WImage interface.
+fn (m mut RGBA) aswimage() -> WImage {
+    return m
+}
+
+fn (m mut NRGBA) aswimage() -> WImage {
+    return m
+}
+
+fn (m mut Gray) aswimage() -> WImage {
+    return m
+}
+
+/// decode reads the whole stream, sniffs the magic bytes, and
+/// decodes — PNG (\x89PNG\r\n\x1a\n) and BMP (BM). Anything else is
+/// "image: unknown format"; GIF and JPEG are out of scope by design.
+fn decode(r: io.Reader) -> [Image, err] {
+    [data, e] = image_readall(r)
+    if e != nil {
+        return nil, e
+    }
+    return decodebytes(data as []byte)
+}
+
+/// decodebytes decodes an image held in memory — the in-RAM twin of
+/// decode(r).
+fn decodebytes(b: []byte) -> [Image, err] {
+    if len(b) > image_max_encoded {
+        return nil, errors.new("image: encoded input exceeds size limit")
+    }
+    if len(b) >= 8 && b[0] == 137 && b[1] == 80 && b[2] == 78 && b[3] == 71 {
+        return png_decodebytes(b)
+    }
+    if len(b) >= 2 && b[0] == 66 && b[1] == 77 {
+        return bmp_decodebytes(b)
+    }
+    return nil, errors.new("image: unknown format")
+}

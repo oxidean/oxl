@@ -1,0 +1,33 @@
+package bmp
+
+// std/image/bmp — the spelled BMP surface over package image's
+// codec, for the same reason std/image/png is a thin surface: the
+// implementation lives in package image so image.decode can
+// dispatch to it without an import cycle. Coverage: uncompressed
+// BI_RGB BMP at 24/32 bits, BITMAPINFOHEADER-and-later DIB headers,
+// bottom-up or top-down rows; OS/2 headers, bitfields, compression,
+// and palettes are rejected. Encode always emits 24-bit bottom-up
+// BI_RGB (alpha is dropped — use PNG for alpha).
+import "std/io"
+
+import "std/image"
+
+/// decode reads a BMP stream — image/bmp.Decode equivalent.
+fn decode(r: io.Reader) -> [image.Image, err] {
+    return image.bmp_decode(r)
+}
+
+/// decodebytes decodes a BMP held in memory.
+fn decodebytes(b: []byte) -> [image.Image, err] {
+    return image.bmp_decodebytes(b)
+}
+
+/// encode writes m to w as a 24-bit BMP.
+fn encode(w: io.Writer, m: image.Image) -> err {
+    return image.bmp_encode(w, m)
+}
+
+/// encodebytes renders m to an in-RAM BMP.
+fn encodebytes(m: image.Image) -> [own []byte, err] {
+    return image.bmp_encodebytes(m)
+}

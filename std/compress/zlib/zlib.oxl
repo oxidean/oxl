@@ -142,6 +142,10 @@ fn (z mut Reader) asreader() -> io.Reader {
     return z
 }
 
+fn (z Reader) unread() -> int {
+    return z.fl.unread()
+}
+
 // slicereader is the minimal io.Reader over a []byte — the
 // decompress() source.
 struct slicereader { b: []byte, i: int }

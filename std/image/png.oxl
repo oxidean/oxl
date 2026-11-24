@@ -1,0 +1,660 @@
+package image
+
+// std/image png — the PNG half of package image's codec surface
+// (see image.oxl for why the formats live here rather than in
+// std/image/png). Decode covers the non-interlaced 8-bit space plus
+// sub-byte gray and palette rows: color types 0/2/3/4/6 at depth 8,
+// depths 1/2/4 on the single-channel types, PLTE + tRNS alpha.
+// 16-bit depths, interlaced (Adam7) scans, and ancillary chunks are
+// rejected or skipped — enough for the format's common shape, not a
+// full libpng port. Encode always writes color type 6 depth 8
+// through a stored-deflate zlib stream: valid PNG every decoder
+// reads, at the cost of no compression — a real deflater waits on
+// std/compress growing an encode side.
+import "std/io"
+
+import "std/errors"
+
+import "std/compress/zlib"
+
+import "std/hash"
+
+import "std/encoding/binary"
+
+import "std/image/color"
+
+let png_errsig: str = "png: bad signature"
+
+struct png_input { b: []byte, pos: []int }
+
+fn (r mut png_input) read(dst: []byte) -> [int, err] {
+    pos := r.pos[0]
+    if pos >= len(r.b) {
+        return 0, io.eof()
+    }
+    n := len(r.b) - pos
+    if n > len(dst) {
+        n = len(dst)
+    }
+    i := 0
+    for i < n {
+        dst[i] = r.b[pos + i]
+        i = i + 1
+    }
+    r.pos[0] = r.pos[0] + n
+    return n, nil
+}
+
+fn (r mut png_input) asreader() -> io.Reader {
+    return r
+}
+
+// pchan maps PNG color type to its samples per pixel — 0 for an
+// illegal type.
+fn pchan(ctype: int) -> int {
+    if ctype == 0 || ctype == 3 {
+        return 1
+    }
+    if ctype == 2 {
+        return 3
+    }
+    if ctype == 4 {
+        return 2
+    }
+    if ctype == 6 {
+        return 4
+    }
+    return 0
+}
+
+// pdepth_ok gates the depth×color-type matrix this decoder accepts:
+// 8-bit on all five types, sub-byte on the single-channel types
+// (0 gray, 3 palette — their samples pack MSB-first). 16-bit is out
+// of scope (no 16-bit image structs); ct2's 1/2/4 and ct4/ct6's
+// sub-8 don't exist in the spec anyway.
+fn pdepth_ok(ctype: int, depth: int) -> bool {
+    if ctype == 0 {
+        return depth == 8 || depth == 4 || depth == 2 || depth == 1
+    }
+    if ctype == 3 {
+        return depth == 8 || depth == 4 || depth == 2 || depth == 1
+    }
+    return depth == 8
+}
+
+/// pw2 is 2**k — oxl has no shift operator, and the packed-sample
+// math below wants exact powers.
+fn pw2(k: int) -> int {
+    r := 1
+    i := 0
+    for i < k {
+        r = r * 2
+        i = i + 1
+    }
+    return r
+}
+
+// paeth is the PNG Paeth predictor — nearest of {left, up,
+/// up-left} to the linear estimate.
+fn paeth(a: int, b: int, c: int) -> int {
+    p := a + b - c
+    pa := p - a
+    if pa < 0 {
+        pa = -pa
+    }
+    pb := p - b
+    if pb < 0 {
+        pb = -pb
+    }
+    pc := p - c
+    if pc < 0 {
+        pc = -pc
+    }
+    if pa <= pb && pa <= pc {
+        return a
+    }
+    if pb <= pc {
+        return b
+    }
+    return c
+}
+
+// unfilter reverses PNG's per-row filter (None/Sub/Up/Average/Paeth)
+// over src into out — h rows of rowbytes each, bpp the filter unit
+// (bytes per complete pixel, 1 for packed sub-byte depths). out's
+// row 0 treats the previous row as all-zero per spec.
+fn unfilter(src: []byte, out: []byte, w: int, h: int, rowbytes: int, bpp: int) -> err {
+    pos := 0
+    y := 0
+    for y < h {
+        if pos + 1 + rowbytes > len(src) {
+            return errors.new("png: truncated image data")
+        }
+        ft := src[pos]
+        pos = pos + 1
+        row := y * rowbytes
+        prev := row - rowbytes
+        x := 0
+        for x < rowbytes {
+            v := src[pos + x]
+            a := 0
+            if x >= bpp {
+                a = out[row + x - bpp]
+            }
+            b := 0
+            c := 0
+            if y > 0 {
+                b = out[prev + x]
+                if x >= bpp {
+                    c = out[prev + x - bpp]
+                }
+            }
+            if ft == 0 {
+                out[row + x] = v
+            } else if ft == 1 {
+                out[row + x] = v + a & 255
+            } else if ft == 2 {
+                out[row + x] = v + b & 255
+            } else if ft == 3 {
+                out[row + x] = v + (a + b) / 2 & 255
+            } else if ft == 4 {
+                out[row + x] = v + paeth(a, b, c) & 255
+            } else {
+                return errors.new("png: bad filter type")
+            }
+            x = x + 1
+        }
+        pos = pos + rowbytes
+        y = y + 1
+    }
+    return nil
+}
+
+// praw pulls sample i from a row — for packed sub-byte depths the
+// samples run MSB-first inside each byte. Returns the raw sample
+// value 0..(2^depth - 1) at depth 8 too, so tRNS comparisons and
+// palette indices see stored precision.
+fn praw(row: []byte, i: int, depth: int) -> int {
+    if depth == 8 {
+        return row[i]
+    }
+    per := 8 / depth
+    sh := 8 - depth - i % per * depth
+    return row[i / per] / pw2(sh) & pw2(depth) - 1
+}
+
+// pgray is praw plus the gray expansion to 0..255 — Go's
+// v * 0xff / (2^depth - 1).
+fn pgray(row: []byte, i: int, depth: int) -> int {
+    v := praw(row, i, depth)
+    if depth == 1 {
+        return v * 255
+    }
+    if depth == 2 {
+        return v * 85
+    }
+    if depth == 4 {
+        return v * 17
+    }
+    return v
+}
+
+fn ptrans(v: int, depth: int) -> int {
+    if depth == 16 {
+        return v
+    }
+    mask := 1
+    i := 0
+    for i < depth {
+        mask = mask * 2
+        i = i + 1
+    }
+    return v % mask
+}
+
+// pdraw decodes the unfiltered pixels into pix — the destination
+// buffer's packed bytes (dbpp bytes per pixel, stride w*dbpp), so
+// the one routine serves both the Gray and NRGBA models. Modes:
+// 0 gray+tRNS→nrgba, 1 gray→gray, 2 truecolor→nrgba, 3 palette→nrgba,
+// 4 gray-alpha→nrgba, 6 rgba→nrgba.
+fn pdraw(pix: []byte, dbpp: int, mode: int, raw: []byte, w: int, h: int, ch: int, depth: int, plte: []byte, trns: []byte) {
+    rb := (w * ch * depth + 7) / 8
+    y := 0
+    for y < h {
+        row := y * rb
+        x := 0
+        for x < w {
+            i := row + x * ch
+            o := (y * w + x) * dbpp
+            r := 0
+            g := 0
+            b := 0
+            a := 255
+            if mode == 0 {
+                // gray — tRNS compares at the stored depth's
+                // precision (its 16-bit field carries the raw
+                // sample value)
+                v := pgray(raw[row:], x, depth)
+                if len(trns) >= 2 && praw(raw[row:], x, depth) == ptrans(binary.be_u16(trns, 0), depth) {
+                    a = 0
+                }
+                r = v
+                g = v
+                b = v
+            } else if mode == 1 {
+                pix[o] = pgray(raw[row:], x, depth)
+                x = x + 1
+                continue
+            } else if mode == 2 {
+                // truecolor — tRNS picks one transparent RGB triple
+                if len(trns) >= 6 && raw[i] == ptrans(binary.be_u16(trns, 0), depth) && raw[i + 1] == ptrans(binary.be_u16(trns, 2), depth) && raw[i + 2] == ptrans(binary.be_u16(trns, 4), depth) {
+                    a = 0
+                }
+                r = raw[i]
+                g = raw[i + 1]
+                b = raw[i + 2]
+            } else if mode == 3 {
+                // palette — tRNS carries per-index alpha; an
+                // out-of-range index reads as transparent black
+                idx := praw(raw[row:], x, depth)
+                if idx < len(trns) {
+                    a = trns[idx]
+                }
+                if idx * 3 + 2 < len(plte) {
+                    r = plte[idx * 3]
+                    g = plte[idx * 3 + 1]
+                    b = plte[idx * 3 + 2]
+                } else {
+                    a = 0
+                }
+            } else if mode == 4 {
+                r = raw[i]
+                g = raw[i]
+                b = raw[i]
+                a = raw[i + 1]
+            } else {
+                r = raw[i]
+                g = raw[i + 1]
+                b = raw[i + 2]
+                a = raw[i + 3]
+            }
+            pix[o] = r
+            pix[o + 1] = g
+            pix[o + 2] = b
+            pix[o + 3] = a
+            x = x + 1
+        }
+        y = y + 1
+    }
+}
+
+// png_run does the chunk walk + pixel decode behind both decode
+// entries — the out param takes whichever image the color type
+// asked for, boxed by the caller.
+fn png_run(b: []byte) -> [Image, err] {
+    if len(b) < 8 {
+        return nil, errors.new(png_errsig)
+    }
+    if b[0] != 137 || b[1] != 80 || b[2] != 78 || b[3] != 71 || b[4] != 13 || b[5] != 10 || b[6] != 26 || b[7] != 10 {
+        return nil, errors.new(png_errsig)
+    }
+    off := 8
+    w := 0
+    h := 0
+    depth := 0
+    ctype := -1
+    interlace := 0
+    plte := mkslice(byte, 0)
+    trns := mkslice(byte, 0)
+    idat := mkslice(byte, 0)
+    seen_ihdr := 0
+    seen_idat := 0
+    seen_plte := 0
+    seen_trns := 0
+    seen_iend := 0
+    idat_done := 0
+    for off + 8 <= len(b) {
+        n := binary.be_u32(b, off)
+        if n < 0 || off + 12 + n > len(b) {
+            return nil, errors.new("png: truncated chunk")
+        }
+        data := b[off + 8:off + 8 + n]
+        want := binary.be_u32(b, off + 8 + n)
+        got := hash.crc32(b[off + 4:off + 8 + n])
+        if got != want {
+            return nil, errors.new("png: bad chunk crc")
+        }
+        typ := b[off + 4:off + 8] as str
+        j := 0
+        for j < 4 {
+            c := b[off + 4 + j]
+            if !(c >= 65 && c <= 90) && !(c >= 97 && c <= 122) {
+                return nil, errors.new("png: invalid chunk type")
+            }
+            j = j + 1
+        }
+        if b[off + 6] < 65 || b[off + 6] > 90 {
+            return nil, errors.new("png: invalid chunk type")
+        }
+        if seen_ihdr == 0 && (typ != "IHDR" || off != 8) {
+            return nil, errors.new("png: IHDR must be first")
+        }
+        if seen_idat == 1 && typ != "IDAT" {
+            idat_done = 1
+        }
+        if typ == "IHDR" {
+            if off != 8 || seen_ihdr == 1 || n != 13 {
+                return nil, errors.new("png: bad IHDR")
+            }
+            seen_ihdr = 1
+            w = binary.be_u32(data, 0)
+            h = binary.be_u32(data, 4)
+            depth = data[8]
+            ctype = data[9]
+            if data[10] != 0 || data[11] != 0 {
+                return nil, errors.new("png: unsupported compression/filter method")
+            }
+            interlace = data[12]
+            if w <= 0 || h <= 0 {
+                return nil, errors.new("png: bad dimensions")
+            }
+        } else if typ == "PLTE" {
+            if seen_plte == 1 || seen_trns == 1 || seen_idat == 1 || n < 3 || n % 3 != 0 || n / 3 > 256 {
+                return nil, errors.new("png: bad PLTE")
+            }
+            if ctype == 0 || ctype == 4 {
+                return nil, errors.new("png: PLTE not allowed for color type")
+            }
+            if ctype == 3 && n / 3 > pw2(depth) {
+                return nil, errors.new("png: too many palette entries")
+            }
+            seen_plte = 1
+            j := 0
+            for j < n {
+                plte = push(plte, data[j])
+                j = j + 1
+            }
+        } else if typ == "tRNS" {
+            if seen_trns == 1 || seen_idat == 1 {
+                return nil, errors.new("png: bad tRNS order")
+            }
+            if ctype == 0 && n != 2 || ctype == 2 && n != 6 {
+                return nil, errors.new("png: bad tRNS length")
+            }
+            if ctype == 3 && (seen_plte == 0 || n == 0 || n > len(plte) / 3) {
+                return nil, errors.new("png: bad tRNS length")
+            }
+            if ctype != 0 && ctype != 2 && ctype != 3 {
+                return nil, errors.new("png: tRNS not allowed for color type")
+            }
+            seen_trns = 1
+            j := 0
+            for j < n {
+                trns = push(trns, data[j])
+                j = j + 1
+            }
+        } else if typ == "IDAT" {
+            if idat_done == 1 {
+                return nil, errors.new("png: nonconsecutive IDAT")
+            }
+            if ctype == 3 && seen_plte == 0 {
+                return nil, errors.new("png: missing PLTE")
+            }
+            seen_idat = 1
+            j := 0
+            for j < n {
+                idat = push(idat, data[j])
+                j = j + 1
+            }
+        } else if typ == "IEND" {
+            if n != 0 || seen_idat == 0 || seen_iend == 1 {
+                return nil, errors.new("png: bad IEND")
+            }
+            seen_iend = 1
+            off = off + 12 + n
+            if off != len(b) {
+                return nil, errors.new("png: trailing data after IEND")
+            }
+            break
+        } else if b[off + 4] >= 65 && b[off + 4] <= 90 {
+            return nil, errors.new("png: unknown critical chunk")
+        }
+        // every other chunk — ancillary or unknown — is skipped; the
+        // crc check above already vetted its framing
+        off = off + 12 + n
+    }
+    if seen_ihdr == 0 {
+        return nil, errors.new("png: missing IHDR")
+    }
+    if seen_idat == 0 || seen_iend == 0 {
+        return nil, errors.new("png: missing IDAT or IEND")
+    }
+    if interlace != 0 {
+        return nil, errors.new("png: interlaced images not supported")
+    }
+    if w <= 0 || h <= 0 || !image_dims_ok(w, h) {
+        return nil, errors.new("png: image dimensions exceed limits")
+    }
+    ch := pchan(ctype)
+    if ch == 0 {
+        return nil, errors.new("png: bad color type")
+    }
+    if !pdepth_ok(ctype, depth) {
+        return nil, errors.new("png: unsupported bit depth")
+    }
+    if ctype == 3 && len(plte) == 0 {
+        return nil, errors.new("png: missing PLTE")
+    }
+    rowbytes := (w * ch * depth + 7) / 8
+    bpp := ch * depth / 8
+    if bpp < 1 {
+        bpp = 1
+    }
+    need := h * (1 + rowbytes)
+    cursor := mkslice(int, 1)
+    src := png_input{b: idat, pos: cursor}
+    [z, ze] = zlib.newreader(src.asreader())
+    if ze != nil {
+        return nil, ze
+    }
+    [raw0, re] = io.readall(io.limitreader(z.asreader(), need + 1))
+    if re != nil {
+        return nil, re
+    }
+    if cursor[0] - z.unread() != len(idat) {
+        return nil, errors.new("png: trailing zlib data")
+    }
+    if len(raw0) != need {
+        return nil, errors.new("png: invalid decompressed size")
+    }
+    raw := raw0 as []byte
+    flat := mkslice(byte, h * rowbytes)
+    ue := unfilter(raw, flat, w, h, rowbytes, bpp)
+    if ue != nil {
+        return nil, ue
+    }
+    // pick the model — gray stays Gray unless tRNS adds alpha, the
+    // rest decode as NRGBA (non-premultiplied source, same buffer)
+    // the returned iface must box an own handle, not a borrow of a
+    // local — a boxed mut borrow of a scope local dangles once this
+    // frame returns (the own pointee is address-stable)
+    if ctype == 0 && len(trns) == 0 {
+        g := new(new_gray(rect(0, 0, w, h)))
+        pdraw(g.pix, 1, 1, flat, w, h, ch, depth, plte, trns)
+        let gi: Image = g
+        return gi, nil
+    }
+    m := new(new_nrgba(rect(0, 0, w, h)))
+    pdraw(m.pix, 4, ctype, flat, w, h, ch, depth, plte, trns)
+    let mi: Image = m
+    return mi, nil
+}
+
+/// png_decode decodes a PNG stream — the io.Reader entry over
+/// png_decodebytes.
+fn png_decode(r: io.Reader) -> [Image, err] {
+    [data, e] = image_readall(r)
+    if e != nil {
+        return nil, e
+    }
+    return png_decodebytes(data as []byte)
+}
+
+/// png_decodebytes decodes a PNG held in memory.
+fn png_decodebytes(b: []byte) -> [Image, err] {
+    if len(b) > image_max_encoded {
+        return nil, errors.new("image: encoded input exceeds size limit")
+    }
+    return png_run(b)
+}
+
+// zstore wraps src in a valid zlib stream without compressing it —
+// a 2-byte header (CMF 0x78 / FLG 0x01, the %31 check lands at 0),
+// deflate "stored" blocks of at most 65535 bytes each, and the
+// big-endian adler32 trailer. Legal deflate every inflator accepts;
+// the ratio is 1:1 + 5 bytes per 64KiB.
+fn zstore(src: []byte) -> []byte {
+    out := mkslice(byte, 0)
+    out = push(out, 120) // 0x78
+    out = push(out, 1) // 0x01
+    pos := 0
+    for true {
+        n := len(src) - pos
+        if n > 65535 {
+            n = 65535
+        }
+        if pos + n >= len(src) {
+            out = push(out, 1) // BFINAL, BTYPE=00
+        } else {
+            out = push(out, 0)
+        }
+        out = push(out, n % 256)
+        out = push(out, n / 256 % 256)
+        nl := 65535 - n
+        out = push(out, nl % 256)
+        out = push(out, nl / 256 % 256)
+        j := 0
+        for j < n {
+            out = push(out, src[pos + j])
+            j = j + 1
+        }
+        pos = pos + n
+        if pos >= len(src) {
+            break
+        }
+    }
+    sum := hash.adler32(src)
+    out = push(out, sum / 16777216 % 256)
+    out = push(out, sum / 65536 % 256)
+    out = push(out, sum / 256 % 256)
+    out = push(out, sum % 256)
+    return out
+}
+
+// pchunk appends one length+type+data+crc PNG chunk to out.
+fn pchunk(out: []byte, typ: str, data: []byte) -> []byte {
+    n := len(data)
+    out = push(out, n / 16777216 % 256)
+    out = push(out, n / 65536 % 256)
+    out = push(out, n / 256 % 256)
+    out = push(out, n % 256)
+    tb := typ as []byte
+    j := 0
+    for j < 4 {
+        out = push(out, tb[j])
+        j = j + 1
+    }
+    j = 0
+    for j < n {
+        out = push(out, data[j])
+        j = j + 1
+    }
+    // crc runs over type+data — one contiguous range of the buffer
+    // we just appended
+    sum := hash.crc32(out[len(out) - 4 - n:len(out)])
+    out = push(out, sum / 16777216 % 256)
+    out = push(out, sum / 65536 % 256)
+    out = push(out, sum / 256 % 256)
+    out = push(out, sum % 256)
+    return out
+}
+
+// png_bytes renders m as a PNG byte string — always color type 6
+// (RGBA) at depth 8 with filter 0 rows, the one shape every decoder
+// accepts. Pixels come through at() so any Image works; premultiplied
+// buffers unpremultiply on the way out (PNG samples are straight
+// alpha).
+fn png_bytes(m: Image) -> [[]byte, err] {
+    r := m.bounds()
+    w := r.dx()
+    h := r.dy()
+    if w <= 0 || h <= 0 || !image_dims_ok(w, h) {
+        return nil, errors.new("png: image dimensions exceed limits")
+    }
+    out := mkslice(byte, 0)
+    out = push(out, 137)
+    out = push(out, 80)
+    out = push(out, 78)
+    out = push(out, 71)
+    out = push(out, 13)
+    out = push(out, 10)
+    out = push(out, 26)
+    out = push(out, 10)
+    ihdr := mkslice(byte, 13)
+    binary.put_be_u32(ihdr, 0, w)
+    binary.put_be_u32(ihdr, 4, h)
+    ihdr[8] = 8 // bit depth
+    ihdr[9] = 6 // color type RGBA
+    // compression 0, filter 0, interlace 0 — the zeroed tail
+    out = pchunk(out, "IHDR", ihdr)
+    rows := mkslice(byte, 0)
+    y := r.min.y
+    for y < r.max.y {
+        rows = push(rows, 0) // filter None
+        x := r.min.x
+        for x < r.max.x {
+            c := m.at(x, y)
+            n := color.unpremul16(c.rgba())
+            rows = push(rows, n.r)
+            rows = push(rows, n.g)
+            rows = push(rows, n.b)
+            rows = push(rows, n.a)
+            x = x + 1
+        }
+        y = y + 1
+    }
+    z := zstore(rows)
+    out = pchunk(out, "IDAT", z)
+    out = pchunk(out, "IEND", mkslice(byte, 0))
+    return out, nil
+}
+
+/// png_encode writes m to w as a PNG — png.Encoder over the
+/// zstore compressor.
+fn png_encode(w: io.Writer, m: Image) -> err {
+    [out, e] = png_bytes(m)
+    if e != nil {
+        return e
+    }
+    pos := 0
+    for pos < len(out) {
+        [n, e] = w.write(out[pos:])
+        if e != nil {
+            return e
+        }
+        if n <= 0 {
+            return io.noprogress()
+        }
+        pos = pos + n
+    }
+    return nil
+}
+
+/// png_encodebytes renders m to an in-RAM PNG.
+fn png_encodebytes(m: Image) -> [own []byte, err] {
+    [out, e] = png_bytes(m)
+    if e != nil {
+        return nil, e
+    }
+    return new(out), nil
+}

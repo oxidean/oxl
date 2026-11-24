@@ -56,6 +56,33 @@ struct Config {
     alpn: []str, // empty ⇒ no ALPN extension
     verify: Verifier, // nil ⇒ x509.verify + match_hostname; non-nil
     // replaces BOTH (tests/private PKI pinning)
+    min_ver: int, // lowest TLS version — 0 defaults to V13
+    max_ver: int, // highest TLS version — 0 defaults to V13
+    // min=max=V12 pins TLS 1.2; min=V12,max=V13 explicitly opts into
+    // auto negotiation. The default is TLS 1.3 only.
+}
+
+// Protocol versions accepted in Config.min_ver/max_ver — the
+// ServerHello version code points.
+let V12 = 771 // 0x0303
+
+let V13 = 772 // 0x0304
+
+// cfg_minv/cfg_maxv resolve the version pins. A zero-valued Config
+// intentionally means TLS 1.3 only; callers must explicitly select
+// TLS 1.2 or the [V12,V13] auto range.
+fn cfg_minv(cfg: Config) -> int {
+    if cfg.min_ver == 0 {
+        return V13
+    }
+    return cfg.min_ver
+}
+
+fn cfg_maxv(cfg: Config) -> int {
+    if cfg.max_ver == 0 {
+        return V13
+    }
+    return cfg.max_ver
 }
 
 /// Verifier is the full-override certificate hook — an interface so
@@ -66,7 +93,7 @@ interface Verifier { check(leaf: x509.Cert, untrusted: []x509.Cert) -> err }
 /// default_cfg is the sane starting point — roots lazy-loads the
 /// system store at handshake time; server_name/verify/alpn empty.
 fn default_cfg() -> Config {
-    return Config{server_name: "", roots: x509.Roots{cas: nil}, alpn: nil, verify: nil}
+    return Config{server_name: "", roots: x509.Roots{cas: nil}, alpn: nil, verify: nil, min_ver: 0, max_ver: 0}
 }
 
 // ---- session state ------------------------------------------------------
@@ -76,7 +103,8 @@ fn default_cfg() -> Config {
 // windows, transcript, and the verified peer leaf. Fields are plain
 // values; the box's own handle is what Conn copies alias.
 struct Session {
-    suite: int, // negotiated suite (SUITE_*); 0 pre-SH
+    suite: int, // negotiated suite (SUITE_* / SUITE12_*); 0 pre-SH
+    ver: int, // negotiated protocol version (V12/V13); 0 pre-SH
     aead: int,
     hlen: int,
     hf: fn() -> hash.Hash,
@@ -102,6 +130,10 @@ struct Session {
     wclosed: int, // close_notify sent
     // handshake working state
     random: []byte, // client random we sent
+    srandom: []byte, // server random (TLS 1.2 — SKE signature +
+    // master-secret PRF seeds)
+    ems: int, // extended_master_secret negotiated (1.2)
+    r12pend: int, // 1.2 read keys staged — the peer's CCS arms ren
     session_id: []byte, // legacy_session_id we sent (echo check)
     xsk: []byte, // x25519 private share (32B)
     xpk: []byte, // x25519 public share
@@ -267,7 +299,12 @@ fn client_tmo(c: net.Conn, cfg: Config, tmo_ms: int) -> [Conn, err] {
     if len(cfg.server_name) == 0 && cfg.verify == nil {
         return badconn(), errors.wrap("tls: server_name empty and no verifier", x509.err_name())
     }
-    tc := mkconn(c, new(Session{suite: 0, aead: 0, hlen: 0, hf: sha256.new, th: nil, ch1: nil, rkey: nil, riv: nil, rseq: 0, ren: 0, wkey: nil, wiv: nil, wseq: 0, wen: 0, rsecret: nil, wsecret: nil, c_hs: nil, ks: KeySched{hf: sha256.new, hlen: 0, early: nil, hs: nil, master: nil, c_hs: nil, s_hs: nil, c_ap: nil, s_ap: nil}, hsbuf: mkslice(byte, 0), appbuf: mkslice(byte, 0), ccs: 0, notify: 0, wclosed: 0, random: nil, session_id: nil, xsk: nil, xpk: nil, psk2: nil, ppk: nil, group: 0, gsk: nil, gsk_pub: nil, hrr: 0, cookie: nil, hver: 0, cr_seen: 0, cr_ctx: nil, alpn: "", leaf: x509.Cert{raw: nil, version: 0, serial: nil, issuer: "", subject: "", issuer_der: nil, subject_der: nil, not_before: 0, not_after: 0, dns_names: nil, ip_addrs: nil, is_ca: 0, max_path: -1, ku: -1, eku: nil, sig_alg: 0, spki_alg: 0, spki: nil, skid: nil, akid: nil, sig: nil, tbs: nil}, has_leaf: 0, deadline: 0, hs_tmo: tmo_ms, capin: nil, capout: nil}))
+    minv := cfg_minv(cfg)
+    maxv := cfg_maxv(cfg)
+    if minv > maxv || minv < V12 || maxv > V13 {
+        return badconn(), errors.wrap("tls: bad min_ver/max_ver", err_proto())
+    }
+    tc := mkconn(c, new(Session{suite: 0, ver: 0, aead: 0, hlen: 0, hf: sha256.new, th: nil, ch1: nil, rkey: nil, riv: nil, rseq: 0, ren: 0, wkey: nil, wiv: nil, wseq: 0, wen: 0, rsecret: nil, wsecret: nil, c_hs: nil, ks: KeySched{hf: sha256.new, hlen: 0, early: nil, hs: nil, master: nil, c_hs: nil, s_hs: nil, c_ap: nil, s_ap: nil}, hsbuf: mkslice(byte, 0), appbuf: mkslice(byte, 0), ccs: 0, notify: 0, wclosed: 0, random: nil, srandom: nil, ems: 0, r12pend: 0, session_id: nil, xsk: nil, xpk: nil, psk2: nil, ppk: nil, group: 0, gsk: nil, gsk_pub: nil, hrr: 0, cookie: nil, hver: 0, cr_seen: 0, cr_ctx: nil, alpn: "", leaf: x509.Cert{raw: nil, version: 0, serial: nil, issuer: "", subject: "", issuer_der: nil, subject_der: nil, not_before: 0, not_after: 0, dns_names: nil, ip_addrs: nil, is_ca: 0, max_path: -1, ku: -1, eku: nil, sig_alg: 0, spki_alg: 0, spki: nil, skid: nil, akid: nil, sig: nil, tbs: nil}, has_leaf: 0, deadline: 0, hs_tmo: tmo_ms, capin: nil, capout: nil}))
     e := hs_client(tc, cfg)
     if e != nil {
         tc.close()

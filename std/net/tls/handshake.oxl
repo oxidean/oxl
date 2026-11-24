@@ -70,6 +70,24 @@ let X_PSK_MODES = 45
 
 let X_KEY_SHARE = 51
 
+// extension types that matter only to the 1.2 fallback path
+let X_EC_FORMATS = 11
+
+let X_TICKET = 35
+
+let X_EMS = 23 // extended_master_secret, RFC 7627
+
+let X_RENEG = 65281 // renegotiation_info, RFC 5746
+
+// handshake message types only TLS 1.2 emits/accepts
+let HS_HELLO_REQUEST = 0
+
+let HS_SERVER_KEY_EXCHANGE = 12
+
+let HS_SERVER_HELLO_DONE = 14
+
+let HS_CLIENT_KEY_EXCHANGE = 16
+
 // unhex is hex.decode for compile-time-known constants — a bad
 // literal here is a bug, not input, so it asserts.
 fn unhex(s: str) -> []byte {
@@ -85,14 +103,22 @@ fn hrr_magic() -> []byte {
     return unhex("cf21ad74e59a6111be1d8c021e65b891c2a211167abb8c5e079e09e2c8a8339c")
 }
 
-// downgrade sentinels — RFC 8446 §4.1.3. We offer 1.3 only, so their
-// presence in a ServerHello.random is an attack, not a negotiation.
+// downgrade sentinels — RFC 8446 §4.1.3. They signal an abort only
+// when this ClientHello offered TLS 1.3 and accepts a TLS 1.2 answer.
 fn downgrade_v12() -> []byte {
     return unhex("444f574e47524401") // "DOWNGRD\x01"
 }
 
 fn downgrade_v11() -> []byte {
     return unhex("444f574e47524400") // "DOWNGRD\x00"
+}
+
+fn downgrade_sentinel(cfg: Config, sh: ShInfo, is_hrr: bool) -> bool {
+    if is_hrr || sh.vers_ok != 0 || cfg_minv(cfg) > V12 || cfg_maxv(cfg) < V13 {
+        return false
+    }
+    tail := sh.random[24:32]
+    return bequal(tail, downgrade_v12()) || bequal(tail, downgrade_v11())
 }
 
 // raw_msg wraps a handshake body in its 4-byte header.
@@ -156,6 +182,9 @@ fn is_ipish(name: str) -> bool {
 // send key_share for ([x25519, p256] initially, [demanded] post-HRR).
 fn ch_exts(c: mut Conn, cfg: Config, share_groups: []int, w: mut wr) -> err {
     s := c.s
+    minv := cfg_minv(cfg)
+    maxv := cfg_maxv(cfg)
+    v12ok := minv <= V12 && maxv >= V12
     // server_name — DNS names only
     if len(cfg.server_name) > 0 && !is_ipish(cfg.server_name) {
         w.u16(X_SERVER_NAME)
@@ -168,47 +197,64 @@ fn ch_exts(c: mut Conn, cfg: Config, share_groups: []int, w: mut wr) -> err {
         w.lenpatch(host_off + 2, 2)
         w.lenpatch(host_off, 2)
     }
-    // supported_versions: 0x0304 only
-    w.u16(X_SUPPORTED_VERS)
-    w.u16(3)
-    w.u8(2)
-    w.u8(3)
-    w.u8(4)
-    // supported_groups: all three advertised
+    // supported_versions — a 1.3-capable CH always carries 0x0304,
+    // plus 0x0303 when the 1.2 fallback is on; a max_ver-pinned
+    // 1.2-only CH omits the extension entirely
+    if maxv >= V13 {
+        w.u16(X_SUPPORTED_VERS)
+        if v12ok {
+            w.u16(5)
+            w.u8(4)
+            w.u8(3)
+            w.u8(4)
+            w.u8(3)
+            w.u8(3)
+        } else {
+            w.u16(3)
+            w.u8(2)
+            w.u8(3)
+            w.u8(4)
+        }
+    }
+    // supported_groups: all three advertised — 1.3 key_share and
+    // 1.2 ECDHE both read it
     w.u16(X_SUPPORTED_GROUPS)
     w.u16(8)
     w.u16(6)
     w.u16(G_X25519)
     w.u16(G_P256)
     w.u16(G_P384)
-    // key_share — one share per group in share_groups
-    w.u16(X_KEY_SHARE)
-    ks_off := len(w.b)
-    w.u16(0)
-    w.u16(0) // client_shares len
-    i := 0
-    for i < len(share_groups) {
-        g := share_groups[i]
-        if g == G_X25519 {
-            w.u16(G_X25519)
-            w.u16(32)
-            w.put(s.xpk)
-        } else if g == G_P256 {
-            w.u16(G_P256)
-            w.u16(65)
-            w.put(s.ppk)
-        } else if g == G_P384 {
-            // the HRR path generates this share on demand
-            w.u16(G_P384)
-            w.u16(97)
-            w.put(s.gsk_pub)
-        } else {
-            return errors.new("tls: bad share group")
+    // key_share — one share per group in share_groups; 1.3-only
+    // (harmless to a 1.2 peer, but kept out of a pinned 1.2 CH)
+    if maxv >= V13 {
+        w.u16(X_KEY_SHARE)
+        ks_off := len(w.b)
+        w.u16(0)
+        w.u16(0) // client_shares len
+        i := 0
+        for i < len(share_groups) {
+            g := share_groups[i]
+            if g == G_X25519 {
+                w.u16(G_X25519)
+                w.u16(32)
+                w.put(s.xpk)
+            } else if g == G_P256 {
+                w.u16(G_P256)
+                w.u16(65)
+                w.put(s.ppk)
+            } else if g == G_P384 {
+                // the HRR path generates this share on demand
+                w.u16(G_P384)
+                w.u16(97)
+                w.put(s.gsk_pub)
+            } else {
+                return errors.new("tls: bad share group")
+            }
+            i = i + 1
         }
-        i = i + 1
+        w.lenpatch(ks_off + 2, 2)
+        w.lenpatch(ks_off, 2)
     }
-    w.lenpatch(ks_off + 2, 2)
-    w.lenpatch(ks_off, 2)
     // signature_algorithms — the full advertised set (PKCS#1 values
     // ride for cert signatures; they are illegal in CV per §4.4.3)
     w.u16(X_SIG_ALGS)
@@ -223,18 +269,40 @@ fn ch_exts(c: mut Conn, cfg: Config, share_groups: []int, w: mut wr) -> err {
     w.u16(SA_PKCS1_SHA256)
     w.u16(SA_PKCS1_SHA384)
     w.u16(SA_PKCS1_SHA512)
-    // psk_key_exchange_modes — sent for form (we offer no PSKs)
-    w.u16(X_PSK_MODES)
-    w.u16(2)
-    w.u8(1)
-    w.u8(1) // psk_dhe_ke
+    // psk_key_exchange_modes — sent for form (we offer no PSKs);
+    // 1.3-only
+    if maxv >= V13 {
+        w.u16(X_PSK_MODES)
+        w.u16(2)
+        w.u8(1)
+        w.u8(1) // psk_dhe_ke
+    }
+    // TLS 1.2 fallback extensions — ec_point_formats names the only
+    // point form we take (uncompressed), extended_master_secret is
+    // the RFC 7627 tripwire, renegotiation_info is the RFC 5746
+    // initial-handshake token
+    if v12ok {
+        w.u16(X_EC_FORMATS)
+        w.u16(2)
+        w.u8(1)
+        w.u8(0) // uncompressed
+        w.u16(X_EMS)
+        w.u16(0)
+        w.u16(X_RENEG)
+        w.u16(1)
+        w.u8(0) // empty renegotiated_connection
+        // Accept and discard session tickets; no resumption state is
+        // retained or exposed to callers.
+        w.u16(X_TICKET)
+        w.u16(0)
+    }
     // alpn — only when configured
     if len(cfg.alpn) > 0 {
         w.u16(X_ALPN)
         al_off := len(w.b)
         w.u16(0)
         w.u16(0) // protocol_name_list len
-        i = 0
+        i := 0
         for i < len(cfg.alpn) {
             p := cfg.alpn[i]
             w.u8(len(p))
@@ -267,10 +335,30 @@ fn ch_build(c: mut Conn, cfg: Config, share_groups: []int) -> [own []byte, err] 
     w.put(s.random)
     w.u8(len(s.session_id))
     w.put(s.session_id)
-    w.u16(6)
-    w.u16(SUITE_AES128_GCM)
-    w.u16(SUITE_CHACHA20)
-    w.u16(SUITE_AES256_GCM)
+    // cipher_suites: the 1.3 set first, then the ECDHE-GCM 1.2 set
+    // the fallback accepts — each gated on its configured range
+    minv := cfg_minv(cfg)
+    maxv := cfg_maxv(cfg)
+    ns := 0
+    if maxv >= V13 {
+        ns = ns + 3
+    }
+    v12ok := minv <= V12 && maxv >= V12
+    if v12ok {
+        ns = ns + 4
+    }
+    w.u16(2 * ns)
+    if maxv >= V13 {
+        w.u16(SUITE_AES128_GCM)
+        w.u16(SUITE_CHACHA20)
+        w.u16(SUITE_AES256_GCM)
+    }
+    if v12ok {
+        w.u16(S12_RSA_AES128GCM)
+        w.u16(S12_RSA_AES256GCM)
+        w.u16(S12_ECDSA_AES128GCM)
+        w.u16(S12_ECDSA_AES256GCM)
+    }
     w.u8(1)
     w.u8(0) // null compression
     exts_off := len(w.b)
@@ -803,14 +891,8 @@ fn hs_client(c: mut Conn, cfg: Config) -> err {
     if e != nil {
         return e
     }
-    // compat mode: one dummy ChangeCipherSpec (§D.4 middlebox
-    // accommodation); inbound CCS is tolerated once per direction
-    ccsb := mkslice(byte, 1)
-    ccsb[0] = 1
-    e = rec_write(c, CT_CCS, ccsb)
-    if e != nil {
-        return e
-    }
+    // compat CCS waits for the version dispatch — a TLS 1.2 peer
+    // reads it as the real epoch-change signal, not §D.4 noise
     // the receive budget begins with the server flight
     s.deadline = now_ms() + s.hs_tmo
 
@@ -827,38 +909,53 @@ fn hs_client(c: mut Conn, cfg: Config) -> err {
     if she != nil {
         return fail(c, AL_DECODE_ERR, "bad server_hello")
     }
-    if !suite_ok(sh.suite) {
-        return fail(c, AL_ILLEGAL_PARAM, "unoffered cipher suite")
-    }
     is_hrr := bequal(sh.random, hrr_magic())
     if !is_hrr && len(sh.cookie) > 0 {
         // cookie is HRR-only — in a plain ServerHello it is an
         // extension we never offered
         return fail(c, AL_ILLEGAL_PARAM, "cookie extension in server_hello")
     }
-    if !is_hrr {
-        tail := sh.random[24:32]
-        if bequal(tail, downgrade_v12()) || bequal(tail, downgrade_v11()) {
-            return fail(c, AL_ILLEGAL_PARAM, "downgrade sentinel in server random")
-        }
+    if downgrade_sentinel(cfg, sh, is_hrr) {
+        return fail(c, AL_ILLEGAL_PARAM, "downgrade sentinel in server random")
     }
-    // session id echo is mandatory in compat mode (§4.1.3)
+    // session-id echo + compression parse identically in a 1.2
+    // ServerHello — the compression pin holds in both versions; the
+    // echo check is 1.3-only (a 1.2 server assigns its own id)
     r2 := mkrd(raw[4:len(raw)])
     r2.u16()
     r2.bytes(32)
     echo := r2.bytes(r2.u8())
-    if r2.ok == 0 || !bequal(echo, s.session_id) {
-        return fail(c, AL_ILLEGAL_PARAM, "session id echo mismatch")
-    }
     r2.u16()
-    if r2.u8() != 0 {
+    comp := r2.u8()
+    if r2.ok == 0 || comp != 0 {
         return fail(c, AL_ILLEGAL_PARAM, "nonzero compression")
     }
+    if sh.vers_ok <= 0 && !is_hrr {
+        // a 0x0303-only ServerHello is a TLS 1.2 answer — the
+        // fallback driver validates suite + config policy itself
+        return hs12_drive(c, cfg, raw, sh)
+    }
     if sh.vers_ok <= 0 {
-        // a 0x0303-only ServerHello is a 1.2 answer — mandatory
-        // supported_versions pin missing/wrong
+        // an HRR without supported_versions is a 1.3 protocol error
         return fail(c, AL_PROTOCOL_VER, "server_hello without tls 1.3")
     }
+    if !suite_ok(sh.suite) {
+        return fail(c, AL_ILLEGAL_PARAM, "unoffered cipher suite")
+    }
+    if !bequal(echo, s.session_id) {
+        return fail(c, AL_ILLEGAL_PARAM, "session id echo mismatch")
+    }
+    // compat mode (§D.4): one dummy ChangeCipherSpec, emitted only
+    // once the 1.3 pin is established — the 1.2 path never emits
+    // one (CCS is a real epoch change there); inbound CCS is
+    // tolerated once per direction
+    ccsb := mkslice(byte, 1)
+    ccsb[0] = 1
+    e = rec_write(c, CT_CCS, ccsb)
+    if e != nil {
+        return e
+    }
+    s.ver = V13
     s.suite = sh.suite
     s.aead = suite_aead(sh.suite)
     s.hlen = suite_hlen(sh.suite)
@@ -890,8 +987,7 @@ fn hs_client(c: mut Conn, cfg: Config) -> err {
         if bequal(sh3.random, hrr_magic()) {
             return fail(c, AL_UNEXPECTED, "second hello_retry_request")
         }
-        tail := sh3.random[24:32]
-        if bequal(tail, downgrade_v12()) || bequal(tail, downgrade_v11()) {
+        if downgrade_sentinel(cfg, sh3, false) {
             return fail(c, AL_ILLEGAL_PARAM, "downgrade sentinel in server random")
         }
         if sh3.suite != sh.suite {

@@ -12,6 +12,10 @@ and `dial`/`dial_timeout`/`client` over `net.Conn` — and **X7 ships
 `https://` in `std/net/http`** — the `Url.secure` / `Client.tlscfg`
 seam that closes the milestone.
 
+Issue #224 extends the client with an explicitly selected TLS 1.2
+ECDHE/AES-GCM profile. TLS 1.3 remains the default; TLS 1.2 is never
+enabled by a zero-valued Config.
+
 ## `crypto/x509` surface
 
 ```oxl
@@ -133,7 +137,8 @@ explicit ask, not a bug report.
 
 ```oxl
 struct Config { server_name: str, roots: x509.Roots,
-                alpn: []str, verify: Verifier }
+                alpn: []str, verify: Verifier,
+                min_ver: int, max_ver: int }
 iface Verifier { check(leaf: x509.Cert, untrusted: []x509.Cert) -> err }
 struct Conn { ... }   // net.Conn parity: read/write/close/rawfd +
                       // asreader/aswriter/ascloser/asreadwriter, peer()
@@ -144,7 +149,38 @@ dial_timeout(host, port, tmo_ms, cfg) -> [Conn, err]
 client(inner: net.Conn, cfg) -> [Conn, err]
 ```
 
-Client-only TLS 1.3. Cipher suites `TLS_AES_128_GCM_SHA256`,
+TLS 1.3 is the default and is the only version enabled by a zero-valued
+or `default_cfg()` Config (`min_ver=max_ver=0` resolves to TLS 1.3).
+TLS 1.2 is never an implicit fallback. To pin a legacy endpoint to
+TLS 1.2, set both fields to `tls.V12`; to explicitly enable automatic
+negotiation between TLS 1.3 and TLS 1.2, set `min_ver=tls.V12` and
+`max_ver=tls.V13`. Auto mode sends one ClientHello offering both
+versions and accepts a TLS 1.2 ServerHello only when it is valid and
+has no downgrade sentinel; there is no retry that lowers the caller's
+minimum version. TLS 1.0 and 1.1 are rejected.
+
+The TLS 1.2 profile is limited to ephemeral ECDHE with AES-GCM:
+`TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256`,
+`TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384`,
+`TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256`, and
+`TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384`. X25519, secp256r1, and
+secp384r1 groups and SHA-256/SHA-384/SHA-512 TLS 1.2 handshake
+signature algorithms are supported. Static RSA key transport, CBC,
+and non-AEAD suites are not offered. Extended Master Secret (RFC
+7627) and secure renegotiation signaling are required; renegotiation
+is disabled. Session tickets are validated and discarded; resumption
+is not implemented.
+
+Certificate chain and hostname verification are mandatory in both
+versions: nil `verify` uses `x509.verify` and `match_hostname`, while
+a configured `Verifier` is the explicit replacement for both checks.
+There is no insecure bypass. The RFC 8446 downgrade sentinel causes an
+abort only when auto mode offered TLS 1.3 and the peer answers with
+TLS 1.2. A TLS 1.2-pinned ClientHello did not offer TLS 1.3, so the
+sentinel is not treated as an attack in that mode. TLS 1.3 remains
+first choice in auto mode.
+
+TLS 1.3 cipher suites `TLS_AES_128_GCM_SHA256`,
 `TLS_CHACHA20_POLY1305_SHA256`, `TLS_AES_256_GCM_SHA384` in that
 order; groups x25519 + secp256r1/secp384r1 key shares; one
 HelloRetryRequest honoured (cookie echoed, demanded group must be
@@ -159,7 +195,7 @@ surfaces `err_eof` — truncation is never silent. `close()` emits a
 best-effort `close_notify` then closes the inner socket and is
 idempotent.
 
-Explicitly out of scope: TLS <= 1.2, server side, resumption/PSK/
+Explicitly out of scope: server side, resumption/PSK/
 0-RTT, client certificates (a CertificateRequest is answered with
 an empty Certificate per RFC 8446), and OCSP/CRL.
 
@@ -237,7 +273,8 @@ actionable ("add the CA to `OXL_SSL_CERT_FILE`", "clock is wrong").
   item when its trigger fires):
   - TLS server (`tls.listen`/`accept`) — first serving consumer
     needing inbound TLS.
-  - TLS 1.2 fallback — first consumer hitting a 1.2-only endpoint.
+  - TLS 1.2 suite/profile expansion — a concrete consumer requirement
+    plus a separate cryptographic review.
   - Session resumption / PSK — measured reconnect cost on a real
     workload.
   - Client certs (mTLS) — first consumer needing mutual auth;

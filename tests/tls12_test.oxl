@@ -11,6 +11,8 @@ import "std/errors"
 
 import "std/net/tls"
 
+import "std/crypto/x509"
+
 import "std/testing"
 
 fn hx12(s: str) -> []byte {
@@ -92,6 +94,20 @@ fn test_tls12_version_policy_and_sentinels() {
     testing.expect(cbc_ok == false, "CBC suite rejected")
 }
 
+fn test_tls12_suite_auth_family() {
+    rsa := x509.zcert()
+    rsa.spki_alg = x509.SPKI_rsa
+    p256 := x509.zcert()
+    p256.spki_alg = x509.SPKI_ec_p256
+    p384 := x509.zcert()
+    p384.spki_alg = x509.SPKI_ec_p384
+    testing.expect(tls.suite12_auth_matches(tls.S12_RSA_AES128GCM, rsa), "RSA suite accepts RSA certificate")
+    testing.expect(!tls.suite12_auth_matches(tls.S12_ECDSA_AES128GCM, rsa), "ECDSA suite rejects RSA certificate")
+    testing.expect(tls.suite12_auth_matches(tls.S12_ECDSA_AES128GCM, p256), "ECDSA suite accepts P-256 certificate")
+    testing.expect(tls.suite12_auth_matches(tls.S12_ECDSA_AES256GCM, p384), "ECDSA suite accepts P-384 certificate")
+    testing.expect(!tls.suite12_auth_matches(tls.S12_RSA_AES256GCM, p256), "RSA suite rejects ECDSA certificate")
+}
+
 fn test_tls12_malformed_handshake_vectors() {
     testing.expect(tls.ticket12_valid(hx12("000000010003616263")), "well-formed tls 1.2 ticket")
     testing.expect(!tls.ticket12_valid(hx12("000000010004616263")), "truncated tls 1.2 ticket rejected")
@@ -131,6 +147,7 @@ fn test_tls12_gcm_server_finished_record() {
 fn main() {
     test_tls12_prf_vectors()
     test_tls12_version_policy_and_sentinels()
+    test_tls12_suite_auth_family()
     test_tls12_malformed_handshake_vectors()
     test_tls12_gcm_server_finished_record()
     println("tls12 tests ok")

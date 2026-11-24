@@ -441,6 +441,13 @@ fn ske12_sig(c: mut Conn, alg: int, content: []byte, sig: []byte) -> err {
     return ed25519.verify(key, content, sig)
 }
 
+fn suite12_auth_matches(suite: int, cert: x509.Cert) -> bool {
+    if suite == S12_RSA_AES128GCM || suite == S12_RSA_AES256GCM {
+        return cert.spki_alg == x509.SPKI_rsa
+    }
+    return cert.spki_alg == x509.SPKI_ec_p256 || cert.spki_alg == x509.SPKI_ec_p384
+}
+
 // cr12_recv consumes a TLS 1.2 CertificateRequest — the three
 // vectors are validated for shape but unused: the client answer is
 // always the empty certificate_list (mTLS is out of scope).
@@ -571,6 +578,9 @@ fn hs12_drive(c: mut Conn, cfg: Config, shraw: []byte, sh: ShInfo) -> err {
             e = cert12_verify(c, cfg, body)
             if e != nil {
                 return e
+            }
+            if !suite12_auth_matches(s.suite, s.leaf) {
+                return fail(c, AL_BAD_CERT, "certificate key type does not match tls 1.2 cipher suite")
             }
             state = 1
         } else if mty == HS_SERVER_KEY_EXCHANGE && state == 1 {

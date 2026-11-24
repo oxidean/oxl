@@ -180,6 +180,9 @@ fn main() {
     want_ok(oe, "open :memory:")
     want_ok(db.exec("CREATE TABLE items(id INTEGER, name TEXT, price REAL, active INTEGER, code INTEGER)"), "create table")
     stamp := itoa(time.unix_ms())
+    missing_parent := os.temp_dir() + "/oxl_sql_missing_" + stamp + "/child.db"
+    [missing_db, missing_err] = sql.open_driver("sqlite3", missing_parent)
+    want_err(missing_err, "sqlite open missing parent")
     main_db_path := os.temp_dir() + "/oxl_sql_exec_main_" + stamp + ".db"
     lock_db_path := os.temp_dir() + "/oxl_sql_exec_lock_" + stamp + ".db"
     [lock_db, lock_open_err] = sql.open(lock_db_path)
@@ -687,5 +690,14 @@ fn main() {
     }
     mdb.close()
     db.close()
+    sql.register("sqlite3", MockDrv{tag: "sqlite-override"})
+    [override_db, override_err] = sql.open_driver("sqlite3", "anything")
+    want_ok(override_err, "override builtin driver")
+    override_exec := override_db.exec("q")
+    want_err(override_exec, "builtin override exec")
+    if find(errors.msg(override_exec), "sqlite-override") < 0 {
+        fails("builtin driver override lost: " + errors.msg(override_exec))
+    }
+    override_db.close()
     println("db_sql ok")
 }

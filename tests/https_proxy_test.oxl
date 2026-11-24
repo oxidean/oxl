@@ -64,6 +64,9 @@ fn test_https_proxy_connect() {
     if mode == "badgateway" {
         host = "badgateway.invalid"
     }
+    if mode == "non200" {
+        host = "notunnel.invalid"
+    }
     if mode == "interim" {
         host = "interim.invalid"
     }
@@ -99,19 +102,34 @@ fn test_https_proxy_connect() {
         cl.tmo = 0
     }
     req := http.request_get("https://" + host + ":" + itoa(origin) + "/")
-    if mode == "explicit" || mode == "origin_sni" || mode == "explicit_override" || mode == "reject" || mode == "badgateway" || mode == "interim" || mode == "badcl" || mode == "badte" || mode == "cumulative" || mode == "zero_timeout" || mode == "malformed" || mode == "truncated" || mode == "oversized" || mode == "badname" || mode == "badroot" {
+    if mode == "explicit" || mode == "origin_sni" || mode == "explicit_override" || mode == "reject" || mode == "badgateway" || mode == "non200" || mode == "interim" || mode == "badcl" || mode == "badte" || mode == "cumulative" || mode == "zero_timeout" || mode == "malformed" || mode == "truncated" || mode == "oversized" || mode == "badname" || mode == "badroot" {
         req.proxy = "http://127.0.0.1:" + itoa(proxy)
+    }
+    if mode == "bad_proxy_url" {
+        req.proxy = "ftp://127.0.0.1"
+    }
+    if mode == "secure_proxy" {
+        req.proxy = "https://127.0.0.1:" + itoa(proxy)
     }
     if mode == "direct" {
         req.proxy = "direct"
     }
     [resp, e] = cl.do(req)
-    if mode == "reject" || mode == "badgateway" {
+    if mode == "bad_proxy_url" || mode == "secure_proxy" {
+        testing.expect(e != nil, "invalid proxy configuration fails")
+        if mode == "bad_proxy_url" {
+            testing.expect(strings.contains(errors.msg(e), "bad proxy url"), "malformed proxy URL rejected")
+        } else {
+            testing.expect(strings.contains(errors.msg(e), "proxy url must be http"), "HTTPS proxy URL rejected")
+        }
+    } else if mode == "reject" || mode == "badgateway" || mode == "non200" {
         testing.expect(e != nil, "proxy rejection fails")
         if mode == "reject" {
             testing.expect(strings.contains(errors.msg(e), "407"), "proxy status preserved")
-        } else {
+        } else if mode == "badgateway" {
             testing.expect(strings.contains(errors.msg(e), "502"), "proxy status preserved")
+        } else {
+            testing.expect(strings.contains(errors.msg(e), "204"), "only 200 establishes a tunnel")
         }
     } else if mode == "zero_timeout" {
         testing.expect(e != nil, "zero timeout fails before CONNECT")
@@ -139,7 +157,7 @@ fn test_https_proxy_connect() {
         testing.expect(strings.contains(resp.body, "proxy origin ok"), "origin response body")
     }
     captured := os.readfile_(capture_file)
-    if mode == "direct" || mode == "no_proxy" || mode == "zero_timeout" {
+    if mode == "direct" || mode == "no_proxy" || mode == "zero_timeout" || mode == "bad_proxy_url" || mode == "secure_proxy" {
         testing.expect_eq(len(captured), 0, "bypass did not use proxy")
     } else if mode != "proxy_bypass_rule" {
         testing.expect(strings.contains(captured, "CONNECT " + host + ":" + itoa(origin) + " HTTP/1.1"), "CONNECT authority captured")

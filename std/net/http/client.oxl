@@ -294,6 +294,7 @@ fn connect_proxy(c: net.Conn, u: Url, tmo: int) -> err {
                 }
                 if status >= 100 && status < 200 && status != 101 {
                     response = ""
+                    scan_from = 0
                 } else {
                     set_rcvtimo_ms(c.rawfd(), 0)
                     return nil

@@ -32,6 +32,9 @@ class Proxy(socketserver.BaseRequestHandler):
         if host == b"badgateway.invalid":
             self.request.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
             return
+        if host == b"notunnel.invalid":
+            self.request.sendall(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+            return
         if host == b"malformed.invalid":
             self.request.sendall(b"not an HTTP response\r\n\r\n")
             return

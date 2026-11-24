@@ -24,9 +24,9 @@ jobs:
     runs-on: ${{ matrix.os }}
     # bound the legs: a hung test deadlocks the runner silently otherwise —
     # observed once at 68min on a docs-only diff vs ~20min normal (#117).
-    # windows gets 150 (others 60): its suite runs ~3-4x slower than the
-    # other legs and kept outgrowing each cap — 45→90→120 all hit mid-run.
-    timeout-minutes: ${{ matrix.os == 'windows-latest' && 150 || 60 }}
+    # windows gets 180 (others 60): its suite runs ~3-4x slower than the
+    # other legs and outgrew the 150-minute cap during stage0 findings.
+    timeout-minutes: ${{ matrix.os == 'windows-latest' && 180 || 60 }}
     strategy:
       fail-fast: false
       matrix:

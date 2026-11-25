@@ -1,0 +1,63 @@
+package main
+
+import "std/crypto/x509"
+
+import "std/errors"
+
+import "std/net/http"
+
+import "std/net/tls"
+
+import "std/os"
+
+import "std/strings"
+
+import "std/testing"
+
+fn test_http2_tls_through_connect_proxy() {
+    port := atoi(os.getenv("OXL_HTTP2_TLS_PORT"))
+    proxy := atoi(os.getenv("OXL_HTTP2_PROXY_PORT"))
+    cfg := tls.default_cfg()
+    [n, e] = cfg.roots.load_pem(os.readfile_("tests/tls/ca.pem"))
+    testing.expect(e == nil && n > 0, "load trusted CA")
+    cl := http.Client{tmo: 15000, tlscfg: cfg}
+    req := http.request_get("https://localhost:" + itoa(port) + "/")
+    req.proxy = "http://127.0.0.1:" + itoa(proxy)
+    req.http_version = "2"
+    [resp, de] = cl.do(req)
+    testing.expect(de == nil, "HTTP/2 request through CONNECT proxy")
+    if de == nil {
+        testing.expect(resp.status == 200 && resp.body == "abc", "HTTP/2 response through CONNECT proxy")
+    }
+    capture := os.readfile_(os.getenv("OXL_HTTP2_PROXY_CAPTURE"))
+    testing.expect(strings.contains(capture, "CONNECT localhost:" + itoa(port) + " HTTP/1.1"), "CONNECT request reaches proxy")
+}
+
+fn test_http1_rejects_h2_alpn() {
+    port := atoi(os.getenv("OXL_HTTP2_TLS_PORT"))
+    proxy := atoi(os.getenv("OXL_HTTP2_PROXY_PORT"))
+    cfg := tls.default_cfg()
+    [n, e] = cfg.roots.load_pem(os.readfile_("tests/tls/ca.pem"))
+    testing.expect(e == nil && n > 0, "load trusted CA")
+    cfg.alpn = push(mkslice(str, 0), "h2")
+    cl := http.Client{tmo: 15000, tlscfg: cfg}
+    req := http.request_get("https://localhost:" + itoa(port) + "/")
+    [_, de] = cl.do(req)
+    testing.expect(de != nil && strings.contains(errors.msg(de), "unsupported negotiated ALPN"), "HTTP/1.1 rejects negotiated h2")
+    req.proxy = "http://127.0.0.1:" + itoa(proxy)
+    [_, proxy_err] = cl.do(req)
+    testing.expect(proxy_err != nil && strings.contains(errors.msg(proxy_err), "unsupported negotiated ALPN"), "HTTP/1.1 rejects h2 through CONNECT")
+}
+
+fn test_http2_falls_back_to_http1_alpn() {
+    port := atoi(os.getenv("OXL_HTTP1_TLS_PORT"))
+    cfg := tls.default_cfg()
+    [n, e] = cfg.roots.load_pem(os.readfile_("tests/tls/ca.pem"))
+    testing.expect(e == nil && n > 0, "load trusted CA")
+    cfg.alpn = push(mkslice(str, 0), "http/1.1")
+    cl := http.Client{tmo: 15000, tlscfg: cfg}
+    req := http.request_get("https://localhost:" + itoa(port) + "/")
+    req.http_version = "2"
+    [resp, de] = cl.do(req)
+    testing.expect(de == nil && resp.status == 200 && resp.body == "http/1.1", "HTTP/2 request falls back on negotiated HTTP/1.1")
+}

@@ -1,0 +1,160 @@
+package main
+
+import "std/net/http2"
+
+import "std/net/http"
+
+import "std/net/tls"
+
+import "std/crypto/x509"
+
+import "std/testing"
+
+import "std/errors"
+
+import "std/os"
+
+fn test_http2_interop() {
+    port := atoi(os.getenv("OXL_HTTP2_PORT"))
+    [conn, de] = http2.dial_h2c("127.0.0.1", port, 3000)
+    testing.expect(de == nil, "HTTP/2 prior-knowledge handshake")
+    req := mkslice(http2.Header, 0)
+    req = push(req, http2.Header{name: ":method", value: "GET"})
+    req = push(req, http2.Header{name: ":scheme", value: "http"})
+    req = push(req, http2.Header{name: ":path", value: "/trailers"})
+    req = push(req, http2.Header{name: ":authority", value: "127.0.0.1"})
+    [id, oe] = conn.open_stream(req, true)
+    testing.expect(oe == nil, "send HTTP/2 request")
+    body := mkslice(byte, 0)
+    got_trailer := false
+    for !got_trailer {
+        [event, re] = conn.next_event()
+        testing.expect(re == nil, "receive HTTP/2 event")
+        if event.kind == 1 && !event.trailers {
+            testing.expect(event.stream_id == id && event.headers[0].name == ":status" && event.headers[0].value == "200", "receive HTTP/2 status")
+        } else if event.kind == 0 {
+            testing.expect(event.stream_id == id, "receive HTTP/2 body stream")
+            i := 0
+            for i < len(event.payload) {
+                body = push(body, event.payload[i])
+                i = i + 1
+            }
+            if event.flow_bytes > 0 {
+                testing.expect(conn.ack_data(id, event.flow_bytes) == nil, "ack HTTP/2 DATA")
+            }
+        } else if event.kind == 1 && event.trailers {
+            testing.expect(event.stream_id == id && len(event.headers) == 1 && event.headers[0].name == "x-check" && event.headers[0].value == "done", "receive HTTP/2 trailers")
+            got_trailer = true
+        }
+    }
+    testing.expect(body as str == "abc", "HTTP/2 response body")
+    conn.close()
+    http1_port := atoi(os.getenv("OXL_HTTP1_PORT"))
+    [_, h1_error] = http2.dial_h2c("127.0.0.1", http1_port, 3000)
+    testing.expect(h1_error != nil, "prior-knowledge H2 rejects HTTP/1 peer without fallback")
+    println("http2 interop ok")
+}
+
+fn test_http2_tls_alpn() {
+    roots := x509.Roots{cas: nil}
+    [n, re] = roots.load_pem(os.readfile_("tests/tls/ca.pem"))
+    testing.expect(re == nil && n == 1, "load local HTTP/2 test CA")
+    cfg := tls.default_cfg()
+    cfg.roots = roots
+    cfg.server_name = "localhost"
+    cfg.alpn = push(mkslice(str, 0), "h2")
+    cfg.alpn = push(cfg.alpn, "http/1.1")
+    cfg.alpn = push(cfg.alpn, "custom/1")
+    port := atoi(os.getenv("OXL_HTTP2_TLS_PORT"))
+    [result, de] = http2.dial_tls_config("127.0.0.1", port, 5000, cfg)
+    testing.expect(de == nil && result.protocol == "h2" && result.conn != nil, "select h2 through TLS ALPN: " + errors.msg(de) + " protocol=" + result.protocol)
+    wrong_name := cfg
+    wrong_name.server_name = "wrong.invalid"
+    [_, name_err] = http2.dial_tls_config("127.0.0.1", port, 5000, wrong_name)
+    testing.expect(name_err != nil, "preserve caller TLS server_name for HTTP/2")
+    req := mkslice(http2.Header, 0)
+    req = push(req, http2.Header{name: ":method", value: "GET"})
+    req = push(req, http2.Header{name: ":scheme", value: "https"})
+    req = push(req, http2.Header{name: ":path", value: "/trailers"})
+    req = push(req, http2.Header{name: ":authority", value: "127.0.0.1"})
+    [id, oe] = result.conn.open_stream(req, true)
+    testing.expect(oe == nil, "send TLS HTTP/2 request")
+    saw_trailer := false
+    body := mkslice(byte, 0)
+    for !saw_trailer {
+        [event, ee] = result.conn.next_event()
+        testing.expect(ee == nil, "read TLS HTTP/2 event")
+        if event.kind == 0 {
+            i := 0
+            for i < len(event.payload) {
+                body = push(body, event.payload[i])
+                i = i + 1
+            }
+            if event.flow_bytes > 0 {
+                testing.expect(result.conn.ack_data(id, event.flow_bytes) == nil, "ack TLS HTTP/2 DATA")
+            }
+        } else if event.trailers {
+            testing.expect(event.stream_id == id && event.headers[0].value == "done", "read TLS HTTP/2 trailers")
+            saw_trailer = true
+        }
+    }
+    testing.expect(body as str == "abc", "read TLS HTTP/2 response body")
+    result.conn.close()
+    http1_only := cfg
+    http1_only.alpn = push(mkslice(str, 0), "http/1.1")
+    [restricted, restricted_err] = http2.dial_tls_config("127.0.0.1", port, 5000, http1_only)
+    testing.expect(restricted_err == nil && restricted.protocol == "http/1.1" && restricted.conn == nil && restricted.transport != nil, "respect caller HTTP/1.1-only ALPN")
+    restricted.closer.close()
+    fallback_port := atoi(os.getenv("OXL_HTTP1_TLS_PORT"))
+    [fallback, fe] = http2.dial_tls_config("127.0.0.1", fallback_port, 5000, cfg)
+    testing.expect(fe == nil && fallback.protocol == "http/1.1" && fallback.conn == nil && fallback.transport != nil, "return HTTP/1.1 transport only when ALPN selects it")
+    fallback.closer.close()
+    [_, bad_tls] = http2.dial_tls_config("127.0.0.1", port, 5000, tls.default_cfg())
+    testing.expect(bad_tls != nil, "TLS verification failure does not fall back")
+}
+
+fn test_http_client_http2() {
+    port := atoi(os.getenv("OXL_HTTP2_PORT"))
+    client := http.new_client(5000)
+    req := http.request_get("http://127.0.0.1:" + itoa(port) + "/trailers")
+    req.proxy = "direct"
+    req.http_version = "2-prior-knowledge"
+    [resp, e] = client.do(req)
+    testing.expect(e == nil && resp.status == 200 && resp.body == "abc", "HTTP client prior-knowledge request: " + errors.msg(e))
+    testing.expect(len(resp.trailers) == 1 && resp.trailers[0].name == "x-check" && resp.trailers[0].value == "done", "HTTP client prior-knowledge trailers")
+
+    accepted_req := http.request_get("http://127.0.0.1:" + itoa(port) + "/goaway-accepted")
+    accepted_req.proxy = "direct"
+    accepted_req.http_version = "2-prior-knowledge"
+    [accepted_resp, accepted_err] = client.do(accepted_req)
+    testing.expect(accepted_err == nil && accepted_resp.body == "accepted", "continue a stream accepted by GOAWAY: " + errors.msg(accepted_err))
+
+    roots := x509.Roots{cas: nil}
+    [n, re] = roots.load_pem(os.readfile_("tests/tls/ca.pem"))
+    testing.expect(re == nil && n == 1, "load HTTP client CA")
+    secure := http.new_client(5000)
+    secure.tlscfg.roots = roots
+    tls_port := atoi(os.getenv("OXL_HTTP2_TLS_PORT"))
+    tls_req := http.request_get("https://127.0.0.1:" + itoa(tls_port) + "/trailers")
+    tls_req.proxy = "direct"
+    tls_req.http_version = "2"
+    [tls_resp, te] = secure.do(tls_req)
+    testing.expect(te == nil && tls_resp.status == 200 && tls_resp.body == "abc", "HTTP client TLS HTTP/2 request: " + errors.msg(te))
+    testing.expect(len(tls_resp.trailers) == 1 && tls_resp.trailers[0].value == "done", "HTTP client TLS HTTP/2 trailers")
+
+    fallback := http.new_client(5000)
+    fallback.tlscfg.roots = roots
+    h1_port := atoi(os.getenv("OXL_HTTP1_TLS_PORT"))
+    h1_req := http.request_get("https://127.0.0.1:" + itoa(h1_port) + "/")
+    h1_req.proxy = "direct"
+    h1_req.http_version = "2"
+    [h1_resp, he] = fallback.do(h1_req)
+    testing.expect(he == nil && h1_resp.status == 200, "HTTP client falls back only when ALPN selects HTTP/1.1: " + errors.msg(he))
+
+    untrusted := http.new_client(5000)
+    bad_req := http.request_get("https://127.0.0.1:" + itoa(tls_port) + "/trailers")
+    bad_req.proxy = "direct"
+    bad_req.http_version = "2"
+    [_, bad_tls] = untrusted.do(bad_req)
+    testing.expect(bad_tls != nil, "HTTP client TLS error does not fall back")
+}

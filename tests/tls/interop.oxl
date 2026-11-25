@@ -14,6 +14,15 @@ package main
 //           handshake must fail with err_root              → INTEROP_BADROOT
 //   badname trusted CA but server_name is wrong; the
 //           handshake must fail with err_name              → INTEROP_BADNAME
+//   tls12   explicit TLS 1.2-only connection                → INTEROP_TLS12
+//   auto12  explicit [TLS 1.2,TLS 1.3] auto negotiation     → INTEROP_AUTO12
+//   mtls    TLS 1.3 client auth: present cert+key (argv 4,5)
+//           against `s_server -Verify 1`                   → INTEROP_MTLS
+//   mtls_nocert  against `-Verify 1` with no identity — or one the
+//           CR's signature_algorithms leaves unusable; the
+//           certificate_required alert must surface on I/O → INTEROP_MTLS_NOCERT
+//   mtls_nocr    cert configured but the server sends no
+//           CertificateRequest — plain handshake           → INTEROP_MTLS_NOCR
 import "std/crypto/x509"
 
 import "std/errors"
@@ -64,7 +73,7 @@ fn roundtrip(c: tls.Conn) {
 
 fn main() {
     if os.nargs() < 4 {
-        die("usage: interop.oxl <scenario> <port> <ca.pem>")
+        die("usage: interop.oxl <scenario> <port> <ca.pem> [cert.pem key.pem]")
     }
     scen := os.args(1)
     port := atoi(os.args(2))
@@ -72,15 +81,96 @@ fn main() {
 
     cfg := tls.default_cfg()
     cfg.roots = roots_of(cafile)
-    if scen == "badname" {
+    if scen == "tls12" || scen == "tls12rsa" || scen == "badroot12" || scen == "badname12" || scen == "sentinel_pinned" || scen == "badhello12" {
+        cfg.min_ver = tls.V12
+        cfg.max_ver = tls.V12
+    } else if scen == "auto12" || scen == "sentinel_auto" {
+        cfg.min_ver = tls.V12
+        cfg.max_ver = tls.V13
+    }
+    if scen == "badname" || scen == "badname12" {
         cfg.server_name = "wrong-name.invalid"
     } else {
         // dial 127.0.0.1 but verify the DNS SAN like a real client
         cfg.server_name = "localhost"
     }
+    if scen == "mtls" || scen == "mtls_nocr" || scen == "mtls_nocert" {
+        // mtls_nocert takes an optional identity: loaded but unusable
+        // (no offered scheme fits the key) still answers empty
+        if os.nargs() >= 6 {
+            [cc, ce] = tls.load_cert_pem(os.readfile_(os.args(4)), os.readfile_(os.args(5)))
+            if ce != nil {
+                die("client identity: " + errors.msg(ce))
+            }
+            cfg.client_cert = cc
+        } else if scen != "mtls_nocert" {
+            die(scen + " needs <cert.pem> <key.pem>")
+        }
+    }
     [c, e] = tls.dial("127.0.0.1", port, cfg)
 
-    if scen == "badroot" {
+    if scen == "mtls_nocert" {
+        // a -Verify server tolerates the empty certificate_list
+        // through the client flight — the certificate_required alert
+        // lands after Finished, so it surfaces on write/read, not
+        // necessarily the dial
+        if e != nil {
+            println("INTEROP_MTLS_NOCERT")
+            return
+        }
+        [nw, we] = c.write("GET / HTTP/1.0\r\nhost: x\r\n\r\n" as []byte)
+        if we == nil && nw > 0 {
+            buf := mkslice(byte, 1024)
+            tries := 0
+            for tries < 8 && we == nil {
+                [nr, re] = c.read(buf)
+                if nr >= 0 {
+                    we = re
+                } else {
+                    we = re
+                }
+                tries = tries + 1
+            }
+        }
+        c.close()
+        if we == nil {
+            die("required client auth never failed")
+        }
+        println("INTEROP_MTLS_NOCERT")
+        return
+    }
+
+    if scen == "tls12default" {
+        if e == nil {
+            println("negotiated_version=" + itoa(c.s.ver))
+            c.close()
+            die("default config unexpectedly negotiated TLS 1.2")
+        }
+        println("INTEROP_TLS12_DEFAULT_REJECTED")
+        return
+    }
+    if scen == "sentinel_auto" {
+        if e == nil || !strings.contains(errors.msg(e), "downgrade sentinel") {
+            die("expected downgrade sentinel abort, got: " + errors.msg(e))
+        }
+        println("INTEROP_SENTINEL_AUTO")
+        return
+    }
+    if scen == "sentinel_pinned" {
+        if e == nil || strings.contains(errors.msg(e), "downgrade sentinel") {
+            die("pinned TLS 1.2 mishandled sentinel: " + errors.msg(e))
+        }
+        println("INTEROP_SENTINEL_PINNED")
+        return
+    }
+    if scen == "badhello12" {
+        if e == nil || strings.contains(errors.msg(e), "downgrade sentinel") {
+            die("malformed ServerHello was not rejected: " + errors.msg(e))
+        }
+        println("INTEROP_MALFORMED12")
+        return
+    }
+    if scen == "badroot" || scen == "badroot12" {
         if e == nil {
             die("untrusted CA handshake unexpectedly succeeded")
         }
@@ -90,7 +180,7 @@ fn main() {
         println("INTEROP_BADROOT")
         return
     }
-    if scen == "badname" {
+    if scen == "badname" || scen == "badname12" {
         if e == nil {
             die("wrong-name handshake unexpectedly succeeded")
         }
@@ -104,12 +194,27 @@ fn main() {
     if e != nil {
         die("handshake: " + errors.msg(e))
     }
+    if scen == "tls12" || scen == "tls12rsa" || scen == "auto12" {
+        if c.s.ver != tls.V12 {
+            die("expected TLS 1.2, negotiated " + itoa(c.s.ver))
+        }
+    }
     if scen == "hrr" && c.s.hrr == 0 {
         die("expected demanded-group hrr, plain sh seen")
     }
     roundtrip(c)
     if scen == "hrr" {
         println("INTEROP_HRR")
+    } else if scen == "mtls" {
+        println("INTEROP_MTLS")
+    } else if scen == "mtls_nocr" {
+        println("INTEROP_MTLS_NOCR")
+    } else if scen == "tls12" {
+        println("INTEROP_TLS12")
+    } else if scen == "tls12rsa" {
+        println("INTEROP_TLS12_RSA")
+    } else if scen == "auto12" {
+        println("INTEROP_AUTO12")
     } else {
         println("INTEROP_OK")
     }

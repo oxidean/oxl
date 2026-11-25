@@ -28,6 +28,8 @@ import "std/os"
 
 import "std/net/tls"
 
+import "std/net/http2"
+
 /// xconn is the connection do_once talks over — net.Conn (http) and
 /// tls.Conn (https) both satisfy it; rawfd stays reachable through the
 /// box so the fd-level timeout builtins keep working on either
@@ -57,11 +59,12 @@ struct Request {
     // added there, and new_client covers the default). redirects:
     // -1 = CLIENT_REDIRECTS default, 0 = never follow, >0 = hop
     // budget. decompress: advertise+decode gzip. proxy: "" = honor
-    // HTTP_PROXY env, "direct" = bypass, otherwise an http:// proxy
-    // URL.
+    // scheme proxy env then ALL_PROXY, "direct" = bypass, otherwise
+    // an http:// proxy URL.
     redirects: int,
     decompress: bool,
     proxy: str,
+    http_version: str,
 }
 
 /// Response is the full client-side result: status line split into
@@ -99,7 +102,7 @@ fn (r ref Response) header(name: str) -> str {
 /// is a struct literal away — set redirects/decompress/proxy per
 /// request.
 fn request_get(url: str) -> Request {
-    return Request{method: "GET", url: url, headers: mkslice(Header, 0), body: "", redirects: -1, decompress: true, proxy: ""}
+    return Request{method: "GET", url: url, headers: mkslice(Header, 0), body: "", redirects: -1, decompress: true, proxy: "", http_version: ""}
 }
 
 fn request_post(url: str, ctype: str, body: str) -> Request {
@@ -107,7 +110,7 @@ fn request_post(url: str, ctype: str, body: str) -> Request {
     if len(ctype) > 0 {
         hs = push(hs, Header{name: "content-type", value: ctype})
     }
-    return Request{method: "POST", url: url, headers: hs, body: body, redirects: -1, decompress: true, proxy: ""}
+    return Request{method: "POST", url: url, headers: hs, body: body, redirects: -1, decompress: true, proxy: "", http_version: ""}
 }
 
 /// basic_auth is the Authorization header for HTTP Basic — base64 of
@@ -126,13 +129,8 @@ fn bearer_auth(token: str) -> Header {
 /// a redirect loop can't spin forever
 let CLIENT_REDIRECTS = 10
 
-/// proxy_from_env reads the proxy environment for host — curl's
-/// convention: plain http consults HTTP_PROXY then http_proxy; a
-/// secure URL consults https_proxy then HTTPS_PROXY only (an
-/// HTTP_PROXY setting never covers https — CONNECT-less forwarding
-/// would be cleartext, so going direct is honest). NO_PROXY/no_proxy
-/// is a comma-separated suffix list (".internal.example" or
-/// "example.com" both match subdomains). "" means connect directly.
+/// proxy_from_env reads the scheme-specific proxy before ALL_PROXY and
+/// applies NO_PROXY/no_proxy to environment-selected proxies.
 fn proxy_from_env(host: str, secure: int) -> str {
     p := ""
     if secure != 0 {
@@ -140,10 +138,16 @@ fn proxy_from_env(host: str, secure: int) -> str {
         if len(p) == 0 {
             p = os.getenv("HTTPS_PROXY")
         }
-    } else {
+    } else if len(os.getenv("REQUEST_METHOD")) == 0 {
         p = os.getenv("HTTP_PROXY")
         if len(p) == 0 {
             p = os.getenv("http_proxy")
+        }
+    }
+    if len(p) == 0 {
+        p = os.getenv("all_proxy")
+        if len(p) == 0 {
+            p = os.getenv("ALL_PROXY")
         }
     }
     if len(p) == 0 {
@@ -162,6 +166,157 @@ fn proxy_from_env(host: str, secure: int) -> str {
         return ""
     }
     return p
+}
+
+fn connect_authority(u: Url) -> str {
+    host := u.host
+    if find(host, ":") >= 0 {
+        host = "[" + host + "]"
+    }
+    return host + ":" + itoa(u.port)
+}
+
+fn connect_response_status(head: str) -> [int, err] {
+    end := find(head, "\r\n\r\n")
+    if end < 0 || end + 4 != len(head) {
+        return 0, errors.new("http: malformed CONNECT response")
+    }
+    line_end := find(head, "\r\n")
+    if line_end < 0 {
+        return 0, errors.new("http: malformed CONNECT status line")
+    }
+    line := substr(head, 0, line_end)
+    sp := find(line, " ")
+    if sp < 0 {
+        return 0, errors.new("http: malformed CONNECT status line")
+    }
+    version := substr(line, 0, sp)
+    if version != "HTTP/1.0" && version != "HTTP/1.1" {
+        return 0, errors.new("http: malformed CONNECT HTTP version")
+    }
+    rest := substr(line, sp + 1, len(line))
+    sp2 := find(rest, " ")
+    code := rest
+    if sp2 >= 0 {
+        code = substr(rest, 0, sp2)
+    }
+    if len(code) != 3 {
+        return 0, errors.new("http: malformed CONNECT status code")
+    }
+    i := 0
+    for i < 3 {
+        b := byteat(code, i)
+        if b < 48 || b > 57 {
+            return 0, errors.new("http: malformed CONNECT status code")
+        }
+        i = i + 1
+    }
+    [status, se] = strconv.atoi(code)
+    if se != nil || status < 100 || status > 599 {
+        return 0, errors.new("http: malformed CONNECT status code")
+    }
+    pos := line_end + 2
+    for pos < end {
+        eol := find_from(head, "\r\n", pos)
+        if eol < 0 || eol > end {
+            return 0, errors.new("http: malformed CONNECT headers")
+        }
+        if eol == pos {
+            break
+        }
+        field := substr(head, pos, eol)
+        colon := find(field, ":")
+        if colon <= 0 {
+            return 0, errors.new("http: malformed CONNECT header")
+        }
+        name := substr(field, 0, colon)
+        value := substr(field, colon + 1, len(field))
+        lo := 0
+        for lo < len(value) && (byteat(value, lo) == 32 || byteat(value, lo) == 9) {
+            lo = lo + 1
+        }
+        hi := len(value)
+        for hi > lo && (byteat(value, hi - 1) == 32 || byteat(value, hi - 1) == 9) {
+            hi = hi - 1
+        }
+        value = substr(value, lo, hi)
+        if !header_value_ok(name, value) {
+            return 0, errors.new("http: malformed CONNECT header")
+        }
+        name = lwr(name)
+        if name == "transfer-encoding" && len(value) > 0 {
+            return 0, errors.new("http: invalid CONNECT transfer encoding")
+        }
+        if name == "content-length" {
+            [length, le] = strconv.atoi(value)
+            if le != nil || length != 0 {
+                return 0, errors.new("http: invalid CONNECT content length")
+            }
+        }
+        pos = eol + 2
+    }
+    if status != 200 && (status < 100 || status >= 200 || status == 101) {
+        return status, errors.new("http: proxy CONNECT returned status " + itoa(status))
+    }
+    return status, nil
+}
+
+fn connect_proxy(c: net.Conn, u: Url, tmo: int) -> err {
+    if tmo <= 0 {
+        return errors.new("http: proxy CONNECT timeout")
+    }
+    authority := connect_authority(u)
+    wire := "CONNECT " + authority + " HTTP/1.1\r\nhost: " + authority + "\r\nproxy-connection: keep-alive\r\n\r\n"
+    set_sndtimo(c.rawfd(), (tmo + 999) / 1000)
+    we := write_all(c, wire)
+    if we != nil {
+        return errors.wrap("http: proxy CONNECT write", we)
+    }
+    response := ""
+    read_bytes := 0
+    scan_from := 0
+    deadline := now_ms() + tmo
+    buf := mkslice(byte, 1)
+    for read_bytes < 32768 {
+        if tmo > 0 {
+            remaining := deadline - now_ms()
+            if remaining <= 0 {
+                return errors.new("http: proxy CONNECT timeout")
+            }
+            set_rcvtimo_ms(c.rawfd(), remaining)
+        }
+        [n, re] = c.read(buf)
+        if n > 0 {
+            response = response + buf[0:n] as str
+            read_bytes = read_bytes + n
+            head_end := find_from(response, "\r\n\r\n", scan_from)
+            if head_end >= 0 {
+                [status, pe] = connect_response_status(response)
+                if pe != nil {
+                    return pe
+                }
+                if status >= 100 && status < 200 && status != 101 {
+                    response = ""
+                    scan_from = 0
+                } else {
+                    set_rcvtimo_ms(c.rawfd(), 0)
+                    return nil
+                }
+            } else {
+                scan_from = len(response) - 3
+                if scan_from < 0 {
+                    scan_from = 0
+                }
+            }
+        }
+        if re != nil {
+            return errors.wrap("http: proxy CONNECT read", re)
+        }
+        if n <= 0 {
+            return errors.new("http: proxy CONNECT response ended early")
+        }
+    }
+    return errors.new("http: proxy CONNECT headers too large")
 }
 
 /// is_loopback_host reports whether host names the local machine —
@@ -528,7 +683,7 @@ fn remove_dot_segments(path: str) -> str {
 fn redirect_request(cur: Request, status: int, loc: str) -> [Request, err] {
     [nurl, ne] = resolve_location(cur.url, loc)
     if ne != nil {
-        return Request{method: "", url: "", headers: mkslice(Header, 0), body: "", redirects: 0, decompress: false, proxy: "direct"}, ne
+        return Request{method: "", url: "", headers: mkslice(Header, 0), body: "", redirects: 0, decompress: false, proxy: "direct", http_version: ""}, ne
     }
     method := cur.method
     body := cur.body
@@ -541,13 +696,13 @@ fn redirect_request(cur: Request, status: int, loc: str) -> [Request, err] {
     // must not carry authorization/cookie/proxy-authorization along
     [nu, ne2] = parse_url(nurl)
     if ne2 != nil {
-        return Request{method: "", url: "", headers: mkslice(Header, 0), body: "", redirects: 0, decompress: false, proxy: "direct"}, ne2
+        return Request{method: "", url: "", headers: mkslice(Header, 0), body: "", redirects: 0, decompress: false, proxy: "direct", http_version: ""}, ne2
     }
     // cur.url already parsed inside resolve_location — this cannot
     // fail, but the err channel must still be handled
     [cu, ce] = parse_url(cur.url)
     if ce != nil {
-        return Request{method: "", url: "", headers: mkslice(Header, 0), body: "", redirects: 0, decompress: false, proxy: "direct"}, ce
+        return Request{method: "", url: "", headers: mkslice(Header, 0), body: "", redirects: 0, decompress: false, proxy: "direct", http_version: ""}, ce
     }
     same_origin := nu.host == cu.host && nu.port == cu.port && nu.secure == cu.secure
     hs := mkslice(Header, 0)
@@ -563,7 +718,7 @@ fn redirect_request(cur: Request, status: int, loc: str) -> [Request, err] {
         }
         i = i + 1
     }
-    return Request{method: method, url: nurl, headers: hs, body: body, redirects: cur.redirects, decompress: cur.decompress, proxy: cur.proxy}, nil
+    return Request{method: method, url: nurl, headers: hs, body: body, redirects: cur.redirects, decompress: cur.decompress, proxy: cur.proxy, http_version: cur.http_version}, nil
 }
 
 /// parse_head_headers turns the response head (everything before
@@ -776,7 +931,278 @@ fn exchange(c: xconn, wire: str, tmo: int) -> [str, err] {
 /// do_once performs exactly one request/response exchange — no
 /// redirects, no retries. Shared by do()'s redirect loop and (via
 /// request()) the legacy flat API.
+fn http2_headers(headers: []http2.Header) -> []Header {
+    out := mkslice(Header, 0)
+    i := 0
+    for i < len(headers) {
+        if len(headers[i].name) == 0 || byteat(headers[i].name, 0) != 58 {
+            out = push(out, Header{name: headers[i].name, value: headers[i].value})
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn valid_http2_request(req: Request) -> err {
+    if len(req.method) == 0 {
+        return errors.new("http: empty method")
+    }
+    i := 0
+    for i < len(req.method) {
+        if byteat(req.method, i) <= 32 || byteat(req.method, i) >= 127 {
+            return errors.new("http: bad method " + req.method)
+        }
+        i = i + 1
+    }
+    i = 0
+    for i < len(req.url) {
+        if byteat(req.url, i) < 33 || byteat(req.url, i) == 127 {
+            return errors.new("http: bad url " + req.url)
+        }
+        i = i + 1
+    }
+    i = 0
+    for i < len(req.headers) {
+        h := req.headers[i]
+        if managed_header(h.name) {
+            return errors.new("http: header " + h.name + " is managed by the client")
+        }
+        if !header_value_ok(h.name, h.value) {
+            return errors.new("http: header " + h.name + " contains CR/LF")
+        }
+        i = i + 1
+    }
+    return nil
+}
+
+fn dial_http2_request(cl: ref Client, u: Url, pxy: str) -> [http2.TLSDialResult, err] {
+    if len(pxy) == 0 || pxy == "direct" {
+        return http2.dial_tls_config(u.host, u.port, cl.tmo, cl.tlscfg)
+    }
+    [pu, pe] = parse_url(pxy)
+    if pe != nil {
+        return http2.TLSDialResult{conn: nil, transport: nil, closer: nil, protocol: ""}, errors.new("http: bad proxy url " + pxy)
+    }
+    if pu.secure != 0 {
+        return http2.TLSDialResult{conn: nil, transport: nil, closer: nil, protocol: ""}, errors.new("http: proxy url must be http")
+    }
+    [proxy, de] = net.dial_timeout(pu.host, pu.port, cl.tmo)
+    if de != nil {
+        return http2.TLSDialResult{conn: nil, transport: nil, closer: nil, protocol: ""}, de
+    }
+    pe = connect_proxy(proxy, u, cl.tmo)
+    if pe != nil {
+        proxy.close()
+        return http2.TLSDialResult{conn: nil, transport: nil, closer: nil, protocol: ""}, pe
+    }
+    return http2.dial_tls_over(proxy, u.host, cl.tmo, cl.tlscfg)
+}
+
+fn (cl ref Client) do_once_h2(req: Request, u: Url, prior: bool) -> [Response, err] {
+    bad := Response{status: 0, reason: "", headers: mkslice(Header, 0), body: "", ctype: "", chunked: false, trailers: mkslice(Header, 0)}
+    ve := valid_http2_request(req)
+    if ve != nil {
+        return bad, ve
+    }
+    pxy := req.proxy
+    if len(pxy) == 0 {
+        pxy = proxy_from_env(u.host, u.secure)
+    }
+    if prior {
+        if len(pxy) > 0 && pxy != "direct" {
+            return bad, errors.new("http: h2c through a proxy is not supported")
+        }
+        if u.secure != 0 {
+            return bad, errors.new("http: prior-knowledge HTTP/2 requires a cleartext URL")
+        }
+        [conn, de] = http2.dial_h2c(u.host, u.port, cl.tmo)
+        if de != nil {
+            return bad, de
+        }
+        [response, re] = cl.http2_exchange(req, u, conn)
+        ce := conn.close()
+        if re != nil {
+            return bad, re
+        }
+        if ce != nil {
+            return bad, ce
+        }
+        return response, nil
+    }
+    if u.secure == 0 {
+        return cl.do_once_http1(req)
+    }
+    [result, de] = dial_http2_request(cl, u, pxy)
+    if de != nil {
+        return bad, de
+    }
+    if result.conn == nil {
+        if result.closer != nil {
+            result.closer.close()
+        }
+        return cl.do_once_http1(req)
+    }
+    [response, re] = cl.http2_exchange(req, u, result.conn)
+    ce := result.conn.close()
+    if re != nil {
+        return bad, re
+    }
+    if ce != nil {
+        return bad, ce
+    }
+    return response, nil
+}
+
+fn (cl ref Client) http2_exchange(req: Request, u: Url, conn: mut http2.Conn) -> [Response, err] {
+    bad := Response{status: 0, reason: "", headers: mkslice(Header, 0), body: "", ctype: "", chunked: false, trailers: mkslice(Header, 0)}
+    req_headers := mkslice(http2.Header, 0)
+    req_headers = push(req_headers, http2.Header{name: ":method", value: req.method})
+    req_headers = push(req_headers, http2.Header{name: ":scheme", value: scheme_name(u)})
+    req_headers = push(req_headers, http2.Header{name: ":path", value: u.path})
+    req_headers = push(req_headers, http2.Header{name: ":authority", value: url_authority(u)})
+    if req.decompress {
+        // advertise gzip like the h1 path — never double-set a
+        // caller-supplied accept-encoding
+        has_ae := false
+        j := 0
+        for j < len(req.headers) {
+            if lwr(req.headers[j].name) == "accept-encoding" {
+                has_ae = true
+            }
+            j = j + 1
+        }
+        if !has_ae {
+            req_headers = push(req_headers, http2.Header{name: "accept-encoding", value: "gzip"})
+        }
+    }
+    if len(req.body) > 0 {
+        req_headers = push(req_headers, http2.Header{name: "content-length", value: itoa(len(req.body))})
+    }
+    i := 0
+    for i < len(req.headers) {
+        req_headers = push(req_headers, http2.Header{name: lwr(req.headers[i].name), value: req.headers[i].value})
+        i = i + 1
+    }
+    [id, oe] = conn.open_stream(req_headers, len(req.body) == 0)
+    if oe != nil {
+        return bad, oe
+    }
+    if len(req.body) > 0 {
+        se := conn.send_body(id, req.body as []byte)
+        if se != nil {
+            return bad, se
+        }
+    }
+    response := Response{status: 0, reason: "", headers: mkslice(Header, 0), body: "", ctype: "", chunked: false, trailers: mkslice(Header, 0)}
+    body := bytes.newbuffer()
+    complete := false
+    for !complete {
+        [event, ee] = conn.next_event()
+        if ee != nil {
+            return bad, ee
+        }
+        if event.kind == 7 {
+            if event.last_stream_id < id {
+                return bad, errors.new("http: HTTP/2 peer did not process stream")
+            }
+            continue
+        }
+        if event.stream_id != id {
+            return bad, errors.new("http: unexpected HTTP/2 stream event")
+        }
+        if event.kind == 3 {
+            return bad, errors.new("http: HTTP/2 stream reset")
+        }
+        if event.kind == 1 {
+            if event.trailers {
+                response.trailers = http2_headers(event.headers)
+                complete = true
+            } else {
+                j := 0
+                for j < len(event.headers) {
+                    if event.headers[j].name == ":status" {
+                        [status, status_err] = strconv.atoi(event.headers[j].value)
+                        if status_err != nil {
+                            return bad, errors.new("http: invalid HTTP/2 status")
+                        }
+                        response.status = status
+                    }
+                    j = j + 1
+                }
+                if response.status >= 200 {
+                    response.headers = http2_headers(event.headers)
+                    response.ctype = response.header("content-type")
+                    if (event.flags & 1) != 0 {
+                        complete = true
+                    }
+                }
+            }
+        } else if event.kind == 0 {
+            if body.len() + len(event.payload) > GUNZIP_MAX {
+                return bad, errors.new("http: HTTP/2 body exceeds 64MiB limit")
+            }
+            [_, be] = body.write(event.payload)
+            if be != nil {
+                return bad, be
+            }
+            if event.flow_bytes > 0 {
+                ae := conn.ack_data(id, event.flow_bytes)
+                if ae != nil {
+                    return bad, ae
+                }
+            }
+            if (event.flags & 1) != 0 {
+                complete = true
+            }
+        }
+    }
+    raw := body.str()
+    content_length := ""
+    have_length := false
+    i = 0
+    for i < len(response.headers) {
+        if lwr(response.headers[i].name) == "content-length" {
+            if have_length && content_length != response.headers[i].value {
+                return bad, errors.new("http: conflicting HTTP/2 content-length")
+            }
+            content_length = response.headers[i].value
+            have_length = true
+        }
+        i = i + 1
+    }
+    if have_length {
+        if len(content_length) == 0 || len(content_length) > 18 {
+            return bad, errors.new("http: invalid HTTP/2 content-length")
+        }
+        [want, we] = strconv.atoi(content_length)
+        if we != nil || want < 0 || want != len(raw) {
+            return bad, errors.new("http: HTTP/2 content-length mismatch")
+        }
+    }
+    if req.decompress && lwr(response.header("content-encoding")) == "gzip" {
+        [decoded, ge] = gunzip_capped(raw)
+        if ge != nil {
+            return bad, errors.new("http: gzip decode: " + errors.msg(ge))
+        }
+        raw = decoded
+    }
+    response.body = raw
+    return response, nil
+}
+
 fn (cl ref Client) do_once(req: Request) -> [Response, err] {
+    if req.http_version == "2" || req.http_version == "2-prior-knowledge" {
+        [u, ue] = parse_url(req.url)
+        if ue != nil {
+            bad := Response{status: 0, reason: "", headers: mkslice(Header, 0), body: "", ctype: "", chunked: false, trailers: mkslice(Header, 0)}
+            return bad, ue
+        }
+        return cl.do_once_h2(req, u, req.http_version == "2-prior-knowledge")
+    }
+    return cl.do_once_http1(req)
+}
+
+fn (cl ref Client) do_once_http1(req: Request) -> [Response, err] {
     bad := Response{status: 0, reason: "", headers: mkslice(Header, 0), body: "", ctype: "", chunked: false, trailers: mkslice(Header, 0)}
     // the request line is "METHOD target HTTP/1.1" — a space or CTL in
     // method or url is request-line injection, same class as header CR/LF
@@ -815,9 +1241,8 @@ fn (cl ref Client) do_once(req: Request) -> [Response, err] {
         i = i + 1
     }
     // proxy policy: "" honors the env, "direct" connects straight,
-    // anything else is an http:// proxy URL. The request target stays
-    // absolute-URI through a proxy (plain-HTTP forwarding — CONNECT
-    // is an HTTPS concern).
+    // anything else is an http:// proxy URL. Plain HTTP uses absolute
+    // form; HTTPS establishes CONNECT before TLS.
     pxy := req.proxy
     if len(pxy) == 0 {
         pxy = proxy_from_env(u.host, u.secure)
@@ -842,12 +1267,6 @@ fn (cl ref Client) do_once(req: Request) -> [Response, err] {
         dial_port = pu.port
         via_proxy = true
     }
-    // https through an HTTP proxy needs CONNECT tunneling — parked;
-    // a configured proxy on a secure URL errors, never silently goes
-    // direct or cleartext
-    if u.secure != 0 && via_proxy {
-        return bad, errors.new("http: https via proxy unsupported (no CONNECT)")
-    }
     // Host header names the ORIGIN, not the proxy; the port rides
     // only when it differs from the scheme default — no spurious :443
     hosthdr := target_host
@@ -855,7 +1274,7 @@ fn (cl ref Client) do_once(req: Request) -> [Response, err] {
         hosthdr = hosthdr + ":" + itoa(target_port)
     }
     target := u.path
-    if via_proxy {
+    if via_proxy && u.secure == 0 {
         target = "http://" + url_authority(u) + u.path
     }
     wire := req.method + " " + target + " HTTP/1.1\r\n" + "host: " + hosthdr + "\r\n" + "connection: close\r\n"
@@ -894,15 +1313,46 @@ fn (cl ref Client) do_once(req: Request) -> [Response, err] {
         if len(cfg.alpn) == 0 {
             cfg.alpn = push(mkslice(str, 0), "http/1.1")
         }
-        [tc, te] = tls.dial_timeout(u.host, u.port, cl.tmo, cfg)
-        if te != nil {
-            return bad, te
+        if via_proxy {
+            [pc, pe] = net.dial_timeout(dial_host, dial_port, cl.tmo)
+            if pe != nil {
+                return bad, pe
+            }
+            pe = connect_proxy(pc, u, cl.tmo)
+            if pe != nil {
+                pc.close()
+                return bad, pe
+            }
+            [tc, te] = tls.client_tmo(pc, cfg, cl.tmo)
+            if te != nil {
+                return bad, te
+            }
+            protocol := tc.negotiated_alpn()
+            if protocol != "" && protocol != "http/1.1" {
+                tc.close()
+                return bad, errors.new("http: unsupported negotiated ALPN protocol " + protocol)
+            }
+            [rs, re] = exchange(tc, wire, cl.tmo)
+            if re != nil {
+                return bad, re
+            }
+            resp = rs
+        } else {
+            [tc, te] = tls.dial_timeout(u.host, u.port, cl.tmo, cfg)
+            if te != nil {
+                return bad, te
+            }
+            protocol := tc.negotiated_alpn()
+            if protocol != "" && protocol != "http/1.1" {
+                tc.close()
+                return bad, errors.new("http: unsupported negotiated ALPN protocol " + protocol)
+            }
+            [rs, re] = exchange(tc, wire, cl.tmo)
+            if re != nil {
+                return bad, re
+            }
+            resp = rs
         }
-        [rs, re] = exchange(tc, wire, cl.tmo)
-        if re != nil {
-            return bad, re
-        }
-        resp = rs
     } else {
         [c, de] = net.dial_timeout(dial_host, dial_port, cl.tmo)
         if de != nil {

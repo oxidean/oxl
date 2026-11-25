@@ -1,0 +1,237 @@
+package main
+
+// Local-only protocol coverage; tests/run.sh starts the independent Python peer.
+import "std/net/websocket"
+
+import "std/net/tls"
+
+import "std/os"
+
+import "std/errors"
+
+import "std/testing"
+
+fn ws_options() -> websocket.Options {
+    cfg := tls.default_cfg()
+    protocols := push(mkslice(str, 0), "echo.v1")
+    return websocket.Options{timeout_ms: 3000, max_frame_size: 8192, max_message_size: 100000, subprotocols: protocols, tls_cfg: cfg}
+}
+
+fn ws_url(port: int, path: str) -> str {
+    return "ws://127.0.0.1:" + itoa(port) + path
+}
+
+fn test_ws_upgrade_and_frames() {
+    port := atoi(os.getenv("OXL_WS_PORT"))
+    testing.expect(port > 0, "local websocket peer is running")
+    [c, e] = websocket.dial(ws_url(port, "/ok"), ws_options())
+    if e != nil {
+        testing.expect(false, "websocket dial: " + errors.msg(e))
+        return
+    }
+    testing.expect_streq(c.subprotocol(), "echo.v1", "selected subprotocol")
+    e = c.write_text("hello")
+    testing.expect(e == nil, "write masked text")
+    b := push(mkslice(byte, 0), 0)
+    b = push(b, 255)
+    e = c.write_binary(b)
+    testing.expect(e == nil, "write masked binary")
+    large := mkslice(byte, 130)
+    i := 0
+    for i < len(large) {
+        large[i] = i % 256
+        i = i + 1
+    }
+    e = c.write_binary(large)
+    testing.expect(e == nil, "write 16-bit length frame")
+    huge := mkslice(byte, 65536)
+    i = 0
+    for i < len(huge) {
+        huge[i] = i % 256
+        i = i + 1
+    }
+    e = c.write_binary(huge)
+    testing.expect(e == nil, "write 64-bit length frame")
+    e = c.ping("client-ping" as []byte)
+    testing.expect(e == nil, "send ping")
+    [m, re] = c.read_message()
+    testing.expect(re == nil, "read fragmented text after interleaved ping")
+    testing.expect_eq(m.kind, 1, "text opcode")
+    testing.expect_streq(m.data as str, "fragmented", "fragment reassembly")
+    e = c.close(1000, "done")
+    testing.expect(e == nil, "complete close handshake")
+}
+
+fn test_ws_upgrade_rejections() {
+    port := atoi(os.getenv("OXL_WS_PORT"))
+    paths := mkslice(str, 0)
+    paths = push(paths, "/bad-accept")
+    paths = push(paths, "/missing-accept")
+    paths = push(paths, "/duplicate-accept")
+    paths = push(paths, "/bad-status")
+    paths = push(paths, "/bad-protocol")
+    paths = push(paths, "/missing-upgrade")
+    paths = push(paths, "/missing-connection")
+    paths = push(paths, "/duplicate-upgrade")
+    i := 0
+    for i < len(paths) {
+        [c, e] = websocket.dial(ws_url(port, paths[i]), ws_options())
+        testing.expect(e != nil, "reject malformed upgrade " + paths[i])
+        c.abort()
+        i = i + 1
+    }
+}
+
+fn test_ws_optional_subprotocol_and_empty_reason() {
+    port := atoi(os.getenv("OXL_WS_PORT"))
+    [without_protocol, protocol_err] = websocket.dial(ws_url(port, "/missing-protocol"), ws_options())
+    testing.expect(protocol_err == nil, "accept upgrade without selected subprotocol")
+    testing.expect_streq(without_protocol.subprotocol(), "", "missing subprotocol stays empty")
+    without_protocol.abort()
+    [empty_reason, reason_err] = websocket.dial(ws_url(port, "/empty-reason"), ws_options())
+    testing.expect(reason_err == nil, "accept 101 status without reason phrase")
+    empty_reason.abort()
+}
+
+fn test_ws_bad_server_frames() {
+    port := atoi(os.getenv("OXL_WS_PORT"))
+    paths := mkslice(str, 0)
+    paths = push(paths, "/masked")
+    paths = push(paths, "/masked-small-limit")
+    paths = push(paths, "/reserved-opcode")
+    paths = push(paths, "/bad-utf8")
+    paths = push(paths, "/bad-control")
+    paths = push(paths, "/bad-close-code")
+    paths = push(paths, "/bad-close-length")
+    paths = push(paths, "/oversize")
+    paths = push(paths, "/nonminimal")
+    paths = push(paths, "/huge-length")
+    paths = push(paths, "/long-control")
+    paths = push(paths, "/unexpected-continuation")
+    paths = push(paths, "/new-during-fragment")
+    paths = push(paths, "/fragment-overflow")
+    i := 0
+    for i < len(paths) {
+        o := ws_options()
+        if paths[i] == "/oversize" || paths[i] == "/fragment-overflow" {
+            o.max_frame_size = 8
+            o.max_message_size = 8
+        } else if paths[i] == "/masked-small-limit" {
+            o.max_frame_size = 1
+        }
+        [c, e] = websocket.dial(ws_url(port, paths[i]), o)
+        testing.expect(e == nil, "malformed-frame fixture handshake")
+        if e == nil {
+            [_, re] = c.read_message()
+            testing.expect(re != nil, "reject malformed server frame " + paths[i])
+            [_, retry_err] = c.read_message()
+            testing.expect(retry_err != nil, "failed read poisons connection " + paths[i])
+            testing.expect(c.write_text("after failure") != nil, "failed connection rejects writes " + paths[i])
+            c.abort()
+        }
+        i = i + 1
+    }
+}
+
+fn test_ws_control_frame_under_small_limit() {
+    port := atoi(os.getenv("OXL_WS_PORT"))
+    o := ws_options()
+    o.max_frame_size = 1
+    [c, e] = websocket.dial(ws_url(port, "/ping-small-limit"), o)
+    testing.expect(e == nil, "ping-small-limit fixture handshake")
+    if e == nil {
+        [m, re] = c.read_message()
+        testing.expect(re == nil && m.kind == 1 && m.data as str == "x", "legal ping survives under tiny max_frame")
+        e = c.close(1000, "done")
+        testing.expect(e == nil, "close after control frame")
+    }
+}
+
+fn test_ws_extended_server_length() {
+    port := atoi(os.getenv("OXL_WS_PORT"))
+    [c, e] = websocket.dial(ws_url(port, "/extended"), ws_options())
+    testing.expect(e == nil, "extended length fixture handshake")
+    if e == nil {
+        [m, re] = c.read_message()
+        testing.expect(re == nil && m.kind == 1 && len(m.data) == 126, "parse 16-bit server frame length")
+        c.abort()
+    }
+}
+
+fn test_ws_64bit_client_length() {
+    port := atoi(os.getenv("OXL_WS_PORT"))
+    o := ws_options()
+    o.max_frame_size = 100000
+    [c, e] = websocket.dial(ws_url(port, "/length64"), o)
+    testing.expect(e == nil, "64-bit fixture handshake")
+    if e == nil {
+        large := mkslice(byte, 65536)
+        i := 0
+        for i < len(large) {
+            large[i] = i % 256
+            i = i + 1
+        }
+        we := c.write_binary(large)
+        testing.expect(we == nil, "write 64-bit length frame")
+        ce := c.close(1000, "done")
+        testing.expect(ce == nil, "close after 64-bit frame")
+    }
+}
+
+fn test_ws_read_deadline() {
+    port := atoi(os.getenv("OXL_WS_PORT"))
+    o := ws_options()
+    o.timeout_ms = 1500
+    [c, e] = websocket.dial(ws_url(port, "/timeout"), o)
+    testing.expect(e == nil, "timeout fixture handshake")
+    if e == nil {
+        c.set_deadline(100)
+        [_, re] = c.read_message()
+        testing.expect(re != nil, "read deadline expires")
+        c.abort()
+    }
+}
+
+fn test_ws_write_deadline() {
+    port := atoi(os.getenv("OXL_WS_PORT"))
+    [c, e] = websocket.dial(ws_url(port, "/timeout"), ws_options())
+    testing.expect(e == nil, "write deadline fixture handshake")
+    if e == nil {
+        c.set_deadline(1)
+        msleep(5)
+        we := c.write_text("late")
+        testing.expect(we != nil, "expired write deadline rejected")
+        c.abort()
+    }
+}
+
+fn wss_options(name: str, load_ca: bool) -> websocket.Options {
+    o := ws_options()
+    cfg := tls.default_cfg()
+    cfg.server_name = name
+    if load_ca {
+        [n, e] = cfg.roots.load_pem(os.readfile_("tests/tls/ca.pem"))
+        testing.expect(e == nil && n > 0, "load local websocket CA")
+    }
+    o.tls_cfg = cfg
+    return o
+}
+
+fn test_wss_identity_and_interop() {
+    port := atoi(os.getenv("OXL_WSS_PORT"))
+    [c, e] = websocket.dial("wss://localhost:" + itoa(port) + "/ok", wss_options("localhost", true))
+    if e != nil {
+        testing.expect(false, "wss trusted connection: " + errors.msg(e))
+        return
+    }
+    [m, re] = c.read_message()
+    testing.expect(re == nil && m.kind == 1 && m.data as str == "secure", "wss local peer text")
+    e = c.close(1000, "secure done")
+    testing.expect(e == nil, "wss close handshake")
+    [bad, be] = websocket.dial("wss://localhost:" + itoa(port) + "/ok", wss_options("wrong.invalid", true))
+    testing.expect(be != nil, "wss wrong identity rejected")
+    bad.abort()
+    [untrusted, ue] = websocket.dial("wss://localhost:" + itoa(port) + "/ok", ws_options())
+    testing.expect(ue != nil, "wss untrusted certificate rejected")
+    untrusted.abort()
+}

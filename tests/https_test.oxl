@@ -57,13 +57,6 @@ fn test_url_https() {
     if e6 != nil {
         testing.expect(strings.contains(errors.msg(e6), "proxy url must be http"), "proxy scheme error is loud")
     }
-    rq2 := http.request_get("https://example.com/")
-    rq2.proxy = "http://127.0.0.1:1"
-    [_, e7] = cl.do(rq2)
-    testing.expect(e7 != nil, "https-via-proxy rejected")
-    if e7 != nil {
-        testing.expect(strings.contains(errors.msg(e7), "no CONNECT"), "CONNECT-parked error is loud")
-    }
 }
 
 // the interop lane's env: OXL_HTTPS_TEST_PORT is the s_server port

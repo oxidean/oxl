@@ -76,6 +76,16 @@ fn (w mut wr) u24(v: int) {
     w.b = push(w.b, v % 256)
 }
 
+// u64 appends a big-endian 64-bit value — TLS 1.2's explicit nonce
+// and the AEAD additional-data sequence number.
+fn (w mut wr) u64(v: int) {
+    i := 7
+    for i >= 0 {
+        w.b = push(w.b, v / pow256b(i) % 256)
+        i = i - 1
+    }
+}
+
 fn (w mut wr) put(v: []byte) {
     i := 0
     for i < len(v) {
@@ -128,6 +138,7 @@ fn bcat(a: []byte, b: []byte) -> own []byte {
         out[i] = a[i]
         i = i + 1
     }
+    i = 0
     for i < len(b) {
         out[len(a) + i] = b[i]
         i = i + 1

@@ -86,9 +86,19 @@ with_timeout() {
 scratch=$(mktemp -d)
 srv_pid=""
 relsrv=""
+ws_peer_pid=""
+h2_srv="" h2_proxy_srv="" grpc_srv="" peer_pid=""
+isrv="" hsrv="" tsrv="" rsa_srv="" vsrv="" ssrv="" rsrv="" csrv=""
+origin_srv="" proxy_srv="" sigpid="" base_pid="" scale_pid="" scale_dog=""
 cleanup() {
-    if [ -n "$srv_pid" ]; then kill "$srv_pid" 2>/dev/null || true; fi
-    if [ -n "$relsrv" ]; then kill "$relsrv" 2>/dev/null || true; wait "$relsrv" 2>/dev/null || true; fi
+    # every fixture server the suite can spawn — a mid-suite failure
+    # must not orphan node/python/openssl peers holding ports (they
+    # poison later runs on the same machine)
+    for p in $srv_pid $relsrv $ws_peer_pid $h2_srv $h2_proxy_srv $grpc_srv $peer_pid \
+             $isrv $hsrv $tsrv $rsa_srv $vsrv $ssrv $rsrv $csrv $origin_srv $proxy_srv \
+             $sigpid $base_pid $scale_pid $scale_dog; do
+        [ -n "$p" ] && kill "$p" 2>/dev/null || true
+    done
     # v2's sealed module-cache slots are read-only — restore write
     # permission or rm leaves them behind
     chmod -R u+w "$scratch" 2>/dev/null
@@ -375,6 +385,141 @@ printf '%s
 for t in test_base64 test_hex test_binary test_csv; do
     grep -q "$t ... ok" <<<"$out" || { echo "FAIL enc: $out"; exit 1; }
 done
+out=$("$OXL" test tests/http2_frame_test.oxl)
+printf '%s\n' "$out" >&2
+for t in test_http2_frame_header_roundtrip test_http2_frame_header_rejects_invalid_input test_http2_frame_payload test_http2_frame_io_roundtrip test_http2_frame_type_validation; do
+    grep -q "$t ... ok" <<<"$out" || { echo "FAIL http2 frame: $out"; exit 1; }
+done
+out=$("$OXL" test tests/http2_hpack_test.oxl)
+printf '%s\n' "$out" >&2
+for t in test_http2_hpack_rfc_request_vector test_http2_hpack_rejects_bounds_and_indexes test_http2_hpack_rfc_huffman test_http2_hpack_encode_request; do
+    grep -q "$t ... ok" <<<"$out" || { echo "FAIL http2 HPACK: $out"; exit 1; }
+done
+out=$("$OXL" test tests/http2_conn_test.oxl)
+printf '%s\n' "$out" >&2
+for t in test_http2_connection_streams_and_trailers test_http2_connection_multiplexes_stream_ids test_http2_peer_max_concurrent_streams test_http2_cancel_reclaims_receive_credit_and_slot test_http2_reset_reclaims_receive_credit_and_slot test_http2_send_body_handles_goaway_for_accepted_stream test_http2_send_body_rejects_goaway_excluded_stream test_http2_goaway_last_stream_is_monotonic test_http2_pending_event_limit test_http2_enable_push_setting test_http2_connection_control_frames test_http2_rst_after_close_is_ignored test_http2_dial_rejects_nonpositive_timeout test_http2_control_frame_flood test_http2_continuation_sequence_enforced test_http2_data_exceeding_recv_window_rejected; do
+    grep -q "$t ... ok" <<<"$out" || { echo "FAIL http2 connection: $out"; exit 1; }
+done
+out=$("$OXL" test tests/grpc_wire_test.oxl) || { echo "FAIL gRPC wire unit: $out"; exit 1; }
+printf '%s\n' "$out" >&2
+for t in test_grpc_frame_decode_and_limits test_grpc_metadata_and_target_validation test_grpc_goaway_maps_unprocessed_stream_unavailable test_grpc_send_respects_peer_window_and_maps_deadlines; do
+    grep -q "$t ... ok" <<<"$out" || { echo "FAIL gRPC wire unit: $out"; exit 1; }
+done
+if command -v node >/dev/null 2>&1; then
+    h2_port=$((30000 + RANDOM % 15000))
+    h2_tls_port=$((h2_port + 1))
+    h1_tls_port=$((h2_port + 2))
+    h1_port=$((h2_port + 3))
+    h2_proxy_port=$((h2_port + 6))
+    h2_proxy_capture=$(mktemp)
+    node tests/http2_server.mjs "$h2_port" "$h2_tls_port" "$h1_tls_port" "$h1_port" >/dev/null 2>&1 &
+    h2_srv=$!
+    "$PY" tests/tls/connect_proxy.py "$h2_proxy_port" "$h2_tls_port" "$h2_proxy_capture" >/dev/null 2>&1 &
+    h2_proxy_srv=$!
+h2_ready=0
+for _ in {1..50}; do
+    kill -0 "$h2_srv" 2>/dev/null || break
+    (exec 3<>"/dev/tcp/127.0.0.1/$h2_port" && exec 4<>"/dev/tcp/127.0.0.1/$h2_tls_port" && exec 5<>"/dev/tcp/127.0.0.1/$h1_tls_port" && exec 6<>"/dev/tcp/127.0.0.1/$h1_port" && exec 7<>"/dev/tcp/127.0.0.1/$h2_proxy_port") 2>/dev/null && { exec 3>&- 3<&- 4>&- 4<&- 5<&- 6>&- 6<&- 7>&- 7<&-; h2_ready=1; break; }
+    sleep 0.1
+done
+if [ "$h2_ready" != 1 ]; then
+    kill "$h2_srv" "$h2_proxy_srv" 2>/dev/null || true
+    wait "$h2_srv" "$h2_proxy_srv" 2>/dev/null || true
+    rm -f "$h2_proxy_capture"
+    echo "FAIL http2 interop: local server did not start"
+    exit 1
+fi
+out=$(OXL_HTTP2_PORT="$h2_port" OXL_HTTP2_TLS_PORT="$h2_tls_port" OXL_HTTP1_TLS_PORT="$h1_tls_port" OXL_HTTP1_PORT="$h1_port" "$OXL" test tests/http2_interop_test.oxl) || {
+    kill "$h2_srv" "$h2_proxy_srv" 2>/dev/null || true
+    wait "$h2_srv" "$h2_proxy_srv" 2>/dev/null || true
+    rm -f "$h2_proxy_capture"
+    echo "FAIL http2 interop: $out"
+    exit 1
+}
+printf '%s\n' "$out" >&2
+grep -q "test_http2_interop ... ok" <<<"$out" && grep -q "test_http2_tls_alpn ... ok" <<<"$out" && grep -q "test_http_client_http2 ... ok" <<<"$out" || {
+    kill "$h2_srv" "$h2_proxy_srv" 2>/dev/null || true
+    wait "$h2_srv" "$h2_proxy_srv" 2>/dev/null || true
+    rm -f "$h2_proxy_capture"
+    echo "FAIL http2 interop: $out"
+    exit 1
+}
+out=$(OXL_HTTP2_TLS_PORT="$h2_tls_port" OXL_HTTP1_TLS_PORT="$h1_tls_port" OXL_HTTP2_PROXY_PORT="$h2_proxy_port" OXL_HTTP2_PROXY_CAPTURE="$h2_proxy_capture" "$OXL" test tests/http2_proxy_test.oxl) || {
+    kill "$h2_srv" "$h2_proxy_srv" 2>/dev/null || true
+    wait "$h2_srv" "$h2_proxy_srv" 2>/dev/null || true
+    rm -f "$h2_proxy_capture"
+    echo "FAIL HTTP/2 CONNECT proxy: $out"
+    exit 1
+}
+printf '%s\n' "$out" >&2
+grep -q "test_http2_tls_through_connect_proxy ... ok" <<<"$out" && grep -q "test_http1_rejects_h2_alpn ... ok" <<<"$out" && grep -q "test_http2_falls_back_to_http1_alpn ... ok" <<<"$out" || {
+    kill "$h2_srv" "$h2_proxy_srv" 2>/dev/null || true
+    wait "$h2_srv" "$h2_proxy_srv" 2>/dev/null || true
+    rm -f "$h2_proxy_capture"
+    echo "FAIL HTTP/2 CONNECT proxy: $out"
+    exit 1
+}
+kill "$h2_proxy_srv" 2>/dev/null || true
+wait "$h2_proxy_srv" 2>/dev/null || true
+rm -f "$h2_proxy_capture"
+timeout_out=$(with_timeout 60 env OXL_HTTP2_PORT="$h2_port" "$OXL" test tests/http2_timeout_test.oxl) || {
+    kill "$h2_srv" 2>/dev/null || true
+    wait "$h2_srv" 2>/dev/null || true
+    echo "FAIL HTTP/2 deadline test: $timeout_out"
+    exit 1
+}
+printf "%s\n" "$timeout_out" >&2
+grep -q "test_http2_client_deadline ... ok" <<<"$timeout_out" || { echo "FAIL HTTP/2 deadline test: $timeout_out"; exit 1; }
+# Independent gRPC interoperability peer: Node's built-in HTTP/2 stack,
+# separate from the oxl transport and its existing HTTP/2 fixture.
+grpc_port=$((h2_port + 4))
+grpc_tls_port=$((h2_port + 5))
+node tests/grpc_server.mjs "$grpc_port" "$grpc_tls_port" >/dev/null 2>&1 &
+grpc_srv=$!
+grpc_ready=0
+for _ in {1..50}; do
+    kill -0 "$grpc_srv" 2>/dev/null || break
+    (exec 7<>"/dev/tcp/127.0.0.1/$grpc_port" && exec 8<>"/dev/tcp/127.0.0.1/$grpc_tls_port") 2>/dev/null && { exec 7>&- 7<&- 8>&- 8<&-; grpc_ready=1; break; }
+    sleep 0.1
+done
+if [ "$grpc_ready" != 1 ]; then
+    kill "$grpc_srv" 2>/dev/null || true
+    wait "$grpc_srv" 2>/dev/null || true
+    kill "$h2_srv" 2>/dev/null || true
+    wait "$h2_srv" 2>/dev/null || true
+    echo "FAIL gRPC interop: local H2 fixture did not start"
+    exit 1
+fi
+grpc_out=$(with_timeout 40 env OXL_GRPC_PORT="$grpc_port" OXL_GRPCS_PORT="$grpc_tls_port" "$OXL" test tests/grpc_interop_test.oxl) || {
+    kill "$grpc_srv" 2>/dev/null || true
+    wait "$grpc_srv" 2>/dev/null || true
+    kill "$h2_srv" 2>/dev/null || true
+    wait "$h2_srv" 2>/dev/null || true
+    echo "FAIL gRPC interop: $grpc_out"
+    exit 1
+}
+printf '%s\n' "$grpc_out" >&2
+for t in test_grpc_interop_unary_and_metadata test_grpc_interop_client_streaming test_grpc_interop_server_streaming test_grpc_interop_bidirectional_streaming test_grpc_interop_status_trailers_and_oversize test_grpc_unknown_status_and_http_response_validation test_grpcs_interop_uses_h2_alpn test_grpc_deadline_and_cancel test_grpc_concurrent_call_bound; do
+    grep -q "$t ... ok" <<<"$grpc_out" || {
+        kill "$grpc_srv" 2>/dev/null || true
+        wait "$grpc_srv" 2>/dev/null || true
+        kill "$h2_srv" 2>/dev/null || true
+        wait "$h2_srv" 2>/dev/null || true
+        echo "FAIL gRPC interop: $grpc_out"
+        exit 1
+    }
+done
+kill "$grpc_srv" 2>/dev/null || true
+wait "$grpc_srv" 2>/dev/null || true
+kill "$h2_srv" 2>/dev/null || true
+wait "$h2_srv" 2>/dev/null || true
+else
+    if [ "${CI:-}" = "true" ]; then
+        echo "FAIL http2 interop: node is required in CI"
+        exit 1
+    fi
+    echo "http2 interop skipped: node unavailable"
+fi
 out=$("$OXL" test tests/hash_test.oxl)
 printf '%s
 ' "$out" >&2
@@ -413,6 +558,11 @@ printf '%s
 for t in test_csrand; do
     grep -q "$t ... ok" <<<"$out" || { echo "FAIL crypto_rand: $out"; exit 1; }
 done
+out=$("$OXL" test tests/sha1_test.oxl) || { printf '%s
+' "$out" >&2; exit 1; }
+printf '%s
+' "$out" >&2
+grep -q "test_sha1_vectors ... ok" <<<"$out" || { echo "FAIL sha1: $out"; exit 1; }
 out=$("$OXL" test tests/sha512_test.oxl) || { printf '%s
 ' "$out" >&2; exit 1; }
 printf '%s
@@ -566,6 +716,49 @@ printf '%s
 for t in test_handshake test_handshake_hrr test_handshake_cookie test_rawfd_and_adapters; do
     grep -q "$t ... ok" <<<"$out" || { echo "FAIL tls_handshake: $out"; exit 1; }
 done
+out=$("$OXL" test tests/tls12_test.oxl) || { printf '%s\n' "$out" >&2; exit 1; }
+printf '%s\n' "$out" >&2
+for t in test_tls12_prf_vectors test_tls12_version_policy_and_sentinels test_tls12_suite_auth_family test_tls12_malformed_handshake_vectors test_tls12_gcm_server_finished_record; do
+    grep -q "$t ... ok" <<<"$out" || { echo "FAIL tls12: $out"; exit 1; }
+done
+
+out=$("$OXL" test tests/mtls_test.oxl) || { printf '%s\n' "$out" >&2; exit 1; }
+printf '%s\n' "$out" >&2
+for t in test_privkey_pem_parse test_privkey_rejects test_key_cert_match test_sign_roundtrip test_cv_alg_pick test_no_cert_default; do
+    grep -q "$t ... ok" <<<"$out" || { echo "FAIL mtls: $out"; exit 1; }
+done
+
+echo "== adversarial TLS 1.2 negotiation probes =="
+tls_probe_base="${TLS_INTEROP_PORT:-24443}"
+tls12_peer_probe() { # <client scenario> <peer mode> <port> <marker>
+    local scenario=$1 mode=$2 port=$3 marker=$4 out tries
+    "$PY" tests/tls/tls12_peer.py "$port" "$mode" >"$scratch/tls12-peer.out" 2>&1 &
+    peer_pid=$! # global on purpose — the EXIT trap sweeps it
+    tries=0
+    while ! grep -q '^READY$' "$scratch/tls12-peer.out" 2>/dev/null && [ "$tries" -lt 50 ]; do
+        sleep 0.05
+        tries=$((tries + 1))
+    done
+    if ! grep -q '^READY$' "$scratch/tls12-peer.out" 2>/dev/null; then
+        cat "$scratch/tls12-peer.out" >&2
+        kill "$peer_pid" 2>/dev/null || true
+        return 1
+    fi
+    out=$("$OXL" run tests/tls/interop.oxl -- "$scenario" "$port" tests/tls/ca.pem) || {
+        printf '%s\n' "$out" >&2
+        wait "$peer_pid" 2>/dev/null || true
+        return 1
+    }
+    printf '%s\n' "$out" >&2
+    wait "$peer_pid" || return 1
+    grep -q "$marker" <<<"$out"
+}
+tls12_peer_probe sentinel_auto auto "$((tls_probe_base + 4))" INTEROP_SENTINEL_AUTO \
+    || { echo "FAIL TLS 1.2 auto sentinel abort"; exit 1; }
+tls12_peer_probe sentinel_pinned pinned "$((tls_probe_base + 5))" INTEROP_SENTINEL_PINNED \
+    || { echo "FAIL pinned TLS 1.2 sentinel handling"; exit 1; }
+tls12_peer_probe badhello12 malformed "$((tls_probe_base + 6))" INTEROP_MALFORMED12 \
+    || { echo "FAIL malformed TLS 1.2 ServerHello"; exit 1; }
 
 echo "== openssl interop: tls (x6) =="
 # Live wire: real openssl s_server instances answer each scenario —
@@ -583,16 +776,35 @@ echo "== openssl interop: tls (x6) =="
 # LibreSSL s_server lacks -tls1_3/-groups — that's "openssl absent"
 # for this lane's purposes; macos-latest's stock openssl is LibreSSL
 if command -v openssl >/dev/null 2>&1 && openssl version 2>/dev/null | grep -q '^OpenSSL'; then
-    tls_interop() { # <scenario> <port> <ca.pem> <marker>
-        local out
-        out=$("$OXL" run tests/tls/interop.oxl -- "$1" "$2" "$3") || {
+    tls_interop() { # <scenario> <port> <ca.pem> <marker> [extra args...]
+        local scen=$1 port=$2 ca=$3 marker=$4 out
+        shift 4
+        out=$("$OXL" run tests/tls/interop.oxl -- "$scen" "$port" "$ca" "$@") || {
             printf '%s\n' "$out" >&2
             return 1
         }
-        grep -q "$4" <<<"$out"
+        grep -q "$marker" <<<"$out"
     }
     iport="${TLS_INTEROP_PORT:-24443}"
     hport=$((iport + 1))
+    tport=$((iport + 10))
+    rport=$((tport + 1))
+    cat >"$scratch/tls12-rsa.cnf" <<'EOF'
+[req]
+distinguished_name = dn
+x509_extensions = server
+prompt = no
+[dn]
+CN = localhost
+[server]
+basicConstraints = critical,CA:FALSE
+keyUsage = critical,digitalSignature,keyEncipherment
+extendedKeyUsage = serverAuth
+subjectAltName = DNS:localhost,IP:127.0.0.1
+EOF
+    openssl req -x509 -newkey rsa:2048 -nodes -sha256 \
+        -keyout "$scratch/tls12-rsa-key.pem" -out "$scratch/tls12-rsa-cert.pem" \
+        -days 1 -config "$scratch/tls12-rsa.cnf" -extensions server >/dev/null 2>&1
     openssl s_server -accept "$iport" \
         -cert tests/tls/server.pem -key tests/tls/server-key.pem \
         -tls1_3 -www -naccept 16 -quiet >/dev/null 2>&1 &
@@ -601,6 +813,35 @@ if command -v openssl >/dev/null 2>&1 && openssl version 2>/dev/null | grep -q '
         -cert tests/tls/server.pem -key tests/tls/server-key.pem \
         -tls1_3 -www -groups P-384 -naccept 4 -quiet >/dev/null 2>&1 &
     hsrv=$!
+    openssl s_server -accept "$tport" \
+        -cert tests/tls/server.pem -key tests/tls/server-key.pem \
+        -tls1_2 -cipher ECDHE-ECDSA-AES128-GCM-SHA256 \
+        -www -naccept 12 -quiet >/dev/null 2>&1 &
+    tsrv=$!
+    openssl s_server -accept "$rport" \
+        -cert "$scratch/tls12-rsa-cert.pem" -key "$scratch/tls12-rsa-key.pem" \
+        -tls1_2 -cipher ECDHE-RSA-AES256-GCM-SHA384 -groups P-384 \
+        -www -naccept 4 -quiet >/dev/null 2>&1 &
+    rsa_srv=$!
+    # mTLS listeners (#221): -Verify 1 makes client auth mandatory and
+    # -CAfile names the client CA the CR's certificate_authorities
+    # advertises; the constrained listener additionally shrinks the
+    # CR's signature_algorithms to rsa_pss_rsae_sha384 +
+    # ecdsa_secp256r1_sha256 (the server's own CV scheme must stay
+    # listed or the handshake dies server-side)
+    vport=$((iport + 7))
+    sport=$((iport + 8))
+    openssl s_server -accept "$vport" \
+        -cert tests/tls/server.pem -key tests/tls/server-key.pem \
+        -tls1_3 -Verify 1 -CAfile tests/fixtures/mtls/client-ca.pem \
+        -www -naccept 8 -quiet >/dev/null 2>&1 &
+    vsrv=$!
+    openssl s_server -accept "$sport" \
+        -cert tests/tls/server.pem -key tests/tls/server-key.pem \
+        -tls1_3 -Verify 1 -CAfile tests/fixtures/mtls/client-ca.pem \
+        -sigalgs rsa_pss_rsae_sha384:ecdsa_secp256r1_sha256 \
+        -www -naccept 4 -quiet >/dev/null 2>&1 &
+    ssrv=$!
     # wait for both listeners — each probe connect eats one -naccept
     # slot, which the counts above already budget for
     iready=0
@@ -615,31 +856,87 @@ if command -v openssl >/dev/null 2>&1 && openssl version 2>/dev/null | grep -q '
         (exec 3<>"/dev/tcp/127.0.0.1/$hport") 2>/dev/null && { exec 3>&- 3<&-; hready=1; break; }
         sleep 0.1
     done
-    if [ "$iready" != 1 ] || [ "$hready" != 1 ]; then
+    tready=0
+    for i in $(seq 1 50); do
+        kill -0 "$tsrv" 2>/dev/null || break
+        (exec 3<>"/dev/tcp/127.0.0.1/$tport") 2>/dev/null && { exec 3>&- 3<&-; tready=1; break; }
+        sleep 0.1
+    done
+    rready=0
+    for i in $(seq 1 50); do
+        kill -0 "$rsa_srv" 2>/dev/null || break
+        (exec 3<>"/dev/tcp/127.0.0.1/$rport") 2>/dev/null && { exec 3>&- 3<&-; rready=1; break; }
+        sleep 0.1
+    done
+    vready=0
+    for i in $(seq 1 50); do
+        kill -0 "$vsrv" 2>/dev/null || break
+        (exec 3<>"/dev/tcp/127.0.0.1/$vport") 2>/dev/null && { exec 3>&- 3<&-; vready=1; break; }
+        sleep 0.1
+    done
+    sready=0
+    for i in $(seq 1 50); do
+        kill -0 "$ssrv" 2>/dev/null || break
+        (exec 3<>"/dev/tcp/127.0.0.1/$sport") 2>/dev/null && { exec 3>&- 3<&-; sready=1; break; }
+        sleep 0.1
+    done
+    if [ "$iready" != 1 ] || [ "$hready" != 1 ] || [ "$tready" != 1 ] || [ "$rready" != 1 ] || [ "$vready" != 1 ] || [ "$sready" != 1 ]; then
         echo "FAIL tls interop: s_server did not listen" >&2
-        kill "$isrv" "$hsrv" 2>/dev/null || true
+        kill "$isrv" "$hsrv" "$tsrv" "$rsa_srv" "$vsrv" "$ssrv" 2>/dev/null || true
         exit 1
     fi
     tls_interop ok "$iport" tests/tls/ca.pem INTEROP_OK \
-        || { echo "FAIL tls interop ok"; kill "$isrv" "$hsrv" 2>/dev/null || true; exit 1; }
+        || { echo "FAIL tls interop ok"; kill "$isrv" "$hsrv" "$tsrv" "$rsa_srv" "$vsrv" "$ssrv" 2>/dev/null || true; exit 1; }
     tls_interop hrr "$hport" tests/tls/ca.pem INTEROP_HRR \
-        || { echo "FAIL tls interop hrr"; kill "$isrv" "$hsrv" 2>/dev/null || true; exit 1; }
+        || { echo "FAIL tls interop hrr"; kill "$isrv" "$hsrv" "$tsrv" "$rsa_srv" "$vsrv" "$ssrv" 2>/dev/null || true; exit 1; }
     tls_interop badroot "$iport" tests/fixtures/x509/roots.pem INTEROP_BADROOT \
-        || { echo "FAIL tls interop badroot"; kill "$isrv" "$hsrv" 2>/dev/null || true; exit 1; }
+        || { echo "FAIL tls interop badroot"; kill "$isrv" "$hsrv" "$tsrv" "$rsa_srv" "$vsrv" "$ssrv" 2>/dev/null || true; exit 1; }
     tls_interop badname "$iport" tests/tls/ca.pem INTEROP_BADNAME \
-        || { echo "FAIL tls interop badname"; kill "$isrv" "$hsrv" 2>/dev/null || true; exit 1; }
+        || { echo "FAIL tls interop badname"; kill "$isrv" "$hsrv" "$tsrv" "$rsa_srv" "$vsrv" "$ssrv" 2>/dev/null || true; exit 1; }
+    tls_interop tls12default "$tport" tests/tls/ca.pem INTEROP_TLS12_DEFAULT_REJECTED \
+        || { echo "FAIL tls 1.3-only default against tls 1.2 peer"; kill "$isrv" "$hsrv" "$tsrv" "$rsa_srv" "$vsrv" "$ssrv" 2>/dev/null || true; exit 1; }
+    tls_interop tls12 "$tport" tests/tls/ca.pem INTEROP_TLS12 \
+        || { echo "FAIL pinned tls 1.2 interop"; kill "$isrv" "$hsrv" "$tsrv" "$rsa_srv" "$vsrv" "$ssrv" 2>/dev/null || true; exit 1; }
+    tls_interop auto12 "$tport" tests/tls/ca.pem INTEROP_AUTO12 \
+        || { echo "FAIL tls 1.2 explicit auto interop"; kill "$isrv" "$hsrv" "$tsrv" "$rsa_srv" "$vsrv" "$ssrv" 2>/dev/null || true; exit 1; }
+    tls_interop tls12rsa "$rport" "$scratch/tls12-rsa-cert.pem" INTEROP_TLS12_RSA \
+        || { echo "FAIL TLS 1.2 RSA/AES-256-GCM-SHA384 interop"; kill "$isrv" "$hsrv" "$tsrv" "$rsa_srv" "$vsrv" "$ssrv" 2>/dev/null || true; exit 1; }
+    tls_interop badroot12 "$tport" tests/fixtures/x509/roots.pem INTEROP_BADROOT \
+        || { echo "FAIL tls 1.2 bad-root verification"; kill "$isrv" "$hsrv" "$tsrv" "$rsa_srv" "$vsrv" "$ssrv" 2>/dev/null || true; exit 1; }
+    tls_interop badname12 "$tport" tests/tls/ca.pem INTEROP_BADNAME \
+        || { echo "FAIL tls 1.2 hostname verification"; kill "$isrv" "$hsrv" "$tsrv" "$rsa_srv" "$vsrv" "$ssrv" 2>/dev/null || true; exit 1; }
+    # #221 mTLS probes — every signature family through a mandatory
+    # -Verify handshake, the no-cert alert, and the constrained
+    # signature_algorithms listener (RSA must fall to pss_sha384, an
+    # ed25519 key has nothing offered and answers empty)
+    tls_interop mtls "$vport" tests/tls/ca.pem INTEROP_MTLS tests/fixtures/mtls/client_rsa.pem tests/fixtures/mtls/client_rsa.key \
+        || { echo "FAIL mtls rsa interop"; kill "$isrv" "$hsrv" "$tsrv" "$rsa_srv" "$vsrv" "$ssrv" 2>/dev/null || true; exit 1; }
+    tls_interop mtls "$vport" tests/tls/ca.pem INTEROP_MTLS tests/fixtures/mtls/client_ec.pem tests/fixtures/mtls/client_ec.key \
+        || { echo "FAIL mtls p256 interop"; kill "$isrv" "$hsrv" "$tsrv" "$rsa_srv" "$vsrv" "$ssrv" 2>/dev/null || true; exit 1; }
+    tls_interop mtls "$vport" tests/tls/ca.pem INTEROP_MTLS tests/fixtures/mtls/client_ec384.pem tests/fixtures/mtls/client_ec384.key \
+        || { echo "FAIL mtls p384 interop"; kill "$isrv" "$hsrv" "$tsrv" "$rsa_srv" "$vsrv" "$ssrv" 2>/dev/null || true; exit 1; }
+    tls_interop mtls "$vport" tests/tls/ca.pem INTEROP_MTLS tests/fixtures/mtls/client_ed.pem tests/fixtures/mtls/client_ed.key \
+        || { echo "FAIL mtls ed25519 interop"; kill "$isrv" "$hsrv" "$tsrv" "$rsa_srv" "$vsrv" "$ssrv" 2>/dev/null || true; exit 1; }
+    tls_interop mtls_nocert "$vport" tests/tls/ca.pem INTEROP_MTLS_NOCERT \
+        || { echo "FAIL mtls no-cert interop"; kill "$isrv" "$hsrv" "$tsrv" "$rsa_srv" "$vsrv" "$ssrv" 2>/dev/null || true; exit 1; }
+    tls_interop mtls "$sport" tests/tls/ca.pem INTEROP_MTLS tests/fixtures/mtls/client_rsa.pem tests/fixtures/mtls/client_rsa.key \
+        || { echo "FAIL mtls constrained-sigalgs interop"; kill "$isrv" "$hsrv" "$tsrv" "$rsa_srv" "$vsrv" "$ssrv" 2>/dev/null || true; exit 1; }
+    tls_interop mtls_nocert "$sport" tests/tls/ca.pem INTEROP_MTLS_NOCERT tests/fixtures/mtls/client_ed.pem tests/fixtures/mtls/client_ed.key \
+        || { echo "FAIL mtls unusable-scheme interop"; kill "$isrv" "$hsrv" "$tsrv" "$rsa_srv" "$vsrv" "$ssrv" 2>/dev/null || true; exit 1; }
+    tls_interop mtls_nocr "$iport" tests/tls/ca.pem INTEROP_MTLS_NOCR tests/fixtures/mtls/client_ec.pem tests/fixtures/mtls/client_ec.key \
+        || { echo "FAIL mtls no-request interop"; kill "$isrv" "$hsrv" "$tsrv" "$rsa_srv" "$vsrv" "$ssrv" 2>/dev/null || true; exit 1; }
     # x7 https seam — the same s_server through http.Client.request:
     # env roots carry the CA bundle, server_name defaults to the URL
     # host (an iPAddress SAN on the fixture cert)
     hout=$(OXL_HTTPS_TEST_PORT="$iport" OXL_HTTPS_TEST_CA=tests/tls/ca.pem \
         "$OXL" test tests/https_test.oxl) || {
         printf '%s\n' "$hout" >&2
-        kill "$isrv" "$hsrv" 2>/dev/null || true
+        kill "$isrv" "$hsrv" "$tsrv" "$rsa_srv" "$vsrv" "$ssrv" 2>/dev/null || true
         exit 1
     }
     printf '%s\n' "$hout" >&2
     for t in test_https_get test_https_bad_cert test_https_wrong_name; do
-        grep -q "$t ... ok" <<<"$hout" || { echo "FAIL https interop $t: $hout"; kill "$isrv" "$hsrv" 2>/dev/null || true; exit 1; }
+        grep -q "$t ... ok" <<<"$hout" || { echo "FAIL https interop $t: $hout"; kill "$isrv" "$hsrv" "$tsrv" "$rsa_srv" "$vsrv" "$ssrv" 2>/dev/null || true; exit 1; }
     done
     # https redirect credential-strip — a TLS 302 down to cleartext
     # must not carry authorization. s_server can't emit redirects and
@@ -669,30 +966,119 @@ if command -v openssl >/dev/null 2>&1 && openssl version 2>/dev/null | grep -q '
         done
         if [ "$rready" != 1 ] || [ "$cready" != 1 ]; then
             echo "FAIL https redirect: stubs did not listen" >&2
-            kill "$rsrv" "$csrv" "$isrv" "$hsrv" 2>/dev/null || true
+            kill "$rsrv" "$csrv" "$isrv" "$hsrv" "$tsrv" "$vsrv" "$ssrv" 2>/dev/null || true
             exit 1
         fi
         rout=$(OXL_HTTPS_TEST_REDIR_PORT="$rport"             OXL_HTTPS_TEST_CAPTURE_FILE="$capfile"             OXL_HTTPS_TEST_CA=tests/tls/ca.pem             "$OXL" test tests/https_test.oxl) || {
             printf '%s\n' "$rout" >&2
-            kill "$rsrv" "$csrv" "$isrv" "$hsrv" 2>/dev/null || true
+            kill "$rsrv" "$csrv" "$isrv" "$hsrv" "$tsrv" "$vsrv" "$ssrv" 2>/dev/null || true
             rm -f "$capfile"
             exit 1
         }
         printf '%s\n' "$rout" >&2
         grep -q "test_https_redirect_noleak ... ok" <<<"$rout" \
-            || { echo "FAIL https redirect noleak: $rout"; kill "$rsrv" "$csrv" "$isrv" "$hsrv" 2>/dev/null || true; rm -f "$capfile"; exit 1; }
+            || { echo "FAIL https redirect noleak: $rout"; kill "$rsrv" "$csrv" "$isrv" "$hsrv" "$tsrv" "$vsrv" "$ssrv" 2>/dev/null || true; rm -f "$capfile"; exit 1; }
         kill "$rsrv" "$csrv" 2>/dev/null || true
         wait "$rsrv" "$csrv" 2>/dev/null || true
         rm -f "$capfile"
-        echo "  interop: ok hrr badroot badname https redirect-noleak"
+        echo "  interop: ok hrr tls12 pinned/auto/default badroot/name tls1.3 mtls https redirect-noleak"
     else
         echo "  python3+ssl not found — skipping https redirect interop"
-        echo "  interop: ok hrr badroot badname https"
+        echo "  interop: ok hrr tls12 pinned/auto/default badroot/name tls1.3 mtls https"
     fi
-    kill "$isrv" "$hsrv" 2>/dev/null || true
-    wait "$isrv" "$hsrv" 2>/dev/null || true
+    kill "$isrv" "$hsrv" "$tsrv" "$rsa_srv" "$vsrv" "$ssrv" 2>/dev/null || true
+    wait "$isrv" "$hsrv" "$tsrv" "$rsa_srv" "$vsrv" "$ssrv" 2>/dev/null || true
 else
     echo "  openssl not found — skipping live interop"
+fi
+
+if command -v "$PY" >/dev/null 2>&1 && "$PY" -c 'import ssl' 2>/dev/null; then
+    origin_port="${TLS_INTEROP_PORT:-24443}"
+    proxy_port=$((origin_port + 4))
+    connect_capture=$(mktemp)
+    "$PY" tests/tls/https_origin.py "$origin_port" tests/tls/server.pem tests/tls/server-key.pem >/dev/null 2>&1 &
+    origin_srv=$!
+    "$PY" tests/tls/connect_proxy.py "$proxy_port" "$origin_port" "$connect_capture" >/dev/null 2>&1 &
+    proxy_srv=$!
+    origin_ready=0
+    for i in $(seq 1 50); do
+        kill -0 "$origin_srv" 2>/dev/null || break
+        (exec 3<>"/dev/tcp/127.0.0.1/$origin_port") 2>/dev/null && { exec 3>&- 3<&-; origin_ready=1; break; }
+        sleep 0.1
+    done
+    proxy_ready=0
+    for i in $(seq 1 50); do
+        kill -0 "$proxy_srv" 2>/dev/null || break
+        (exec 3<>"/dev/tcp/127.0.0.1/$proxy_port") 2>/dev/null && { exec 3>&- 3<&-; proxy_ready=1; break; }
+        sleep 0.1
+    done
+    if [ "$origin_ready" != 1 ] || [ "$proxy_ready" != 1 ]; then
+        echo "FAIL https CONNECT: local fixtures did not listen" >&2
+        kill "$proxy_srv" "$origin_srv" 2>/dev/null || true
+        rm -f "$connect_capture"
+        exit 1
+    fi
+    proxy_test() {
+        local mode="$1" hp="$2" ap="$3" np="$4" hproxy="$5" request_method="$6" lhp="${7:-}" lap="${8:-}" lnp="${9:-}" lhttp="${10:-}" pout
+        : > "$connect_capture"
+        pout=$(OXL_HTTPS_TEST_PORT="$origin_port" OXL_HTTPS_PROXY_PORT="$proxy_port" \
+            OXL_HTTPS_TEST_CA=tests/tls/ca.pem OXL_PROXY_CAPTURE="$connect_capture" \
+            OXL_PROXY_MODE="$mode" HTTP_PROXY="$hproxy" http_proxy="$lhttp" REQUEST_METHOD="$request_method" \
+            HTTPS_PROXY="$hp" https_proxy="$lhp" ALL_PROXY="$ap" all_proxy="$lap" NO_PROXY="$np" no_proxy="$lnp" \
+            "$OXL" test tests/https_proxy_test.oxl) || {
+            printf '%s\n' "$pout" >&2
+            kill "$proxy_srv" "$origin_srv" 2>/dev/null || true
+            rm -f "$connect_capture"
+            exit 1
+        }
+        grep -q "test_https_proxy_connect ... ok" <<<"$pout" || {
+            echo "FAIL https CONNECT $mode: $pout" >&2
+            kill "$proxy_srv" "$origin_srv" 2>/dev/null || true
+            rm -f "$connect_capture"
+            exit 1
+        }
+        printf '%s\n' "$pout" >&2
+    }
+    proxy_url="http://127.0.0.1:$proxy_port"
+    case "$(uname -s)" in
+        MINGW*|MSYS*|CYGWIN*) ;;
+        *)
+            proxy_test env_precedence http://scheme.invalid http://fallback.invalid "" "" "" "" "" ""
+            proxy_test env_http_precedence "" "" "" http://uppercase.invalid "" "" "" "" http://lowercase.invalid
+            proxy_test env_https_precedence http://uppercase.invalid "" "" "" "" http://lowercase.invalid "" ""
+            proxy_test proxy_bypass_lower "" "" "" "" "" http://lowercase.invalid "" example.invalid
+            proxy_test env_https_lower "" "" "" "" "" "$proxy_url" "" ""
+            proxy_test env_all_lower "" "" "" "" "" "" "$proxy_url" ""
+            ;;
+    esac
+    proxy_test explicit "" "" "" "" ""
+    proxy_test origin_sni "" "" "" "" ""
+    proxy_test env_https "$proxy_url" "" "" "" ""
+    proxy_test zero_timeout "" "" "" "" ""
+    proxy_test env_all "" "$proxy_url" "" "" ""
+    proxy_test no_proxy "$proxy_url" "" "127.0.0.1" "" ""
+    proxy_test proxy_bypass_rule "$proxy_url" "" "example.invalid" "" ""
+    proxy_test http_proxy_cgi_guard "" "" "" "$proxy_url" GET
+    proxy_test explicit_override "$proxy_url" "" "example.invalid" "" ""
+    proxy_test direct "$proxy_url" "" "" "" ""
+    proxy_test reject "" "" "" "" ""
+    proxy_test badgateway "" "" "" "" ""
+    proxy_test non200 "" "" "" "" ""
+    proxy_test bad_proxy_url "" "" "" "" ""
+    proxy_test secure_proxy "" "" "" "" ""
+    proxy_test interim "" "" "" "" ""
+    proxy_test malformed "" "" "" "" ""
+    proxy_test badcl "" "" "" "" ""
+    proxy_test badte "" "" "" "" ""
+    proxy_test cumulative "" "" "" "" ""
+    proxy_test truncated "" "" "" "" ""
+    proxy_test oversized "" "" "" "" ""
+    proxy_test badname "" "" "" "" ""
+    proxy_test badroot "" "" "" "" ""
+    kill "$proxy_srv" "$origin_srv" 2>/dev/null || true
+    wait "$proxy_srv" "$origin_srv" 2>/dev/null || true
+    rm -f "$connect_capture"
+    echo "  https CONNECT local proxy tests: success, env, bypass, rejection, bounds, trust"
 fi
 
 echo "== oxl test: https (x7) =="
@@ -768,6 +1154,32 @@ out=$("$OXL" run tests/httpclient_rich.oxl)
 printf '%s
 ' "$out" >&2
 grep -q "httpclient rich done" <<<"$out" || { echo "FAIL httpclient rich: $out"; exit 1; }
+
+echo "== oxl test: websocket client (#220) =="
+"$PY" tests/websocket_peer.py "$scratch/ws-ports" >"$scratch/ws-peer.log" 2>&1 &
+ws_peer_pid=$!
+for i in $(seq 1 100); do
+    [ -s "$scratch/ws-ports" ] && break
+    kill -0 "$ws_peer_pid" 2>/dev/null || { cat "$scratch/ws-peer.log" >&2; echo "FAIL websocket peer startup"; exit 1; }
+    sleep 0.05
+done
+[ -s "$scratch/ws-ports" ] || { echo "FAIL websocket peer did not publish ports"; exit 1; }
+read -r ws_port wss_port < "$scratch/ws-ports"
+: > "$scratch/ws-errors"
+out=$(OXL_WS_PORT="$ws_port" OXL_WSS_PORT="$wss_port" OXL_WS_ERRORS="$scratch/ws-errors" \
+    with_timeout 90 "$OXL" test tests/websocket_test.oxl) || { printf '%s
+' "$out" >&2; cat "$scratch/ws-errors" >&2; exit 1; }
+printf '%s
+' "$out" >&2
+for t in test_ws_upgrade_and_frames test_ws_upgrade_rejections test_ws_optional_subprotocol_and_empty_reason test_ws_bad_server_frames test_ws_control_frame_under_small_limit test_ws_extended_server_length test_ws_64bit_client_length test_ws_read_deadline test_ws_write_deadline test_wss_identity_and_interop; do
+    grep -q "$t ... ok" <<<"$out" || { echo "FAIL websocket $t: $out"; exit 1; }
+done
+[ ! -s "$scratch/ws-errors" ] || { cat "$scratch/ws-errors" >&2; echo "FAIL websocket peer assertions"; exit 1; }
+kill "$ws_peer_pid" 2>/dev/null || true
+wait "$ws_peer_pid" 2>/dev/null || true
+ws_peer_pid=""
+out=$("$OXL" test tests/websocket_smoke.oxl)
+grep -q "test_ws_bad_url ... ok" <<<"$out" || { echo "FAIL websocket URL validation: $out"; exit 1; }
 
 echo "== oxl test: exec + fs (t0) =="
 out=$("$OXL" test tests/exec_test.oxl)
@@ -1687,7 +2099,7 @@ done
 # s4 enc/hash/crypto + x1/x3/x4 crypto through the self-hosted emitter +
 # cc — exercises [][]str return emission (csv.read_all), hash/crypto,
 # and the big-limb arithmetic under -test
-for tf in enc hash crypto aesgcm chacha sha512 hkdf crypto_rand bignum rsa x25519 nistec ed25519 x509 tls_keys tls_handshake https; do
+for tf in enc hash crypto aesgcm chacha sha1 sha512 hkdf crypto_rand bignum rsa x25519 nistec ed25519 x509 tls_keys tls_handshake https; do
     "$OXL" run bootstrap/cmd/codegen -- --test "tests/${tf}_test.oxl" > "$cgen_dir/$tf.c"
     tfcrypto=""; tfcryptolib=""; tfnet=""
     grep -q 'rt_csrand(' "$cgen_dir/$tf.c" && { tfcrypto="-DOXL_CRYPTO"; tfcryptolib="$CRYPTO_LIBS"; }
@@ -1712,6 +2124,7 @@ done
 for t in test_chacha20 test_poly1305 test_aead; do
     grep -q "$t ... ok" "$cgen_dir/chacha.out" || { echo "FAIL codegen chacha $t"; cat "$cgen_dir/chacha.out"; exit 1; }
 done
+grep -q "test_sha1_vectors ... ok" "$cgen_dir/sha1.out" || { echo "FAIL codegen sha1"; cat "$cgen_dir/sha1.out"; exit 1; }
 for t in test_sha512 test_sha384 test_hmac_sha512; do
     grep -q "$t ... ok" "$cgen_dir/sha512.out" || { echo "FAIL codegen sha512 $t"; cat "$cgen_dir/sha512.out"; exit 1; }
 done

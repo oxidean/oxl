@@ -1,0 +1,767 @@
+package tls
+
+// std/net/tls — TLS 1.2 client fallback (RFC 5246, RFC 5288
+// AES-GCM records, RFC 7627 extended master secret). Entered from
+// hs_client when a 1.3-offering ClientHello draws a 0x0303-only
+// ServerHello without the RFC 7507 downgrade sentinel. Deliberately
+// narrow: ECDHE key exchange only (TLS_ECDHE_{RSA,ECDSA}_WITH_AES_
+// {128,256}_GCM_SHA{256,384}) — no CBC suites (padding-oracle
+// surface), no RSA key transport (the stack ships no private-key
+// op), no session tickets or resumption, no renegotiation
+// (HelloRequest is answered with the no_renegotiation warning), and
+// no TLS <= 1.1.
+import "std/errors"
+
+import "std/hash"
+
+import "std/crypto/x509"
+
+import "std/crypto/nistec"
+
+import "std/crypto/rsa"
+
+import "std/crypto/ed25519"
+
+import "std/crypto/sha256"
+
+import "std/crypto/sha512"
+
+// TLS 1.2 cipher suites offered, in ClientHello preference order
+let S12_RSA_AES128GCM = 49199 // 0xC02F ECDHE_RSA + AES-128-GCM-SHA256
+
+let S12_RSA_AES256GCM = 49200 // 0xC030 ECDHE_RSA + AES-256-GCM-SHA384
+
+let S12_ECDSA_AES128GCM = 49195 // 0xC02B ECDHE_ECDSA + AES-128-GCM
+
+let S12_ECDSA_AES256GCM = 49196 // 0xC02C ECDHE_ECDSA + AES-256-GCM
+
+fn suite12_ok(s: int) -> bool {
+    return s == S12_RSA_AES128GCM || s == S12_RSA_AES256GCM || s == S12_ECDSA_AES128GCM || s == S12_ECDSA_AES256GCM
+}
+
+// suite12_hash is the suite's PRF hash — RFC 5246 §5 ties both the
+// PRF and the Finished transcript hash to it (SHA-256 for the
+// _SHA256 suites, SHA-384 for _SHA384).
+fn suite12_hash(s: int) -> fn() -> hash.Hash {
+    if s == S12_RSA_AES256GCM || s == S12_ECDSA_AES256GCM {
+        return sha512.new384
+    }
+    return sha256.new
+}
+
+fn suite12_hlen(s: int) -> int {
+    if s == S12_RSA_AES256GCM || s == S12_ECDSA_AES256GCM {
+        return 48
+    }
+    return 32
+}
+
+fn suite12_aead(s: int) -> int {
+    if s == S12_RSA_AES256GCM || s == S12_ECDSA_AES256GCM {
+        return AEAD_AES256
+    }
+    return AEAD_AES128
+}
+
+fn suite12_klen(s: int) -> int {
+    if s == S12_RSA_AES256GCM || s == S12_ECDSA_AES256GCM {
+        return 32
+    }
+    return 16
+}
+
+// ---- PRF (RFC 5246 §5) ---------------------------------------------------
+
+// prf12 is the TLS 1.2 PRF: P_hash(secret, label || seed) truncated
+// to n bytes. A(i) chains HMAC(secret, A(i-1)) with A(0) = label ||
+// seed; each round emits HMAC(secret, A(i) || label || seed).
+fn prf12(hf: fn() -> hash.Hash, secret: []byte, label: str, seed: []byte, n: int) -> [own []byte, err] {
+    sw := mkwr()
+    sw.putstr(label)
+    sw.put(seed)
+    sd := sw.b
+    out := mkslice(byte, 0)
+    a := sd
+    for len(out) < n {
+        [na, e] = hmac_sum(hf, secret, a)
+        if e != nil {
+            return nil, e
+        }
+        a = na[0:len(na)]
+        w := mkwr()
+        w.put(a)
+        w.put(sd)
+        [t, e2] = hmac_sum(hf, secret, w.b)
+        if e2 != nil {
+            return nil, e2
+        }
+        i := 0
+        for i < len(t) {
+            out = push(out, t[i])
+            i = i + 1
+        }
+    }
+    return new(out[0:n]), nil
+}
+
+// ---- record layer (RFC 5288) ----------------------------------------------
+
+// rec12_seal emits one armed TLS 1.2 AEAD record — the true content
+// type stays on the wire (no inner-type wrap): nonce =
+// write_iv(4) || explicit(8) where the explicit nonce is the record
+// sequence number, AAD = seq || type || 0x0303 || plaintext_len,
+// fragment = explicit || ciphertext+tag.
+fn rec12_seal(c: mut Conn, typ: int, content: []byte) -> err {
+    s := c.s
+    w := mkwr()
+    w.u8(typ)
+    w.u16(771) // every 1.2 record carries 0x0303 on the wire
+    nw := mkwr()
+    nw.u64(s.wseq)
+    expl := nw.b
+    aw := mkwr()
+    aw.u64(s.wseq)
+    aw.u8(typ)
+    aw.u16(771)
+    aw.u16(len(content))
+    nnc := bcat(s.wiv, expl)
+    [ct, e] = aead_seal(s.aead, s.wkey, nnc, aw.b, content)
+    if e != nil {
+        return errors.wrap("tls: seal: " + errors.msg(e), err_keys())
+    }
+    w.u16(8 + len(ct))
+    w.put(expl)
+    w.put(ct)
+    s.wseq = s.wseq + 1
+    return inner_write(c, w.b)
+}
+
+// rec12_open decrypts one armed TLS 1.2 record — the outer type is
+// the real content type and the fragment is explicit(8) ||
+// ciphertext+tag. The AAD sequence number is the implicit record
+// counter, never the wire nonce.
+fn rec12_open(c: mut Conn, typ: int, hdr: []byte, frag: []byte) -> [Rec, err] {
+    z := Rec{ty: 0, pl: nil}
+    s := c.s
+    if typ != CT_HANDSHAKE && typ != CT_ALERT && typ != CT_APPDATA {
+        return z, fail(c, AL_UNEXPECTED, "record type " + itoa(typ))
+    }
+    if len(frag) < 24 {
+        return z, fail(c, AL_DECODE_ERR, "short tls 1.2 record")
+    }
+    if s.rseq < 0 {
+        return z, fail(c, AL_UNEXPECTED, "read seq wrapped")
+    }
+    aw := mkwr()
+    aw.u64(s.rseq)
+    aw.u8(typ)
+    aw.u16(771)
+    aw.u16(len(frag) - 24)
+    nnc := bcat(s.riv, frag[0:8])
+    [pt, oe] = aead_open(s.aead, s.rkey, nnc, aw.b, frag[8:len(frag)])
+    if oe != nil {
+        // AEAD-open failure is the record layer's only integrity
+        // verdict — bad_record_mac, never a bare close
+        return z, fail(c, AL_BAD_MAC, "bad_record_mac")
+    }
+    s.rseq = s.rseq + 1
+    if typ == CT_ALERT {
+        return alert_recv(c, pt)
+    }
+    z.ty = typ
+    z.pl = pt
+    return z, nil
+}
+
+// ---- ServerHello extensions -----------------------------------------------
+
+// sh12_exts parses the extension block of a 1.2 ServerHello —
+// renegotiation_info must be the initial empty token, EMS echoes
+// empty to arm the tripwire, ALPN echoes exactly one offered
+// protocol, server_name/ec_point_formats are tolerated forms, and
+// anything else is an extension we didn't offer.
+fn sh12_exts(c: mut Conn, cfg: Config, shraw: []byte) -> err {
+    s := c.s
+    r := mkrd(shraw[4:len(shraw)])
+    r.u16()
+    r.bytes(32)
+    r.bytes(r.u8())
+    r.u16()
+    r.u8()
+    elen := r.u16()
+    if r.ok == 0 {
+        return fail(c, AL_DECODE_ERR, "bad server_hello")
+    }
+    end := r.p + elen
+    reneg := 0
+    seen := mkslice(int, 0)
+    for r.ok != 0 && r.p < end {
+        ty := r.u16()
+        d := r.bytes(r.u16())
+        if r.ok == 0 {
+            break
+        }
+        i := 0
+        for i < len(seen) {
+            if seen[i] == ty {
+                return fail(c, AL_DECODE_ERR, "duplicate server_hello extension")
+            }
+            i = i + 1
+        }
+        seen = push(seen, ty)
+        if ty == X_RENEG {
+            if len(d) != 1 || d[0] != 0 {
+                return fail(c, AL_HANDSHAKE_FAIL, "bad renegotiation_info")
+            }
+            reneg = 1
+        } else if ty == X_EMS {
+            if len(d) != 0 {
+                return fail(c, AL_ILLEGAL_PARAM, "extended_master_secret with data")
+            }
+            s.ems = 1
+        } else if ty == X_TICKET {
+            if len(d) != 0 {
+                return fail(c, AL_ILLEGAL_PARAM, "session_ticket extension with data")
+            }
+        } else if ty == X_SERVER_NAME {
+            if len(d) != 0 || len(cfg.server_name) == 0 || is_ipish(cfg.server_name) {
+                return fail(c, AL_ILLEGAL_PARAM, "server_name ext with data")
+            }
+        } else if ty == X_EC_FORMATS {
+            if len(d) < 2 || d[0] != len(d) - 1 {
+                return fail(c, AL_DECODE_ERR, "bad ec_point_formats")
+            }
+            has_uncompressed := false
+            i := 1
+            for i < len(d) {
+                if d[i] == 0 {
+                    has_uncompressed = true
+                }
+                i = i + 1
+            }
+            if !has_uncompressed {
+                return fail(c, AL_ILLEGAL_PARAM, "server omitted uncompressed point format")
+            }
+        } else if ty == X_ALPN {
+            if len(d) < 3 {
+                return fail(c, AL_DECODE_ERR, "bad alpn ext")
+            }
+            plen := d[2]
+            if len(d) != 3 + plen {
+                return fail(c, AL_DECODE_ERR, "bad alpn ext")
+            }
+            pb := mkslice(byte, plen)
+            i := 0
+            for i < plen {
+                pb[i] = d[3 + i]
+                i = i + 1
+            }
+            proto := pb as str
+            if !slices_contains_str(cfg.alpn, proto) {
+                return fail(c, AL_ILLEGAL_PARAM, "alpn echo not offered")
+            }
+            s.alpn = proto
+        } else {
+            return fail(c, AL_ILLEGAL_PARAM, "unoffered extension " + itoa(ty))
+        }
+    }
+    if r.ok == 0 || r.p != end {
+        return fail(c, AL_DECODE_ERR, "bad server_hello")
+    }
+    if s.ems == 0 {
+        return fail(c, AL_HANDSHAKE_FAIL, "extended_master_secret not negotiated")
+    }
+    if reneg == 0 {
+        return fail(c, AL_HANDSHAKE_FAIL, "secure renegotiation not negotiated")
+    }
+    return nil
+}
+
+// ---- server flight --------------------------------------------------------
+
+// cert12_parse splits a TLS 1.2 Certificate message — a u24 list of
+// u24-framed DER blobs; no context byte, no per-entry extensions.
+fn cert12_parse(body: []byte) -> [[][]byte, err] {
+    let out: [][]byte = nil
+    r := mkrd(body)
+    tot := r.u24()
+    if r.ok == 0 || r.p + tot != len(body) {
+        return out, errors.new("tls: bad certificate message")
+    }
+    end := r.p + tot
+    for r.p < end {
+        clen := r.u24()
+        der := r.bytes(clen)
+        if r.ok == 0 {
+            return out, errors.new("tls: bad certificate entry")
+        }
+        out = push(out, der)
+    }
+    if r.p != end {
+        return out, errors.new("tls: bad certificate list")
+    }
+    return out, nil
+}
+
+// cert12_verify parses the chain and runs the same configured
+// verification the 1.3 path does — cfg.verify replaces BOTH chain
+// and hostname checks; nil rides x509.verify + match_hostname.
+fn cert12_verify(c: mut Conn, cfg: Config, body: []byte) -> err {
+    s := c.s
+    [ders, pe] = cert12_parse(body)
+    if pe != nil {
+        return fail(c, AL_DECODE_ERR, "bad certificate: " + errors.msg(pe))
+    }
+    if len(ders) == 0 {
+        return fail(c, AL_BAD_CERT, "empty certificate")
+    }
+    [leaf, le] = x509.parse_cert(ders[0])
+    if le != nil {
+        send_alert(c, 2, AL_BAD_CERT)
+        return errors.wrap("tls: leaf: " + errors.msg(le), le)
+    }
+    chain := mkslice(x509.Cert, 0)
+    i := 1
+    for i < len(ders) {
+        [cc, ce] = x509.parse_cert(ders[i])
+        if ce != nil {
+            send_alert(c, 2, AL_BAD_CERT)
+            return errors.wrap("tls: chain cert: " + errors.msg(ce), ce)
+        }
+        chain = push(chain, cc)
+        i = i + 1
+    }
+    s.leaf = leaf
+    s.has_leaf = 1
+    return verify_chain(c, cfg, leaf, chain)
+}
+
+// Ske12 is the parsed ServerKeyExchange surface — the ECDHE params
+// (named group + server public share) once the signature verifies.
+struct Ske12 { group: int, pub: []byte }
+
+// ske12_verify parses ServerECDHParams then checks the
+// digitally-signed block over client_random || server_random ||
+// params (RFC 5246 §7.4.3 / RFC 8422 §5.4) under the leaf's SPKI.
+fn ske12_verify(c: mut Conn, body: []byte) -> [Ske12, err] {
+    z := Ske12{group: 0, pub: nil}
+    s := c.s
+    r := mkrd(body)
+    ctype := r.u8()
+    group := r.u16()
+    plen := r.u8()
+    pub := r.bytes(plen)
+    if r.ok == 0 || ctype != 3 { // named_curve is the only type sent
+        return z, fail(c, AL_DECODE_ERR, "bad server_key_exchange params")
+    }
+    pend := r.p
+    alg := r.u16()
+    sig := r.bytes(r.u16())
+    if r.ok == 0 || r.p != len(body) {
+        return z, fail(c, AL_DECODE_ERR, "bad server_key_exchange")
+    }
+    // the chosen group must be one of our supported_groups
+    if group != G_X25519 && group != G_P256 && group != G_P384 {
+        return z, fail(c, AL_ILLEGAL_PARAM, "unoffered ecdhe group " + itoa(group))
+    }
+    w := mkwr()
+    w.put(s.random)
+    w.put(s.srandom)
+    w.put(body[0:pend])
+    ve := ske12_sig(c, alg, w.b, sig)
+    if ve != nil {
+        return z, fail(c, AL_DECRYPT_ERR, "server_key_exchange: " + errors.msg(ve))
+    }
+    z.group = group
+    z.pub = bclone(pub)
+    return z, nil
+}
+
+// ske12_sig checks the (hash, signature) pair — alg must be in the
+// advertised signature_algorithms set and match the leaf's key
+// family — then verifies over content. The set covers both the
+// rsa_pkcs1_* values TLS 1.2 SKE uses and the rsa_pss_rsae_* /
+// ecdsa_* / ed25519 values shared with the 1.3 registry.
+fn ske12_sig(c: mut Conn, alg: int, content: []byte, sig: []byte) -> err {
+    s := c.s
+    legal := alg == SA_PKCS1_SHA256 || alg == SA_PKCS1_SHA384 || alg == SA_PKCS1_SHA512 || alg == SA_PSS_SHA256 || alg == SA_PSS_SHA384 || alg == SA_PSS_SHA512 || alg == SA_ECDSA_P256_SHA256 || alg == SA_ECDSA_P384_SHA384 || alg == SA_ED25519
+    if !legal {
+        return errors.new("tls: bad ske alg " + itoa(alg))
+    }
+    leaf := s.leaf
+    [key, ke] = x509.spki_key(leaf.spki)
+    if ke != nil {
+        return errors.new("tls: leaf spki unreadable")
+    }
+    if alg == SA_PKCS1_SHA256 || alg == SA_PKCS1_SHA384 || alg == SA_PKCS1_SHA512 || alg == SA_PSS_SHA256 || alg == SA_PSS_SHA384 || alg == SA_PSS_SHA512 {
+        if leaf.spki_alg != x509.SPKI_rsa {
+            return errors.new("tls: rsa ske signature on non-rsa key")
+        }
+        [pk, e] = rsa.parse_pub_key(key)
+        if e != nil {
+            return errors.new("tls: leaf rsa key unreadable")
+        }
+        if alg == SA_PKCS1_SHA256 {
+            return rsa.verify_v15(pk, sha256.new, content, sig)
+        }
+        if alg == SA_PKCS1_SHA384 {
+            return rsa.verify_v15(pk, sha512.new384, content, sig)
+        }
+        if alg == SA_PKCS1_SHA512 {
+            return rsa.verify_v15(pk, sha512.new, content, sig)
+        }
+        if alg == SA_PSS_SHA256 {
+            return rsa.verify_pss(pk, sha256.new, content, sig, 32)
+        }
+        if alg == SA_PSS_SHA384 {
+            return rsa.verify_pss(pk, sha512.new384, content, sig, 48)
+        }
+        return rsa.verify_pss(pk, sha512.new, content, sig, 64)
+    }
+    if alg == SA_ECDSA_P256_SHA256 || alg == SA_ECDSA_P384_SHA384 {
+        want := x509.SPKI_ec_p256
+        if alg == SA_ECDSA_P384_SHA384 {
+            want = x509.SPKI_ec_p384
+        }
+        if leaf.spki_alg != want {
+            return errors.new("tls: ecdsa ske signature on wrong curve key")
+        }
+        [rs, e] = x509.ecdsa_rs(sig)
+        if e != nil {
+            return errors.new("tls: bad ecdsa signature der")
+        }
+        if alg == SA_ECDSA_P256_SHA256 {
+            return nistec.ecdsa_verify(nistec.p256(), key, sha256.new, content, rs.r, rs.s)
+        }
+        return nistec.ecdsa_verify(nistec.p384(), key, sha512.new384, content, rs.r, rs.s)
+    }
+    if leaf.spki_alg != x509.SPKI_ed25519 {
+        return errors.new("tls: ed25519 ske signature on wrong key")
+    }
+    return ed25519.verify(key, content, sig)
+}
+
+fn suite12_auth_matches(suite: int, cert: x509.Cert) -> bool {
+    if suite == S12_RSA_AES128GCM || suite == S12_RSA_AES256GCM {
+        return cert.spki_alg == x509.SPKI_rsa
+    }
+    return cert.spki_alg == x509.SPKI_ec_p256 || cert.spki_alg == x509.SPKI_ec_p384
+}
+
+// cr12_recv consumes a TLS 1.2 CertificateRequest — the three
+// vectors are validated for shape but unused: the client answer is
+// always the empty certificate_list (mTLS is out of scope).
+fn cr12_recv(c: mut Conn, body: []byte) -> err {
+    s := c.s
+    r := mkrd(body)
+    r.bytes(r.u8()) // certificate_types
+    r.bytes(r.u16()) // signature_algorithms
+    r.bytes(r.u16()) // certificate_authorities
+    if r.ok == 0 || r.p != len(body) {
+        return fail(c, AL_DECODE_ERR, "bad certificate_request")
+    }
+    s.cr_seen = 1
+    return nil
+}
+
+// ticket12_valid validates the TLS 1.2 NewSessionTicket vectors. The
+// ticket is discarded because the client has no resumption API.
+fn ticket12_valid(body: []byte) -> bool {
+    r := mkrd(body)
+    r.bytes(4) // lifetime_hint
+    ticket_len := r.u16()
+    r.bytes(ticket_len)
+    return r.ok != 0 && r.p == len(body)
+}
+
+// ticket13_valid validates the RFC 8446 NewSessionTicket vectors.
+// Tickets are intentionally consumed and ignored (no PSK/resumption).
+fn ticket13_valid(body: []byte) -> bool {
+    r := mkrd(body)
+    r.bytes(8) // lifetime and age_add
+    nonce_len := r.u8()
+    r.bytes(nonce_len)
+    ticket_len := r.u16()
+    if ticket_len == 0 {
+        return false
+    }
+    r.bytes(ticket_len)
+    ext_len := r.u16()
+    end := r.p + ext_len
+    if r.ok == 0 || end != len(body) {
+        return false
+    }
+    seen := mkslice(int, 0)
+    for r.p < end {
+        ty := r.u16()
+        r.bytes(r.u16())
+        if r.ok == 0 {
+            return false
+        }
+        i := 0
+        for i < len(seen) {
+            if seen[i] == ty {
+                return false
+            }
+            i = i + 1
+        }
+        seen = push(seen, ty)
+    }
+    return r.ok != 0 && r.p == len(body)
+}
+
+// ---- the driver ------------------------------------------------------------
+
+// share_pub is the client key_exchange_public for the group —
+// x25519's raw 32 bytes or a SEC1 uncompressed point.
+fn share_pub(c: mut Conn, group: int) -> []byte {
+    s := c.s
+    if group == G_X25519 {
+        return s.xpk
+    }
+    if group == G_P256 {
+        return s.ppk
+    }
+    return s.gsk_pub
+}
+
+// hs12_drive runs the TLS 1.2 flight after a 0x0303-only
+// ServerHello: Certificate → ServerKeyExchange →
+// [CertificateRequest] → ServerHelloDone on the way in, then
+// [Certificate] → ClientKeyExchange → CCS → Finished on the way out
+// and the peer's CCS → Finished to close. Keys come from the RFC
+// 5246 PRF — master_secret (or the RFC 7627 extended form) →
+// key_block → per-direction AEAD key + 4-byte salt.
+fn hs12_drive(c: mut Conn, cfg: Config, shraw: []byte, sh: ShInfo) -> err {
+    s := c.s
+    if cfg_minv(cfg) > V12 || cfg_maxv(cfg) < V12 {
+        return fail(c, AL_PROTOCOL_VER, "server_hello answered tls 1.2; fallback disabled")
+    }
+    if sh.vers_ok != 0 {
+        return fail(c, AL_ILLEGAL_PARAM, "supported_versions in tls 1.2 server_hello")
+    }
+    if !suite12_ok(sh.suite) {
+        return fail(c, AL_ILLEGAL_PARAM, "unoffered tls 1.2 cipher suite")
+    }
+    s.ver = V12
+    s.suite = sh.suite
+    s.aead = suite12_aead(sh.suite)
+    s.hlen = suite12_hlen(sh.suite)
+    s.hf = suite12_hash(sh.suite)
+    s.srandom = bclone(sh.random)
+    e := sh12_exts(c, cfg, shraw)
+    if e != nil {
+        return e
+    }
+    // transcript begins now the suite (and its PRF hash) is known
+    s.th = s.hf()
+    e = th_update(c, s.ch1)
+    if e != nil {
+        return e
+    }
+    e = th_update(c, shraw)
+    if e != nil {
+        return e
+    }
+    ske := Ske12{group: 0, pub: nil}
+    state := 0 // 0=Certificate, 1=SKE, 2=CertificateRequest|SHDone, 3=SHDone
+    done := 0
+    for done == 0 {
+        [hm, me] = hs_next(c)
+        if me != nil {
+            return me
+        }
+        mty := hm.ty
+        mraw := hm.raw
+        body := mraw[4:len(mraw)]
+        if mty == HS_CERTIFICATE && state == 0 {
+            e = cert12_verify(c, cfg, body)
+            if e != nil {
+                return e
+            }
+            if !suite12_auth_matches(s.suite, s.leaf) {
+                return fail(c, AL_BAD_CERT, "certificate key type does not match tls 1.2 cipher suite")
+            }
+            state = 1
+        } else if mty == HS_SERVER_KEY_EXCHANGE && state == 1 {
+            [sk, se] = ske12_verify(c, body)
+            if se != nil {
+                return se
+            }
+            ske = sk
+            state = 2
+        } else if mty == HS_CERT_REQUEST && state == 2 {
+            e = cr12_recv(c, body)
+            if e != nil {
+                return e
+            }
+            state = 3
+        } else if mty == HS_SERVER_HELLO_DONE && (state == 2 || state == 3) {
+            if len(body) != 0 {
+                return fail(c, AL_DECODE_ERR, "server_hello_done with data")
+            }
+            done = 1
+        } else {
+            return fail(c, AL_UNEXPECTED, "message type " + itoa(mty) + " in tls 1.2 server flight")
+        }
+        e = th_update(c, mraw)
+        if e != nil {
+            return e
+        }
+    }
+    return hs12_client_flight(c, ske)
+}
+
+// hs12_client_flight emits the client's answer flight and verifies
+// the server's CCS + Finished: [empty Certificate when a
+// CertificateRequest arrived] → ClientKeyExchange → CCS → Finished.
+fn hs12_client_flight(c: mut Conn, ske: Ske12) -> err {
+    s := c.s
+    // our private share for the server's chosen group — p384
+    // generates on demand, same rule as the 1.3 path
+    e := sel_share(c, ske.group)
+    if e != nil {
+        return fail(c, AL_ILLEGAL_PARAM, "ecdhe group not offered")
+    }
+    [premaster, ee] = ecdhe(c, ske.group, ske.pub)
+    if ee != nil {
+        if errors.is(ee, err_proto()) {
+            return fail(c, AL_ILLEGAL_PARAM, "x25519 all-zero share")
+        }
+        return fail(c, AL_ILLEGAL_PARAM, "bad ecdhe server share")
+    }
+    // Certificate answers a CertificateRequest — always empty (the
+    // client signs nothing; no CertificateVerify follows)
+    if s.cr_seen != 0 {
+        cw := mkwr()
+        cw.u24(0) // empty certificate_list
+        e = hs_send_t(c, HS_CERTIFICATE, cw.b)
+        if e != nil {
+            return e
+        }
+    }
+    pub := share_pub(c, ske.group)
+    kw := mkwr()
+    kw.u8(len(pub))
+    kw.put(pub)
+    e = hs_send_t(c, HS_CLIENT_KEY_EXCHANGE, kw.b)
+    if e != nil {
+        return e
+    }
+    // master secret — RFC 7627 extended form when both sides echoed
+    // the extension; the session hash is the transcript through
+    // ClientKeyExchange
+    sw := mkwr()
+    label := "master secret"
+    if s.ems != 0 {
+        label = "extended master secret"
+        sw.put(th_sum(c))
+    } else {
+        sw.put(s.random)
+        sw.put(s.srandom)
+    }
+    [master, me] = prf12(s.hf, premaster, label, sw.b, 48)
+    if me != nil {
+        return errors.wrap("tls: master secret: " + errors.msg(me), err_keys())
+    }
+    // key_block: client_write_key, server_write_key, then the two
+    // 4-byte GCM salts (RFC 5288 §3 — no IV/seq secrets for AEAD)
+    kw2 := mkwr()
+    kw2.put(s.srandom)
+    kw2.put(s.random)
+    kl := suite12_klen(s.suite)
+    [kb, ke] = prf12(s.hf, master, "key expansion", kw2.b, 2 * kl + 8)
+    if ke != nil {
+        return errors.wrap("tls: key block: " + errors.msg(ke), err_keys())
+    }
+    s.wkey = bclone(kb[0:kl])
+    s.rkey = bclone(kb[kl:2 * kl])
+    s.wiv = bclone(kb[2 * kl:2 * kl + 4])
+    s.riv = bclone(kb[2 * kl + 4:2 * kl + 8])
+    // CCS rides the plaintext epoch — rec_write stays naked until
+    // wen arms — then the Finished is the first protected record
+    ccsb := mkslice(byte, 1)
+    ccsb[0] = 1
+    e = rec_write(c, CT_CCS, ccsb)
+    if e != nil {
+        return e
+    }
+    s.wen = 1
+    s.wseq = 0
+    [vd, ve] = prf12(s.hf, master, "client finished", th_sum(c), 12)
+    if ve != nil {
+        return errors.wrap("tls: client finished: " + errors.msg(ve), err_keys())
+    }
+    e = hs_send_t(c, HS_FINISHED, vd)
+    if e != nil {
+        return e
+    }
+    // stage the read epoch — the peer's plaintext CCS arms it
+    // (rec_read), and the first protected record must carry the
+    // server Finished
+    s.r12pend = 1
+    for true {
+        [hm, me2] = hs_next(c)
+        if me2 != nil {
+            return me2
+        }
+        if hm.ty == HS_NEW_SESSION_TICKET {
+            body := hm.raw[4:len(hm.raw)]
+            if !ticket12_valid(body) {
+                return fail(c, AL_DECODE_ERR, "bad tls 1.2 new_session_ticket")
+            }
+            e = th_update(c, hm.raw)
+            if e != nil {
+                return e
+            }
+            continue
+        }
+        if hm.ty != HS_FINISHED {
+            return fail(c, AL_UNEXPECTED, "message type " + itoa(hm.ty) + " after client flight")
+        }
+        body := hm.raw[4:len(hm.raw)]
+        [vd2, ve2] = prf12(s.hf, master, "server finished", th_sum(c), 12)
+        if ve2 != nil {
+            return errors.wrap("tls: server finished: " + errors.msg(ve2), err_keys())
+        }
+        if !bequal(body, vd2) {
+            return fail(c, AL_DECRYPT_ERR, "finished verify_data mismatch")
+        }
+        e = th_update(c, hm.raw)
+        if e != nil {
+            return e
+        }
+        break
+    }
+    // handshake budget disarms — the caller's own set_*timo applies
+    s.deadline = 0
+    set_rcvtimo_ms(c.inner.fd, 0)
+    return nil
+}
+
+// post_hs12_dispatch consumes post-handshake TLS 1.2 handshake
+// messages — a HelloRequest (renegotiation ask) is answered with the
+// RFC-mandated no_renegotiation warning; anything else is
+// unexpected_message.
+fn post_hs12_dispatch(c: mut Conn) -> err {
+    for true {
+        raw := hs_pending(c)
+        if len(raw) == 0 {
+            return nil
+        }
+        ty := raw[0]
+        if ty == HS_HELLO_REQUEST {
+            if len(raw) != 4 {
+                return fail(c, AL_DECODE_ERR, "bad hello_request")
+            }
+            send_alert(c, 1, 100) // no_renegotiation — warning, not fatal
+        } else if ty == HS_NEW_SESSION_TICKET {
+            if !ticket12_valid(raw[4:len(raw)]) {
+                return fail(c, AL_DECODE_ERR, "bad tls 1.2 new_session_ticket")
+            }
+        } else {
+            return fail(c, AL_UNEXPECTED, "post-handshake message type " + itoa(ty))
+        }
+    }
+    return nil
+}

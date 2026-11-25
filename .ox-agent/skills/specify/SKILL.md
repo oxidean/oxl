@@ -9,7 +9,7 @@ Turn a work-item intent into a detailed, testable specification with explicit sc
 
 ## Invocation contract
 
-- You run against a work-item packet (JSON): `context` carries the bounded inputs, `constraints` the limits, and `output` declares where to write your result (`output.path`, relative to `.ox-agent/`) and the schema it must satisfy (`output.schema`).
+- You run against a work-item packet (JSON): `context` carries the bounded inputs, `constraints` the limits, and `output` declares where to write your result (`output.path`, relative to `.ox-agent/`) and the schema it must satisfy (`output.schema`). `work_item_dir` and `artifacts_dir` give the resolved `.ox-agent`-relative paths of the work item's directory and its artifact directory.
 - Write exactly one JSON object to `output.path`. `ox-agent` schema-validates it on collection, journals the outcome, and applies your declared `next_action`.
 - `next_action.type` must be one of `advance_stage` (unit of work done — move to the next stage), `retry` (needs another pass — the run does not count as done, so the skill stays dispatchable), `escalate` (blocked on work — needs a human), `await_input` (needs a human answer — the run files a durable request and stays dispatchable), or `complete` (stage/pipeline finished). Always include a `reason`.
 - On `escalate` the runtime files a durable input request and marks the item blocked — the human answers asynchronously via `ox-agent input respond`; do not wait for an in-turn reply.
@@ -17,11 +17,16 @@ Turn a work-item intent into a detailed, testable specification with explicit sc
 
 ## Consumes
 
-- the chosen brainstorm direction and relevant standards/decisions.
+- the chosen brainstorm direction, relevant standards/decisions, and `context.specs` for any spec of record on this subject.
 
 ## Produces
 
-- a spec artifact (path in `artifacts`) with acceptance criteria a `verify` run can check.
+- a spec artifact (path in `artifacts`) with acceptance criteria a `verify` run can check — `covers:` globs on it, and `spec_impact` declaring whether it amends an existing spec of record.
+
+## Spec reconciliation
+
+- Check `context.specs` for an existing spec on this subject: your spec either amends it — declare that in `spec_impact` and edit the promoted file — or establishes a new spec of record.
+- Write `covers:` front-matter globs on the spec naming the repo paths it governs (e.g. `internal/harness/**`) — coverage is what lets collection catch later changes that never consulted it.
 
 ## Operating rules
 
@@ -29,7 +34,7 @@ Turn a work-item intent into a detailed, testable specification with explicit sc
 - Preserve evidence and disagreement rather than inventing certainty.
 - Do not exceed the permissions or paths in the input contract.
 - Return a compact structured result matching the output schema.
-- Promote durable decisions and blockers into the appropriate work-item artifact.
+- Work-item artifacts go under `artifacts_dir` and the item's directory is `work_item_dir` — both come resolved in the packet, so never derive or glob the work-item path yourself. Content with a declared home elsewhere (context entries, decisions) keeps its own contract location. Promote durable decisions and blockers into the appropriate work-item artifact.
 
 ## Evaluation
 

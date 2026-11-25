@@ -1,0 +1,154 @@
+package main
+
+// TLS 1.2 policy, PRF/key-block, and untrusted handshake-vector tests.
+import "std/crypto/sha256"
+
+import "std/crypto/sha512"
+
+import "std/encoding/hex"
+
+import "std/errors"
+
+import "std/net/tls"
+
+import "std/crypto/x509"
+
+import "std/testing"
+
+fn hx12(s: str) -> []byte {
+    [b, e] = hex.decode(s)
+    testing.expect(e == nil, "hex input")
+    return b[0:len(b)]
+}
+
+fn test_tls12_prf_vectors() {
+    // RFC 5246 Appendix C's SHA-256 test input, plus the matching
+    // SHA-384 result. Outputs were cross-checked with independent
+    // Python hmac/hashlib P_hash code.
+    secret := hx12("9bbe436ba940f017b17652849a71db35")
+    seed := hx12("a0ba9f936cda311827a6f796ffd5198c")
+    [p256, e] = tls.prf12(sha256.new, secret, "test label", seed, 96)
+    testing.expect(e == nil, "sha256 PRF: " + errors.msg(e))
+    testing.expect_streq(hex.encode(p256), "e3f229ba727be17b8d122620557cd453c2aab21d07c3d495329b52d4e61edb5a6b301791e90d35c9c9a46b4e14baf9af0fa022f7077def17abfd3797c0564bab4fbc91666e9def9b97fce34f796789baa48082d122ee42c5a72e5a5110fff701", "sha256 PRF vector")
+    [p384, e2] = tls.prf12(sha512.new384, secret, "test label", seed, 96)
+    testing.expect(e2 == nil, "sha384 PRF: " + errors.msg(e2))
+    testing.expect_streq(hex.encode(p384), "dd88775cd827187b67a3f7652b5c13f715791cc46e0274a6d3fb16651103defc544cd8afb68369a219bb918b8b21ddb1764af0a70339e6dec085e574f655851ba692513203536bdfc3675e53768210f0a2389dd324311a440c7c30ef44b391d9", "sha384 PRF vector")
+
+    master := mkslice(byte, 48)
+    i := 0
+    for i < len(master) {
+        master[i] = i
+        i = i + 1
+    }
+    keyseed := mkslice(byte, 64)
+    i = 0
+    for i < len(keyseed) {
+        keyseed[i] = i + 64
+        i = i + 1
+    }
+    [kb256, e3] = tls.prf12(sha256.new, master, "key expansion", keyseed, 72)
+    testing.expect(e3 == nil, "sha256 key expansion")
+    testing.expect_streq(hex.encode(kb256), "25b8932c0824c8f2962638ec1c6ec99e1b07457bc265278c23064c1d63c61e0417053567ed3a0d6c431f60219bcc5357c4451e2e158a5edb30d23cd1f2e3b267fed87da243fe882a", "sha256 key block")
+    [kb384, e4] = tls.prf12(sha512.new384, master, "key expansion", keyseed, 72)
+    testing.expect(e4 == nil, "sha384 key expansion")
+    testing.expect_streq(hex.encode(kb384), "3288e85d38fe09d3dcbb30ef211d546e81c947e4be7963709d27eb6d5f082fcb5790b97c651f2b7d143853361bc9b1b5ef1aa49d3cc6494deb85c73cd413fea9b1a66b28f715bcea", "sha384 key block")
+}
+
+fn test_tls12_version_policy_and_sentinels() {
+    cfg := tls.default_cfg()
+    testing.expect_eq(tls.cfg_minv(cfg), tls.V13, "default minimum is TLS 1.3")
+    testing.expect_eq(tls.cfg_maxv(cfg), tls.V13, "default maximum is TLS 1.3")
+
+    pinned := cfg
+    pinned.min_ver = tls.V12
+    pinned.max_ver = tls.V12
+    testing.expect_eq(tls.cfg_minv(pinned), tls.V12, "pinned 1.2 minimum")
+    testing.expect_eq(tls.cfg_maxv(pinned), tls.V12, "pinned 1.2 maximum")
+
+    auto := cfg
+    auto.min_ver = tls.V12
+    auto.max_ver = tls.V13
+    testing.expect_eq(tls.cfg_minv(auto), tls.V12, "auto minimum")
+    testing.expect_eq(tls.cfg_maxv(auto), tls.V13, "auto maximum")
+
+    random := mkslice(byte, 32)
+    down := hx12("444f574e47524401")
+    i := 0
+    for i < len(down) {
+        random[24 + i] = down[i]
+        i = i + 1
+    }
+    sh := tls.ShInfo{random: random, suite: tls.S12_RSA_AES128GCM, vers_ok: 0, ks_group: 0, ks_key: nil, cookie: nil, badext: -1}
+    testing.expect(!tls.downgrade_sentinel(pinned, sh, false), "pinned 1.2 accepts server's sentinel")
+    testing.expect(tls.downgrade_sentinel(auto, sh, false), "auto mode rejects downgrade sentinel")
+    testing.expect(!tls.downgrade_sentinel(auto, sh, true), "HRR random is not a downgrade sentinel")
+    sh.vers_ok = 1
+    testing.expect(!tls.downgrade_sentinel(auto, sh, false), "TLS 1.3 ServerHello does not use downgrade sentinel")
+    sh.vers_ok = 0
+
+    testing.expect(tls.suite12_ok(tls.S12_RSA_AES128GCM), "ECDHE-RSA AES-128-GCM accepted")
+    testing.expect(tls.suite12_ok(tls.S12_ECDSA_AES256GCM), "ECDHE-ECDSA AES-256-GCM accepted")
+    rsa_kx_ok := tls.suite12_ok(47)
+    cbc_ok := tls.suite12_ok(49171)
+    testing.expect(rsa_kx_ok == false, "RSA key transport/CBC rejected")
+    testing.expect(cbc_ok == false, "CBC suite rejected")
+}
+
+fn test_tls12_suite_auth_family() {
+    rsa := x509.zcert()
+    rsa.spki_alg = x509.SPKI_rsa
+    p256 := x509.zcert()
+    p256.spki_alg = x509.SPKI_ec_p256
+    p384 := x509.zcert()
+    p384.spki_alg = x509.SPKI_ec_p384
+    testing.expect(tls.suite12_auth_matches(tls.S12_RSA_AES128GCM, rsa), "RSA suite accepts RSA certificate")
+    testing.expect(!tls.suite12_auth_matches(tls.S12_ECDSA_AES128GCM, rsa), "ECDSA suite rejects RSA certificate")
+    testing.expect(tls.suite12_auth_matches(tls.S12_ECDSA_AES128GCM, p256), "ECDSA suite accepts P-256 certificate")
+    testing.expect(tls.suite12_auth_matches(tls.S12_ECDSA_AES256GCM, p384), "ECDSA suite accepts P-384 certificate")
+    testing.expect(!tls.suite12_auth_matches(tls.S12_RSA_AES256GCM, p256), "RSA suite rejects ECDSA certificate")
+}
+
+fn test_tls12_malformed_handshake_vectors() {
+    testing.expect(tls.ticket12_valid(hx12("000000010003616263")), "well-formed tls 1.2 ticket")
+    testing.expect(!tls.ticket12_valid(hx12("000000010004616263")), "truncated tls 1.2 ticket rejected")
+    testing.expect(!tls.ticket12_valid(hx12("00000001")), "short tls 1.2 ticket rejected")
+
+    testing.expect(tls.ticket13_valid(hx12("0000000100000002016e00036162630000")), "well-formed tls 1.3 ticket")
+    testing.expect(!tls.ticket13_valid(hx12("0000000100000002016e00046162630000")), "truncated tls 1.3 ticket rejected")
+    testing.expect(!tls.ticket13_valid(hx12("0000000100000002016e00036162630002")), "truncated tls 1.3 extensions rejected")
+
+    // Certificate list framing is checked before DER parsing.
+    [certs, ce] = tls.cert12_parse(hx12("0000050000023000"))
+    testing.expect(ce == nil && len(certs) == 1, "valid tls 1.2 certificate framing")
+    [bad_certs, be] = tls.cert12_parse(hx12("0000050000033000"))
+    testing.expect(be != nil && len(bad_certs) == 0, "malformed tls 1.2 certificate framing")
+    [sh, se] = tls.sh_parse(hx12("0303"))
+    testing.expect(se != nil, "truncated ServerHello rejected")
+    [old10, e10] = tls.sh_parse(hx12("0301" + "0000000000000000000000000000000000000000000000000000000000000000" + "00c02f000000"))
+    testing.expect(e10 != nil, "TLS 1.0 ServerHello rejected")
+    [old11, e11] = tls.sh_parse(hx12("0302" + "0000000000000000000000000000000000000000000000000000000000000000" + "00c02f000000"))
+    testing.expect(e11 != nil, "TLS 1.1 ServerHello rejected")
+}
+
+fn test_tls12_gcm_server_finished_record() {
+    // Captured independently from OpenSSL 3's ECDHE-ECDSA-AES128-GCM
+    // TLS 1.2 profile; the key/IV come from its CLIENT_RANDOM key log.
+    key := hx12("94b4637088277bc74f38e475db7ed554")
+    nonce := hx12("310c5c01ef9dc482f001f200")
+    aad := hx12("00000000000000001603030010")
+    ct := hx12("889c35c7c60a7f0746193a4cc56c86113f70cab0178e4f3117c515fcefbccc87")
+    [pt, e] = tls.aead_open(tls.AEAD_AES128, key, nonce, aad, ct)
+    testing.expect(e == nil, "TLS 1.2 GCM record: " + errors.msg(e))
+    testing.expect_streq(hex.encode(pt), "1400000cb6e882d98282dc62ec897ff8", "server Finished plaintext")
+    joined := tls.bcat(hx12("01020304"), hx12("aabbccddeeff0011"))
+    testing.expect_streq(hex.encode(joined), "01020304aabbccddeeff0011", "nonce concatenation")
+}
+
+fn main() {
+    test_tls12_prf_vectors()
+    test_tls12_version_policy_and_sentinels()
+    test_tls12_suite_auth_family()
+    test_tls12_malformed_handshake_vectors()
+    test_tls12_gcm_server_finished_record()
+    println("tls12 tests ok")
+}

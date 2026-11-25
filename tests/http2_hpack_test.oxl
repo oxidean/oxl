@@ -1,0 +1,87 @@
+package main
+
+import "std/net/http2"
+
+import "std/encoding/hex"
+
+import "std/testing"
+
+fn test_http2_hpack_rfc_request_vector() {
+    [block, be] = hex.decode("828684410f7777772e6578616d706c652e636f6d")
+    testing.expect(be == nil, "decode RFC HPACK request vector")
+    [d, de] = http2.new_decoder(4096, 65536)
+    testing.expect(de == nil, "create HPACK decoder")
+    [headers, e] = http2.decode_headers(d, block)
+    testing.expect(e == nil, "decode HPACK static and literal fields")
+    testing.expect(len(headers) == 4, "HPACK request field count")
+    testing.expect(headers[0].name == ":method" && headers[0].value == "GET", "HPACK method")
+    testing.expect(headers[1].name == ":scheme" && headers[1].value == "http", "HPACK scheme")
+    testing.expect(headers[2].name == ":path" && headers[2].value == "/", "HPACK path")
+    testing.expect(headers[3].name == ":authority" && headers[3].value == "www.example.com", "HPACK authority")
+    [same, se] = hex.decode("be")
+    testing.expect(se == nil, "decode dynamic index vector")
+    [again, ae] = http2.decode_headers(d, same)
+    testing.expect(ae == nil && len(again) == 1 && again[0].name == ":authority" && again[0].value == "www.example.com", "dynamic table reference")
+}
+
+fn test_http2_hpack_rejects_bounds_and_indexes() {
+    [d, de] = http2.new_decoder(64, 32)
+    testing.expect(de == nil, "create bounded HPACK decoder")
+    [oversize, oe] = hex.decode("3f61")
+    testing.expect(oe == nil, "decode HPACK size update vector")
+    [_, e1] = http2.decode_headers(d, oversize)
+    testing.expect(e1 != nil, "reject dynamic table size over limit")
+    [bad, be] = hex.decode("ff")
+    testing.expect(be == nil, "decode HPACK bad index vector")
+    [_, e2] = http2.decode_headers(d, bad)
+    testing.expect(e2 != nil, "reject missing dynamic index")
+}
+
+fn test_http2_hpack_rfc_huffman() {
+    [block, be] = hex.decode("828684418cf1e3c2e5f23a6ba0ab90f4ff")
+    testing.expect(be == nil, "decode RFC Huffman vector")
+    [d, de] = http2.new_decoder(4096, 65536)
+    testing.expect(de == nil, "create Huffman decoder")
+    [headers, e] = http2.decode_headers(d, block)
+    testing.expect(e == nil, "decode Huffman header block")
+    testing.expect(len(headers) == 4 && headers[3].name == ":authority" && headers[3].value == "www.example.com", "Huffman authority value")
+    block[len(block) - 1] = 254
+    [d2, de2] = http2.new_decoder(4096, 65536)
+    testing.expect(de2 == nil, "create malformed Huffman decoder")
+    [_, pe] = http2.decode_headers(d2, block)
+    testing.expect(pe != nil, "reject invalid Huffman padding")
+    eos := mkslice(byte, 0)
+    eos = push(eos, 1)
+    eos = push(eos, 132)
+    eos = push(eos, 255)
+    eos = push(eos, 255)
+    eos = push(eos, 255)
+    eos = push(eos, 252)
+    [d3, de3] = http2.new_decoder(4096, 65536)
+    testing.expect(de3 == nil, "create EOS test decoder")
+    [_, eos_error] = http2.decode_headers(d3, eos)
+    testing.expect(eos_error != nil, "reject HPACK Huffman EOS symbol")
+}
+
+fn test_http2_hpack_encode_request() {
+    headers := mkslice(http2.Header, 0)
+    headers = push(headers, http2.Header{name: ":method", value: "GET"})
+    headers = push(headers, http2.Header{name: ":scheme", value: "http"})
+    headers = push(headers, http2.Header{name: ":path", value: "/"})
+    headers = push(headers, http2.Header{name: ":authority", value: "www.example.com"})
+    [block, e] = http2.encode_headers(headers)
+    testing.expect(e == nil, "encode request headers")
+    testing.expect(block[0] == 130 && block[1] == 134 && block[2] == 132, "use static indexes for common pseudo headers")
+    [d, de] = http2.new_decoder(4096, 65536)
+    testing.expect(de == nil, "create request round-trip decoder")
+    [decoded, re] = http2.decode_headers(d, block)
+    testing.expect(re == nil && len(decoded) == 4 && decoded[3].value == "www.example.com", "encode/decode request headers")
+    sensitive := mkslice(http2.Header, 0)
+    sensitive = push(sensitive, http2.Header{name: "authorization", value: "Bearer secret"})
+    [sb, se] = http2.encode_headers(sensitive)
+    testing.expect(se == nil && sb[0] / 16 == 1, "encode sensitive field as never-indexed")
+    bad := mkslice(http2.Header, 0)
+    bad = push(bad, http2.Header{name: "X-Test", value: "x"})
+    [_, xe] = http2.encode_headers(bad)
+    testing.expect(xe != nil, "reject uppercase header name")
+}

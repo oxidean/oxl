@@ -12,6 +12,10 @@ and `dial`/`dial_timeout`/`client` over `net.Conn` — and **X7 ships
 `https://` in `std/net/http`** — the `Url.secure` / `Client.tlscfg`
 seam that closes the milestone.
 
+Issue #224 extends the client with an explicitly selected TLS 1.2
+ECDHE/AES-GCM profile. TLS 1.3 remains the default; TLS 1.2 is never
+enabled by a zero-valued Config.
+
 ## `crypto/x509` surface
 
 ```oxl
@@ -133,7 +137,10 @@ explicit ask, not a bug report.
 
 ```oxl
 struct Config { server_name: str, roots: x509.Roots,
-                alpn: []str, verify: Verifier }
+                alpn: []str, verify: Verifier,
+                min_ver: int, max_ver: int,
+                client_cert: ClientCert }
+struct ClientCert { chain: [][]byte, key: x509.PrivKey }
 iface Verifier { check(leaf: x509.Cert, untrusted: []x509.Cert) -> err }
 struct Conn { ... }   // net.Conn parity: read/write/close/rawfd +
                       // asreader/aswriter/ascloser/asreadwriter, peer()
@@ -142,9 +149,41 @@ default_cfg() -> Config
 dial(host, port, cfg) -> [Conn, err]             // server_name <- host
 dial_timeout(host, port, tmo_ms, cfg) -> [Conn, err]
 client(inner: net.Conn, cfg) -> [Conn, err]
+load_cert_pem(cert_pem, key_pem) -> [ClientCert, err] // checked identity
 ```
 
-Client-only TLS 1.3. Cipher suites `TLS_AES_128_GCM_SHA256`,
+TLS 1.3 is the default and is the only version enabled by a zero-valued
+or `default_cfg()` Config (`min_ver=max_ver=0` resolves to TLS 1.3).
+TLS 1.2 is never an implicit fallback. To pin a legacy endpoint to
+TLS 1.2, set both fields to `tls.V12`; to explicitly enable automatic
+negotiation between TLS 1.3 and TLS 1.2, set `min_ver=tls.V12` and
+`max_ver=tls.V13`. Auto mode sends one ClientHello offering both
+versions and accepts a TLS 1.2 ServerHello only when it is valid and
+has no downgrade sentinel; there is no retry that lowers the caller's
+minimum version. TLS 1.0 and 1.1 are rejected.
+
+The TLS 1.2 profile is limited to ephemeral ECDHE with AES-GCM:
+`TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256`,
+`TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384`,
+`TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256`, and
+`TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384`. X25519, secp256r1, and
+secp384r1 groups and SHA-256/SHA-384/SHA-512 TLS 1.2 handshake
+signature algorithms are supported. Static RSA key transport, CBC,
+and non-AEAD suites are not offered. Extended Master Secret (RFC
+7627) and secure renegotiation signaling are required; renegotiation
+is disabled. Session tickets are validated and discarded; resumption
+is not implemented.
+
+Certificate chain and hostname verification are mandatory in both
+versions: nil `verify` uses `x509.verify` and `match_hostname`, while
+a configured `Verifier` is the explicit replacement for both checks.
+There is no insecure bypass. The RFC 8446 downgrade sentinel causes an
+abort only when auto mode offered TLS 1.3 and the peer answers with
+TLS 1.2. A TLS 1.2-pinned ClientHello did not offer TLS 1.3, so the
+sentinel is not treated as an attack in that mode. TLS 1.3 remains
+first choice in auto mode.
+
+TLS 1.3 cipher suites `TLS_AES_128_GCM_SHA256`,
 `TLS_CHACHA20_POLY1305_SHA256`, `TLS_AES_256_GCM_SHA384` in that
 order; groups x25519 + secp256r1/secp384r1 key shares; one
 HelloRetryRequest honoured (cookie echoed, demanded group must be
@@ -159,9 +198,26 @@ surfaces `err_eof` — truncation is never silent. `close()` emits a
 best-effort `close_notify` then closes the inner socket and is
 idempotent.
 
-Explicitly out of scope: TLS <= 1.2, server side, resumption/PSK/
-0-RTT, client certificates (a CertificateRequest is answered with
-an empty Certificate per RFC 8446), and OCSP/CRL.
+Client certificates (mutual TLS, TLS 1.3 only) are configured through
+`cfg.client_cert`: `load_cert_pem` parses a PEM chain (leaf first)
+plus a PKCS#8, PKCS#1, or SEC1 PEM private key and rejects a key that
+is not the leaf's private half — a mismatch is a config error, never a
+handshake-time surprise. `x509.parse_key_pem`/`parse_key_der` cover
+the standalone key forms; DER holders can fill `ClientCert` directly.
+When the server sends a CertificateRequest the client answers with
+the chain and a CertificateVerify signed over the transcript with a
+scheme the CR's `signature_algorithms` offered and the key can use
+(`rsa_pss_rsae_*`, `ecdsa_secp256r1_sha256`, `ecdsa_secp384r1_sha384`,
+`ed25519` — `rsa_pkcs1_*` stays CV-illegal). No identity, an
+out-of-scope issuer under `certificate_authorities`, or no usable
+offered scheme all answer the RFC-mandated empty certificate_list —
+the server then decides. A CR missing `signature_algorithms` aborts
+`missing_extension`. Post-handshake client auth stays unsupported
+(the ClientHello does not advertise `post_handshake_auth`) and the
+TLS 1.2 fallback ignores `client_cert`.
+
+Explicitly out of scope: server side, resumption/PSK/
+0-RTT, post-handshake client authentication, and OCSP/CRL.
 
 ## `net/http` seam (X7)
 
@@ -186,8 +242,25 @@ scheme default — no spurious `:443`. Redirect resolution
 Locations, scheme-relative `//h/p` on a secure base, and relative
 merges all keep the scheme, and `same_origin` includes `secure` so
 credentials never cross an http→https hop. HTTPS through an HTTP
-proxy needs CONNECT tunneling — parked — so a configured proxy on a
-secure URL errors rather than silently going direct or cleartext.
+proxy uses a bounded CONNECT exchange, then wraps the same socket with
+origin-verified TLS; proxy failures never fall back to direct or cleartext
+requests. HTTPS proxies and SOCKS remain out of scope. An empty
+`Request.proxy` uses `https_proxy` then `HTTPS_PROXY` for secure URLs,
+`HTTP_PROXY` then `http_proxy` for plain HTTP, and `all_proxy` then
+`ALL_PROXY` as fallback. `NO_PROXY`/`no_proxy` is a comma-separated
+host/suffix list for environment-selected proxies; an explicit proxy
+URL takes precedence, while `Request.proxy = "direct"` bypasses env
+proxies. HTTP proxy variables are ignored when `REQUEST_METHOD` is set
+to avoid CGI `HTTP_PROXY` injection. Proxy authentication is not
+implemented.
+`Request.http_version = "2"` offers `h2` and `http/1.1` through ALPN for
+HTTPS and uses HTTP/1.1 only when the peer selects it; TLS or HTTP/2
+protocol failures do not fall back. For cleartext HTTP, set
+`Request.http_version = "2-prior-knowledge"` to require h2c without an
+HTTP/1.1 upgrade or fallback. Through a configured HTTP proxy, HTTPS
+requests tunnel with CONNECT before TLS, then negotiate `h2` or
+`http/1.1` over the tunnel; prior-knowledge h2c rejects a configured
+proxy. HTTP/2 response trailers are returned in `Response.trailers`.
 `serve` is untouched; a TLS listener is not part of this surface.
 
 ## Error taxonomy
@@ -213,20 +286,26 @@ actionable ("add the CA to `OXL_SSL_CERT_FILE`", "clock is wrong").
   error. Orderly `close_notify` is the only clean end.
 - **Side-channel posture is documented, not claimed.** `.oxl`
   arithmetic compiles through C with no constant-time discipline —
-  branches on secret material are written, not eliminated. The
-  exposure is narrow for a client (session keys, not long-term
-  identity keys) and the verify-only design ships no signing
-  oracle. A constant-time pass is parked; trigger: first
-  server-side or signing consumer.
+  branches on secret material are written, not eliminated. mTLS made
+  this real: client-auth signing rides variable-time primitives
+  (unblinded `bignum.modexp` for RSA, `nistec` scalar multiplication
+  for ECDSA — Ed25519/ECDSA nonces are at least deterministic, RFC
+  6979/8032, so no RNG reuse failure exists). The exposure is one
+  signature per handshake on a long-term identity key — acceptable
+  for a client on a local socket boundary, but the constant-time
+  review trigger is now live: a constant-time pass over the signing
+  ops is the standing follow-on work, required before this surface
+  grows (server-side TLS or a signing oracle with repeated use).
 - **Non-goals with their reopen triggers** (each becomes a work
   item when its trigger fires):
   - TLS server (`tls.listen`/`accept`) — first serving consumer
     needing inbound TLS.
-  - TLS 1.2 fallback — first consumer hitting a 1.2-only endpoint.
+  - TLS 1.2 suite/profile expansion — a concrete consumer requirement
+    plus a separate cryptographic review.
   - Session resumption / PSK — measured reconnect cost on a real
     workload.
-  - Client certs (mTLS) — first consumer needing mutual auth;
-    brings the signing surface back into scope.
+  - Constant-time signing ops — the mTLS review trigger fired;
+    needed before the signing surface grows again.
   - Revocation (OCSP/CRL) — first consumer needing revocation
     proof.
   - Bundled root list — first consumer on a platform image with

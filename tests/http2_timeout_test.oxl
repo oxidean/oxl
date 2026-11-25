@@ -1,0 +1,27 @@
+package main
+
+import "std/net/http"
+
+import "std/testing"
+
+import "std/os"
+
+import "std/errors"
+
+fn test_http2_client_deadline() {
+    port := atoi(os.getenv("OXL_HTTP2_PORT"))
+    client := http.new_client(300)
+    req := http.request_get("http://127.0.0.1:" + itoa(port) + "/stall")
+    req.proxy = "direct"
+    req.http_version = "2-prior-knowledge"
+    started := now_ms()
+    [_, e] = client.do(req)
+    elapsed := now_ms() - started
+    msg := ""
+    if e != nil {
+        msg = errors.msg(e)
+    }
+    testing.expect(e != nil && find(msg, "deadline") >= 0, "stalled HTTP/2 response returns deadline error: " + msg)
+    testing.expect(elapsed < 1000, "HTTP/2 response deadline bounds read wait: " + itoa(elapsed))
+    println("HTTP/2 deadline ok")
+}

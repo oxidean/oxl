@@ -1,12 +1,18 @@
 package rsa
 
-// std/crypto/rsa — RSA signature verification only (X3): DER
-// RSAPublicKey decode, PKCS#1 v1.5 EMSA verify (DigestInfo prefixes
-// for sha256/384/512 — sha1/md5 are absent by design), and
-// RSASSA-PSS verify (MGF1 over the same hash, recovered or pinned
-// salt length, 0xbc trailer). No sign/encrypt/decrypt surface —
-// the TLS client posture needs verify only.
+// std/crypto/rsa — RSA signatures (X3 verify; signing added for
+// client mTLS): DER RSAPublicKey decode, PKCS#1 v1.5 EMSA verify/sign
+// (DigestInfo prefixes for sha256/384/512 — sha1/md5 are absent by
+// design), and RSASSA-PSS verify/sign (MGF1 over the same hash,
+// recovered or pinned salt length, 0xbc trailer). The sign surface is
+// the CertificateVerify primitive: one exponentiation per handshake,
+// variable-time like every bignum consumer — the package carries no
+// constant-time claim.
 import "std/crypto/bignum"
+
+import "std/crypto/rand"
+
+import "std/crypto/sha256"
 
 import "std/encoding/binary"
 
@@ -144,7 +150,7 @@ fn check_pub(n: []int, e: []int) -> err {
     if e[0] % 2 == 0 || bignum.cmp(e, bignum.from_int(3)) < 0 {
         return errors.new("rsa: public exponent out of range")
     }
-    if bignum.bitlen(e) > 64 || bignum.cmp(e, n) >= 0 || bignum.bitlen(n) > 8192 {
+    if bignum.bitlen(e) > 64 || bignum.cmp(e, n) >= 0 || bignum.bitlen(n) > 8192 || bignum.bitlen(n) < 1024 {
         return errors.new("rsa: key parameters out of range")
     }
     return nil
@@ -438,4 +444,180 @@ fn verify_pss(pk: PubKey, hf: fn() -> hash.Hash, msg: []byte, sig: []byte, saltl
         return errors.new("rsa: pss hash mismatch")
     }
     return nil
+}
+
+// ---- signing (TLS 1.3 client CertificateVerify) -----------------------------
+
+/// PrivKey is an RSA private key — modulus n, public exponent e and
+/// private exponent d as bignum limb slices. CRT parameters are not
+/// carried: signing is one modexp per handshake, so the CRT split's
+/// speedup doesn't justify a second exponent path.
+struct PrivKey { n: []int, e: []int, d: []int }
+
+// check_priv bounds private-key parameters before modexp — own-key
+// input, but a misloaded key should fail loudly, not produce garbage
+// signatures. Structural pins only: n is odd (a product of odd
+// primes) and sanely sized, e is odd and in (1, n), d sits in (1, n).
+// The d·e consistency proof lives in priv_selftest, which the key
+// loader runs once at parse time.
+fn check_priv(pk: PrivKey) -> err {
+    if len(pk.n) == 0 || len(pk.e) == 0 || len(pk.d) == 0 || bignum.is_zero(pk.n) || bignum.is_zero(pk.d) {
+        return errors.new("rsa: zero or missing key parameter")
+    }
+    if pk.n[0] % 2 == 0 {
+        return errors.new("rsa: even modulus")
+    }
+    if pk.e[0] % 2 == 0 || bignum.is_one(pk.e) {
+        return errors.new("rsa: bad public exponent")
+    }
+    bits := bignum.bitlen(pk.n)
+    if bits < 1024 || bits > 8192 {
+        return errors.new("rsa: modulus outside 1024..8192 bits")
+    }
+    if bignum.is_one(pk.d) || bignum.cmp(pk.d, pk.n) >= 0 || bignum.cmp(pk.e, pk.n) >= 0 {
+        return errors.new("rsa: key parameters out of range")
+    }
+    return nil
+}
+
+// priv_selftest proves d actually pairs with e under n: sign a fixed
+// probe message, verify it with the public half. Structural bounds
+// can't catch a mis-serialized or mismatched exponent — two modexps,
+// so it runs once at key-load time, never inside a handshake.
+fn priv_selftest(pk: PrivKey) -> err {
+    ce := check_priv(pk)
+    if ce != nil {
+        return ce
+    }
+    probe := "oxl rsa private key self-test" as []byte
+    [sig, se] = sign_v15(pk, sha256.new, probe)
+    if se != nil {
+        return se
+    }
+    pub := PubKey{n: pk.n, e: pk.e}
+    ve := verify_v15(pub, sha256.new, probe, sig)
+    if ve != nil {
+        return errors.new("rsa: private exponent fails self-test")
+    }
+    return nil
+}
+
+/// sign_v15 produces a PKCS#1 v1.5 signature (RSASSA-PKCS1-v1_5,
+/// RFC 8017 §8.2.1): EM = 00 || 01 || FF* || 00 || DigestInfo || H,
+// then EM^d mod n. DigestInfo table identical to verify_v15's.
+fn sign_v15(pk: PrivKey, hf: fn() -> hash.Hash, msg: []byte) -> [own []byte, err] {
+    ce := check_priv(pk)
+    if ce != nil {
+        return nil, ce
+    }
+    k := (bignum.bitlen(pk.n) + 7) / 8
+    mhash := digest(hf, msg)
+    hlen := len(mhash)
+    pbuf := mkslice(byte, 19)
+    plen := di_prefix(hlen, pbuf)
+    if plen < 0 {
+        return nil, errors.new("rsa: hash outside the v1.5 prefix set")
+    }
+    tl := plen + hlen
+    if k < tl + 11 {
+        return nil, errors.new("rsa: modulus too short for hash")
+    }
+    em := mkslice(byte, k)
+    em[0] = 0
+    em[1] = 1
+    i := 2
+    for i < k - tl - 1 {
+        em[i] = 255
+        i = i + 1
+    }
+    // em[k-tl-1] is already the 0 separator
+    i = 0
+    for i < plen {
+        em[k - tl + i] = pbuf[i]
+        i = i + 1
+    }
+    i = 0
+    for i < hlen {
+        em[k - hlen + i] = mhash[i]
+        i = i + 1
+    }
+    m := bignum.from_be_bytes(em)
+    s := bignum.modexp(m, pk.d, pk.n)
+    return bignum.to_be_bytes(s, k), nil
+}
+
+/// sign_pss produces a RSASSA-PSS signature (RFC 8017 §8.1.1): EMSA
+/// encode — salt from crypto/rand, M' = 00*8 || mHash || salt, DB
+/// masked under MGF1(H'), 0xbc trailer, the top unused bits cleared —
+/// then EM^d mod n. saltlen should be the hash length for TLS
+/// CertificateVerify.
+/// pss_emlen is the encoded-message length PSS works over for pk —
+/// (bitlen(n) - 1 bits, rounded up). A PSS signature needs
+/// emlen >= hlen + saltlen + 2, so callers offering a hash must check
+/// the modulus can carry it before committing to the scheme.
+fn pss_emlen(pk: PrivKey) -> int {
+    return (bignum.bitlen(pk.n) + 6) / 8
+}
+
+fn sign_pss(pk: PrivKey, hf: fn() -> hash.Hash, msg: []byte, saltlen: int) -> [own []byte, err] {
+    ce := check_priv(pk)
+    if ce != nil {
+        return nil, ce
+    }
+    k := (bignum.bitlen(pk.n) + 7) / 8
+    mhash := digest(hf, msg)
+    hlen := len(mhash)
+    if saltlen < 0 {
+        return nil, errors.new("rsa: negative salt length")
+    }
+    embits := bignum.bitlen(pk.n) - 1
+    emlen := (embits + 7) / 8
+    if emlen < hlen + saltlen + 2 {
+        return nil, errors.new("rsa: modulus too short for hash")
+    }
+    salt := mkslice(byte, saltlen)
+    re := rand.fill(salt)
+    if re != nil {
+        return nil, re
+    }
+    h2 := hf()
+    zb := mkslice(byte, 8)
+    [w1, e1] = h2.write(zb)
+    [w2, e2] = h2.write(mhash)
+    [w3, e3] = h2.write(salt)
+    hp := h2.sum(nil)
+    mlen := emlen - hlen - 1
+    db := mkslice(byte, mlen)
+    db[mlen - saltlen - 1] = 1
+    i := 0
+    for i < saltlen {
+        db[mlen - saltlen + i] = salt[i]
+        i = i + 1
+    }
+    dbmask := mgf1(hf, hp, mlen)
+    i = 0
+    for i < mlen {
+        db[i] = db[i] ^ dbmask[i]
+        i = i + 1
+    }
+    // clear the leftmost 8*emlen - embits bits of maskedDB
+    unused := 8 * emlen - embits
+    if unused > 0 {
+        db[0] = db[0] % sp2(8 - unused)
+    }
+    em := mkslice(byte, emlen)
+    i = 0
+    for i < mlen {
+        em[i] = db[i]
+        i = i + 1
+    }
+    i = 0
+    for i < hlen {
+        em[mlen + i] = hp[i]
+        i = i + 1
+    }
+    em[emlen - 1] = 188
+    m := bignum.from_be_bytes(em)
+    s := bignum.modexp(m, pk.d, pk.n)
+    return bignum.to_be_bytes(s, k), nil
 }

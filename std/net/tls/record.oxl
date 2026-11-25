@@ -263,15 +263,19 @@ fn inner_write(c: mut Conn, rec: []byte) -> err {
 }
 
 // rec_write emits one record of type `typ` carrying `content`. Armed
-// epochs seal content||typ and send outer type 23; plaintext epochs
-// send the content naked (version 0x0301 on the wire — middlebox
-// compat, the field is ignored by 1.3 peers anyway).
+// epochs seal content||typ and send outer type 23 (TLS 1.3), or seal
+// the content under its own type with an explicit nonce prefix (TLS
+// 1.2 AEAD, RFC 5288); plaintext epochs send the content naked
+// (version 0x0301 on the first record — middlebox compat).
 fn rec_write(c: mut Conn, typ: int, content: []byte) -> err {
     s := c.s
     w := mkwr()
     if s.wen != 0 {
         if s.wseq < 0 {
             return errors.wrap("tls: write seq wrapped", err_proto())
+        }
+        if s.ver == V12 {
+            return rec12_seal(c, typ, content)
         }
         w.u8(CT_APPDATA)
         w.u16(771) // 0x0303
@@ -379,9 +383,9 @@ fn rec_read(c: mut Conn) -> [Rec, err] {
         }
     }
     if s.ren != 0 {
-        // armed epoch: outer type is always 23 — a plaintext
-        // handshake/alert record here is unexpected_message; a
-        // plaintext CCS is tolerated once per direction (§D.4)
+        // armed epoch: a plaintext CCS is tolerated once per
+        // direction; 1.3 wraps every real record in outer type 23,
+        // 1.2 keeps the true type on the wire
         if typ == CT_CCS {
             if s.ccs != 0 {
                 return z, fail(c, AL_UNEXPECTED, "second change_cipher_spec")
@@ -389,6 +393,9 @@ fn rec_read(c: mut Conn) -> [Rec, err] {
             s.ccs = 1
             z.ty = CT_CCS
             return z, nil
+        }
+        if s.ver == V12 {
+            return rec12_open(c, typ, hdr, frag)
         }
         if typ != CT_APPDATA {
             return z, fail(c, AL_UNEXPECTED, "plaintext record type " + itoa(typ) + " post-ServerHello")
@@ -421,6 +428,13 @@ fn rec_read(c: mut Conn) -> [Rec, err] {
             return z, fail(c, AL_UNEXPECTED, "second change_cipher_spec")
         }
         s.ccs = 1
+        if s.ver == V12 && s.r12pend != 0 {
+            // TLS 1.2: the peer's CCS is itself plaintext and arms
+            // the staged read epoch — the next record is AEAD
+            s.ren = 1
+            s.rseq = 0
+            s.r12pend = 0
+        }
         z.ty = CT_CCS
         return z, nil
     }
@@ -548,7 +562,11 @@ fn rec_pump(c: mut Conn) -> err {
             if e != nil {
                 return e
             }
-            e = post_hs_dispatch(c)
+            if s.ver == V12 {
+                e = post_hs12_dispatch(c)
+            } else {
+                e = post_hs_dispatch(c)
+            }
             if e != nil {
                 return e
             }
@@ -582,6 +600,9 @@ fn post_hs_dispatch(c: mut Conn) -> err {
         if ty == HS_NEW_SESSION_TICKET {
             // parsed and dropped — resumption is out of scope;
             // erroring would break interop with every real server
+            if !ticket13_valid(body) {
+                return fail(c, AL_DECODE_ERR, "bad tls 1.3 new_session_ticket")
+            }
         } else if ty == HS_KEY_UPDATE {
             e := key_update_recv(c, body)
             if e != nil {

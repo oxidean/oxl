@@ -1,0 +1,12 @@
+package main
+
+import "std/crypto/sha1"
+
+import "std/encoding/hex"
+
+import "std/testing"
+
+fn test_sha1_vectors() {
+    testing.expect(hex.encode(sha1.sum("" as []byte)) == "da39a3ee5e6b4b0d3255bfef95601890afd80709", "sha1 empty")
+    testing.expect(hex.encode(sha1.sum("abc" as []byte)) == "a9993e364706816aba3e25717850c26c9cd0d89d", "sha1 abc")
+}

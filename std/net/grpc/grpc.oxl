@@ -1,0 +1,829 @@
+package grpc
+
+// gRPC framing and HTTP/2 metadata adapter. Applications own protobuf
+// descriptors, generated types, and protobuf/protojson serialization. Payloads
+// here are serialized messages. Reflection and compression are not provided.
+import "std/errors"
+
+import "std/net/http2"
+
+import "std/net"
+
+import "std/net/tls"
+
+import "std/net/url"
+
+import "std/strings"
+
+import "std/strconv"
+
+import "std/sync"
+
+let MAX_MESSAGE_SIZE = 4194304
+
+let MAX_METADATA_SIZE = 8192
+
+let MAX_METADATA_FIELDS = 64
+
+let MAX_CONCURRENT_CALLS = 16
+
+let call_guard = sync.mutex()
+
+let active_calls = sync.counter()
+
+// The current H2 surface has no flow-control pump; cap each request below
+// the initial 65,535-byte send window until that transport API is extended.
+let MAX_OUTBOUND_BYTES = 60000
+
+let STATUS_OK = 0
+
+let STATUS_CANCELLED = 1
+
+let STATUS_UNKNOWN = 2
+
+let STATUS_INVALID_ARGUMENT = 3
+
+let STATUS_DEADLINE_EXCEEDED = 4
+
+let STATUS_NOT_FOUND = 5
+
+let STATUS_ALREADY_EXISTS = 6
+
+let STATUS_PERMISSION_DENIED = 7
+
+let STATUS_RESOURCE_EXHAUSTED = 8
+
+let STATUS_FAILED_PRECONDITION = 9
+
+let STATUS_ABORTED = 10
+
+let STATUS_OUT_OF_RANGE = 11
+
+let STATUS_UNIMPLEMENTED = 12
+
+let STATUS_INTERNAL = 13
+
+let STATUS_UNAVAILABLE = 14
+
+let STATUS_DATA_LOSS = 15
+
+let STATUS_UNAUTHENTICATED = 16
+
+struct Metadata { name: str, value: str }
+
+struct Status { code: int, raw_code: int, message: str }
+
+struct Endpoint { host: str, port: int, secure: bool }
+
+struct Client { endpoint: Endpoint, timeout_ms: int, tls_config: tls.Config }
+
+struct Call {
+    conn: own http2.Conn,
+    stream_id: int,
+    tx_bytes: int,
+    rx: []byte,
+    response_headers: []Metadata,
+    response_trailers: []Metadata,
+    response_metadata_bytes: int,
+    response_metadata_fields: int,
+    status: Status,
+    got_status: bool,
+    finished: bool,
+    cancelled: bool,
+    send_closed: bool,
+    slot_owned: bool,
+    got_content_type: bool,
+}
+
+struct UnaryResult {
+    response: []byte,
+    headers: []Metadata,
+    trailers: []Metadata,
+    status: Status,
+}
+
+fn empty_status() -> Status {
+    return Status{code: STATUS_UNKNOWN, raw_code: STATUS_UNKNOWN, message: ""}
+}
+
+fn status(code: int, message: str) -> Status {
+    return Status{code: code, raw_code: code, message: message}
+}
+
+fn has_prefix(value: str, prefix: str) -> bool {
+    return len(value) >= len(prefix) && substr(value, 0, len(prefix)) == prefix
+}
+
+/// grpc/http are plaintext, grpcs/https use TLS; scheme-less loopback is
+/// plaintext and other bare targets use TLS. std/net currently requires IPv4.
+fn parse_target(target: str) -> [Endpoint, err] {
+    if len(target) == 0 {
+        return Endpoint{host: "", port: 0, secure: false}, errors.new("grpc: empty target")
+    }
+    scheme_less := find(target, "://") < 0
+    raw := target
+    if scheme_less {
+        raw = "https://" + target
+    }
+    [u, ue] = url.parse(raw)
+    if ue != nil {
+        return Endpoint{host: "", port: 0, secure: false}, errors.wrap("grpc: invalid target", ue)
+    }
+    secure := false
+    if scheme_less {
+        hostname := u.hostname()
+        secure = !(strings.upper(hostname) == "LOCALHOST" || net.isip4(hostname) && has_prefix(hostname, "127."))
+    } else if u.scheme == "grpc" || u.scheme == "http" {
+        secure = false
+    } else if u.scheme == "grpcs" || u.scheme == "https" {
+        secure = true
+    } else {
+        return Endpoint{host: "", port: 0, secure: false}, errors.new("grpc: unsupported target scheme " + u.scheme)
+    }
+    hostname := u.hostname()
+    if len(hostname) == 0 || u.hasuser || len(u.path) > 0 && u.path != "/" || len(u.rawquery) > 0 || len(u.fragment) > 0 {
+        return Endpoint{host: "", port: 0, secure: false}, errors.new("grpc: target must contain only an authority")
+    }
+    if net.isip6(hostname) {
+        return Endpoint{host: "", port: 0, secure: false}, errors.new("grpc: IPv6 targets are unsupported by std/net")
+    }
+    port := 443
+    if !secure {
+        port = 80
+    }
+    if len(u.port()) > 0 {
+        [parsed, pe] = strconv.atoi(u.port())
+        if pe != nil || parsed < 1 || parsed > 65535 {
+            return Endpoint{host: "", port: 0, secure: false}, errors.new("grpc: invalid target port")
+        }
+        port = parsed
+    }
+    return Endpoint{host: hostname, port: port, secure: secure}, nil
+}
+
+/// dial creates a client. Each RPC uses a dedicated H2 transport so its
+/// transport timeout is also the total deadline for that RPC.
+fn dial(target: str, timeout_ms: int) -> [own Client, err] {
+    return dial_config(target, timeout_ms, tls.default_cfg())
+}
+
+fn dial_config(target: str, timeout_ms: int, cfg: tls.Config) -> [own Client, err] {
+    if timeout_ms <= 0 {
+        return nil, errors.new("grpc: timeout must be positive")
+    }
+    [ep, e] = parse_target(target)
+    if e != nil {
+        return nil, e
+    }
+    return new(Client{endpoint: ep, timeout_ms: timeout_ms, tls_config: cfg}), nil
+}
+
+fn timeout_header(ms: int) -> str {
+    if ms <= 99999999 {
+        return itoa(ms) + "m"
+    }
+    seconds := ms / 1000
+    if ms % 1000 != 0 {
+        seconds = seconds + 1
+    }
+    if seconds <= 99999999 {
+        return itoa(seconds) + "S"
+    }
+    return "99999999H"
+}
+
+fn metadata_error(metadata: []Metadata) -> err {
+    if len(metadata) > MAX_METADATA_FIELDS {
+        return errors.new("grpc: metadata field count exceeds 64")
+    }
+    total := 0
+    i := 0
+    for i < len(metadata) {
+        m := metadata[i]
+        if len(m.name) == 0 || len(m.name) > 128 {
+            return errors.new("grpc: invalid metadata name")
+        }
+        j := 0
+        for j < len(m.name) {
+            c := byteat(m.name, j)
+            if !(c >= 97 && c <= 122 || c >= 48 && c <= 57 || c == 45 || c == 95 || c == 46) {
+                return errors.new("grpc: metadata names must be lowercase ASCII")
+            }
+            j = j + 1
+        }
+        if has_prefix(m.name, "grpc-") || m.name == "content-type" || m.name == "te" || m.name == "user-agent" {
+            return errors.new("grpc: metadata name is reserved: " + m.name)
+        }
+        if find(m.value, "\r") >= 0 || find(m.value, "\n") >= 0 {
+            return errors.new("grpc: metadata value contains CR/LF")
+        }
+        total = total + len(m.name) + len(m.value) + 32
+        if total > MAX_METADATA_SIZE {
+            return errors.new("grpc: metadata exceeds 8KiB")
+        }
+        i = i + 1
+    }
+    return nil
+}
+
+fn acquire_call_slot() -> bool {
+    sync.mlock(call_guard)
+    active := sync.cval(active_calls)
+    if active >= MAX_CONCURRENT_CALLS {
+        sync.munlock(call_guard)
+        return false
+    }
+    sync.cinc(active_calls)
+    sync.munlock(call_guard)
+    return true
+}
+
+fn release_call_slot() {
+    sync.mlock(call_guard)
+    if sync.cval(active_calls) > 0 {
+        sadd(active_calls, -1)
+    }
+    sync.munlock(call_guard)
+}
+
+fn open_transport(client: ref Client) -> [own http2.Conn, err] {
+    if !client.endpoint.secure {
+        return http2.dial_h2c(client.endpoint.host, client.endpoint.port, client.timeout_ms)
+    }
+    [result, e] = http2.dial_tls_config(client.endpoint.host, client.endpoint.port, client.timeout_ms, client.tls_config)
+    if e != nil {
+        return nil, e
+    }
+    if result.protocol != "h2" || result.conn == nil {
+        if result.closer != nil {
+            result.closer.close()
+        }
+        return nil, errors.new("grpc: TLS peer did not negotiate HTTP/2")
+    }
+    return result.conn, nil
+}
+
+/// begin starts a streaming RPC. The same primitives support client-stream,
+/// server-stream, and bidi RPCs; unary() is a convenience wrapper.
+fn (client ref Client) begin(path: str, metadata: []Metadata) -> [own Call, err] {
+    if len(path) < 2 || byteat(path, 0) != 47 || find(path, "?") >= 0 || find(path, "#") >= 0 || find(path, "\r") >= 0 || find(path, "\n") >= 0 {
+        return nil, errors.new("grpc: method path must be /service/method")
+    }
+    i := 0
+    for i < len(path) {
+        b := byteat(path, i)
+        if b <= 32 || b == 127 {
+            return nil, errors.new("grpc: method path must be /service/method")
+        }
+        i = i + 1
+    }
+    me := metadata_error(metadata)
+    if me != nil {
+        return nil, me
+    }
+    if !acquire_call_slot() {
+        return nil, errors.new("grpc: concurrent call limit of 16 reached")
+    }
+    [conn, de] = open_transport(client)
+    if de != nil {
+        release_call_slot()
+        return nil, errors.wrap("grpc: dial", de)
+    }
+    scheme := "http"
+    if client.endpoint.secure {
+        scheme = "https"
+    }
+    headers := mkslice(http2.Header, 0)
+    headers = push(headers, http2.Header{name: ":method", value: "POST"})
+    headers = push(headers, http2.Header{name: ":scheme", value: scheme})
+    headers = push(headers, http2.Header{name: ":path", value: path})
+    headers = push(headers, http2.Header{name: ":authority", value: client.endpoint.host + ":" + itoa(client.endpoint.port)})
+    headers = push(headers, http2.Header{name: "content-type", value: "application/grpc"})
+    headers = push(headers, http2.Header{name: "te", value: "trailers"})
+    headers = push(headers, http2.Header{name: "user-agent", value: "oxl-grpc/1"})
+    headers = push(headers, http2.Header{name: "grpc-timeout", value: timeout_header(client.timeout_ms)})
+    i := 0
+    for i < len(metadata) {
+        headers = push(headers, http2.Header{name: metadata[i].name, value: metadata[i].value})
+        i = i + 1
+    }
+    [id, oe] = conn.open_stream(headers, false)
+    if oe != nil {
+        conn.close()
+        release_call_slot()
+        return nil, errors.wrap("grpc: open RPC stream", oe)
+    }
+    return new(Call{conn: conn, stream_id: id, tx_bytes: 0, rx: mkslice(byte, 0), response_headers: mkslice(Metadata, 0), response_trailers: mkslice(Metadata, 0), response_metadata_bytes: 0, response_metadata_fields: 0, status: empty_status(), got_status: false, finished: false, cancelled: false, send_closed: false, slot_owned: true, got_content_type: false}), nil
+}
+
+fn append_bytes(dst: []byte, src: []byte) -> []byte {
+    out := dst
+    i := 0
+    for i < len(src) {
+        out = push(out, src[i])
+        i = i + 1
+    }
+    return out
+}
+
+fn message_frame(message: []byte) -> [[]byte, err] {
+    if len(message) > MAX_MESSAGE_SIZE {
+        return mkslice(byte, 0), errors.new("grpc: message exceeds 4MiB limit")
+    }
+    frame := mkslice(byte, len(message) + 5)
+    frame[0] = 0
+    frame[1] = len(message) / 16777216 % 256
+    frame[2] = len(message) / 65536 % 256
+    frame[3] = len(message) / 256 % 256
+    frame[4] = len(message) % 256
+    i := 0
+    for i < len(message) {
+        frame[i + 5] = message[i]
+        i = i + 1
+    }
+    return frame, nil
+}
+
+fn deadline_error(e: err) -> bool {
+    message := errors.msg(e)
+    return find(message, "deadline") >= 0 || find(message, "timeout") >= 0
+}
+
+fn (call mut Call) fail_send(operation: str, cause: err) -> err {
+    if deadline_error(cause) {
+        call.status = status(STATUS_DEADLINE_EXCEEDED, "deadline exceeded")
+    } else {
+        call.status = status(STATUS_UNAVAILABLE, "request write failed")
+    }
+    call.finished = true
+    call.cancelled = true
+    call.conn.cancel_stream(call.stream_id)
+    return errors.wrap("grpc: " + operation, cause)
+}
+
+/// send_message writes one uncompressed payload. Outbound frames per call
+/// are capped at 60,000 bytes because H2 lacks a public flow-control pump.
+fn (call mut Call) send_message(message: []byte) -> err {
+    if call.finished || call.cancelled || call.send_closed {
+        return errors.new("grpc: RPC is already finished")
+    }
+    [frame, fe] = message_frame(message)
+    if fe != nil {
+        return fe
+    }
+    limit := MAX_OUTBOUND_BYTES
+    if call.conn.peer_initial_window < limit {
+        limit = call.conn.peer_initial_window
+    }
+    stream_index := http2.stream_index(call.conn, call.stream_id)
+    if stream_index < 0 {
+        return errors.new("grpc: HTTP/2 stream is not available")
+    }
+    available := call.conn.conn_send_window
+    if call.conn.streams[stream_index].send_window < available {
+        available = call.conn.streams[stream_index].send_window
+    }
+    if call.tx_bytes + len(frame) > limit {
+        return errors.new("grpc: outbound stream exceeds 60000-byte HTTP/2 window budget")
+    }
+    if len(frame) > available {
+        return errors.new("grpc: outbound message exceeds current HTTP/2 flow-control window")
+    }
+    pos := 0
+    for pos < len(frame) {
+        end := pos + 16384
+        if end > len(frame) {
+            end = len(frame)
+        }
+        e := call.conn.send_data(call.stream_id, frame[pos:end], false)
+        if e != nil {
+            return call.fail_send("send message", e)
+        }
+        pos = end
+    }
+    call.tx_bytes = call.tx_bytes + len(frame)
+    return nil
+}
+
+/// close_send half-closes the request side after its last message.
+fn (call mut Call) close_send() -> err {
+    if call.finished || call.cancelled || call.send_closed {
+        return errors.new("grpc: RPC is already finished")
+    }
+    e := call.conn.send_data(call.stream_id, mkslice(byte, 0), true)
+    if e != nil {
+        return call.fail_send("close send side", e)
+    }
+    call.send_closed = true
+    return nil
+}
+
+fn hex_value(c: int) -> int {
+    if c >= 48 && c <= 57 {
+        return c - 48
+    }
+    if c >= 65 && c <= 70 {
+        return c - 55
+    }
+    if c >= 97 && c <= 102 {
+        return c - 87
+    }
+    return -1
+}
+
+fn decode_grpc_message(value: str) -> [str, err] {
+    out := mkslice(byte, 0)
+    i := 0
+    for i < len(value) {
+        c := byteat(value, i)
+        if c == 37 {
+            if i + 2 >= len(value) {
+                return "", errors.new("grpc: malformed grpc-message escape")
+            }
+            hi := hex_value(byteat(value, i + 1))
+            lo := hex_value(byteat(value, i + 2))
+            if hi < 0 || lo < 0 {
+                return "", errors.new("grpc: malformed grpc-message escape")
+            }
+            out = push(out, hi * 16 + lo)
+            i = i + 3
+        } else {
+            out = push(out, c)
+            i = i + 1
+        }
+    }
+    return out as str, nil
+}
+
+fn grpc_content_type(value: str) -> bool {
+    prefix := "application/grpc"
+    if len(value) < len(prefix) {
+        return false
+    }
+    i := 0
+    for i < len(prefix) {
+        ch := byteat(value, i)
+        if ch >= 65 && ch <= 90 {
+            ch = ch + 32
+        }
+        if ch != byteat(prefix, i) {
+            return false
+        }
+        i = i + 1
+    }
+    return len(value) == len(prefix) || byteat(value, len(prefix)) == 43 || byteat(value, len(prefix)) == 59
+}
+
+fn interim_response(headers: []http2.Header) -> bool {
+    status_count := 0
+    status_code := 0
+    status_valid := false
+    i := 0
+    for i < len(headers) {
+        if headers[i].name == ":status" {
+            status_count = status_count + 1
+            [code, e] = strconv.atoi(headers[i].value)
+            if e == nil {
+                status_code = code
+                status_valid = true
+            }
+        }
+        i = i + 1
+    }
+    return status_count == 1 && status_valid && status_code >= 100 && status_code < 200 && status_code != 101
+}
+
+fn grpc_status_for_http(code: int) -> int {
+    if code == 400 {
+        return STATUS_INTERNAL
+    }
+    if code == 401 {
+        return STATUS_UNAUTHENTICATED
+    }
+    if code == 403 {
+        return STATUS_PERMISSION_DENIED
+    }
+    if code == 404 {
+        return STATUS_UNIMPLEMENTED
+    }
+    if code == 429 || code == 502 || code == 503 || code == 504 {
+        return STATUS_UNAVAILABLE
+    }
+    return STATUS_UNKNOWN
+}
+
+fn (call mut Call) capture_headers(headers: []http2.Header, trailers: bool) -> err {
+    metadata := mkslice(Metadata, 0)
+    total := 0
+    http_status := 0
+    content_type_seen := call.got_content_type
+    content_type_valid := false
+    i := 0
+    for i < len(headers) {
+        h := headers[i]
+        if h.name == ":status" {
+            [code, se] = strconv.atoi(h.value)
+            if se != nil {
+                return errors.new("grpc: invalid HTTP status")
+            }
+            http_status = code
+        } else if h.name == "content-type" {
+            content_type_seen = true
+            content_type_valid = grpc_content_type(h.value)
+        } else if h.name == "grpc-status" {
+            if len(h.value) < 1 || len(h.value) > 3 {
+                return errors.new("grpc: invalid grpc-status")
+            }
+            digits := true
+            i := 0
+            for i < len(h.value) {
+                b := byteat(h.value, i)
+                if b < 48 || b > 57 {
+                    digits = false
+                }
+                i = i + 1
+            }
+            if !digits {
+                return errors.new("grpc: invalid grpc-status")
+            }
+            [code, ce] = strconv.atoi(h.value)
+            if ce != nil || code < 0 {
+                return errors.new("grpc: invalid grpc-status")
+            }
+            call.status = Status{code: code, raw_code: code, message: call.status.message}
+            if code > 16 {
+                call.status.code = STATUS_UNKNOWN
+            }
+            call.got_status = true
+        } else if h.name == "grpc-message" {
+            [message, me] = decode_grpc_message(h.value)
+            if me != nil {
+                return me
+            }
+            call.status.message = message
+        } else if h.name == "grpc-encoding" && h.value != "" && h.value != "identity" {
+            call.status = status(STATUS_UNIMPLEMENTED, "compressed gRPC messages are unsupported")
+            call.got_status = true
+            call.cancelled = true
+            call.conn.cancel_stream(call.stream_id)
+            return errors.new("grpc: compressed messages are unsupported")
+        }
+        total = total + len(h.name) + len(h.value) + 32
+        if call.response_metadata_bytes + total > MAX_METADATA_SIZE {
+            return errors.new("grpc: response metadata exceeds 8KiB")
+        }
+        if h.name != ":status" && h.name != "content-type" && h.name != "grpc-encoding" && h.name != "grpc-accept-encoding" && h.name != "grpc-status" && h.name != "grpc-message" {
+            if call.response_metadata_fields + len(metadata) >= MAX_METADATA_FIELDS {
+                return errors.new("grpc: response metadata exceeds 64 fields")
+            }
+            metadata = push(metadata, Metadata{name: h.name, value: h.value})
+        }
+        i = i + 1
+    }
+    if !trailers {
+        if http_status != 200 {
+            call.status = status(grpc_status_for_http(http_status), "HTTP status " + itoa(http_status))
+            call.got_status = true
+            call.finished = true
+            return errors.new("grpc: HTTP status " + itoa(http_status))
+        }
+        if !content_type_seen || !content_type_valid {
+            call.status = status(STATUS_INTERNAL, "invalid gRPC content-type")
+            call.finished = true
+            return errors.new("grpc: response is not application/grpc")
+        }
+        call.got_content_type = true
+    } else if !call.got_content_type {
+        call.status = status(STATUS_INTERNAL, "missing gRPC content-type")
+        call.finished = true
+        return errors.new("grpc: response is missing application/grpc content-type")
+    }
+    call.response_metadata_bytes = call.response_metadata_bytes + total
+    call.response_metadata_fields = call.response_metadata_fields + len(metadata)
+    if trailers {
+        call.response_trailers = metadata
+        if !call.got_status {
+            return errors.new("grpc: response trailers lack grpc-status")
+        }
+        call.finished = true
+    } else {
+        call.response_headers = metadata
+    }
+    return nil
+}
+
+fn (call mut Call) read_until_event() -> err {
+    for !call.finished {
+        [event, ee] = call.conn.next_event()
+        if ee != nil {
+            call.finished = true
+            if deadline_error(ee) {
+                call.status = status(STATUS_DEADLINE_EXCEEDED, "deadline exceeded")
+            }
+            return errors.wrap("grpc: receive", ee)
+        }
+        if event.kind == 7 {
+            if event.last_stream_id < call.stream_id {
+                call.status = status(STATUS_UNAVAILABLE, "peer did not process RPC stream")
+                call.finished = true
+                return errors.new("grpc: peer did not process RPC stream")
+            }
+            continue
+        }
+        if event.stream_id != call.stream_id {
+            return errors.new("grpc: unexpected HTTP/2 stream event")
+        }
+        if event.kind == 3 {
+            call.status = status(STATUS_UNAVAILABLE, "HTTP/2 stream reset")
+            call.finished = true
+            return errors.new("grpc: RPC stream reset")
+        } else if event.kind == 1 {
+            if !event.trailers && interim_response(event.headers) {
+                continue
+            }
+            e := call.capture_headers(event.headers, event.trailers)
+            if e != nil {
+                if !call.finished {
+                    call.finished = true
+                    if !call.cancelled {
+                        call.status = status(STATUS_INTERNAL, errors.msg(e))
+                        call.cancelled = true
+                        call.conn.cancel_stream(call.stream_id)
+                    }
+                }
+                return e
+            }
+            if !event.trailers && (event.flags & 1) != 0 {
+                if !call.got_status {
+                    call.finished = true
+                    call.status = status(STATUS_INTERNAL, "response ended without grpc-status")
+                    return errors.new("grpc: response ended without grpc-status")
+                }
+                call.finished = true
+            }
+        } else if event.kind == 0 {
+            if len(call.rx) + len(event.payload) > MAX_MESSAGE_SIZE + 5 + 16384 {
+                call.status = status(STATUS_RESOURCE_EXHAUSTED, "gRPC message exceeds 4MiB limit")
+                call.conn.cancel_stream(call.stream_id)
+                call.finished = true
+                return errors.new("grpc: message exceeds 4MiB limit")
+            }
+            call.rx = append_bytes(call.rx, event.payload)
+            if event.flow_bytes > 0 {
+                ae := call.conn.ack_data(call.stream_id, event.flow_bytes)
+                if ae != nil {
+                    return errors.wrap("grpc: acknowledge response data", ae)
+                }
+            }
+            if (event.flags & 1) != 0 {
+                if !call.got_status {
+                    call.finished = true
+                    call.status = status(STATUS_INTERNAL, "response ended without grpc-status")
+                    return errors.new("grpc: response ended without grpc-status")
+                }
+                call.finished = true
+            }
+            return nil
+        }
+    }
+    return nil
+}
+
+/// receive_message returns a protobuf payload, EOF after OK trailers, or a
+/// status error. The 5-byte prefix and payload are bounded to 4MiB + 5.
+fn (call mut Call) receive_message() -> [[]byte, err] {
+    for true {
+        if len(call.rx) >= 5 {
+            compressed := call.rx[0]
+            size := call.rx[1] * 16777216 + call.rx[2] * 65536 + call.rx[3] * 256 + call.rx[4]
+            if compressed != 0 {
+                call.status = status(STATUS_UNIMPLEMENTED, "compressed gRPC messages are unsupported")
+                call.conn.cancel_stream(call.stream_id)
+                call.finished = true
+                return mkslice(byte, 0), errors.new("grpc: compressed messages are unsupported")
+            }
+            if size > MAX_MESSAGE_SIZE {
+                call.status = status(STATUS_RESOURCE_EXHAUSTED, "gRPC message exceeds 4MiB limit")
+                call.conn.cancel_stream(call.stream_id)
+                call.finished = true
+                return mkslice(byte, 0), errors.new("grpc: message exceeds 4MiB limit")
+            }
+            if len(call.rx) >= size + 5 {
+                message := call.rx[5:size + 5]
+                call.rx = call.rx[size + 5:len(call.rx)]
+                return message, nil
+            }
+        }
+        if call.finished {
+            if call.got_status && call.status.code != STATUS_OK {
+                return mkslice(byte, 0), errors.new("grpc: status " + itoa(call.status.code) + ": " + call.status.message)
+            }
+            if len(call.rx) > 0 {
+                call.status = status(STATUS_INTERNAL, "truncated gRPC message frame")
+                return mkslice(byte, 0), errors.new("grpc: truncated message frame")
+            }
+            if call.got_status {
+                return mkslice(byte, 0), errors.new("EOF")
+            }
+            return mkslice(byte, 0), errors.new("grpc: RPC ended without status")
+        }
+        e := call.read_until_event()
+        if e != nil {
+            return mkslice(byte, 0), e
+        }
+    }
+}
+
+/// unary performs a unary RPC; protobuf encoding and decoding stay in the app.
+fn (client ref Client) unary(path: str, metadata: []Metadata, request: []byte) -> [UnaryResult, err] {
+    empty := UnaryResult{response: mkslice(byte, 0), headers: mkslice(Metadata, 0), trailers: mkslice(Metadata, 0), status: empty_status()}
+    [call, be] = client.begin(path, metadata)
+    if be != nil {
+        return empty, be
+    }
+    se := call.send_message(request)
+    if se != nil {
+        call.close()
+        return empty, se
+    }
+    ce := call.close_send()
+    if ce != nil {
+        call.close()
+        return empty, ce
+    }
+    [response, re] = call.receive_message()
+    if re != nil {
+        result := UnaryResult{response: mkslice(byte, 0), headers: call.response_headers, trailers: call.response_trailers, status: call.status}
+        call.close()
+        return result, re
+    }
+    [extra, xe] = call.receive_message()
+    if xe == nil {
+        call.close()
+        return empty, errors.new("grpc: unary RPC returned multiple messages")
+    }
+    if errors.msg(xe) != "EOF" {
+        result := UnaryResult{response: mkslice(byte, 0), headers: call.response_headers, trailers: call.response_trailers, status: call.status}
+        call.close()
+        return result, xe
+    }
+    if !call.got_status || call.status.code != STATUS_OK {
+        call.close()
+        return UnaryResult{response: mkslice(byte, 0), headers: call.response_headers, trailers: call.response_trailers, status: call.status}, errors.new("grpc: unary RPC did not complete successfully")
+    }
+    result := UnaryResult{response: response, headers: call.response_headers, trailers: call.response_trailers, status: call.status}
+    call.close()
+    return result, nil
+}
+
+fn (call mut Call) cancel() -> err {
+    if call.finished || call.cancelled {
+        return nil
+    }
+    e := call.conn.cancel_stream(call.stream_id)
+    call.cancelled = true
+    call.finished = true
+    call.status = status(STATUS_CANCELLED, "cancelled")
+    return e
+}
+
+fn (call mut Call) close() -> err {
+    if !call.finished && !call.cancelled {
+        call.cancel()
+    }
+    if call.slot_owned {
+        call.slot_owned = false
+        release_call_slot()
+    }
+    return call.conn.close()
+}
+
+fn (call ref Call) get_status() -> Status {
+    return call.status
+}
+
+fn (call ref Call) headers() -> []Metadata {
+    return call.response_headers
+}
+
+fn (call ref Call) trailers() -> []Metadata {
+    return call.response_trailers
+}
+
+/// frame_decode validates and extracts one complete, uncompressed envelope.
+fn frame_decode(frame: []byte) -> [[]byte, err] {
+    if len(frame) < 5 {
+        return mkslice(byte, 0), errors.new("grpc: truncated 5-byte message header")
+    }
+    if frame[0] != 0 {
+        return mkslice(byte, 0), errors.new("grpc: compressed messages are unsupported")
+    }
+    size := frame[1] * 16777216 + frame[2] * 65536 + frame[3] * 256 + frame[4]
+    if size > MAX_MESSAGE_SIZE {
+        return mkslice(byte, 0), errors.new("grpc: message exceeds 4MiB limit")
+    }
+    if len(frame) != size + 5 {
+        return mkslice(byte, 0), errors.new("grpc: frame length does not match 5-byte header")
+    }
+    return frame[5:len(frame)], nil
+}

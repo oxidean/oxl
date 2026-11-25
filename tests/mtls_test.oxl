@@ -1,0 +1,227 @@
+package main
+
+// #221: client mTLS — PEM private-key parsing (PKCS#8/PKCS#1/SEC1),
+// key/cert matching, per-scheme signature round-trips, and the
+// CertificateRequest signature_algorithms pick. Wire behavior (CR
+// answer, CertificateVerify flight, no-cert and server-no-request
+// paths) is interop-pinned in run.sh's openssl lane; these tests run
+// everywhere.
+import "std/crypto/ed25519"
+
+import "std/crypto/nistec"
+
+import "std/crypto/rsa"
+
+import "std/crypto/sha256"
+
+import "std/crypto/sha512"
+
+import "std/crypto/x509"
+
+import "std/errors"
+
+import "std/net/tls"
+
+import "std/os"
+
+import "std/strings"
+
+import "std/testing"
+
+fn fx(name: str) -> str {
+    return os.readfile_("tests/fixtures/mtls/" + name)
+}
+
+// key_of parses a fixture key PEM and pins its family.
+fn key_of(name: str, want_alg: int) -> x509.PrivKey {
+    [k, e] = x509.parse_key_pem(fx(name))
+    testing.expect(e == nil, "parse " + name + ": " + errors.msg(e))
+    testing.expect_eq(k.alg, want_alg, "key family " + name)
+    return k
+}
+
+// leaf_of parses a fixture cert PEM.
+fn leaf_of(name: str) -> x509.Cert {
+    [cs, e] = x509.parse_pem(fx(name))
+    testing.expect(e == nil, "parse cert " + name + ": " + errors.msg(e))
+    testing.expect_eq(len(cs), 1, "one cert in " + name)
+    return cs[0]
+}
+
+fn test_privkey_pem_parse() {
+    // every PEM grammar the loader reads, per family
+    key_of("client_rsa.key", x509.PK_rsa) // PKCS#8 "PRIVATE KEY"
+    key_of("client_rsa_key_pkcs1.pem", x509.PK_rsa) // PKCS#1 "RSA PRIVATE KEY"
+    key_of("client_ec.key", x509.PK_ec_p256) // PKCS#8
+    key_of("client_ec_key_sec1.pem", x509.PK_ec_p256) // SEC1 "EC PRIVATE KEY"
+    key_of("client_ec384.key", x509.PK_ec_p384)
+    key_of("client_ed.key", x509.PK_ed25519)
+    // the PKCS#1 and PKCS#8 encodings of one key carry the same
+    // parameters — a signature from one verifies under the other
+    [k8, e8] = x509.parse_key_pem(fx("client_rsa.key"))
+    [k1, e1] = x509.parse_key_pem(fx("client_rsa_key_pkcs1.pem"))
+    testing.expect(e8 == nil && e1 == nil, "both rsa encodings parse")
+    pk8 := rsa.PubKey{n: k8.rk.n, e: k8.rk.e}
+    [sig, se] = rsa.sign_v15(k1.rk, sha256.new, "same key" as []byte)
+    testing.expect(se == nil, "v15 sign via pkcs1 parse")
+    testing.expect(rsa.verify_v15(pk8, sha256.new, "same key" as []byte, sig) == nil, "pkcs1 key verifies under pkcs8 n/e")
+}
+
+fn test_privkey_rejects() {
+    // an encrypted PKCS#8 is a named "unsupported", not a DER dump
+    [ke, ee] = x509.parse_key_pem(fx("client_rsa_key_enc.pem"))
+    testing.expect(ee != nil, "encrypted key must reject")
+    if ee != nil {
+        testing.expect(strings.contains(errors.msg(ee), "encrypted"), "encrypted names the problem: " + errors.msg(ee))
+    }
+    // no key block at all
+    [k2, e2] = x509.parse_key_pem("not a pem at all")
+    testing.expect(e2 != nil, "garbage text rejected")
+    // a CERTIFICATE-only pem has no private-key block
+    [k3, e3] = x509.parse_key_pem(fx("client_rsa.pem"))
+    testing.expect(e3 != nil, "cert pem is not a key")
+    // truncated DER inside a well-formed PEM wrapper
+    [k4, e4] = x509.parse_key_pem("-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n")
+    testing.expect(e4 != nil, "truncated der rejected")
+    testing.expect(ke.alg == 0 && k2.alg == 0 && k3.alg == 0 && k4.alg == 0, "rejects leave no key")
+}
+
+fn test_key_cert_match() {
+    // load_cert_pem: happy path per family — chain loaded, key bound
+    fams := mkslice(str, 0)
+    fams = push(fams, "client_rsa")
+    fams = push(fams, "client_ec")
+    fams = push(fams, "client_ec384")
+    fams = push(fams, "client_ed")
+    i := 0
+    for i < len(fams) {
+        [cc, e] = tls.load_cert_pem(fx(fams[i] + ".pem"), fx(fams[i] + ".key"))
+        testing.expect(e == nil, "load " + fams[i] + ": " + errors.msg(e))
+        testing.expect_eq(len(cc.chain), 1, "chain length " + fams[i])
+        i = i + 1
+    }
+    // mismatches must reject at load, never mid-handshake —
+    // same-family (other RSA key vs RSA cert) and cross-family
+    [c1, e1] = tls.load_cert_pem(fx("client_rsa.pem"), fx("other_rsa.key"))
+    testing.expect(e1 != nil, "same-family mismatch rejected")
+    [c2, e2] = tls.load_cert_pem(fx("client_rsa.pem"), fx("client_ec.key"))
+    testing.expect(e2 != nil, "rsa cert + ec key rejected")
+    [c3, e3] = tls.load_cert_pem(fx("client_ec.pem"), fx("other_rsa.key"))
+    testing.expect(e3 != nil, "ec cert + rsa key rejected")
+    [c4, e4] = tls.load_cert_pem(fx("client_ed.pem"), fx("client_rsa.key"))
+    testing.expect(e4 != nil, "ed25519 cert + rsa key rejected")
+    // a cert pem with no CERTIFICATE block
+    [c5, e5] = tls.load_cert_pem(fx("client_rsa.key"), fx("client_rsa.key"))
+    testing.expect(e5 != nil, "key-only pem is not a chain")
+    testing.expect(len(c1.chain) == 0 && len(c2.chain) == 0 && len(c3.chain) == 0 && len(c4.chain) == 0 && len(c5.chain) == 0, "rejects leave no identity")
+}
+
+// cert_rsa_pub pulls the RSA public key out of a cert's SPKI.
+fn cert_rsa_pub(c: x509.Cert) -> rsa.PubKey {
+    testing.expect_eq(c.spki_alg, x509.SPKI_rsa, "rsa cert")
+    [spk, e] = x509.spki_key(c.spki)
+    testing.expect(e == nil, "spki key")
+    [pk, e2] = rsa.parse_pub_key(spk)
+    testing.expect(e2 == nil, "rsa pub parse")
+    return pk
+}
+
+fn test_sign_roundtrip() {
+    msg := "oxl mtls sign probe" as []byte
+    // RSA: PSS at all three TLS hash widths plus v1.5 — the parsed
+    // key signs, the cert's SPKI verifies
+    rk := key_of("client_rsa.key", x509.PK_rsa)
+    pk := cert_rsa_pub(leaf_of("client_rsa.pem"))
+    [s256, e1] = rsa.sign_pss(rk.rk, sha256.new, msg, 32)
+    testing.expect(e1 == nil, "pss sha256 sign")
+    testing.expect(rsa.verify_pss(pk, sha256.new, msg, s256, 32) == nil, "pss sha256 verify")
+    [s384, e2] = rsa.sign_pss(rk.rk, sha512.new384, msg, 48)
+    testing.expect(e2 == nil, "pss sha384 sign")
+    testing.expect(rsa.verify_pss(pk, sha512.new384, msg, s384, 48) == nil, "pss sha384 verify")
+    [s512, e3] = rsa.sign_pss(rk.rk, sha512.new, msg, 64)
+    testing.expect(e3 == nil, "pss sha512 sign")
+    testing.expect(rsa.verify_pss(pk, sha512.new, msg, s512, 64) == nil, "pss sha512 verify")
+    [sv15, e4] = rsa.sign_v15(rk.rk, sha256.new, msg)
+    testing.expect(e4 == nil, "v15 sign")
+    testing.expect(rsa.verify_v15(pk, sha256.new, msg, sv15) == nil, "v15 verify")
+    // tamper rejects under the cert key
+    testing.expect(rsa.verify_pss(pk, sha256.new, "wrong" as []byte, s256, 32) != nil, "pss wrong msg")
+
+    // ECDSA P-256 + P-384: r,s round-trip under the cert's SEC1 point
+    ec := key_of("client_ec.key", x509.PK_ec_p256)
+    ecleaf := leaf_of("client_ec.pem")
+    testing.expect_eq(ecleaf.spki_alg, x509.SPKI_ec_p256, "ec cert family")
+    [ecspk, ee1] = x509.spki_key(ecleaf.spki)
+    testing.expect(ee1 == nil, "ec spki")
+    [sg, ee2] = nistec.ecdsa_sign(nistec.p256(), ec.sk, sha256.new, msg)
+    testing.expect(ee2 == nil, "ecdsa p256 sign")
+    testing.expect(nistec.ecdsa_verify(nistec.p256(), ecspk, sha256.new, msg, sg.r, sg.s) == nil, "ecdsa p256 verify")
+    testing.expect(nistec.ecdsa_verify(nistec.p256(), ecspk, sha256.new, "wrong" as []byte, sg.r, sg.s) != nil, "ecdsa wrong msg")
+
+    ec384 := key_of("client_ec384.key", x509.PK_ec_p384)
+    ec384leaf := leaf_of("client_ec384.pem")
+    testing.expect_eq(ec384leaf.spki_alg, x509.SPKI_ec_p384, "p384 cert family")
+    [e384spk, ee3] = x509.spki_key(ec384leaf.spki)
+    testing.expect(ee3 == nil, "p384 spki")
+    [sg384, ee4] = nistec.ecdsa_sign(nistec.p384(), ec384.sk, sha512.new384, msg)
+    testing.expect(ee4 == nil, "ecdsa p384 sign")
+    testing.expect(nistec.ecdsa_verify(nistec.p384(), e384spk, sha512.new384, msg, sg384.r, sg384.s) == nil, "ecdsa p384 verify")
+
+    // Ed25519: 32-byte seed signs, cert pub verifies
+    ed := key_of("client_ed.key", x509.PK_ed25519)
+    edleaf := leaf_of("client_ed.pem")
+    testing.expect_eq(edleaf.spki_alg, x509.SPKI_ed25519, "ed cert family")
+    [edspk, ee5] = x509.spki_key(edleaf.spki)
+    testing.expect(ee5 == nil, "ed spki")
+    [esig, ee6] = ed25519.sign(ed.sk, msg)
+    testing.expect(ee6 == nil, "ed sign")
+    testing.expect_eq(len(esig), 64, "ed sig len")
+    testing.expect(ed25519.verify(edspk, msg, esig) == nil, "ed verify")
+    testing.expect(ed25519.verify(edspk, "wrong" as []byte, esig) != nil, "ed wrong msg")
+}
+
+fn test_cv_alg_pick() {
+    // the CV scheme is constrained to what the CR's
+    // signature_algorithms offered AND the key's family — code points
+    // are the RFC 8446 decimal values (tls.SA_* pins the same table)
+    all := mkslice(int, 0)
+    all = push(all, tls.SA_ECDSA_P256_SHA256)
+    all = push(all, tls.SA_ECDSA_P384_SHA384)
+    all = push(all, tls.SA_ED25519)
+    all = push(all, tls.SA_PSS_SHA256)
+    all = push(all, tls.SA_PSS_SHA384)
+    all = push(all, tls.SA_PSS_SHA512)
+    testing.expect_eq(tls.cv_alg_for_key(x509.PK_rsa, all, 256), tls.SA_PSS_SHA256, "rsa picks sha256 first")
+    only384 := mkslice(int, 0)
+    only384 = push(only384, tls.SA_PSS_SHA384)
+    testing.expect_eq(tls.cv_alg_for_key(x509.PK_rsa, only384, 256), tls.SA_PSS_SHA384, "rsa falls to offered sha384")
+    pkcs1 := mkslice(int, 0)
+    pkcs1 = push(pkcs1, tls.SA_PKCS1_SHA256)
+    pkcs1 = push(pkcs1, tls.SA_PKCS1_SHA384)
+    testing.expect_eq(tls.cv_alg_for_key(x509.PK_rsa, pkcs1, 256), 0, "pkcs1-only offer is unusable — cv-illegal")
+    testing.expect_eq(tls.cv_alg_for_key(x509.PK_ec_p256, all, 0), tls.SA_ECDSA_P256_SHA256, "p256 picks its sha256 scheme")
+    p384only := mkslice(int, 0)
+    p384only = push(p384only, tls.SA_ECDSA_P384_SHA384)
+    testing.expect_eq(tls.cv_alg_for_key(x509.PK_ec_p256, p384only, 0), 0, "p256 key cannot do p384 scheme")
+    testing.expect_eq(tls.cv_alg_for_key(x509.PK_ec_p384, p384only, 0), tls.SA_ECDSA_P384_SHA384, "p384 picks its scheme")
+    p256only := mkslice(int, 0)
+    p256only = push(p256only, tls.SA_ECDSA_P256_SHA256)
+    testing.expect_eq(tls.cv_alg_for_key(x509.PK_ec_p384, p256only, 0), 0, "p384 key cannot do p256 scheme")
+    testing.expect_eq(tls.cv_alg_for_key(x509.PK_ed25519, all, 0), tls.SA_ED25519, "ed picks ed25519")
+    testing.expect_eq(tls.cv_alg_for_key(x509.PK_ed25519, p384only, 0), 0, "ed25519 key cannot do ecdsa")
+    testing.expect_eq(tls.cv_alg_for_key(0, all, 256), 0, "unknown key family yields nothing")
+    testing.expect_eq(tls.cv_alg_for_key(x509.PK_rsa, nil, 256), 0, "empty offer yields nothing")
+    sha512only := mkslice(int, 0)
+    sha512only = push(sha512only, tls.SA_PSS_SHA512)
+    testing.expect_eq(tls.cv_alg_for_key(x509.PK_rsa, sha512only, 128), 0, "1024-bit rsa cannot carry pss-sha512")
+    testing.expect_eq(tls.cv_alg_for_key(x509.PK_rsa, sha512only, 130), tls.SA_PSS_SHA512, "1032-bit rsa carries pss-sha512")
+    testing.expect_eq(tls.cv_alg_for_key(x509.PK_rsa, all, 96), tls.SA_PSS_SHA256, "small rsa falls to sha256 only")
+}
+
+fn test_no_cert_default() {
+    // the zero Config presents no identity — the CR answer stays the
+    // empty certificate_list (interop pins the wire shape)
+    cfg := tls.default_cfg()
+    testing.expect_eq(len(cfg.client_cert.chain), 0, "default has no client identity")
+    testing.expect_eq(cfg.client_cert.key.alg, 0, "default has no key")
+}

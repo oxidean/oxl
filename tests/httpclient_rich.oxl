@@ -265,6 +265,13 @@ fn main() {
     [_r6b, e6c] = cl.do(rq4b)
     expect(e6c != nil, "CTL header rejected")
 
+    // prior-knowledge h2c cannot run through a proxy
+    rq4c := http.request_get(base + "/hdrcheck")
+    rq4c.proxy = "http://127.0.0.1:9"
+    rq4c.http_version = "2-prior-knowledge"
+    [_r6c, e6d] = cl.do(rq4c)
+    expect(e6d != nil && errors.msg(e6d) == "http: h2c through a proxy is not supported", "h2c through proxy rejected")
+
     // -- bearer + request helpers ----------------------------------
     rq5 := http.request_get(base + "/hdrcheck")
     rq5.headers = push(rq5.headers, http.bearer_auth("tok123"))
@@ -294,7 +301,7 @@ fn main() {
     expect(r9.body == "hello gzip", "gzip decoded got len " + itoa(len(r9.body)))
     // decompression off delivers the raw bytes with the header visible
     cl_raw := http.new_client(30000)
-    rq_raw := http.Request{method: "GET", url: base + "/gzip", headers: mkslice(http.Header, 0), body: "", redirects: 0, decompress: false, proxy: "direct"}
+    rq_raw := http.Request{method: "GET", url: base + "/gzip", headers: mkslice(http.Header, 0), body: "", redirects: 0, decompress: false, proxy: "direct", http_version: ""}
     [r10, e10] = get_retry_req(cl_raw, rq_raw)
     ck(e10, "gzip raw")
     expect(r10.body != "hello gzip", "raw gzip not decoded")

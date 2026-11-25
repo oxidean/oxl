@@ -87,6 +87,9 @@ scratch=$(mktemp -d)
 srv_pid=""
 relsrv=""
 ws_peer_pid=""
+h2_srv="" h2_proxy_srv="" grpc_srv="" peer_pid=""
+isrv="" hsrv="" tsrv="" rsa_srv="" vsrv="" ssrv="" rsrv="" csrv=""
+origin_srv="" proxy_srv="" sigpid="" base_pid="" scale_pid="" scale_dog=""
 cleanup() {
     # every fixture server the suite can spawn — a mid-suite failure
     # must not orphan node/python/openssl peers holding ports (they
